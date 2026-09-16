@@ -22,7 +22,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
-    has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.math_utils import round_down
@@ -805,7 +805,7 @@ def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
-        and has_deep_gemm()
+        and is_deep_gemm_supported()
     )
 
 
@@ -813,7 +813,7 @@ def _supports_flattened_device_query_lens() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(90)
-        and has_deep_gemm()
+        and is_deep_gemm_supported()
     )
 
 
@@ -831,7 +831,10 @@ def _supports_native_decode(next_n: int) -> bool:
     instead of flattening to one single-token row per query, which re-reads
     the KV tile once per row.
     """
-    if not (current_platform.is_cuda() and has_deep_gemm()):
+    # Without DeepGEMM (non-CUDA, or CUDA below SM90 such as Ampere) the
+    # Triton paged kernel takes next_n in {1, 2} natively with the same
+    # (B, next_n) seq_lens layout; larger next_n is flattened.
+    if not (current_platform.is_cuda() and is_deep_gemm_supported()):
         return next_n in (1, 2)
     if current_platform.is_device_capability_family(100):
         return True
@@ -1589,9 +1592,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
+            # DeepGEMM scheduler metadata is only consumed by the DeepGEMM
+            # paged MQA logits kernel; the Triton fallback (no DeepGEMM
+            # support, e.g. Ampere) ignores it.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if current_platform.is_cuda() and is_deep_gemm_supported():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

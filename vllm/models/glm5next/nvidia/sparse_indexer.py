@@ -23,7 +23,7 @@ from vllm.models.glm5next.common.sparse_indexer import (
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -312,16 +312,34 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+            if is_deep_gemm_supported():
+                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
-            logits = fp8_fp4_mqa_logits(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-            )
+                logits = fp8_fp4_mqa_logits(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                # CUDA without DeepGEMM (e.g. Ampere): Triton kernel that
+                # dequantizes the fp8 bytes in-kernel (bf16 MMA, fp32 accum).
+                from vllm.v1.attention.ops.triton_mqa_logits import (
+                    fp8_mqa_logits as triton_fp8_mqa_logits,
+                )
+
+                assert not use_fp4_cache, (
+                    "MXFP4 indexer cache requires DeepGEMM (SM100/SM120)"
+                )
+                logits = triton_fp8_mqa_logits(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
@@ -547,19 +565,42 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+        if is_deep_gemm_supported():
+            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
-        logits = fp8_fp4_paged_mqa_logits(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            padded_weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_pool_len,
-            clean_logits=False,
-            indices=decode_metadata.indices,
-        )
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_pool_len,
+                clean_logits=False,
+                indices=decode_metadata.indices,
+            )
+        else:
+            # CUDA without DeepGEMM (e.g. Ampere): Triton paged kernel over the
+            # uint8 (D + 4)-byte cache with next_n Q rows per request and the
+            # same (B, next_n) seq_lens layout. No scheduler metadata needed;
+            # max_seq_len (token-granular, so an upper bound on the
+            # pool-granular seq_lens) trims the tile grid.
+            from vllm.v1.attention.ops.triton_mqa_logits import (
+                fp8_paged_mqa_logits as triton_fp8_paged_mqa_logits,
+            )
+
+            assert not use_fp4_cache, (
+                "MXFP4 indexer cache requires DeepGEMM (SM100/SM120)"
+            )
+            logits = triton_fp8_paged_mqa_logits(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_pool_len,
+                max_seq_len=attn_metadata_narrowed.max_seq_len,
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -658,9 +699,15 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "Sparse Attention Indexer MXFP4 cache requires DeepGEMM "
+                    "(SM100/SM120)."
+                )
+            logger.info_once(
+                "DeepGEMM is not usable on this device; the sparse attention "
+                "indexer will use the Triton fp8 MQA-logits kernels."
             )
         _cfg = get_current_vllm_config_or_none()
         self.topk_backend = (

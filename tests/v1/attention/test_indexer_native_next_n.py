@@ -23,7 +23,7 @@ def _set_arch(monkeypatch, family: int, *, cuda: bool = True, deep_gemm: bool = 
         "is_device_capability_family",
         lambda capability, device_id=0: capability // 10 == family,
     )
-    monkeypatch.setattr(indexer, "has_deep_gemm", lambda: deep_gemm)
+    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: deep_gemm)
 
 
 @pytest.mark.parametrize(
@@ -50,7 +50,9 @@ def test_native_decode_gate_per_architecture(monkeypatch, family, expected_nativ
     "cuda,deep_gemm", [(False, True), (True, False), (False, False)]
 )
 def test_native_decode_gate_without_deepgemm(monkeypatch, cuda, deep_gemm):
-    """Without the DeepGEMM kernels only the shapes every backend handles."""
+    """Without usable DeepGEMM kernels (non-CUDA, or CUDA below SM90 where
+    the Triton paged kernel serves decode) only the shapes every backend
+    handles."""
     _set_arch(monkeypatch, 9, cuda=cuda, deep_gemm=deep_gemm)
     assert [indexer._supports_native_decode(n) for n in (1, 2, 3, 4)] == [
         True,

@@ -15,9 +15,18 @@ from __future__ import annotations
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.triton_e4m3 import (
+    store_fp8_e4m3,
+    triton_fp8_e4m3_native,
+)
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
+
+# fp8 stores: Hopper+ writes through a float8_e4m3fn pointer (hardware cvt);
+# older devices (Triton rejects fp8e4nv below SM89) get the uint8 byte view of
+# the same tensor and convert in software (see triton_e4m3.py). The wrappers
+# pick the view; the kernels only see FP8_NATIVE.
 
 
 # Hadamard-128 rotation
@@ -65,6 +74,7 @@ def _fwht_quant_kernel(
     sout_ptr,
     n_rows,
     BLOCK_R: tl.constexpr,
+    FP8_NATIVE: tl.constexpr,
 ):
     """Fused Hadamard-128 rotation + per-row absmax FP8 (ue8m0) quant.
 
@@ -101,7 +111,9 @@ def _fwht_quant_kernel(
     scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
 
-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
+    store_fp8_e4m3(
+        qout_ptr + rows[:, None] * 128 + offs[None, :], y, rmask[:, None], FP8_NATIVE
+    )
     tl.store(sout_ptr + rows, scale, mask=rmask)
 
 
@@ -128,7 +140,16 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    native = triton_fp8_e4m3_native()
+    _fwht_quant_kernel[grid](
+        q,
+        q_fp8 if native else q_fp8.view(torch.uint8),
+        q_scale,
+        n_rows,
+        BLOCK_R=BLOCK_R,
+        FP8_NATIVE=native,
+        num_warps=2,
+    )
     return q_fp8, q_scale
 
 
@@ -161,6 +182,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP8_NATIVE: tl.constexpr,
 ):
     """One program per pool. softmax(slot_score+ape)-weighted sum of slot_k ->
     Hadamard-128 -> per-vector fp8 absmax quant -> write to cache at ``loc``."""
@@ -244,14 +266,15 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + S_OFFSET_NBYTES_IN_PAGE // 4
             + loc_token_offset_in_page
         )
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        store_fp8_e4m3(buf_fp8_ptr + out_k_offsets, quantized, mask, FP8_NATIVE)
         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
 
     if RETURN_COMPRESSED:
-        tl.store(
+        store_fp8_e4m3(
             compressed_k_ptr + row * HEAD_DIM + offs,
             quantized,
-            mask=offs < HEAD_DIM,
+            offs < HEAD_DIM,
+            FP8_NATIVE,
         )
         tl.store(compressed_scale_ptr + row, scale)
 
@@ -322,23 +345,27 @@ def kpool_compress_and_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    native = triton_fp8_e4m3_native()
+    buf_fp8 = buf.view(torch.float8_e4m3fn) if native else buf
     buf_fp32 = buf.view(torch.float32)
     # bytes per page (last dim of kv_cache) viewed as uint8
     buf_numel_per_page = buf.stride(0)
     s_offset_nbytes_in_page = page_size * head_dim
 
     if return_compressed:
-        compressed_k = torch.empty(
+        compressed_k_out = torch.empty(
             (slot_k.shape[0], head_dim),
             dtype=torch.float8_e4m3fn,
             device=slot_k.device,
+        )
+        compressed_k = (
+            compressed_k_out if native else compressed_k_out.view(torch.uint8)
         )
         compressed_scale = torch.empty(
             (slot_k.shape[0],), dtype=torch.float32, device=slot_k.device
         )
     else:
-        compressed_k = buf_fp8
+        compressed_k_out = compressed_k = buf_fp8
         compressed_scale = buf_fp32
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
@@ -366,10 +393,11 @@ def kpool_compress_and_write_cache(
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        FP8_NATIVE=native,
     )
 
     if return_compressed:
-        return compressed_k, compressed_scale
+        return compressed_k_out, compressed_scale
     return None
 
 
@@ -485,6 +513,7 @@ def _kpool_decode_update_batched_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP8_NATIVE: tl.constexpr,
 ):
     """One program per request; iterates its NEXT_N verify tokens in order.
 
@@ -608,7 +637,7 @@ def _kpool_decode_update_batched_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            store_fp8_e4m3(buf_fp8_ptr + out_k_offsets, quantized, dim_mask, FP8_NATIVE)
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
         # Stash the current token AFTER any completion read so the completion
@@ -688,7 +717,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     page_size = kv_cache.shape[1]
     buf = kv_cache
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    native = triton_fp8_e4m3_native()
+    buf_fp8 = buf.view(torch.float8_e4m3fn) if native else buf
     buf_fp32 = buf.view(torch.float32)
 
     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),
@@ -725,6 +755,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         S_OFFSET_NBYTES_IN_PAGE=page_size * head_dim,
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        FP8_NATIVE=native,
     )
 
 
