@@ -92,6 +92,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadataBuilder,
 )
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
+from vllm.v1.attention.backends.mla.triton_mla_sparse import (
+    TritonMLASparseBackend,
+)
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
     split_prefill_chunks,
@@ -399,8 +403,8 @@ def _quantize_dequantize_nvfp4_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseTRTLLMBackend],
-    ids=["FlashMLA", "FlashInferTRTLLM"],
+    [FlashMLASparseBackend, FlashInferMLASparseTRTLLMBackend, TritonMLASparseBackend],
+    ids=["FlashMLA", "FlashInferTRTLLM", "TritonMLASparse"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
 @pytest.mark.parametrize(
@@ -458,7 +462,10 @@ def test_sparse_backend_decode_correctness(
             pytest.skip("The NVFP4 DS-MLA kv-cache dtype requires SM 10.x")
 
     supported_block_sizes = backend_cls.get_supported_kernel_block_sizes()
-    if block_size not in supported_block_sizes:
+    if not any(
+        block_size % size.base == 0 if isinstance(size, MultipleOf) else block_size == size
+        for size in supported_block_sizes
+    ):
         pytest.skip(
             f"{backend_cls.get_name()} does not support block_size={block_size}"
         )
