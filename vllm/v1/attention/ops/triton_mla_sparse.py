@@ -22,6 +22,12 @@ import torch
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 
 
+def _cdiv(a: int, b: int) -> int:
+    """Ceiling division. ``triton.cdiv`` is a ``ConstexprFunction``: it costs
+    ~0.9 us of host time per call, which matters on the decode path."""
+    return -(a // -b)
+
+
 @triton.jit
 def _mla_sparse_kernel(
     q_buffer,
@@ -276,20 +282,27 @@ def _mla_store_output(
 def _pick_config(num_tokens: int, index_topk: int) -> tuple[int, int, int, int]:
     """(BLOCK_H, BLOCK_N, num_splits, num_warps).
 
-    Few tokens leave most of the 108 SMs idle, so the top-k axis is split across
-    CTAs and the partials are merged with the lse by the last CTA to finish.
-    Measured (sm_80, GPU time): t=1 wants 8 splits (31 vs 47 us for 4), t=8 and
-    t=24 want 4 (t=8: 69 vs 76 us for 8; t=24: 211 vs 243 us for 2), t>=300
-    gains nothing from splitting. BLOCK_N=32 beats 16 and 64 on every shape with
-    the row-major gather; BLOCK_H 32/64 and 8 warps are slower.
+    A CTA gathers every one of its BLOCK_N cache rows in full, so the 64 heads
+    of a token re-read the same rows once per head block: BLOCK_H=32 halves
+    that traffic against BLOCK_H=16 and is worth 1.25-1.38x wherever the
+    gather dominates (measured GPU time, sm_80, d=512: t=2048 10855 -> 7846 us,
+    t=300 1965 -> 1567, t=128 937 -> 580, t=24 209 -> 186). Only at <= 8 tokens
+    do the extra CTAs of BLOCK_H=16 pay more than the reuse (t=1 36 vs 73 us,
+    t=8 84 vs 96).
+
+    The top-k axis is then split across CTAs until the launch has ~110-160 CTAs;
+    beyond that the split-k merge tail costs more than the added parallelism
+    (t=24: 96 CTAs at 2 splits 186 us vs 192 CTAs at 4 splits 216 us). Splits
+    stay <= 8 because the last-CTA merge reads splits x BLOCK_H x 2 KB.
+    BLOCK_N=32 beats 16 and 64 on every shape; 8 warps is slower everywhere.
     """
-    BLOCK_H = 16
     BLOCK_N = 32
+    BLOCK_H = 16 if num_tokens <= 8 else 32
     ctas = num_tokens * (64 // BLOCK_H)
-    if ctas >= 400:
-        return BLOCK_H, BLOCK_N, 1, 4
-    want = 8 if ctas <= 16 else 4
-    return BLOCK_H, BLOCK_N, min(want, triton.cdiv(index_topk, BLOCK_N)), 4
+    num_splits = 1
+    while num_splits < 8 and ctas * num_splits * 2 <= 160:
+        num_splits *= 2
+    return BLOCK_H, BLOCK_N, min(num_splits, _cdiv(index_topk, BLOCK_N)), 4
 
 
 _WORKSPACE: dict[tuple, tuple[torch.Tensor, ...]] = {}
@@ -360,13 +373,13 @@ def triton_mla_sparse_fwd(
     sm_scale = sm_scale * LOG2E
 
     kv_group_num = num_heads_q // num_heads_kv
-    split_len = triton.cdiv(triton.cdiv(index_topk, num_splits), BLOCK_N) * BLOCK_N
-    num_splits = triton.cdiv(index_topk, split_len)
+    split_len = _cdiv(_cdiv(index_topk, num_splits), BLOCK_N) * BLOCK_N
+    num_splits = _cdiv(index_topk, split_len)
     # merge kernel iterates tl.arange(0, NUM_SPLITS) -> power of two
     num_splits = 1 << (num_splits - 1).bit_length()
     grid = (
         num_tokens,
-        triton.cdiv(num_heads_q, min(BLOCK_H, kv_group_num)),
+        _cdiv(num_heads_q, min(BLOCK_H, kv_group_num)),
         num_splits,
     )
 
@@ -377,15 +390,17 @@ def triton_mla_sparse_fwd(
     else:
         assert out.shape == (num_tokens, num_heads_q, d_v)
         assert out.dtype == q.dtype
-    softmax_lse = torch.empty(
-        (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
+    # One allocation for both [num_tokens, num_heads_q] fp32 statistics: a
+    # torch.empty costs ~2.6 us of host time, which is a fifth of a decode
+    # launch. The two returned tensors are ordinary contiguous views.
+    stats = torch.empty(
+        (2, num_tokens, num_heads_q), dtype=torch.float32, device=q.device
     )
-    max_logits = torch.empty(
-        (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
-    )
+    max_logits, softmax_lse = stats[0], stats[1]
 
-    k = kv
-    v = kv[..., :d_v]
+    # kv[..., :d_v] would have kv's pointer and strides anyway (d_v <=
+    # BLOCK_DMODEL, and the kernel masks the V columns), so skip the slice.
+    k = v = kv
 
     if num_splits == 1:
         # unused; any tensor works as a placeholder pointer
@@ -395,6 +410,7 @@ def triton_mla_sparse_fwd(
             q.device, num_tokens, num_heads_q, num_splits, BLOCK_DV, grid[1]
         )
 
+    sq, skv, so, si = q.stride(), kv.stride(), out.stride(), indices.stride()
     _mla_sparse_kernel[grid](
         q_buffer=q,
         k_buffer=k,
@@ -411,17 +427,17 @@ def triton_mla_sparse_fwd(
         h_q=num_heads_q,
         dim_qk=dim_qk,
         dim_v=d_v,
-        stride_q_token=q.stride(0),
-        stride_q_head=q.stride(1),
-        stride_k_token=k.stride(0),
-        stride_k_head=k.stride(1),
-        stride_v_token=v.stride(0),
-        stride_v_head=v.stride(1),
-        stride_out_token=out.stride(0),
-        stride_out_head=out.stride(1),
-        stride_lse=softmax_lse.stride(0),
-        stride_indices_token=indices.stride(0),
-        stride_indices_head=indices.stride(1),
+        stride_q_token=sq[0],
+        stride_q_head=sq[1],
+        stride_k_token=skv[0],
+        stride_k_head=skv[1],
+        stride_v_token=skv[0],
+        stride_v_head=skv[1],
+        stride_out_token=so[0],
+        stride_out_head=so[1],
+        stride_lse=num_heads_q,  # a contiguous [num_tokens, num_heads_q] row
+        stride_indices_token=si[0],
+        stride_indices_head=si[1],
         sm_scale=sm_scale,
         split_len=split_len,
         kv_group_num=kv_group_num,
@@ -435,6 +451,7 @@ def triton_mla_sparse_fwd(
         V_IS_K=(d_v == BLOCK_DMODEL),
         LOGE2=LOGE2,
         num_warps=num_warps,
+        num_stages=3,
     )
 
     return out, max_logits, softmax_lse

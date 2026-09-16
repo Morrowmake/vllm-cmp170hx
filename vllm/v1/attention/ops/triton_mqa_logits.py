@@ -203,6 +203,7 @@ def fp8_mqa_logits_triton(
     if tiles_per_prog is None:
         tiles_per_prog = _tiles_per_program(num_row_blocks, num_tiles)
     grid = (num_row_blocks, cdiv(num_tiles, tiles_per_prog))
+    sq = q8.stride()
     _mqa_logits_kernel[grid](
         q8,
         k8,
@@ -214,10 +215,10 @@ def fp8_mqa_logits_triton(
         M,
         N,
         tiles_per_prog,
-        q8.stride(0),
-        q8.stride(1),
+        sq[0],
+        sq[1],
         weights.stride(0),
-        logits.stride(0),
+        N,  # stride_om: logits is contiguous [M, N]
         H=H,
         D=D,
         BLOCK_M=block_m,
@@ -363,14 +364,43 @@ def _paged_mqa_logits_kernel(
         )
 
 
+# (data_ptr, numel, uint8 flat view, fp32 flat view) of the last paged cache
+# seen. Re-viewing the cache costs ~1.7 us of a ~25 us decode launch and the
+# cache tensor is a persistent allocation in practice, so one slot suffices.
+_KV_VIEWS: tuple = (0, 0, None, None)
+
+
+def _flat_kv_views(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat uint8 and fp32 views of a contiguous paged KV cache."""
+    global _KV_VIEWS
+    ptr, numel = kv_cache.data_ptr(), kv_cache.numel()
+    cached = _KV_VIEWS
+    if cached[0] == ptr and cached[1] == numel:
+        return cached[2], cached[3]
+    kv_u8 = kv_cache.view(-1)
+    kv_f32 = kv_u8.view(torch.float32)
+    _KV_VIEWS = (ptr, numel, kv_u8, kv_f32)
+    return kv_u8, kv_f32
+
+
 def _per_row_context_lens(context_lens: torch.Tensor, batch_size: int, next_n: int):
     """Normalize ``context_lens`` to a ``[B, next_n]`` int32 tensor.
 
     ``(B, next_n)`` is used as-is (row ``t`` sees ``[0, ctx[b, t])``). A 1-D or
     ``(B, 1)`` tensor is the DeepGEMM 1-D convention: row ``t`` of request
     ``b`` sees ``[0, ctx[b] - (next_n - 1 - t))``.
+
+    Shape / dtype juggling here is on the decode launch path, so the common
+    already-``[B, next_n]``-int32 case returns the caller's tensor untouched.
     """
     ctx = context_lens
+    if (
+        ctx.dtype == torch.int32
+        and ctx.dim() == 2
+        and ctx.shape[0] == batch_size
+        and ctx.shape[1] == next_n
+    ):
+        return ctx  # already the per-row layout: no slice, no copy
     if ctx.dim() == 1:
         ctx = ctx.unsqueeze(-1)
     assert ctx.dim() == 2 and ctx.shape[0] >= batch_size, ctx.shape
@@ -410,8 +440,7 @@ def fp8_paged_mqa_logits_triton(
     assert entry_bytes == D + 4, (kv_cache.shape, D)
     assert block_size & (block_size - 1) == 0 and block_size >= 16, block_size
     page_bytes = block_size * (D + 4)
-    kv_u8 = kv_cache.view(-1)
-    kv_f32 = kv_u8.view(torch.float32)
+    kv_u8, kv_f32 = _flat_kv_views(kv_cache)
     weights = weights.contiguous()
     assert weights.shape[0] >= B * next_n and weights.shape[1] == H
     assert weights.dtype == torch.float32
@@ -429,7 +458,13 @@ def fp8_paged_mqa_logits_triton(
     if n_tiles == 0:
         return logits
     if tiles_per_prog is None:
-        tiles_per_prog = _tiles_per_program(B, n_tiles, cap=8)
+        # A program's tile costs next_n times as much work (the dot is
+        # [NEXT_N_P2*H, D] x [D, BLOCK_SIZE]), so the cap on tiles per program
+        # shrinks with next_n to keep enough programs in flight: at B=8,
+        # 32768 context, next_n=2 the GPU time is 72.8 us at 4 tiles per
+        # program versus 80.9 us at 8 (next_n=1 is unchanged, 58 us at 8).
+        tiles_per_prog = _tiles_per_program(B, n_tiles, cap=max(1, 8 // next_n))
+    sq, sctx = q8.stride(), ctx.stride()
     _paged_mqa_logits_kernel[(B, cdiv(n_tiles, tiles_per_prog))](
         q8,
         kv_u8,
@@ -440,16 +475,16 @@ def fp8_paged_mqa_logits_triton(
         logits,
         max_model_len,
         tiles_per_prog,
-        q8.stride(0),
-        q8.stride(1),
-        q8.stride(2),
+        sq[0],
+        sq[1],
+        sq[2],
         weights.stride(0),
-        ctx.stride(0),
-        ctx.stride(1),
+        sctx[0],
+        sctx[1],
         block_tables.stride(0),
-        logits.stride(0),
+        max_model_len,  # stride_om: logits is contiguous [B*next_n, max_model_len]
         NEXT_N=next_n,
-        NEXT_N_P2=triton.next_power_of_2(next_n),
+        NEXT_N_P2=1 << (next_n - 1).bit_length(),
         H=H,
         D=D,
         BLOCK_SIZE=block_size,
