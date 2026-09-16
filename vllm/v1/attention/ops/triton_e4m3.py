@@ -54,6 +54,48 @@ def e4m3_bits_to_f32_fast(x):
 
 
 @triton.jit
+def e4m3_bits_to_bf16_raw(x):
+    """``uint8`` e4m3fn bit patterns -> ``bfloat16`` holding ``value * 2^-120``.
+
+    Pure bit placement: sign to bit 15, the 7 magnitude bits to bits [4, 11),
+    so the e4m3 exponent lands in the bf16 exponent field with bias 127
+    instead of 7. Normals and denormals are exact (bf16 denormals are
+    representable and never touched by arithmetic here); the two NaN patterns
+    become finite (+-480 * 2^-120), like :func:`e4m3_bits_to_f32_fast`.
+    Callers fold the 2^120 back in elsewhere (e.g. into the other MMA operand
+    and the per-row weights), which is exact and keeps every intermediate in
+    the fp32 normal range.
+
+    Four bytes per PTX instance (``prmt`` spreads them into two 16-bit lanes
+    each), ~2.5 instructions per element versus 8 for the fp32 route -- the
+    logits kernels' K-tile dequant was issue-bound on sm_80.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+        .reg .b32 a, b, m, s;
+        prmt.b32 a, $2, 0, 0x4140;
+        prmt.b32 b, $2, 0, 0x4342;
+        shl.b32 m, a, 4;
+        and.b32 m, m, 0x07F007F0;
+        shl.b32 s, a, 8;
+        and.b32 s, s, 0x80008000;
+        or.b32 $0, m, s;
+        shl.b32 m, b, 4;
+        and.b32 m, m, 0x07F007F0;
+        shl.b32 s, b, 8;
+        and.b32 s, s, 0x80008000;
+        or.b32 $1, m, s;
+        }
+        """,
+        "=r,=r,r",
+        [x],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=4,
+    )
+
+@triton.jit
 def e4m3_bits_to_f32(x):
     """``uint8`` e4m3fn bit patterns -> exact ``float32`` values (NaN for
     ``0x7F`` / ``0xFF``)."""

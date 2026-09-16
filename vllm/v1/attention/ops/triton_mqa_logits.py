@@ -32,7 +32,17 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.ops.triton_e4m3 import e4m3_bits_to_f32_fast
+from vllm.v1.attention.ops.triton_e4m3 import (
+    e4m3_bits_to_bf16_raw,
+    e4m3_bits_to_f32_fast,
+)
+
+# K tiles are dequantized as raw bf16 bits = value * 2^-120 (see
+# e4m3_bits_to_bf16_raw). Half of that scale goes into Q, the other half into
+# the head weights, so q @ k^T sits 2^-60 below its true value (fp32 normal
+# range for every |logit| >= 2^-66) and w * 2^60 * relu(acc) is exact again.
+_TWO60 = tl.constexpr(2.0**60)
+
 
 _NEG_INF = float("-inf")
 
@@ -76,8 +86,9 @@ def _mqa_logits_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """One program: BLOCK_M query rows x ``tiles_per_prog`` consecutive K
-    tiles. Q is dequantized once and reused across the (pipelined) K loop;
-    tiles no row of the block can see (causal / chunk bounds) are skipped."""
+    tiles. Q is dequantized once (scaled by 2^60) and reused across the
+    (pipelined) K loop; K tiles are raw bf16 bits (value * 2^-120); tiles no
+    row of the block can see (causal / chunk bounds) are skipped."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -103,12 +114,12 @@ def _mqa_logits_kernel(
         mask=(q_rows < M)[:, None],
         other=0,
     )
-    q = e4m3_bits_to_f32_fast(q_u8).to(tl.bfloat16)  # [BLOCK_M*H, D]
+    q = (e4m3_bits_to_f32_fast(q_u8) * _TWO60).to(tl.bfloat16)  # [BLOCK_M*H, D]
     w = tl.load(
         w_ptr + rows[:, None] * stride_wm + tl.arange(0, H)[None, :],
         mask=rmask[:, None],
         other=0.0,
-    )  # [BLOCK_M, H]
+    ) * _TWO60  # [BLOCK_M, H]
 
     for t in tl.range(t_begin, t_end):
         cols = t * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -116,7 +127,7 @@ def _mqa_logits_kernel(
         k_u8 = tl.load(
             k_ptr + cols[:, None] * D + d[None, :], mask=cmask[:, None], other=0
         )
-        k = e4m3_bits_to_f32_fast(k_u8).to(tl.bfloat16)  # [BLOCK_N, D]
+        k = e4m3_bits_to_bf16_raw(k_u8)  # [BLOCK_N, D], value * 2^-120
         acc = tl.dot(q, tl.trans(k))  # [BLOCK_M*H, BLOCK_N] fp32
         acc = tl.reshape(acc, (BLOCK_M, H, BLOCK_N))
         s = tl.sum(tl.maximum(acc, 0.0) * w[:, :, None], axis=1)
