@@ -34,6 +34,7 @@ from .model import (
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
+    use_replicated_embed,
 )
 
 
@@ -128,10 +129,14 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 )
             }
         )
+        # Under PP=1 this is replaced by the target's embed_tokens in
+        # maybe_share_target_embed(); build it with the same TP layout so
+        # the drafter's own copy (PP>1) matches VLLM_GLM5_REPLICATED_EMBED.
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            disable_tp=use_replicated_embed(),
         )
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.

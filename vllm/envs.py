@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_GLM5_REPLICATED_EMBED: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1437,6 +1438,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # GLM-5.x: replicate the input embedding table on every TP rank instead
+    # of vocab-sharding it. Removes the [tokens, hidden] all-reduce that the
+    # sharded lookup needs on every prefill chunk / decode step (target model
+    # and MTP drafter) at the cost of the full table per rank (~1.2 GiB for
+    # GLM-5.3-Flash). No effect with TP=1.
+    "VLLM_GLM5_REPLICATED_EMBED": lambda: bool(
+        int(os.getenv("VLLM_GLM5_REPLICATED_EMBED", "0"))
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,

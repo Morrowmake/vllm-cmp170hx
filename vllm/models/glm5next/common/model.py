@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -94,6 +95,28 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+
+
+def use_replicated_embed() -> bool:
+    """Whether to replicate the input embedding table on every TP rank.
+
+    ``VocabParallelEmbedding`` shards the table over the TP group and
+    all-reduces its ``[tokens, hidden]`` output on every call. On a
+    PCIe-only box that is one ~4 ms collective per prefill chunk / decode
+    step for the target model and another for the MTP drafter (which
+    aliases the same table under PP=1). ``VLLM_GLM5_REPLICATED_EMBED=1``
+    builds the table with ``disable_tp=True`` instead: each rank holds the
+    full ``vocab x hidden`` table (+1.18 GiB per rank for GLM-5.3-Flash's
+    154880 x 4096 bf16 table vs. a 1/4 shard) and the lookup is local. The
+    loader then copies the full vocab into each rank (``shard_indices``
+    span the whole table when ``tp_size == 1``). Opt-in so PP-only or
+    memory-tight deployments keep the sharded table; the lm_head stays
+    vocab-parallel either way.
+    """
+    return (
+        envs.VLLM_GLM5_REPLICATED_EMBED
+        and get_tensor_model_parallel_world_size() > 1
+    )
 
 
 class Glm5NextMLP(nn.Module):
@@ -654,10 +677,13 @@ class Glm5NextModel(nn.Module):
             topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
+            # See use_replicated_embed(): VLLM_GLM5_REPLICATED_EMBED=1 trades
+            # a full table per rank for no all-reduce on the lookup.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
+                disable_tp=use_replicated_embed(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
