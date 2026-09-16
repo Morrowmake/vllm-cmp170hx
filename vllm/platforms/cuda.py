@@ -144,6 +144,10 @@ def _get_backend_priorities(
                 sparse_tail.insert(0, flashinfer_sparse)
             else:
                 sparse_tail.append(flashinfer_sparse)
+            # Pure-Triton fallback (any cc >= 8.0, e.g. Ampere); the vendor
+            # sparse kernels above are rejected there by
+            # supports_compute_capability.
+            sparse_tail.append(AttentionBackendEnum.TRITON_MLA_SPARSE)
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
