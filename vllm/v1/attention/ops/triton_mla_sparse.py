@@ -30,6 +30,10 @@ def _mla_sparse_kernel(
     indices_ptr,
     out_ptr,
     softmax_lse_ptr,
+    part_acc_ptr,  # fp32 [T, H, NUM_SPLITS, BLOCK_DV] workspace (NUM_SPLITS > 1)
+    part_sum_ptr,  # fp32 [T, H, NUM_SPLITS]
+    part_max_ptr,  # fp32 [T, H, NUM_SPLITS]
+    counter_ptr,  # int32 [T, head blocks], zero on entry and on exit
     max_logits_ptr,
     seq_kv,
     h_q,
@@ -47,17 +51,21 @@ def _mla_sparse_kernel(
     stride_indices_token,
     stride_indices_head,
     sm_scale,
+    split_len,
     kv_group_num: tl.constexpr,
     index_topk: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,  # >1: write unnormalised partials for _mla_merge_kernel
     BLOCK_H: tl.constexpr,  # block size for num heads
     BLOCK_N: tl.constexpr,  # block size for indices
     BLOCK_DV: tl.constexpr,  # block size for dim_v
     BLOCK_DMODEL: tl.constexpr,  # block size for dim_nope
     BLOCK_DPE: tl.constexpr,  # block size for positional embedding
+    V_IS_K: tl.constexpr,  # v_buffer rows == k_buffer nope rows (d_v == BLOCK_DMODEL)
     LOGE2: tl.constexpr,
 ):
     cur_q = tl.program_id(0)
     cur_head_id = tl.program_id(1)
+    cur_split = tl.program_id(2)
     cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
 
     VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
@@ -94,7 +102,9 @@ def _mla_sparse_kernel(
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
-    for start_indice in range(0, index_topk, BLOCK_N):
+    split_start = cur_split * split_len
+    split_end = tl.minimum(split_start + split_len, index_topk)
+    for start_indice in range(split_start, split_end, BLOCK_N):
         offs_indice = start_indice + tl.arange(0, BLOCK_N)
         mask_indice = offs_indice < index_topk
         indices = tl.load(
@@ -110,17 +120,31 @@ def _mla_sparse_kernel(
 
         mask_kv = (indices >= 0) & (indices < seq_kv)
         mask_kv_d = mask_dmodel
-        offs_k = (
-            indices[None, :] * stride_k_token
-            + cur_kv_head_id * stride_k_head
-            + offs_d[:, None]
-        )
 
-        # q_nope @ k_nope
-        k = tl.load(
-            k_buffer + offs_k, mask=(mask_kv[None, :]) & (mask_kv_d[:, None]), other=0.0
-        )
-        qk = tl.dot(q, k.to(q.dtype))
+        if V_IS_K:
+            # V is the leading dim_v == BLOCK_DMODEL dims of the same rows: gather
+            # each row once in its natural [BLOCK_N, D] layout and reuse it for
+            # both dots instead of reading the row twice from L2.
+            offs_kn = (
+                indices[:, None] * stride_k_token
+                + cur_kv_head_id * stride_k_head
+                + offs_d[None, :]
+            )
+            kn = tl.load(
+                k_buffer + offs_kn, mask=(mask_kv[:, None]) & (mask_kv_d[None, :]), other=0.0
+            ).to(q.dtype)
+            qk = tl.dot(q, tl.trans(kn))
+        else:
+            offs_k = (
+                indices[None, :] * stride_k_token
+                + cur_kv_head_id * stride_k_head
+                + offs_d[:, None]
+            )
+            # q_nope @ k_nope
+            k = tl.load(
+                k_buffer + offs_k, mask=(mask_kv[None, :]) & (mask_kv_d[:, None]), other=0.0
+            )
+            qk = tl.dot(q, k.to(q.dtype))
 
         if BLOCK_DPE > 0:
             # q_rope @ k_rope
@@ -141,16 +165,17 @@ def _mla_sparse_kernel(
         qk *= sm_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, -1.0e30)
 
-        # load v
-        mask_v_d = offs_dv < dim_v
-        offs_v = (
-            indices[:, None] * stride_v_token
-            + cur_kv_head_id * stride_v_head
-            + offs_dv[None, :]
-        )
-        v = tl.load(
-            v_buffer + offs_v, mask=(mask_kv[:, None]) & (mask_v_d[None, :]), other=0.0
-        )
+        if not V_IS_K:
+            # load v
+            mask_v_d = offs_dv < dim_v
+            offs_v = (
+                indices[:, None] * stride_v_token
+                + cur_kv_head_id * stride_v_head
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                v_buffer + offs_v, mask=(mask_kv[:, None]) & (mask_v_d[None, :]), other=0.0
+            )
 
         # online softmax
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -159,12 +184,70 @@ def _mla_sparse_kernel(
         acc *= re_scale[:, None]
 
         # score @ v
-        acc += tl.dot(p.to(v.dtype), v)
+        if V_IS_K:
+            acc += tl.dot(p.to(kn.dtype), kn)
+        else:
+            acc += tl.dot(p.to(v.dtype), v)
 
         # update global sum and max
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
+    if NUM_SPLITS > 1:
+        # Publish this split's unnormalised partial (acc, e_sum, base-2 max),
+        # then the last CTA of this (token, head block) to arrive merges all
+        # NUM_SPLITS partials with the lse and writes the final result.
+        row = cur_q * h_q + cur_head
+        offs_p = (row[:, None] * NUM_SPLITS + cur_split) * BLOCK_DV + offs_dv[None, :]
+        tl.store(part_acc_ptr + offs_p, acc, mask=mask_h[:, None])
+        offs_ps = row * NUM_SPLITS + cur_split
+        tl.store(part_sum_ptr + offs_ps, e_sum, mask=mask_h)
+        tl.store(part_max_ptr + offs_ps, e_max, mask=mask_h)
+        tl.debug_barrier()
+        counter = counter_ptr + cur_q * tl.num_programs(1) + cur_head_id
+        ticket = tl.atomic_add(counter, 1, sem="acq_rel")
+        if ticket == NUM_SPLITS - 1:
+            # every split has arrived; leave the counter zero for the next call
+            tl.store(counter, 0)
+            offs_s = tl.arange(0, NUM_SPLITS)
+            offs_ms = row[:, None] * NUM_SPLITS + offs_s[None, :]
+            m_all = tl.load(
+                part_max_ptr + offs_ms, mask=mask_h[:, None], other=-1.0e30, volatile=True
+            )
+            s_all = tl.load(
+                part_sum_ptr + offs_ms, mask=mask_h[:, None], other=0.0, volatile=True
+            )
+            e_max = tl.max(m_all, 1)
+            e_sum = tl.sum(tl.exp2(m_all - e_max[:, None]) * s_all, 1)
+            acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+            for i in tl.static_range(NUM_SPLITS):
+                m_i = tl.load(
+                    part_max_ptr + row * NUM_SPLITS + i, mask=mask_h, other=-1.0e30, volatile=True
+                )
+                offs_a = (row[:, None] * NUM_SPLITS + i) * BLOCK_DV + offs_dv[None, :]
+                acc_i = tl.load(
+                    part_acc_ptr + offs_a, mask=mask_h[:, None], other=0.0, volatile=True
+                )
+                acc += acc_i * tl.exp2(m_i - e_max)[:, None]
+            _mla_store_output(
+                out_ptr, softmax_lse_ptr, max_logits_ptr, acc, e_sum, e_max,
+                cur_q, cur_head, mask_h, offs_dv, dim_v,
+                stride_out_token, stride_out_head, stride_lse, LOGE2,
+            )
+    else:
+        _mla_store_output(
+            out_ptr, softmax_lse_ptr, max_logits_ptr, acc, e_sum, e_max,
+            cur_q, cur_head, mask_h, offs_dv, dim_v,
+            stride_out_token, stride_out_head, stride_lse, LOGE2,
+        )
+
+
+@triton.jit
+def _mla_store_output(
+    out_ptr, softmax_lse_ptr, max_logits_ptr, acc, e_sum, e_max,
+    cur_q, cur_head, mask_h, offs_dv, dim_v,
+    stride_out_token, stride_out_head, stride_lse, LOGE2: tl.constexpr,
+):
     # rescaling
     acc /= e_sum[:, None]
 
@@ -188,6 +271,44 @@ def _mla_sparse_kernel(
     offs_lse = cur_q * stride_lse + cur_head
     tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
     tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
+
+
+def _pick_config(num_tokens: int, index_topk: int) -> tuple[int, int, int, int]:
+    """(BLOCK_H, BLOCK_N, num_splits, num_warps).
+
+    Few tokens leave most of the 108 SMs idle, so the top-k axis is split across
+    CTAs and the partials are merged with the lse by the last CTA to finish.
+    Measured (sm_80, GPU time): t=1 wants 8 splits (31 vs 47 us for 4), t=8 and
+    t=24 want 4 (t=8: 69 vs 76 us for 8; t=24: 211 vs 243 us for 2), t>=300
+    gains nothing from splitting. BLOCK_N=32 beats 16 and 64 on every shape with
+    the row-major gather; BLOCK_H 32/64 and 8 warps are slower.
+    """
+    BLOCK_H = 16
+    BLOCK_N = 32
+    ctas = num_tokens * (64 // BLOCK_H)
+    if ctas >= 400:
+        return BLOCK_H, BLOCK_N, 1, 4
+    want = 8 if ctas <= 16 else 4
+    return BLOCK_H, BLOCK_N, min(want, triton.cdiv(index_topk, BLOCK_N)), 4
+
+
+_WORKSPACE: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+
+def _workspace(device, num_tokens, num_heads, num_splits, block_dv, head_blocks):
+    """Split-k scratch, cached per shape. The arrival counter is zeroed once here
+    and left zero by the kernel (the merging CTA resets it), so no per-call memset."""
+    key = (device, num_tokens, num_heads, num_splits, block_dv, head_blocks)
+    ws = _WORKSPACE.get(key)
+    if ws is None:
+        acc = torch.empty(
+            (num_tokens, num_heads, num_splits, block_dv), dtype=torch.float32, device=device
+        )
+        stats = torch.empty((2, num_tokens, num_heads, num_splits), dtype=torch.float32, device=device)
+        counter = torch.zeros((num_tokens, head_blocks), dtype=torch.int32, device=device)
+        ws = (acc, stats[0], stats[1], counter)
+        _WORKSPACE[key] = ws
+    return ws
 
 
 def triton_mla_sparse_fwd(
@@ -223,10 +344,9 @@ def triton_mla_sparse_fwd(
     if block_dpe is None:
         block_dpe = dim_qk - d_v
 
-    BLOCK_H = 16
+    BLOCK_H, BLOCK_N, num_splits, num_warps = _pick_config(num_tokens, index_topk)
     BLOCK_DPE = block_dpe
     BLOCK_DMODEL = dim_qk - BLOCK_DPE
-    BLOCK_N = 16
     BLOCK_DV = d_v
     assert BLOCK_DV & (BLOCK_DV - 1) == 0, "d_v must be a power of two"
     assert BLOCK_DMODEL & (BLOCK_DMODEL - 1) == 0, "dim_nope must be a power of two"
@@ -240,9 +360,14 @@ def triton_mla_sparse_fwd(
     sm_scale = sm_scale * LOG2E
 
     kv_group_num = num_heads_q // num_heads_kv
+    split_len = triton.cdiv(triton.cdiv(index_topk, num_splits), BLOCK_N) * BLOCK_N
+    num_splits = triton.cdiv(index_topk, split_len)
+    # merge kernel iterates tl.arange(0, NUM_SPLITS) -> power of two
+    num_splits = 1 << (num_splits - 1).bit_length()
     grid = (
         num_tokens,
         triton.cdiv(num_heads_q, min(BLOCK_H, kv_group_num)),
+        num_splits,
     )
 
     if out is None:
@@ -262,6 +387,14 @@ def triton_mla_sparse_fwd(
     k = kv
     v = kv[..., :d_v]
 
+    if num_splits == 1:
+        # unused; any tensor works as a placeholder pointer
+        part_acc = part_sum = part_max = counter = max_logits
+    else:
+        part_acc, part_sum, part_max, counter = _workspace(
+            q.device, num_tokens, num_heads_q, num_splits, BLOCK_DV, grid[1]
+        )
+
     _mla_sparse_kernel[grid](
         q_buffer=q,
         k_buffer=k,
@@ -269,6 +402,10 @@ def triton_mla_sparse_fwd(
         indices_ptr=indices,
         out_ptr=out,
         softmax_lse_ptr=softmax_lse,
+        part_acc_ptr=part_acc,
+        part_sum_ptr=part_sum,
+        part_max_ptr=part_max,
+        counter_ptr=counter,
         max_logits_ptr=max_logits,
         seq_kv=kv.shape[0],
         h_q=num_heads_q,
@@ -286,14 +423,18 @@ def triton_mla_sparse_fwd(
         stride_indices_token=indices.stride(0),
         stride_indices_head=indices.stride(1),
         sm_scale=sm_scale,
+        split_len=split_len,
         kv_group_num=kv_group_num,
         index_topk=index_topk,
+        NUM_SPLITS=num_splits,
         BLOCK_H=BLOCK_H,
         BLOCK_N=BLOCK_N,
         BLOCK_DV=BLOCK_DV,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
+        V_IS_K=(d_v == BLOCK_DMODEL),
         LOGE2=LOGE2,
+        num_warps=num_warps,
     )
 
     return out, max_logits, softmax_lse
