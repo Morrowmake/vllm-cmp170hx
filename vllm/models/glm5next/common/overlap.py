@@ -97,6 +97,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 __all__ = [
+    "SlicedMHCState",
     "OverlapSettings",
     "read_settings",
     "split_bounds",
@@ -146,6 +147,11 @@ class OverlapSettings:
 
     enabled: bool = False
     splits: int = 2
+    # Carry the micro-batch split across the layer boundary so the NEXT layer's
+    # pre-attention mHC mix runs per slice, under the previous layer's MLP
+    # collective, instead of after a full materialisation. Sub-flag so the
+    # validated S=2 production path is unaffected while this is A/B'd.
+    cross_layer: bool = False
     # MEASURED 2026-09-17: the scheduler issues ~280-380 token prefill forwards
     # in the production serving config, NOT the 1152-token chunks the KV block
     # size suggests, and NOT the token budget (MAX_BATCHED=2304 changes
@@ -169,6 +175,7 @@ def read_settings(env: dict[str, str] | None = None) -> OverlapSettings:
         enabled=enabled,
         splits=_env_int(env, "VLLM_GLM5_PREFILL_OVERLAP_SPLITS", 2, 1),
         min_tokens=_env_int(env, "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS", 512, 1),
+        cross_layer=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER", False),
         debug=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_DEBUG", False),
     )
     if enabled and settings.splits == 1:
@@ -282,6 +289,28 @@ class CudaOverlapExecutor(OverlapExecutor):
 
 
 @dataclass
+class SlicedMHCState:
+    """A layer's pre-attention mHC mix, already applied, still in micro-batches.
+
+    Handed from layer L to layer L+1 in place of the usual
+    ``(residual, post, comb)`` triple when cross-layer mode is on. Layer L
+    computed it slice by slice as each of its MLP collectives landed, so layer
+    L+1 skips its own pre-attention mix and goes straight to attention.
+
+    Only the attention input needs to be contiguous; these three stay sliced,
+    which is what removes the 37.7 MB ``residual`` concatenation per layer.
+    """
+
+    residual: list[torch.Tensor]
+    post: list[torch.Tensor]
+    comb: list[torch.Tensor]
+    bounds: list[tuple[int, int]]
+
+    def __len__(self) -> int:
+        return len(self.bounds)
+
+
+@dataclass
 class PendingAllReduce:
     """One intercepted all-reduce, possibly split into slices."""
 
@@ -324,6 +353,9 @@ class PrefillOverlapRegion:
         self.async_submitted = 0
         self.slices = 0
         self.degraded = False
+        # Settings are frozen and shared; this is per-forward, because
+        # aux-hidden-state capture has to suppress cross-layer handoff.
+        self.cross_layer = settings.cross_layer
 
     @property
     def splits(self) -> int:
@@ -527,6 +559,7 @@ def maybe_open_region(
     num_tokens: int,
     mhc: bool,
     sequence_parallel: bool,
+    allow_cross_layer: bool = True,
 ) -> PrefillOverlapRegion | None:
     """Activate the overlap for this forward, or return ``None``.
 
@@ -571,6 +604,7 @@ def maybe_open_region(
             num_tokens,
         )
     globals()["_OPENED"] = _OPENED + 1
+    _REGION.cross_layer = settings.cross_layer and allow_cross_layer
     _ACTIVE = _REGION
     return _REGION
 

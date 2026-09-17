@@ -113,10 +113,18 @@ class FakeLayer:
     _forward_attn_ffn_overlapped = (
         Glm5NextDecoderLayer._forward_attn_ffn_overlapped
     )
+    _next_overlap_layer = Glm5NextDecoderLayer._next_overlap_layer
 
     def __init__(self, *, is_last: bool = False, moe: bool = True) -> None:
         torch.manual_seed(0)
         self.is_sequence_parallel = False
+        # attn-side mHC params, used when a previous layer absorbs this
+        # layer's pre-attention mix under cross-layer overlap
+        self.hc_attn_fn = 0.5
+        self.hc_attn_scale = 1.25
+        self.hc_attn_base = 0.0625
+        self.input_layernorm = torch.nn.RMSNorm(HIDDEN)
+        self.input_layernorm.variance_epsilon = 1e-6
         self._mlp_is_moe = moe
         self.n = STREAMS
         self.layer_idx = 3
@@ -488,3 +496,172 @@ def test_close_region_clears_the_active_region():
     ov.close_region(region)
     assert ov.get_active_region() is None
     assert region.submitted == 0 and region.slices == 0
+
+
+# --------------------------------------------------------------------------- #
+# Cross-layer split (follow-up 1)
+# --------------------------------------------------------------------------- #
+
+
+def make_cross_region(splits: int = 2, world_size: int = WORLD, cross: bool = True):
+    settings = ov.OverlapSettings(
+        enabled=True, splits=splits, min_tokens=1, cross_layer=cross
+    )
+    executor = DeferredExecutor(world_size)
+    region = ov.PrefillOverlapRegion(
+        settings, executor, fallback_all_reduce=lambda t: t * world_size
+    )
+    region.cross_layer = cross
+    return region, executor
+
+
+def link(first: "FakeLayer", second: "FakeLayer") -> None:
+    first._next_layer = [second]
+
+
+def test_cross_layer_settings_default_off():
+    assert ov.read_settings({}).cross_layer is False
+    assert ov.read_settings(
+        {"VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER": "1"}
+    ).cross_layer is True
+
+
+def test_cross_layer_hands_on_a_sliced_state():
+    region, _ = make_cross_region(splits=2)
+    a, b = FakeLayer(), FakeLayer()
+    link(a, b)
+    x, carried, post, comb = a._forward_attn_ffn_overlapped(*make_inputs(1152), region)
+    assert isinstance(carried, ov.SlicedMHCState)
+    assert post is None and comb is None
+    assert len(carried) == 2 and carried.bounds == ov.split_bounds(1152, 2)
+    # only the attention input is materialised
+    assert x.shape == (1152, HIDDEN)
+    assert [r.shape[0] for r in carried.residual] == [576, 576]
+
+
+def test_cross_layer_two_layer_chain_matches_the_unsplit_reference():
+    """Layer A's tail + layer B's pre-attention mix must equal doing both plainly."""
+    num_tokens = 1152
+
+    # reference: A's unsplit tail, then B's pre-attention mix, unsplit
+    ref_a, ref_b = FakeLayer(), FakeLayer()
+    communication_op.set_tp_all_reduce_interceptor(lambda t: t * WORLD)
+    x, residual, post, comb = ref_a.reference(*make_inputs(num_tokens))
+    want = ref_b.hc_fused_post_pre(
+        x, residual, post, comb,
+        ref_b.hc_attn_fn, ref_b.hc_attn_scale, ref_b.hc_attn_base,
+        norm_weight=ref_b.input_layernorm.weight.data,
+        norm_eps=ref_b.input_layernorm.variance_epsilon,
+    )
+    communication_op.set_tp_all_reduce_interceptor(None)
+
+    region, _ = make_cross_region(splits=2)
+    a, b = FakeLayer(), FakeLayer()
+    link(a, b)
+    got_x, carried, _, _ = a._forward_attn_ffn_overlapped(*make_inputs(num_tokens), region)
+
+    want_residual, want_post, want_comb, want_x = want
+    assert not torch.isnan(got_x).any()
+    assert torch.equal(want_x, got_x)
+    assert torch.equal(want_residual, torch.cat(carried.residual, dim=0))
+    assert torch.equal(want_post, torch.cat(carried.post, dim=0))
+    assert torch.equal(want_comb, torch.cat(carried.comb, dim=0))
+
+
+@pytest.mark.parametrize("splits", [2, 4])
+def test_cross_layer_consumer_matches_the_materialised_path(splits):
+    """B consuming a SlicedMHCState == B consuming the same state materialised."""
+    num_tokens = 1152
+    region, _ = make_cross_region(splits=splits)
+    a, b = FakeLayer(), FakeLayer()
+    link(a, b)
+    x, carried, _, _ = a._forward_attn_ffn_overlapped(*make_inputs(num_tokens), region)
+
+    # B, fed the sliced state
+    region_b, _ = make_cross_region(splits=splits, cross=False)
+    got = b._forward_attn_ffn_overlapped(
+        None, x.clone(), None, None, None, region_b, sliced=carried
+    )
+    # B, fed the same state materialised
+    region_c, _ = make_cross_region(splits=splits, cross=False)
+    b2 = FakeLayer()
+    got2 = b2._forward_attn_ffn_overlapped(
+        None,
+        x.clone(),
+        torch.cat(carried.residual, dim=0),
+        torch.cat(carried.post, dim=0),
+        torch.cat(carried.comb, dim=0),
+        region_c,
+    )
+    for lhs, rhs in zip(got, got2):
+        if lhs is None:
+            assert rhs is None
+            continue
+        assert not torch.isnan(lhs).any()
+        assert torch.equal(lhs, rhs)
+
+
+def test_cross_layer_still_never_splits_attention():
+    region, _ = make_cross_region(splits=4)
+    a, b = FakeLayer(), FakeLayer()
+    link(a, b)
+    a._forward_attn_ffn_overlapped(*make_inputs(1152), region)
+    assert a.attn_calls == [1152]
+
+
+def test_cross_layer_off_materialises_exactly_as_before():
+    region_on, _ = make_cross_region(splits=2, cross=False)
+    a, b = FakeLayer(), FakeLayer()
+    link(a, b)  # linked, but the flag is off
+    got = a._forward_attn_ffn_overlapped(*make_inputs(1152), region_on)
+    assert not isinstance(got[1], ov.SlicedMHCState)
+    region_plain, _ = make_region(splits=2)
+    plain = FakeLayer()._forward_attn_ffn_overlapped(*make_inputs(1152), region_plain)
+    for lhs, rhs in zip(got, plain):
+        assert torch.equal(lhs, rhs)
+
+
+def test_last_layer_never_hands_on():
+    """The final mHC layer contracts; it must materialise, not hand a state on."""
+    region, _ = make_cross_region(splits=2)
+    a, b = FakeLayer(is_last=True), FakeLayer()
+    link(a, b)
+    x, residual, post, comb = a._forward_attn_ffn_overlapped(*make_inputs(1152), region)
+    assert (residual, post, comb) == (None, None, None)
+    assert x.shape == (1152, HIDDEN)
+
+
+def test_unlinked_layer_materialises():
+    """A layer with no successor (last of a pipeline stage) must materialise."""
+    region, _ = make_cross_region(splits=2)
+    a = FakeLayer()  # no link
+    got = a._forward_attn_ffn_overlapped(*make_inputs(1152), region)
+    assert not isinstance(got[1], ov.SlicedMHCState)
+
+
+def test_cross_layer_joins_every_collective_before_use():
+    region, executor = make_cross_region(splits=4)
+    a, b = FakeLayer(), FakeLayer()
+    link(a, b)
+    x, carried, _, _ = a._forward_attn_ffn_overlapped(*make_inputs(1152), region)
+    assert executor._done == len(executor._queue)
+    assert not torch.isnan(x).any()
+    for part in carried.residual + carried.post + carried.comb:
+        assert not torch.isnan(part).any()
+
+
+def test_maybe_open_region_can_suppress_cross_layer(monkeypatch):
+    """Aux-hidden-state capture must be able to turn the handoff off."""
+    settings = ov.read_settings(
+        {
+            "VLLM_GLM5_PREFILL_OVERLAP": "1",
+            "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER": "1",
+        }
+    )
+    assert settings.cross_layer is True
+    region, _ = make_cross_region(cross=True)
+    region.cross_layer = settings.cross_layer and False  # allow_cross_layer=False
+    layer = FakeLayer()
+    link(layer, FakeLayer())
+    got = layer._forward_attn_ffn_overlapped(*make_inputs(1152), region)
+    assert not isinstance(got[1], ov.SlicedMHCState)

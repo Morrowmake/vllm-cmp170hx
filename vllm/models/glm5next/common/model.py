@@ -98,6 +98,7 @@ from .multimodal import (
 )
 from .overlap import (
     PendingAllReduce,
+    SlicedMHCState,
     close_region,
     get_active_region,
     maybe_open_region,
@@ -541,6 +542,16 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             return hidden_states, residual, None, None
 
+        # Cross-layer overlap: the previous layer already applied THIS layer's
+        # pre-attention mHC mix, one micro-batch at a time, under its own MLP
+        # collectives. `hidden_states` is already the mixed layer input.
+        if isinstance(residual, SlicedMHCState):
+            region = get_active_region()
+            assert region is not None, "sliced mHC state outside an overlap region"
+            return self._forward_attn_ffn_overlapped(
+                positions, hidden_states, None, None, None, region, sliced=residual
+            )
+
         # mHC start. `post`/`comb` carry the previous layer's deferred
         # hc_post inputs (its ffn-pre outputs); when present, fuse that
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
@@ -623,14 +634,30 @@ class Glm5NextDecoderLayer(nn.Module):
 
         return x, residual, post, comb
 
+    def _next_overlap_layer(self, region):
+        """The layer whose pre-attention mix this layer may absorb, or None.
+
+        None for the last layer of this pipeline stage (it has no successor
+        here), for the final mHC layer (it contracts instead), and whenever
+        cross-layer mode is off -- in which case the layer materialises its
+        outputs exactly as before.
+        """
+        if not region.cross_layer:
+            return None
+        if self.layer_idx == self.num_hidden_layers - 1:
+            return None
+        nxt = getattr(self, "_next_layer", None)
+        return nxt[0] if nxt else None
+
     def _forward_attn_ffn_overlapped(
         self,
         positions: torch.Tensor,
         x: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
+        residual: torch.Tensor | None,
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
         region,
+        sliced: SlicedMHCState | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -654,6 +681,9 @@ class Glm5NextDecoderLayer(nn.Module):
         all-reduce is sliced.
         """
         assert not self.is_sequence_parallel
+        assert (sliced is None) != (residual is None), (
+            "exactly one of `residual` and `sliced` carries the mHC state"
+        )
         region.begin_layer()
 
         with region.capture(region.splits) as attn_ars:
@@ -666,6 +696,10 @@ class Glm5NextDecoderLayer(nn.Module):
             if attn_ar is not None
             else split_bounds(num_tokens, region.splits)
         )
+        if sliced is not None:
+            # The handed-over slices were cut by the same deterministic
+            # split_bounds, so they must line up with the collective's.
+            assert sliced.bounds == bounds, (sliced.bounds, bounds)
 
         res_parts: list[torch.Tensor] = []
         post_parts: list[torch.Tensor] = []
@@ -676,11 +710,23 @@ class Glm5NextDecoderLayer(nn.Module):
         for i, (lo, hi) in enumerate(bounds):
             if attn_ar is not None:
                 attn_ar.join(i)
+            if sliced is not None:
+                in_res, in_post, in_comb = (
+                    sliced.residual[i],
+                    sliced.post[i],
+                    sliced.comb[i],
+                )
+            else:
+                in_res, in_post, in_comb = (
+                    residual[lo:hi],
+                    post[lo:hi],
+                    comb[lo:hi],
+                )
             res_i, post_i, comb_i, x_i = self.hc_fused_post_pre(
                 x[lo:hi],
-                residual[lo:hi],
-                post[lo:hi],
-                comb[lo:hi],
+                in_res,
+                in_post,
+                in_comb,
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
@@ -697,6 +743,38 @@ class Glm5NextDecoderLayer(nn.Module):
             post_parts.append(post_i)
             comb_parts.append(comb_i)
             out_parts.append(x_i)
+
+        # Cross-layer: as each MLP collective lands, run the NEXT layer's
+        # pre-attention mHC mix on that micro-batch straight away, so it
+        # computes under the collectives still in flight behind it. Only the
+        # attention input is concatenated; residual/post/comb stay sliced,
+        # which also removes this layer's 37.7 MB residual concatenation.
+        nxt = self._next_overlap_layer(region)
+        if nxt is not None:
+            res2: list[torch.Tensor] = []
+            post2: list[torch.Tensor] = []
+            comb2: list[torch.Tensor] = []
+            x2: list[torch.Tensor] = []
+            for i in range(len(bounds)):
+                if mlp_ars[i] is not None:
+                    mlp_ars[i].join_all()
+                r_i, p_i, c_i, xi = nxt.hc_fused_post_pre(
+                    out_parts[i],
+                    res_parts[i],
+                    post_parts[i],
+                    comb_parts[i],
+                    nxt.hc_attn_fn,
+                    nxt.hc_attn_scale,
+                    nxt.hc_attn_base,
+                    norm_weight=nxt.input_layernorm.weight.data,
+                    norm_eps=nxt.input_layernorm.variance_epsilon,
+                )
+                res2.append(r_i)
+                post2.append(p_i)
+                comb2.append(c_i)
+                x2.append(xi)
+            x = x2[0] if len(x2) == 1 else torch.cat(x2, dim=0)
+            return x, SlicedMHCState(res2, post2, comb2, bounds), None, None
 
         # Nothing below reads a micro-batch result before its collective lands.
         for handle in mlp_ars:
@@ -859,6 +937,16 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
+        # Link consecutive ACTIVE layers so a layer can absorb its successor's
+        # pre-attention mHC mix under cross-layer overlap. Stored in a plain
+        # list so nn.Module does not register it as a submodule (which would
+        # duplicate every parameter in the state dict). The last active layer
+        # is deliberately left unlinked: on a non-final pipeline stage it must
+        # materialise its state for the boundary, and on the final stage it
+        # contracts.
+        for earlier, later in zip(self._active_layers, self._active_layers[1:]):
+            if not getattr(earlier, "is_mtp_layer", False):
+                earlier._next_layer = [later]
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1001,10 +1089,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         # Prefill comm/compute overlap. Returns None -- and therefore changes
         # nothing -- unless VLLM_GLM5_PREFILL_OVERLAP=1 and this is a
         # prefill-sized, non-captured, mHC, TP>1 batch. See common/overlap.py.
+        # Aux-hidden-state capture reads a layer's materialised
+        # (residual, post, comb); cross-layer overlap hands those on sliced
+        # instead, so the two cannot both be on.
         overlap_region = maybe_open_region(
             num_tokens=full_num_tokens,
             mhc=self.mhc,
             sequence_parallel=self.is_sequence_parallel,
+            allow_cross_layer=not self.aux_hidden_state_layers,
         )
         try:
             if self.aux_hidden_state_layers:
