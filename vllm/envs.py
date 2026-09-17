@@ -180,6 +180,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
+    VLLM_GLM5_THIN_GEMM: bool = False
+    VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1517,6 +1519,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DECODE_KDA_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_KDA_MAX_TOKENS", "64")
+    ),
+    # Opt in to the sm_80 thin-M BF16 GEMM in vllm/ampere_thin_gemm/ for the
+    # layers GLM-5.3-Flash's W4A16 recipe leaves unquantized (GA100-class parts
+    # only; measured on CMP 170HX, 70 SMs). Default OFF: with this unset the
+    # kernel module is never imported, triton is never touched, and
+    # dispatch_unquantized_gemm returns the upstream callable itself, so the
+    # unflagged path is byte-identical rather than merely equivalent.
+    #
+    "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
+    # Never dispatch above this M (= num_seqs * (1 + num_spec)). 32 is measured,
+    # and it is a cudagraph capture size, so the bound lands exactly on one.
+    # Count-weighted over the whole shape table: M=32 is 1.157x with 0 of 16
+    # shapes losing, M=40 is 0.799x with 10 of 16 losing. Raising it one capture
+    # size costs ~43 % of the step. Re-run the token-bound measurements before
+    # touching this.
+    "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

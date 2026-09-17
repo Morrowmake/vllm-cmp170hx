@@ -202,6 +202,15 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.ampere_decode.warmup import warmup_ampere_decode
 
     warmup_ampere_decode(worker, cudagraph_capture_sizes)
+    # The sm_80 thin-M BF16 GEMM (vllm/ampere_thin_gemm/). This MUST run before
+    # capture_model(): thin_gemm keeps its FP32 split-K partials and arrival
+    # counters in an allocate-once module-level cache, and an allocation made
+    # during a capture lands in that graph's private pool, so a second capture
+    # would reuse freed memory. Triton also compiles on first launch, which
+    # cannot happen inside a capture at all. No-op unless VLLM_GLM5_THIN_GEMM.
+    from vllm.ampere_thin_gemm.warmup import warmup_ampere_thin_gemm
+
+    warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:

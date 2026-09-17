@@ -14,6 +14,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
+from vllm.ampere_thin_gemm import thin_linear
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -377,7 +378,12 @@ class Indexer(nn.Module):
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        # thin_linear IS F.linear unless VLLM_GLM5_THIN_GEMM is on and the call
+        # is inside the measured win region. This site never builds a
+        # LinearBase, so it cannot be reached by the dispatch_unquantized_gemm
+        # hook that covers every other shape (N=128, K=4096, 11 calls/step,
+        # 1.27x vs cuBLAS).
+        gate_score = thin_linear(hidden_states, self.index_kpool_compress_gate)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
