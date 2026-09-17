@@ -96,6 +96,13 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .overlap import (
+    PendingAllReduce,
+    close_region,
+    get_active_region,
+    maybe_open_region,
+    split_bounds,
+)
 
 logger = init_logger(__name__)
 
@@ -564,6 +571,16 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
 
+        # Comm/compute overlap (VLLM_GLM5_PREFILL_OVERLAP=1) takes over the
+        # rest of the layer; see common/overlap.py. This is one module-global
+        # load and returns None unless a prefill-sized batch is running with
+        # the feature on, so the default path below is unchanged.
+        region = get_active_region()
+        if region is not None:
+            return self._forward_attn_ffn_overlapped(
+                positions, x, residual, post, comb, region
+            )
+
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
@@ -599,6 +616,106 @@ class Glm5NextDecoderLayer(nn.Module):
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
+        if self.layer_idx == self.num_hidden_layers - 1:
+            x = self.hc_post(x, residual, post, comb)
+            x = hc_contract(x, self.n)
+            return x, None, None, None
+
+        return x, residual, post, comb
+
+    def _forward_attn_ffn_overlapped(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        region,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Attention + FFN with the layer's two TP all-reduces on a side stream.
+
+        Computes exactly what the tail of ``forward`` computes, but cuts the
+        token dimension into micro-batches after attention so micro-batch i's
+        all-reduce flies while micro-batch i+1 computes. Everything split here
+        is per-token -- the mHC post/pre mixes and RMSNorm are row-wise, MoE
+        routing is top-k per row, and the expert / shared-expert GEMMs are
+        row-independent -- so each slice sees exactly the rows it would have
+        seen unsplit. See common/overlap.py for the ordering and the exactness
+        argument.
+
+        Attention itself is *not* split: the KDA chunked scan carries state
+        across tokens and the DSA indexer maintains kpool/tail state, so an
+        intra-chunk split there is not a row-wise operation. Only its output
+        all-reduce is sliced.
+        """
+        assert not self.is_sequence_parallel
+        region.begin_layer()
+
+        with region.capture(region.splits) as attn_ars:
+            x = self.self_attn(hidden_states=x, positions=positions)
+        attn_ar = region.single(attn_ars, "the attention output projection")
+
+        num_tokens = x.shape[0]
+        bounds = (
+            attn_ar.bounds
+            if attn_ar is not None
+            else split_bounds(num_tokens, region.splits)
+        )
+
+        res_parts: list[torch.Tensor] = []
+        post_parts: list[torch.Tensor] = []
+        comb_parts: list[torch.Tensor] = []
+        out_parts: list[torch.Tensor] = []
+        mlp_ars: list[PendingAllReduce | None] = []
+
+        for i, (lo, hi) in enumerate(bounds):
+            if attn_ar is not None:
+                attn_ar.join(i)
+            res_i, post_i, comb_i, x_i = self.hc_fused_post_pre(
+                x[lo:hi],
+                residual[lo:hi],
+                post[lo:hi],
+                comb[lo:hi],
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm_weight=self.post_attention_layernorm.weight.data,
+                norm_eps=self.post_attention_layernorm.variance_epsilon,
+            )
+            with region.capture(1) as mlp_ar:
+                if self._mlp_is_moe:
+                    x_i = self.mlp(x_i, already_sequence_parallel=False)
+                else:
+                    x_i = self.mlp(x_i)
+            mlp_ars.append(region.single(mlp_ar, "the MLP down projection"))
+            res_parts.append(res_i)
+            post_parts.append(post_i)
+            comb_parts.append(comb_i)
+            out_parts.append(x_i)
+
+        # Nothing below reads a micro-batch result before its collective lands.
+        for handle in mlp_ars:
+            if handle is not None:
+                handle.join_all()
+
+        if len(bounds) == 1:
+            residual, post, comb, x = (
+                res_parts[0],
+                post_parts[0],
+                comb_parts[0],
+                out_parts[0],
+            )
+        else:
+            residual = torch.cat(res_parts, dim=0)
+            post = torch.cat(post_parts, dim=0)
+            comb = torch.cat(comb_parts, dim=0)
+            x = torch.cat(out_parts, dim=0)
+
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
             x = hc_contract(x, self.n)
@@ -881,25 +998,37 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
 
         aux_hidden_states: list[torch.Tensor] = []
-        if self.aux_hidden_state_layers:
-            for layer in self._active_layers:
-                hidden_states, residual, post, comb = layer(
-                    positions, hidden_states, residual, post, comb
-                )
-                # Aux layer ids are "capture after layer i", encoded as i + 1
-                # (see spec_decode get_eagle3_aux_layers_from_config, which
-                # adds 1 to the drafter's dflash_config.target_layer_ids).
-                if layer.layer_idx + 1 in self.aux_hidden_state_layers:
-                    aux_hidden_states.append(
-                        self._capture_aux_hidden_state(
-                            layer, hidden_states, residual, post, comb
-                        )
+        # Prefill comm/compute overlap. Returns None -- and therefore changes
+        # nothing -- unless VLLM_GLM5_PREFILL_OVERLAP=1 and this is a
+        # prefill-sized, non-captured, mHC, TP>1 batch. See common/overlap.py.
+        overlap_region = maybe_open_region(
+            num_tokens=full_num_tokens,
+            mhc=self.mhc,
+            sequence_parallel=self.is_sequence_parallel,
+        )
+        try:
+            if self.aux_hidden_state_layers:
+                for layer in self._active_layers:
+                    hidden_states, residual, post, comb = layer(
+                        positions, hidden_states, residual, post, comb
                     )
-        else:
-            for layer in self._active_layers:
-                hidden_states, residual, post, comb = layer(
-                    positions, hidden_states, residual, post, comb
-                )
+                    # Aux layer ids are "capture after layer i", encoded as
+                    # i + 1 (see spec_decode get_eagle3_aux_layers_from_config,
+                    # which adds 1 to the drafter's
+                    # dflash_config.target_layer_ids).
+                    if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                        aux_hidden_states.append(
+                            self._capture_aux_hidden_state(
+                                layer, hidden_states, residual, post, comb
+                            )
+                        )
+            else:
+                for layer in self._active_layers:
+                    hidden_states, residual, post, comb = layer(
+                        positions, hidden_states, residual, post, comb
+                    )
+        finally:
+            close_region(overlap_region)
 
         if not get_pp_group().is_last_rank:
             if aux_hidden_states:
