@@ -925,6 +925,36 @@ def mhc_fused_post_pre_tilelang(
     num_tokens = residual_flat.shape[0]
     x_flat = x.view(num_tokens, hidden_size)
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
+    from vllm.ampere_decode import use_ampere_mhc_decode
+
+    if use_ampere_mhc_decode(
+        num_tokens, hc_mult, hidden_size, norm_weight=norm_weight
+    ):
+        # Same signature, same four outputs, same dtypes, same accumulation --
+        # and the asserts above have already run. `n_splits` / `tile_n` are
+        # part of the shared MHC operator API and are picked from the runtime
+        # shape by both implementations.
+        from vllm.ampere_decode.mhc_decode import mhc_fused_post_pre
+
+        return mhc_fused_post_pre(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
+
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)

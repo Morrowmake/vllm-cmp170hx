@@ -127,6 +127,24 @@ def moe_align_block_size(
     """
     if return_scatter_idx and expert_map is not None and not ignore_invalid_experts:
         raise ValueError("scatter_idx with expert_map requires ignore_invalid_experts")
+
+    from vllm import envs
+
+    if not return_scatter_idx and envs.VLLM_GLM5_DECODE_KERNELS:
+        from vllm.ampere_decode import take_fused_align
+
+        # `fused_route_align` in vllm/ampere_decode/moe_routing.py produced
+        # this alignment in the same launch as the routing -- the fusion is
+        # exact (count_and_sort is phase 2 of moe_align_block_size and both
+        # consume only topk_ids, which the routing kernel produced, and
+        # nothing reads topk_ids in between). A miss here is harmless: the
+        # upstream path below runs exactly as before.
+        _fused = take_fused_align(
+            topk_ids, block_size, num_experts, expert_map, pad_sorted_ids
+        )
+        if _fused is not None:
+            return _fused
+
     scatter_idx = None
     if return_scatter_idx:
         scatter_idx = torch.empty(

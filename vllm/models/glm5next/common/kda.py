@@ -317,6 +317,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
+        # Set by the fused sm_80 KDA decode path in _forward, read in
+        # forward to skip the o_norm that kernel has already applied.
+        self._ampere_kda_normed = False
 
         additional_config = vllm_config.additional_config
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
@@ -440,7 +443,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             g1=g1,
             beta=beta,
             core_attn_out=core_attn_out,
+            g2=g2,
         )
+        if self._ampere_kda_normed:
+            # o_norm is fused into the sm_80 kernel; skip the second pass.
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
+            return self.o_proj(core_attn_out)[0]
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
@@ -452,7 +460,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g1: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
+        g2: torch.Tensor | None = None,
     ) -> None:
+        # Cleared on every call; set only by the fused sm_80 path below.
+        self._ampere_kda_normed = False
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
@@ -513,6 +524,59 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             ).contiguous()
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
+
+        # --- fused sm_80 spec-decode path ---
+        # ONE kernel for causal_conv1d_update + fused_recurrent_kda + o_norm
+        # (the three are strictly sequential on the same small tensors and
+        # exactly fusable). Restricted to a pure spec-verify step: with
+        # non-spec tokens in the batch the o_norm gate rows would not line up
+        # with the recurrence output rows, which are in spec-token order. The
+        # prefill (causal_conv1d_fn) and plain-decode branches below are
+        # untouched. See vllm/ampere_decode/kda_decode.py.
+        from vllm.ampere_decode import use_ampere_kda_decode
+
+        if (
+            use_spec
+            and g2 is not None
+            and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)
+            and attn_metadata_narrowed.num_prefills == 0
+            and attn_metadata_narrowed.num_decodes == 0
+            and spec_state_indices_tensor is not None
+            and num_accepted_tokens is not None
+            and spec_query_start_loc is not None
+            and recurrent_state.dtype == torch.float32
+            and use_ampere_kda_decode(
+                num_spec_decodes,
+                num_actual_tokens,
+                self.local_num_heads,
+                self.head_dim,
+            )
+        ):
+            from vllm.ampere_decode.kda_decode import kda_decode
+
+            kda_decode(
+                qkv_proj_states,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                g1,
+                beta,
+                g2,
+                self.o_norm.weight,
+                recurrent_state,
+                spec_state_indices_tensor[:, 0][:num_spec_decodes],
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                spec_query_start_loc[: num_spec_decodes + 1],
+                spec_state_indices_tensor.size(-1),
+                self.A_log.view(-1),
+                self.dt_bias,
+                lower_bound=lower_bound,
+                eps=self.o_norm.eps,
+                out=core_attn_out[0, :num_actual_tokens].unsqueeze(0),
+            )
+            self._ampere_kda_normed = True
+            return
 
         # Split projections / gating into spec (draft-verify) and non-spec token
         # groups when speculative decoding is active. Spec tokens carry

@@ -887,6 +887,25 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
     ) -> None:
+        from vllm.ampere_decode import use_ampere_moe_routing
+
+        _moe_cfg = getattr(self, "moe_config", None)
+        if (
+            expert_map is None
+            and _moe_cfg is not None
+            and input.dim() == 3
+            and use_ampere_moe_routing(
+                input.shape[0],
+                getattr(_moe_cfg, "num_experts", 0),
+                input.shape[1],
+            )
+        ):
+            # fp32 accumulation in slot order, same as ops.moe_sum.
+            from vllm.ampere_decode.moe_routing import moe_sum as ampere_moe_sum
+
+            ampere_moe_sum(input, out=output)
+            return
+
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:

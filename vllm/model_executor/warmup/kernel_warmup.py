@@ -194,6 +194,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
 
+    # The sm_80 decode kernels (vllm/ampere_decode/). This MUST run before
+    # capture_model(): moe_routing._scratch() and kda_decode._counter() are
+    # allocate-once module-level buffers, and an allocation made during a
+    # capture lands in that graph's private pool, so a second capture would
+    # reuse freed memory. Triton also compiles on first launch, which cannot
+    # happen inside a capture at all. No-op unless VLLM_GLM5_DECODE_KERNELS.
+    from vllm.ampere_decode.warmup import warmup_ampere_decode
+
+    warmup_ampere_decode(worker, cudagraph_capture_sizes)
+
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
