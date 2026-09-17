@@ -90,6 +90,44 @@ class SchedulerConfig:
     queued and running requests. Only applies when
     long_prefill_token_threshold is nonzero."""
 
+    prefill_chunk_with_decodes: int = Field(default=0, ge=0)
+    """Decode-aware prefill chunk budget ("fair chunked prefill").
+
+    When > 0 and at least one running request is in the decode phase, the
+    total number of *prefill* tokens the scheduler issues in one step is
+    capped at this value. Decode tokens are budgeted separately (against
+    `max_num_batched_tokens`) and are never capped by this, so decode streams
+    get a scheduler step roughly every `prefill_chunk_with_decodes` tokens of
+    prefill work instead of every `max_num_batched_tokens` tokens. When no
+    request is decoding the full `max_num_batched_tokens` budget is used, so
+    a prompt arriving into an idle engine still prefills at full chunk size.
+
+    Unlike `long_prefill_token_threshold`, which caps each request's chunk
+    individually when requests compete, this is a single budget shared by all
+    prefill-phase requests in the step, and it only binds while something is
+    decoding.
+
+    0 (the default) disables the cap and reproduces upstream scheduling
+    exactly. Only takes effect when chunked prefill is enabled."""
+
+    max_num_partial_prefills: int = Field(default=0, ge=0)
+    """Round-robin fairness between concurrent chunked prefills.
+
+    When > 0, the per-step prefill token budget (`prefill_chunk_with_decodes`
+    when that is active, otherwise `max_num_batched_tokens`) is divided evenly
+    between up to this many prefill-phase requests, so a second prompt starts
+    making progress on the step it is admitted rather than waiting for the
+    first prompt's prefill to finish. Requests beyond that many wait for a
+    later step in arrival order, which bounds how thinly the budget is sliced.
+
+    Note this trades mean TTFT for worst-case TTFT: with two equal prompts,
+    first-come-first-served finishes one at T/2 and the other at T, while an
+    even split finishes both at ~T. It pays off when prompt lengths differ a
+    lot (a short prompt no longer waits behind a 30K one).
+
+    0 (the default) disables the split and reproduces upstream scheduling
+    exactly. Only takes effect when chunked prefill is enabled."""
+
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
     at the same time, or None for no limit. When the limit is reached, new
@@ -296,6 +334,8 @@ class SchedulerConfig:
             self.disable_chunked_mm_input = True
             self.enable_chunked_prefill = False
             self.long_prefill_token_threshold = 0
+            self.prefill_chunk_with_decodes = 0
+            self.max_num_partial_prefills = 0
             logger.info(
                 "Encoder-decoder models do not support chunked prefill nor"
                 " prefix caching; disabling both."
@@ -308,6 +348,24 @@ class SchedulerConfig:
             logger.info_once(
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
                 self.max_num_batched_tokens,
+            )
+
+        if not self.enable_chunked_prefill and (
+            self.prefill_chunk_with_decodes or self.max_num_partial_prefills
+        ):
+            logger.warning(
+                "prefill_chunk_with_decodes / max_num_partial_prefills have no "
+                "effect without chunked prefill; ignoring them."
+            )
+            self.prefill_chunk_with_decodes = 0
+            self.max_num_partial_prefills = 0
+
+        if 0 < self.prefill_chunk_with_decodes < self.max_num_partial_prefills:
+            raise ValueError(
+                f"prefill_chunk_with_decodes ({self.prefill_chunk_with_decodes}) "
+                "must be at least max_num_partial_prefills "
+                f"({self.max_num_partial_prefills}) so every concurrent prefill "
+                "can be given at least one token per step."
             )
 
         self.verify_max_model_len(max_model_len)
