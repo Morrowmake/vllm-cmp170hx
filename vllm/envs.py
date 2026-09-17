@@ -181,7 +181,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_KDA: bool = True
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
-    VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 16
+    VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1532,7 +1532,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_GLM5_DECODE_MHC_MAX_TOKENS", "8")
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "16")
+        os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
     ),
     "VLLM_GLM5_DECODE_KDA_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_KDA_MAX_TOKENS", "64")
