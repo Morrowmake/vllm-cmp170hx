@@ -420,6 +420,8 @@ class PrefillOverlapRegion:
 # --------------------------------------------------------------------------- #
 
 _SETTINGS: OverlapSettings | None = None
+_OBSERVED: dict[int, int] = {}
+_OBSERVED_TOTAL = 0
 _SKIPPED = 0
 _OPENED = 0
 _WARNED_DORMANT = False
@@ -438,7 +440,8 @@ def get_settings() -> OverlapSettings:
 def reset_for_testing() -> None:
     """Drop cached settings/region. Tests only."""
     global _SETTINGS, _REGION, _ACTIVE, _LOGGED
-    global _SKIPPED, _OPENED, _WARNED_DORMANT
+    global _SKIPPED, _OPENED, _WARNED_DORMANT, _OBSERVED_TOTAL
+    _OBSERVED_TOTAL = 0
     _SETTINGS = None
     _REGION = None
     _ACTIVE = None
@@ -446,6 +449,33 @@ def reset_for_testing() -> None:
     _SKIPPED = 0
     _OPENED = 0
     _WARNED_DORMANT = False
+    _OBSERVED.clear()
+
+
+def observe_forward(num_tokens: int) -> None:
+    """Log the distribution of prefill-forward token counts.
+
+    VLLM_GLM5_PREFILL_OBSERVE=1, independent of the overlap feature and
+    with no effect on behaviour. Exists because the scheduled chunk size is not
+    something any log line states directly: attention block size/kv lcm
+    block sizes describe the KV block, and the token budget is only an upper
+    bound (an upstream --long-prefill-token-threshold, for one, caps it below
+    both). Measuring it beats inferring it.
+    """
+    global _OBSERVED_TOTAL
+    if not _env_flag(dict(os.environ), "VLLM_GLM5_PREFILL_OBSERVE", False):
+        return
+    if num_tokens < 64:  # decode / drafter steps are not chunks
+        return
+    _OBSERVED[num_tokens] = _OBSERVED.get(num_tokens, 0) + 1
+    _OBSERVED_TOTAL += 1
+    if _OBSERVED_TOTAL % 100 == 0:
+        top = sorted(_OBSERVED.items(), key=lambda kv: -kv[1])[:6]
+        logger.info(
+            "GLM5 prefill chunk observer: %d forwards, most common sizes %s",
+            _OBSERVED_TOTAL,
+            ", ".join(f"{n} tok x{c}" for n, c in top),
+        )
 
 
 def get_active_region() -> PrefillOverlapRegion | None:
@@ -508,6 +538,7 @@ def maybe_open_region(
     """
     global _ACTIVE, _REGION, _LOGGED, _SETTINGS
 
+    observe_forward(num_tokens)
     settings = get_settings()
     if not settings.active:
         return None
