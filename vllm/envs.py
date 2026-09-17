@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
+    VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1468,6 +1469,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ~7 % (measured 0.93x at ctx 2304 / topk 2048, 1.39x at ctx 8192).
     "VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT": lambda: float(
         os.getenv("VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT", "2.0")
+    ),
+    # GLM-5.x: sample a 1/TP slice of the batch on each rank instead of
+    # all-gathering full-vocab logits to every rank. Turns the eager
+    # [rows, 154880] AllGather after lm_head into an all-to-all of
+    # [rows/TP, 154880] (4x fewer wire bytes at TP=4). Implies
+    # --enable-batch-sharded-sampling; the usual blockers for that flag
+    # (TP=1, max_num_seqs < TP, max_logprobs=-1, return_sampling_mask,
+    # adaptive verification) still raise. Sampling is unchanged per row,
+    # so greedy output is bit-identical up to the same all-reduce
+    # nondeterminism the gathered path already has.
+    "VLLM_GLM5_LOCAL_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_LOCAL_LOGITS", "0"))
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

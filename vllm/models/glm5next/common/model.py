@@ -154,6 +154,29 @@ def use_replicated_embed() -> bool:
     )
 
 
+def use_local_logits() -> bool:
+    """Whether to expose ``compute_logits_local`` for batch-sharded sampling.
+
+    The target head is vocab-parallel, so ``LogitsProcessor`` all-gathers the
+    full ``[rows, 154880]`` bf16 logits to every rank before sampling: 0.32 ms
+    per c1 decode step and 1.10 ms at c4 on a PCIe-gen2 box, at 44 % of the
+    throughput the same link sustains during prefill. Batch-sharded sampling
+    instead gives each rank a 1/TP slice of the *rows*: each rank computes its
+    own vocab shard for every row, one all-to-all redistributes them so each
+    rank holds full-vocab logits for its own rows only, it samples those, and
+    just the sampled token ids are all-gathered. Wire bytes per rank drop 4x
+    at TP=4.
+
+    The model runner probes for the method with ``hasattr`` at load time, so
+    the gate has to hide the attribute itself, not just short-circuit its body.
+    Off by default; ``--enable-batch-sharded-sampling`` still works on its own.
+    """
+    return (
+        envs.VLLM_GLM5_LOCAL_LOGITS
+        and get_tensor_model_parallel_world_size() > 1
+    )
+
+
 class Glm5NextMLP(nn.Module):
     def __init__(
         self,
@@ -1377,6 +1400,9 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=self.config.logit_scale
         )
+        if use_local_logits():
+            # Instance attribute, so hasattr() is False when the flag is off.
+            self.compute_logits_local = self._compute_logits_local
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -1444,6 +1470,18 @@ class Glm5NextForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def _compute_logits_local(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """This rank's vocab shard of the logits, ungathered.
+
+        Bound to ``self.compute_logits_local`` in ``__init__`` only when
+        ``use_local_logits()`` is true -- the model runner selects the
+        batch-sharded sampler by ``hasattr(model, "compute_logits_local")``.
+        """
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -1556,6 +1594,12 @@ class Glm5NextForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        if use_local_logits() and hasattr(
+            self.language_model, "compute_logits_local"
+        ):
+            # The runner probes the top-level model, so forward the method that
+            # the text model only exposes when VLLM_GLM5_LOCAL_LOGITS=1.
+            self.compute_logits_local = self.language_model.compute_logits_local
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [

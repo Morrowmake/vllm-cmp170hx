@@ -3029,6 +3029,15 @@ class VllmConfig:
 
     def _validate_batch_sharded_sampling(self) -> None:
         """Validate `enable_batch_sharded_sampling` against the rest of the config."""
+        if (
+            self.parallel_config.enable_batch_sharded_sampling is None
+            and envs.VLLM_GLM5_LOCAL_LOGITS
+            and self.parallel_config.tensor_parallel_size > 1
+        ):
+            # VLLM_GLM5_LOCAL_LOGITS=1 is the GLM-5.x opt-in for the same
+            # feature; route it through the flag so every blocker below is
+            # still checked rather than silently ignored.
+            self.parallel_config.enable_batch_sharded_sampling = True
         if not self.parallel_config.enable_batch_sharded_sampling:
             # Default to False if not set.
             self.parallel_config.enable_batch_sharded_sampling = False
@@ -3077,7 +3086,8 @@ class VllmConfig:
         if blockers:
             raise ValueError(
                 "Batch-sharded sampling was explicitly enabled via "
-                "the --enable-batch-sharded-sampling flag, but is not supported "
+                "the --enable-batch-sharded-sampling flag (or "
+                "VLLM_GLM5_LOCAL_LOGITS=1), but is not supported "
                 "in this configuration for the following reason(s): "
                 f"{'; '.join(blockers)}."
             )
