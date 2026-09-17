@@ -496,7 +496,38 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    adaptive_k: dict[str, Any] | None = None
+    """Acceptance-adaptive per-step draft count. ``None`` (the default)
+    disables it and leaves speculative decoding byte-identical.
+
+    When set, the scheduler keeps an exponential moving average of how many
+    draft tokens each running request has recently had accepted, and picks one
+    draft count for the whole step (decode runs as a uniform batch under full
+    CUDA graphs, so a step cannot mix counts). Recognised keys:
+
+    - ``min`` / ``max``: bounds on the chosen count. ``max`` defaults to
+      ``num_speculative_tokens`` and may not exceed it.
+    - ``ema``: EMA decay on the per-request acceptance, default ``0.8``.
+    - ``margin``: added to the EMA before rounding, so a request whose drafts
+      are all accepted reaches for one more. Default ``1.0``, giving
+      ``k = clamp(round(ema_accepted_drafts + margin), min, max)``.
+    - ``quantile``: which quantile of the batch's per-request choices becomes
+      the step's count, in ``[0, 1]``. Default ``0.5`` (the median). ``0.0``
+      is the batch minimum, which never over-drafts a request but falls as
+      concurrency rises even when acceptance does not.
+    - ``allowed``: explicit list of permitted counts, e.g. ``[2, 4, 7]``.
+      Defaults to every count in ``1..num_speculative_tokens``. Decode CUDA
+      graphs are captured for exactly this set.
+    - ``log_interval``: emit a chosen-k histogram every N steps (0 = off).
+
+    All of this runs on the scheduler's CPU thread; unlike
+    ``enable_adaptive_verification`` nothing is trimmed on the device, so it
+    works with backends such as the DSA indexer.
+    """
+
     # params generated in the post-init stage
+    adaptive_k_config: SkipValidation[Any] = None  # AdaptiveKConfig | None
+    """Validated form of ``adaptive_k``; None when the feature is off."""
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
     draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
@@ -1855,6 +1886,24 @@ class SpeculativeConfig:
                 "omit it."
             )
 
+        if self.adaptive_k is not None:
+            from vllm.v1.spec_decode.dynamic.adaptive_k import AdaptiveKConfig
+
+            if self.uses_dynamic_speculative_decoding():
+                raise ValueError(
+                    "adaptive_k and num_speculative_tokens_per_batch_size both "
+                    "choose the per-step draft count; enable only one."
+                )
+            if self.enable_adaptive_verification:
+                raise ValueError(
+                    "adaptive_k (host-side) and enable_adaptive_verification "
+                    "(device-side) both size the verification budget; enable "
+                    "only one."
+                )
+            self.adaptive_k_config = AdaptiveKConfig.from_dict(
+                self.adaptive_k, self.num_speculative_tokens
+            )
+
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
         return self
@@ -1951,6 +2000,13 @@ class SpeculativeConfig:
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_adaptive_k(self) -> bool:
+        return self.adaptive_k_config is not None
+
+    def adaptive_k_draft_counts(self) -> tuple[int, ...]:
+        """Draft counts the scheduler may pick, so graphs can be captured."""
+        return self.adaptive_k_config.allowed if self.adaptive_k_config else ()
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

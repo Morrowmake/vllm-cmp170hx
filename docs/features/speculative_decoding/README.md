@@ -20,6 +20,7 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [Custom Proposer Backend (Experimental)](#custom-proposer-backend-experimental)
 - [Dynamic Speculative Decoding](dynamic_speculative_decoding.md)
 - [Adaptive Verification](adaptive_verification.md)
+- [Acceptance-Adaptive Draft Count](adaptive_k.md)
 - [Per-Request Acceptance Metrics](acceptance_metrics.md)
 
 ## Method Selection at a Glance

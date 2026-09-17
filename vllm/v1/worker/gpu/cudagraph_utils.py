@@ -148,6 +148,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        adaptive_k_capture: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -157,6 +158,8 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        # Only target verification and autoregressive prefill vary with K.
+        self.adaptive_k_capture = adaptive_k_capture
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
 
@@ -266,6 +269,13 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
+        # Acceptance-adaptive SD picks the draft count per step on the host, so
+        # every count it is allowed to pick needs its own uniform decode graph.
+        # Branch on the counts themselves rather than on uses_adaptive_k(), so
+        # a config that reports the feature on but names no counts (and a test
+        # double that answers every predicate truthily) still lands on the
+        # ordinary single-query-length path.
+        adaptive_k_counts = self._adaptive_k_draft_counts()
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
@@ -286,6 +296,17 @@ class CudaGraphManager:
                     num_spec + num_new_sampled_tokens_per_step
                     for num_spec in dense_schedule[1:]
                 }
+            )
+        elif adaptive_k_counts:
+            # Without a graph per count, dispatch() silently falls back to
+            # eager; warn_on_missing_adaptive_graphs() checks at startup that
+            # the capture sizes actually cover the set.
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            decode_query_lens = sorted(
+                num_spec + num_new_sampled_tokens_per_step
+                for num_spec in adaptive_k_counts
             )
         else:
             decode_query_lens = [self.decode_query_len]
@@ -383,6 +404,59 @@ class CudaGraphManager:
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)
                     current_range_start = num_tokens + 1
+
+    def _adaptive_k_draft_counts(self) -> tuple[int, ...]:
+        """Draft counts the acceptance-adaptive policy may choose, or ()."""
+        if not self.adaptive_k_capture:
+            return ()
+        speculative_config = self.vllm_config.speculative_config
+        if not (speculative_config and speculative_config.uses_adaptive_k()):
+            return ()
+        return tuple(speculative_config.adaptive_k_draft_counts())
+
+    def warn_on_missing_adaptive_graphs(self) -> None:
+        """Check every adaptive draft count has a single-request decode graph.
+
+        ``dispatch`` returns CUDAGraphMode.NONE on a miss and the step quietly
+        runs eager, which would read as a mysterious slowdown rather than a
+        misconfiguration, so surface it once at startup.
+        """
+        adaptive_k_counts = self._adaptive_k_draft_counts()
+        if not adaptive_k_counts:
+            return
+        if not self.cudagraph_mode or not self.cudagraph_mode.decode_mode():
+            return
+
+        num_new_sampled_tokens_per_step = (
+            self.decode_query_len - self.vllm_config.num_speculative_tokens
+        )
+        covered, missing = [], []
+        for num_spec in adaptive_k_counts:
+            query_len = num_spec + num_new_sampled_tokens_per_step
+            desc = self.dispatch(
+                num_reqs=1,
+                num_tokens=query_len,
+                uniform_token_count=query_len,
+                num_active_loras=0,
+                max_query_len=query_len,
+            )
+            (covered if desc.cg_mode != CUDAGraphMode.NONE else missing).append(
+                num_spec
+            )
+        if missing:
+            logger.warning(
+                "Adaptive SD: no decode CUDA graph for draft count(s) %s "
+                "(need capture sizes that are multiples of %s); steps that "
+                "choose them will run eager. Captured: %s.",
+                missing,
+                [k + num_new_sampled_tokens_per_step for k in missing],
+                covered,
+            )
+        else:
+            logger.info(
+                "Adaptive SD: decode CUDA graphs captured for draft counts %s.",
+                covered,
+            )
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -568,6 +642,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        adaptive_k_capture: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -577,6 +652,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             ubatch_runner=ubatch_runner,
+            adaptive_k_capture=adaptive_k_capture,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []

@@ -59,6 +59,12 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
 class BaseSpeculator(ABC):
     num_query_per_req: int = 1
 
+    # Whether propose() honours the ``num_steps`` override. True only for
+    # drafters that emit one token per pass, where the draft loop can simply
+    # stop early; a drafter whose block size is baked into its own CUDA graph
+    # must keep drafting its full block and let the scheduler verify a prefix.
+    supports_variable_num_steps: bool = False
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -94,6 +100,11 @@ class BaseSpeculator(ABC):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        # Draft this many tokens instead of num_speculative_tokens. Only
+        # honoured by drafters that generate one token per pass; a drafter
+        # whose block size is baked into its CUDA graph ignores it, and the
+        # scheduler verifies a prefix of the block instead.
+        num_steps: int | None = None,
     ) -> torch.Tensor:
         pass
 

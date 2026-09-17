@@ -27,6 +27,10 @@ logger = init_logger(__name__)
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
+    # One token per request per pass, so the draft loop is just replays of a
+    # single captured graph and can stop short of num_speculative_steps.
+    supports_variable_num_steps = True
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
@@ -127,6 +131,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
+            adaptive_k_capture=True,
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -220,14 +225,23 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
+        # Each draft step past the first is another replay of the *same*
+        # single-token-per-request graph, so stopping the loop early is
+        # CUDA-graph-safe; only the returned width changes.
+        num_steps = (
+            self.num_speculative_steps
+            if num_steps is None
+            else min(max(num_steps, 1), self.num_speculative_steps)
+        )
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_speculative_steps, self.max_model_len
+            max_seq_len + num_steps, self.max_model_len
         )
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
@@ -322,7 +336,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if num_steps == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
 
@@ -379,10 +393,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             decode_batch_desc,
             num_tokens_across_dp,
             input_batch.seq_lens_cpu_upper_bound,
+            num_steps,
         )
         self.on_multi_step_decode_end(num_reqs)
 
-        return self.draft_tokens[:num_reqs]
+        return self.draft_tokens[:num_reqs, :num_steps]
 
     @torch.inference_mode()
     def _run_model(
@@ -505,6 +520,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
         seq_lens_cpu_upper_bound: torch.Tensor,
+        num_steps: int,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
@@ -512,7 +528,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, num_steps):
             # Rebuild every step when positions advance, or just once
             # on the first step when positions are constant (Gemma4 MTP).
             if not skip_attn and (self.advance_draft_positions or step == 1):
@@ -555,6 +571,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
         seq_lens_cpu_upper_bound: torch.Tensor,
+        num_steps: int,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
@@ -582,6 +599,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # The whole loop is inside one captured graph, so its step count
+            # is fixed; the extra drafts are simply not verified.
             assert self.decode_cudagraph_manager is not None
             self.decode_cudagraph_manager.run_fullgraph(batch_desc)
             return
@@ -593,6 +612,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mappings_by_layer,
             num_tokens_across_dp,
             batch_desc.cg_mode,
+            num_steps,
         )
 
     def _generate_fused_drafts(
@@ -603,7 +623,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_steps: int | None = None,
     ) -> None:
+        num_steps = num_steps or self.num_speculative_steps
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
@@ -613,7 +635,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else []
         )
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, num_steps):
             self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
@@ -624,7 +646,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode,
             )
             if (
-                step < self.num_speculative_steps - 1
+                step < num_steps - 1
                 and attn_metadata is not None
                 and self.advance_draft_positions
             ):

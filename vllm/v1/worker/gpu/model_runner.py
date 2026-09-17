@@ -267,6 +267,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        # Acceptance-adaptive SD: the scheduler picks this step's draft count
+        # on the host and ships it as num_spec_tokens_to_schedule.
+        self.adaptive_k_enabled = bool(
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.uses_adaptive_k()
+            and vllm_config.speculative_config.adaptive_k_draft_counts()
+        )
+        # Count decode steps that missed their CUDA graph, so an unregistered
+        # draft count surfaces as a warning instead of a silent eager fallback.
+        self._adaptive_k_cg_misses = 0
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
@@ -725,6 +735,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
+            adaptive_k_capture=True,
         )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
@@ -1055,6 +1066,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             ):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)
+                    self.cudagraph_manager.warn_on_missing_adaptive_graphs()
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1703,6 +1715,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )
 
+        if (
+            self.adaptive_k_enabled
+            and uniform_tok_count is not None
+            and not dummy_run
+            and batch_desc.cg_mode == CUDAGraphMode.NONE
+            and self.cudagraph_manager.cudagraph_mode
+        ):
+            # A uniform decode batch that found no graph runs eager, which
+            # would otherwise read as an unexplained slowdown.
+            self._adaptive_k_cg_misses += 1
+            if self._adaptive_k_cg_misses & (self._adaptive_k_cg_misses - 1) == 0:
+                logger.warning(
+                    "Adaptive SD: uniform decode batch (num_reqs=%d, "
+                    "num_tokens=%d, tokens/req=%d) has no captured CUDA graph "
+                    "and ran eager (%d such steps so far).",
+                    num_reqs,
+                    num_toks,
+                    uniform_tok_count,
+                    self._adaptive_k_cg_misses,
+                )
+
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1969,6 +2002,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        # How many drafts to produce for the *next* step. Fixed at
+        # num_speculative_steps unless the acceptance-adaptive policy lowered
+        # it. The scheduler decides this on the host and every rank receives
+        # the same SchedulerOutput, so PP ranks cannot disagree. Carried on
+        # ExecuteModelState because sample_tokens(), where the drafter runs,
+        # has no SchedulerOutput of its own. A dummy run (profiling, CUDA
+        # graph capture) always drafts the full width: its SchedulerOutput is
+        # an empty placeholder and the capture must cover the widest shape.
+        num_draft_tokens_to_propose = self.num_speculative_steps
+        if self.adaptive_k_enabled and not dummy_run:
+            num_draft_tokens_to_propose = min(
+                max(scheduler_output.num_spec_tokens_to_schedule, 1),
+                self.num_speculative_steps,
+            )
+
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -1980,6 +2028,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
+            num_draft_tokens_to_propose=num_draft_tokens_to_propose,
         )
 
         if not self.is_last_pp_rank:
@@ -2009,6 +2058,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        num_draft_tokens_to_propose = (
+            self.execute_model_state.num_draft_tokens_to_propose
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2137,6 +2189,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
+            propose_kwargs: dict[str, Any] = {}
+            if num_draft_tokens_to_propose < self.num_speculative_steps and (
+                self.speculator.supports_variable_num_steps
+            ):
+                propose_kwargs["num_steps"] = num_draft_tokens_to_propose
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2152,8 +2209,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler.sampling_states.seeds.gpu,
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
+                    **propose_kwargs,
                 )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if draft_tokens.shape[1] == self.req_states.draft_tokens.shape[1]:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            else:
+                # Adaptive SD asked for a narrow block; leave the tail columns
+                # alone (they are never read -- verification is capped at the
+                # width the scheduler shipped).
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, : draft_tokens.shape[1]
+                ] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
@@ -2162,10 +2228,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
-            )
+            # Under adaptive SD only the first num_draft_tokens_to_propose
+            # columns were written this step; hand on exactly those so the
+            # scheduler never schedules a stale draft. The count comes from
+            # the scheduler output rather than the drafter's return shape, so
+            # every PP rank agrees on the width.
+            proposed_drafts = self.req_states.draft_tokens[input_batch.idx_mapping]
+            if num_draft_tokens_to_propose < proposed_drafts.shape[1]:
+                proposed_drafts = proposed_drafts[:, :num_draft_tokens_to_propose]
+            self.draft_tokens_handler.set_draft_tokens(input_batch, proposed_drafts)
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
@@ -2311,6 +2382,9 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    # Width of the draft block to propose for the next step; equals
+    # num_speculative_steps unless acceptance-adaptive SD narrowed it.
+    num_draft_tokens_to_propose: int
 
 
 class BatchReqState(NamedTuple):
