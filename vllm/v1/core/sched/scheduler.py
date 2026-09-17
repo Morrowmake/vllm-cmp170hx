@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -358,6 +359,17 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.scheduler_reserve_full_isl
         )
 
+        # Fair chunked prefill (opt-in). Both knobs at 0 -> `fair_prefill` is
+        # False and every code path below is bypassed, so the schedule is
+        # identical to upstream.
+        self.prefill_chunk_with_decodes = (
+            self.scheduler_config.prefill_chunk_with_decodes
+        )
+        self.max_num_partial_prefills = self.scheduler_config.max_num_partial_prefills
+        self.fair_prefill = self.scheduler_config.enable_chunked_prefill and bool(
+            self.prefill_chunk_with_decodes or self.max_num_partial_prefills
+        )
+
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         # Blocks that async KV loads will overwrite this step, skipped from
@@ -429,6 +441,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        max_prefill_tokens: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -483,10 +496,17 @@ class Scheduler(SchedulerInterface):
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            if max_prefill_tokens is None:
+                # Widest chunk any step could give this request. The caller
+                # passes its own limit when fair chunked prefill narrowed it;
+                # a block too wide for that limit has to advance sub-block or
+                # the request would never be scheduled at all.
+                max_prefill_tokens = self.max_num_scheduled_tokens
+                long_prefill_threshold = (
+                    self.scheduler_config.long_prefill_token_threshold
+                )
+                if long_prefill_threshold > 0:
+                    max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -571,6 +591,55 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _fair_prefill_budget(self) -> tuple[int, int]:
+        """Fair chunked prefill: this step's prefill budget and per-request cap.
+
+        Returns ``(total, per_request)``, both counted in prefill tokens only.
+        Decode tokens draw on ``token_budget`` / ``input_budget`` as usual and
+        are never charged here, which is what lets a decode stream keep its
+        slot in every step while someone else's prompt is being prefilled.
+
+        * ``total`` is ``max_num_scheduled_tokens``, narrowed to
+          ``prefill_chunk_with_decodes`` whenever at least one running request
+          is past its prefill (i.e. would decode this step). With nothing
+          decoding the full budget is kept, so a solo prompt is unaffected.
+        * ``per_request`` splits ``total`` evenly between up to
+          ``max_num_partial_prefills`` prefill-phase requests (running chunks
+          plus the waiting requests that could be admitted this step), so
+          several prompts advance together instead of one at a time.
+        """
+        total = self.max_num_scheduled_tokens
+        if self.prefill_chunk_with_decodes > 0 and any(
+            not r.is_prefill_chunk for r in self.running
+        ):
+            total = min(total, self.prefill_chunk_with_decodes)
+
+        per_request = total
+        if self.max_num_partial_prefills > 0:
+            num_running_prefills = sum(1 for r in self.running if r.is_prefill_chunk)
+            free_slots = max(
+                0,
+                self.max_num_active_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+            )
+            num_waiting = (
+                min(len(self.waiting), free_slots)
+                if self._pause_state == PauseState.UNPAUSED
+                else 0
+            )
+            num_prefills = min(
+                self.max_num_partial_prefills, num_running_prefills + num_waiting
+            )
+            per_request = total // max(num_prefills, 1)
+
+        # Floor both: `_reserve_prefill_lookahead` refuses to end a chunk within
+        # `num_prefill_lookahead` of the prefill end, so a cap at or below that
+        # would zero every chunk and stall the prefill forever. Non-binding for
+        # any sane setting (the lookahead is a handful of tokens).
+        floor = self.num_prefill_lookahead + 1
+        return max(total, floor), max(per_request, floor)
+
     def _select_adaptive_k(self) -> tuple[int, int]:
         """Pick this step's verification width and the next drafting width.
 
@@ -633,6 +702,16 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        # Fair chunked prefill: a second budget that only prefill tokens draw
+        # on. When the feature is off it equals `token_budget` and can never
+        # bind, so the schedule is unchanged.
+        prefill_token_budget = token_budget
+        prefill_chunk_cap = token_budget
+        if self.fair_prefill:
+            prefill_token_budget, prefill_chunk_cap = self._fair_prefill_budget()
+        # Observability only; refunded when scheduled prefills are preempted.
+        num_prefill_tokens = 0
+        num_prefill_reqs = 0
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -729,6 +808,17 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            # Fair chunked prefill leaves decode work outside this budget.
+            req_is_prefill = request.is_prefill_chunk
+            is_prefill = self.fair_prefill and req_is_prefill
+            prefill_chunk_limit: int | None = None
+            if is_prefill:
+                prefill_chunk_limit = min(prefill_chunk_cap, prefill_token_budget)
+                if long_prefill_token_threshold > 0:
+                    prefill_chunk_limit = min(
+                        prefill_chunk_limit, long_prefill_token_threshold
+                    )
+                num_new_tokens = min(num_new_tokens, prefill_chunk_limit)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -744,8 +834,9 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
+                # Positional: tests monkeypatch this with a `*args` stub.
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, 0, 0, prefill_chunk_limit
                 )
 
             # Schedule encoder inputs.
@@ -837,6 +928,11 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            if preempted_req.is_prefill_chunk:
+                                if self.fair_prefill:
+                                    prefill_token_budget += restored
+                                num_prefill_tokens -= restored
+                                num_prefill_reqs -= 1
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -875,6 +971,11 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if is_prefill:
+                prefill_token_budget -= num_new_tokens
+            if req_is_prefill:
+                num_prefill_tokens += num_new_tokens
+                num_prefill_reqs += 1
             req_index += 1
 
             # Speculative decode related.
@@ -1115,6 +1216,9 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                req_is_prefill = False
+                is_prefill = False
+                prefill_chunk_limit = None
 
                 # SWA bounded replay: recompute the tail of the hit without
                 # rewriting its cached KV. An async load replays once the KV
@@ -1173,6 +1277,29 @@ class Scheduler(SchedulerInterface):
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
 
+                    # Fair chunked prefill: prefill-phase work draws on the
+                    # (decode-aware) prefill budget, split between concurrent
+                    # prefills. Same predicate the DP prefill throttle uses:
+                    # a request only replaying its last token is a decode, not
+                    # prefill work, so it is left alone. A prefix-cache hit has
+                    # already been folded into num_computed_tokens, so only the
+                    # tokens actually recomputed are charged.
+                    req_is_prefill = num_computed_tokens < request.num_tokens - 1
+                    is_prefill = self.fair_prefill and req_is_prefill
+                    if is_prefill:
+                        prefill_chunk_limit = min(
+                            prefill_chunk_cap, prefill_token_budget
+                        )
+                        if long_prefill_token_threshold > 0:
+                            prefill_chunk_limit = min(
+                                prefill_chunk_limit, long_prefill_token_threshold
+                            )
+                        if prefill_chunk_limit <= 0:
+                            # No prefill budget left this step. Leave the request
+                            # at the head of the queue for the next one.
+                            break
+                        num_new_tokens = min(num_new_tokens, prefill_chunk_limit)
+
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
@@ -1193,6 +1320,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            prefill_chunk_limit,
                         )
                         if num_new_tokens == 0:
                             break
@@ -1374,6 +1502,11 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if is_prefill:
+                    prefill_token_budget -= num_new_tokens
+                if req_is_prefill:
+                    num_prefill_tokens += num_new_tokens
+                    num_prefill_reqs += 1
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1419,6 +1552,21 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert prefill_token_budget >= 0
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "fairprefill step=%d total=%d prefill=%d/%dreq "
+                "decode=%d/%dreq cap=%d left=%d",
+                self.current_step,
+                total_num_scheduled_tokens,
+                num_prefill_tokens,
+                num_prefill_reqs,
+                total_num_scheduled_tokens - num_prefill_tokens,
+                len(num_scheduled_tokens) - num_prefill_reqs,
+                prefill_chunk_cap,
+                prefill_token_budget,
+            )
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
