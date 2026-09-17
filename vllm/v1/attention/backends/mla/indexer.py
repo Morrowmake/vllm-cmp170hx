@@ -692,6 +692,28 @@ def compute_kpool_tail_slot_mapping(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map every token to its request's one circular tail block."""
+    # VLLM_GLM5_PROLOGUE_FUSE=1: one kernel writes the whole output -- both the
+    # [:num_actual_tokens] circular mapping and the untouched tail that the
+    # copy_ below would otherwise carry over. Integer index arithmetic only, so
+    # the result is bit-identical.
+    from vllm.v1.worker.gpu import prologue_fuse
+
+    _pf = prologue_fuse.settings()
+    if _pf.enabled and _pf.kpool and num_actual_tokens > 0 and num_reqs > 0:
+        if out is None:
+            out = torch.empty_like(slot_mapping)
+        else:
+            assert out.shape == slot_mapping.shape
+        return prologue_fuse.kpool_tail_slot_mapping(
+            slot_mapping,
+            block_table,
+            query_start_loc,
+            positions,
+            num_actual_tokens,
+            num_reqs,
+            kpool,
+            out,
+        )
     if out is None:
         out = torch.empty_like(slot_mapping)
     else:

@@ -228,6 +228,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         uniform_spec_sequence_length = None
+        # VLLM_GLM5_PROLOGUE_FUSE=1: in steady spec decode every row is a
+        # spec-decode row and the padded rows sit empty at the back, so the six
+        # copy_ / five fill_ launches below collapse into one kernel. Returns
+        # None -- and the unmodified body runs -- for every other batch shape.
+        from vllm.v1.worker.gpu import prologue_fuse
+
+        _fused = prologue_fuse.try_build_gdn_spec_decode(
+            self, m, block_table_tensor, num_accepted_tokens,
+            num_decode_draft_tokens_cpu,
+        )
+        if _fused is not None:
+            return _fused
+
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
