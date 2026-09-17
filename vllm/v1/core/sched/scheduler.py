@@ -1555,6 +1555,10 @@ class Scheduler(SchedulerInterface):
         assert prefill_token_budget >= 0
 
         if logger.isEnabledFor(logging.DEBUG):
+            # One line per step, enough to answer "did the decode streams ride
+            # along with every prefill chunk?" from a server log. Enable just
+            # this logger (not global DEBUG) via VLLM_LOGGING_CONFIG_PATH.
+            # Use the per-step fields to check decode coverage.
             logger.debug(
                 "fairprefill step=%d total=%d prefill=%d/%dreq "
                 "decode=%d/%dreq cap=%d left=%d",
