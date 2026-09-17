@@ -1269,10 +1269,21 @@ def _get_kv_cache_groups_glm5_next(
         for name, spec in kv_cache_spec.items()
         if isinstance(spec, KpoolTailSpec)
     }
+    # A spec-decode drafter that carries its own attention (DFlash/DFlash2)
+    # registers plain sliding-window layers on top of the GLM-5.3-Flash
+    # hybrid. Partition them out -- exact type, since KpoolTailSpec subclasses
+    # SlidingWindowSpec -- so they do not disqualify the model from this
+    # layout; they become one extra group below.
+    draft_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if type(spec) is SlidingWindowSpec
+    }
     attn_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
         if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+        and type(spec) is not SlidingWindowSpec
     }
     if not mamba_specs or not all(
         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
@@ -1329,11 +1340,79 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
+    draft_group: KVCacheGroupSpec | None = None
+    if draft_specs:
+        draft_group = _glm5_next_draft_group(draft_specs, mla_specs, mla_names, mla_page)
+        if draft_group is None:
+            # Unsupported drafter geometry: fall back to the generic path
+            # (which reports the real page-size conflict) rather than build a
+            # group the tensor layout below cannot describe.
+            return None
+
+    # The drafter group is appended LAST so the existing group ids (attn,
+    # tail, mamba) keep their positions.
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + ([draft_group] if draft_group is not None else [])
     )
+
+
+def _glm5_next_draft_group(
+    draft_specs: dict[str, KVCacheSpec],
+    mla_specs: dict[str, MLAAttentionSpec],
+    mla_names: list[str],
+    mla_page: int,
+) -> KVCacheGroupSpec | None:
+    """One KV group for a DFlash-style drafter's sliding-window layers.
+
+    Only the *exact-fit* geometry is supported: the drafter's block size is
+    chosen so its page is byte-for-byte the MLA page, which lets drafter layer
+    i ride MLA tensor i at disjoint block ids out of the one shared pool --
+    exactly how the mamba groups already share those tensors. The per-block
+    cost of the pool is therefore unchanged and KV capacity is not reduced;
+    the drafter's sliding window bounds it to a few block ids per request.
+
+    ``page_size_padded`` is deliberately not used: a padded page is read
+    through a strided view, which is only valid while the backend does not
+    split the manager block into smaller kernel blocks. Returning None instead
+    keeps the failure loud.
+    """
+    any_draft = next(iter(draft_specs.values()))
+    if not all(spec == any_draft for spec in draft_specs.values()):
+        return None
+    bytes_per_token = any_draft.page_size_bytes // any_draft.block_size
+    if not bytes_per_token or mla_page % bytes_per_token:
+        return None
+    fit_block = mla_page // bytes_per_token
+    mla_block = mla_specs[mla_names[0]].block_size
+    if (
+        # A 64-divisible manager block splits cleanly into any kernel block
+        # size the sliding-window backends register (16 / 32 / 64).
+        fit_block % 64
+        # Keep the scheduler's block-size LCM at max(mla_block, fit_block).
+        or (fit_block % mla_block and mla_block % fit_block)
+        # Each drafter layer needs an MLA tensor to ride in.
+        or len(draft_specs) > len(mla_names)
+    ):
+        return None
+    logger.info(
+        "DFlash drafter KV: %d sliding-window layers ride the MLA tensors "
+        "(block_size %d -> %d, page %d B, no extra bytes per block)",
+        len(draft_specs),
+        any_draft.block_size,
+        fit_block,
+        mla_page,
+    )
+    fitted: dict[str, KVCacheSpec] = {
+        name: replace(spec, block_size=fit_block) for name, spec in draft_specs.items()
+    }
+    assert all(spec.page_size_bytes == mla_page for spec in fitted.values())
+    draft_uniform = UniformTypeKVCacheSpecs.from_specs(fitted)
+    if draft_uniform is None:
+        return None
+    return KVCacheGroupSpec(list(fitted), draft_uniform)
 
 
 def _glm5_next_tensor_layout(
@@ -1348,10 +1427,15 @@ def _glm5_next_tensor_layout(
         int,
         list[str],
         int,
+        KVCacheGroupSpec | None,
     ]
     | None
 ):
-    """Recognize the GLM-5.3-Flash grouping after optional PP projection."""
+    """Recognize the GLM-5.3-Flash grouping after optional PP projection.
+
+    The last tuple element is the optional DFlash drafter group (see
+    ``_glm5_next_draft_group``); it is ``None`` without a spec-decode drafter.
+    """
     uniform_groups = [
         group
         for group in kv_cache_groups
@@ -1362,12 +1446,16 @@ def _glm5_next_tensor_layout(
     ]
     attn_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
+    draft_group: KVCacheGroupSpec | None = None
     for group in uniform_groups:
         inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
         if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
             attn_group = group
         elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
             tail_group = group
+        elif inner and all(type(spec) is SlidingWindowSpec for spec in inner.values()):
+            # DFlash drafter group; validated against the MLA page below.
+            draft_group = group
     if attn_group is None or not mamba_groups:
         return None
     if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
@@ -1394,6 +1482,18 @@ def _glm5_next_tensor_layout(
     idx_page = idx_pages.pop()
     if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
         return None
+    if draft_group is not None:
+        # Exact fit only: unpadded, one page per drafter layer equal to the
+        # MLA page, and no more drafter layers than MLA tensors to ride in.
+        draft_inner = cast(
+            UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
+        ).kv_cache_specs
+        if any(spec.page_size_padded is not None for spec in draft_inner.values()):
+            return None
+        if {spec.page_size_bytes for spec in draft_inner.values()} != {mla_page}:
+            return None
+        if len(draft_group.layer_names) > len(mla_names):
+            return None
 
     tail_names: list[str] = []
     tail_page = 0
@@ -1421,6 +1521,7 @@ def _glm5_next_tensor_layout(
         idx_page,
         tail_names,
         tail_page,
+        draft_group,
     )
 
 
@@ -1652,7 +1753,9 @@ def _get_kv_cache_bytes_per_block(
 ) -> int:
     """Return the largest cache group's bytes per block."""
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
+        # An exact-fit drafter group rides the MLA tensors, so it adds no
+        # bytes to the per-block cost.
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, _ = glm5_layout
         return len(mla_names) * mla_page + len(idx_names) * idx_page
 
     bytes_per_block = max(
@@ -1760,7 +1863,17 @@ def get_kv_cache_config_from_groups(
             idx_page,
             tail_names,
             _,
+            draft_group,
         ) = glm5_layout
+        draft_names: list[str] = []
+        draft_specs: dict[str, KVCacheSpec] = {}
+        if draft_group is not None:
+            draft_names = list(draft_group.layer_names)
+            draft_specs = dict(
+                cast(
+                    UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
+                ).kv_cache_specs
+            )
         bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
         num_blocks = may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
@@ -1789,6 +1902,11 @@ def get_kv_cache_config_from_groups(
             for group in mamba_groups:
                 if index < len(group.layer_names):
                     add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
+            if index < len(draft_names):
+                # Exact-fit DFlash drafter layer i co-owns MLA tensor i at
+                # disjoint block ids, the same way the mamba groups do.
+                draft_name = draft_names[index]
+                add_tensor(draft_name, draft_specs[draft_name], offset)
 
         idx_base = len(mla_names) * mla_page * num_blocks
         for index, idx_name in enumerate(idx_names):
@@ -2527,6 +2645,7 @@ def _max_memory_usage_bytes_from_groups(
             idx_page,
             tail_names,
             _,
+            draft_group,
         ) = glm5_layout
         uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
         total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
@@ -2539,6 +2658,13 @@ def _max_memory_usage_bytes_from_groups(
         )
         if tail_names:
             total_blocks += 1
+        if draft_group is not None:
+            # The drafter claims its own (window-bounded) block ids from the
+            # shared pool; its pages ride the MLA tensors, so only the block
+            # count grows.
+            total_blocks += cast(
+                UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
+            ).max_memory_usage_pages(vllm_config)
         return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
 
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
