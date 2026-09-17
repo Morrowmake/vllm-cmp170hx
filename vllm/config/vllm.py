@@ -1013,11 +1013,22 @@ class VllmConfig:
 
     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
         speculative_config = self.speculative_config
-        if (
-            speculative_config is None
-            or not speculative_config.uses_dynamic_speculative_decoding()
-            or self.parallel_config.data_parallel_size <= 1
-        ):
+        if speculative_config is None or self.parallel_config.data_parallel_size <= 1:
+            return
+
+        if speculative_config.uses_adaptive_k():
+            logger.warning_once(
+                "Acceptance-adaptive speculative decoding is not supported "
+                "with data parallelism because data-parallel ranks can select "
+                "different speculative-token counts, causing DP divergence "
+                "and deadlocks. Disabling adaptive_k and falling back to "
+                "static num_speculative_tokens=%d.",
+                speculative_config.num_speculative_tokens,
+            )
+            speculative_config.adaptive_k = None
+            speculative_config.adaptive_k_config = None
+
+        if not speculative_config.uses_dynamic_speculative_decoding():
             return
 
         logger.warning_once(

@@ -68,6 +68,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.adaptive_k import AdaptiveKPolicy
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -281,7 +282,27 @@ class Scheduler(SchedulerInterface):
         self.prefix_replay_tokens = replay_windows.pop() if replay_windows else 0
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
+        self.adaptive_k: AdaptiveKPolicy | None = None
+        # Draft count this step verifies. Equals num_spec_tokens unless the
+        # adaptive-k policy lowered it; read by the uniform-decode padding and
+        # the spec-token truncation below so both agree within a step.
+        self.cur_num_spec_tokens = self.num_spec_tokens
+        # Draft count the drafter is asked to produce for the next step. It
+        # can exceed cur_num_spec_tokens while k is climbing back up.
+        self.next_num_spec_tokens = self.num_spec_tokens
         if speculative_config is not None:
+            if speculative_config.uses_adaptive_k():
+                self.adaptive_k = AdaptiveKPolicy(
+                    speculative_config.adaptive_k_config
+                )
+                logger.info(
+                    "Acceptance-adaptive speculative decoding enabled: "
+                    "draft counts %s, ema=%.2f, margin=%.2f, quantile=%.2f",
+                    list(self.adaptive_k.config.allowed),
+                    self.adaptive_k.config.ema,
+                    self.adaptive_k.config.margin,
+                    self.adaptive_k.config.quantile,
+                )
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -550,6 +571,41 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _select_adaptive_k(self) -> tuple[int, int]:
+        """Pick this step's verification width and the next drafting width.
+
+        The policy proposes a count from the running requests' acceptance
+        EMAs. That count is what the drafter is asked to produce for the next
+        step. What this step can *verify* is additionally capped by the drafts
+        already on hand: every request in a uniform decode batch must present
+        the same number of drafts, so the batch minimum wins, and longer draft
+        lists are truncated here -- before ``num_tokens_with_spec`` is read, so
+        every downstream size follows. Keeping the two separate is what lets k
+        climb again: a step verifies the two drafts it has while asking for
+        three, and gets three on the next step.
+        """
+        assert self.adaptive_k is not None
+        running = self.running
+        if not running:
+            return self.num_spec_tokens, self.num_spec_tokens
+        k_draft = self.adaptive_k.select_k([r.request_id for r in running])
+
+        available = min(
+            (len(r.spec_token_ids) for r in running if r.spec_token_ids),
+            default=k_draft,
+        )
+        k_verify = k_draft if available >= k_draft else self.adaptive_k.snap(available)
+
+        for request in running:
+            if len(request.spec_token_ids) > k_verify:
+                # Rebind rather than mutate: AsyncScheduler hands every
+                # request the same placeholder list object.
+                request.spec_token_ids = request.spec_token_ids[:k_verify]
+
+        self.adaptive_k.record_choice(k_verify)
+        self.adaptive_k.maybe_log()
+        return k_verify, k_draft
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -592,6 +648,18 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # Acceptance-adaptive draft count. Chosen once, on the host, before any
+        # request is sized, so the uniform-decode padding below and the
+        # truncation of already-proposed drafts agree on one width for the
+        # whole step -- which is what keeps the decode batch inside a captured
+        # full CUDA graph.
+        self.cur_num_spec_tokens = self.num_spec_tokens
+        self.next_num_spec_tokens = self.num_spec_tokens
+        if self.adaptive_k is not None and self.num_spec_tokens > 0:
+            self.cur_num_spec_tokens, self.next_num_spec_tokens = (
+                self._select_adaptive_k()
+            )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -1079,13 +1147,16 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (
+                            self.cur_num_spec_tokens > 0
+                            and self.dynamic_sd_lookup is None
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
                     ):
-                        padded_num_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.cur_num_spec_tokens
                         # Pad only when there is room for the sampled token(s).
                         if (
                             num_computed_tokens
@@ -1127,7 +1198,7 @@ class Scheduler(SchedulerInterface):
                             break
                         if (
                             pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
+                            and num_new_tokens != 1 + self.cur_num_spec_tokens
                         ):
                             # Alignment clipped the placeholder rows. The split
                             # aligns prefill chunks, but the padded tail rows are
@@ -1306,10 +1377,14 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
-                    assert num_new_tokens == 1 + self.num_spec_tokens
+                    assert num_new_tokens == 1 + self.cur_num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
-                    ] * self.num_spec_tokens
+                    ] * self.cur_num_spec_tokens
+                    if self.adaptive_k is not None:
+                        # Placeholder drafts are rejected by construction;
+                        # keep them out of the acceptance EMA.
+                        self.adaptive_k.mark_padded(request_id)
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1431,7 +1506,9 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
+        # This is how many drafts to *produce* during this step (for the next
+        # one); what this step verifies is cur_num_spec_tokens.
+        num_spec_tokens_to_schedule = self.next_num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
@@ -2003,6 +2080,17 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                if self.adaptive_k is not None:
+                    # Grammar-invalidated drafts were never really proposed,
+                    # so they must not count against the acceptance EMA.
+                    num_invalid = (
+                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                        if scheduler_output.num_invalid_spec_tokens
+                        else 0
+                    )
+                    self.adaptive_k.observe(
+                        req_id, num_draft_tokens - num_invalid, num_accepted
+                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -2583,6 +2671,8 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        if self.adaptive_k is not None:
+            self.adaptive_k.forget(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
