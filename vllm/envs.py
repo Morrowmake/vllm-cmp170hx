@@ -173,6 +173,13 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_LOCAL_LOGITS: bool = False
+    VLLM_GLM5_DECODE_KERNELS: bool = False
+    VLLM_GLM5_DECODE_MHC: bool = True
+    VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
+    VLLM_GLM5_DECODE_KDA: bool = True
+    VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
+    VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 16
+    VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1481,6 +1488,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nondeterminism the gathered path already has.
     "VLLM_GLM5_LOCAL_LOGITS": lambda: bool(
         int(os.getenv("VLLM_GLM5_LOCAL_LOGITS", "0"))
+    ),
+    # Opt in to the sm_80 decode kernels in vllm/ampere_decode/ (GA100-class
+    # parts only; measured on CMP 170HX, 70 SMs). Default OFF: with this unset
+    # no kernel in that package is imported or called and every call site keeps
+    # the upstream code path exactly. The three per-family switches below are
+    # only consulted when this is on, so a single family can be disabled on the
+    # server without a rebuild -- which is how a regression gets bisected.
+    #
+    "VLLM_GLM5_DECODE_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_KERNELS", "0"))
+    ),
+    "VLLM_GLM5_DECODE_MHC": lambda: bool(int(os.getenv("VLLM_GLM5_DECODE_MHC", "1"))),
+    "VLLM_GLM5_DECODE_MOE_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_MOE_ROUTING", "1"))
+    ),
+    "VLLM_GLM5_DECODE_KDA": lambda: bool(int(os.getenv("VLLM_GLM5_DECODE_KDA", "1"))),
+    # Per-family token bounds: never dispatch above these. Each is the top of
+    # the family's measured win region, not a shared cap -- mHC is 0.90x at
+    # M=16, which is the concurrency-4 decode shape (4 seqs x (1 + 3) spec
+    # tokens), and MoE routing is 0.93x at M=32. KDA wins at every measured M.
+    # The per-M table is in vllm/ampere_decode/__init__.py.
+    "VLLM_GLM5_DECODE_MHC_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_DECODE_MHC_MAX_TOKENS", "8")
+    ),
+    "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "16")
+    ),
+    "VLLM_GLM5_DECODE_KDA_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_DECODE_KDA_MAX_TOKENS", "64")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

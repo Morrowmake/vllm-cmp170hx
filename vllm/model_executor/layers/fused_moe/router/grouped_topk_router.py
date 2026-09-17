@@ -326,6 +326,65 @@ class GroupedTopKRouter(BaseRouter):
                 )
             return topk_weights, topk_ids
 
+        # One fused kernel for the routing AND the block alignment that
+        # `fused_marlin_moe` asks for later (see moe_align_block_size.py: the
+        # two call sites are far apart, so the alignment is handed over
+        # through the single-slot stash keyed by the topk_ids identity).
+        from vllm.ampere_decode import (
+            marlin_block_size_m,
+            stash_fused_align,
+            use_ampere_moe_routing,
+        )
+
+        _bias = self.e_score_correction_bias
+        if (
+            _bias is not None
+            and not self.skip_padding
+            and self.eplb_state is None
+            and self.num_fused_shared_experts == 0
+            and indices_type in (None, torch.int32)
+            and router_logits.dim() == 2
+            and router_logits.dtype == torch.float32
+            and _bias.dtype == torch.float32
+            and use_ampere_moe_routing(
+                router_logits.shape[0],
+                router_logits.shape[-1],
+                self.top_k,
+                scoring_func=self.scoring_func,
+                num_expert_group=self.num_expert_group,
+                topk_group=self.topk_group,
+                renormalize=self.renormalize,
+            )
+        ):
+            from vllm.ampere_decode.moe_routing import fused_route_align
+
+            _num_experts = router_logits.shape[-1]
+            _block_size = marlin_block_size_m(
+                router_logits.shape[0], self.top_k, _num_experts
+            )
+            (
+                topk_weights,
+                topk_ids,
+                _sorted_ids,
+                _expert_ids,
+                _num_tokens_post_pad,
+            ) = fused_route_align(
+                router_logits,
+                _bias.data,
+                topk=self.top_k,
+                block_size=_block_size,
+                num_experts=_num_experts,
+                renormalize=self.renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            stash_fused_align(
+                topk_ids,
+                _block_size,
+                _num_experts,
+                (_sorted_ids, _expert_ids, _num_tokens_post_pad),
+            )
+            return topk_weights, topk_ids
+
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():
             if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
