@@ -151,11 +151,14 @@ def test_mhc_bound_is_8(on):
         assert use_ampere_mhc_decode(m, HC, HIDDEN) is False, m
 
 
-def test_moe_bound_is_16(on):
-    """0.93x at M=32; 1.06x still at M=16."""
-    for m in (1, 2, 4, 8, 16):
+def test_moe_bound_is_8(on):
+    """At block_size 8 -- what marlin actually picks at every decode M -- the
+    family is 1.56x at M=4 but 0.98x at M=16 and 0.80x at M=32.  The earlier result of
+    1.06x at M=16 was measured at block_size 48, a prefill shape.  Measured
+    GPU 2, --repeats 3, incumbent in the same run."""
+    for m in (1, 2, 4, 8):
         assert use_ampere_moe_routing(m, EXPERTS, TOPK) is True, m
-    for m in (17, 32, 64):
+    for m in (9, 16, 17, 32, 64):
         assert use_ampere_moe_routing(m, EXPERTS, TOPK) is False, m
 
 
@@ -414,7 +417,7 @@ def _main():
         test_per_family_flags,
         test_prefill_chunk_never_dispatches,
         test_mhc_bound_is_8,
-        test_moe_bound_is_16,
+        test_moe_bound_is_8,
         test_kda_bound_is_64,
         test_bounds_are_configurable,
         test_mhc_needs_a_norm_weight,
