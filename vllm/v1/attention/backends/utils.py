@@ -1156,6 +1156,18 @@ def mamba_get_block_table_tensor(
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
+        # VLLM_GLM5_PROLOGUE_FUSE=1: one kernel instead of the seven below.
+        # Integer index arithmetic only, so the result is bit-identical.
+        from vllm.v1.worker.gpu import prologue_fuse
+
+        _pf = prologue_fuse.settings()
+        if _pf.enabled and _pf.mamba_block_table:
+            return prologue_fuse.mamba_tail_block_table(
+                block_table,
+                seq_lens,
+                kv_cache_spec.block_size,
+                kv_cache_spec.num_speculative_blocks,
+            )
         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
         # to handle the invalid block table.
         start_indices = (seq_lens - 1) // kv_cache_spec.block_size
