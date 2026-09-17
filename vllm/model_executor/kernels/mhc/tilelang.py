@@ -25,6 +25,16 @@ def _use_ampere_prefill_prenorm(num_tokens: int) -> bool:
     Resolved on the host, per call, outside any graph. At decode sizes the
     upstream TileLang kernel is the one that was tuned, so the threshold keeps
     every captured CUDA graph on it.
+
+    COVERAGE. This gates `_hc_prenorm_gemm_outputs`, which is the choke point
+    for `mhc_pre_tilelang`, `mhc_pre_broadcast_tilelang` and
+    `mhc_fused_post_pre_tilelang` -- the last of which is what GLM-5.3-Flash
+    actually dispatches (confirmed in the trace: `vllm::mhc_fused_post_pre_
+    tilelang`, 90 calls per 1152-token chunk). The two *delayed* variants,
+    `mhc_pre_delayed_tilelang` and `mhc_fused_post_pre_delayed_tilelang`, call
+    `_HC_PRENORM_GEMM_TILELANG_KERNEL` inline and are deliberately left on the
+    upstream kernel: this deployment does not take them. If that ever changes,
+    extend the hook there too rather than assuming it is already covered.
     """
     from vllm import envs
     from vllm.platforms import current_platform
