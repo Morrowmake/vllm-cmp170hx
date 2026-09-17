@@ -146,6 +146,12 @@ class OverlapSettings:
 
     enabled: bool = False
     splits: int = 2
+    # MEASURED 2026-09-17: the scheduler issues ~280-380 token prefill forwards
+    # in the production serving config, NOT the 1152-token chunks the KV block
+    # size suggests, and NOT the token budget (MAX_BATCHED=2304 changes
+    # nothing). A 512 default therefore keeps this feature permanently dormant
+    # on the real path -- which is how the first PHASE 2 run measured +0.8%
+    # on a feature that never ran. See overlap_NOTES.md R2/R3/R11.
     min_tokens: int = 512
     # Emit a one-line summary of what the first overlapped chunk did.
     debug: bool = False
@@ -414,6 +420,9 @@ class PrefillOverlapRegion:
 # --------------------------------------------------------------------------- #
 
 _SETTINGS: OverlapSettings | None = None
+_SKIPPED = 0
+_OPENED = 0
+_WARNED_DORMANT = False
 _REGION: PrefillOverlapRegion | None = None
 _ACTIVE: PrefillOverlapRegion | None = None
 _LOGGED = False
@@ -429,10 +438,14 @@ def get_settings() -> OverlapSettings:
 def reset_for_testing() -> None:
     """Drop cached settings/region. Tests only."""
     global _SETTINGS, _REGION, _ACTIVE, _LOGGED
+    global _SKIPPED, _OPENED, _WARNED_DORMANT
     _SETTINGS = None
     _REGION = None
     _ACTIVE = None
     _LOGGED = False
+    _SKIPPED = 0
+    _OPENED = 0
+    _WARNED_DORMANT = False
 
 
 def get_active_region() -> PrefillOverlapRegion | None:
@@ -499,6 +512,7 @@ def maybe_open_region(
     if not settings.active:
         return None
     if num_tokens < settings.min_tokens:
+        note_forward_skipped(num_tokens)
         return None
     if not mhc or sequence_parallel:
         return None
@@ -525,8 +539,35 @@ def maybe_open_region(
             settings.min_tokens,
             num_tokens,
         )
+    globals()["_OPENED"] = _OPENED + 1
     _ACTIVE = _REGION
     return _REGION
+
+
+def note_forward_skipped(num_tokens: int) -> None:
+    """Record a prefill-sized forward that did NOT open a region.
+
+    Guards against the failure mode that cost a whole PHASE 2 leg: the feature
+    switched on, never engaging, and reporting as "no effect" rather than
+    "never ran". After enough skipped forwards we say so, once, loudly.
+    """
+    global _SKIPPED, _WARNED_DORMANT
+    settings = get_settings()
+    if not settings.active or _WARNED_DORMANT:
+        return
+    _SKIPPED += 1
+    if _SKIPPED >= 64 and _OPENED == 0:
+        _WARNED_DORMANT = True
+        logger.warning(
+            "GLM5 prefill overlap is ENABLED but has never engaged: %d "
+            "forwards were all below min_tokens=%d (most recent: %d tokens). "
+            "The feature is doing nothing. Lower "
+            "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS below the real chunk size, "
+            "or turn the feature off.",
+            _SKIPPED,
+            settings.min_tokens,
+            num_tokens,
+        )
 
 
 def close_region(region: PrefillOverlapRegion | None) -> None:
