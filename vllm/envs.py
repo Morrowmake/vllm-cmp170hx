@@ -169,6 +169,9 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_GLM5_REPLICATED_EMBED: bool = False
+    VLLM_GLM5_PREFILL_KERNELS: bool = False
+    VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
+    VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1445,6 +1448,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GLM-5.3-Flash). No effect with TP=1.
     "VLLM_GLM5_REPLICATED_EMBED": lambda: bool(
         int(os.getenv("VLLM_GLM5_REPLICATED_EMBED", "0"))
+    ),
+    # Opt in to the sm_80 prefill kernels in vllm/ampere_prefill/ (GA100-class
+    # parts only; measured on CMP 170HX, 70 SMs). Default OFF: with this unset
+    # nothing in that package is imported and every call site keeps the upstream
+    # code path exactly.
+    "VLLM_GLM5_PREFILL_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PREFILL_KERNELS", "0"))
+    ),
+    # Token threshold. Below it the upstream kernels win (they are tuned for
+    # decode shapes) and every captured CUDA graph keeps the upstream kernel.
+    "VLLM_GLM5_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_PREFILL_MIN_TOKENS", "512")
+    ),
+    # Sparse MLA only: require seq_kv >= this multiple of index_topk. The tuned
+    # kernel wins by manufacturing L2 reuse across queries; when the context is
+    # barely larger than top-k almost every row is selected by almost every
+    # query, so it is L2-resident already and the extra index arithmetic costs
+    # ~7 % (measured 0.93x at ctx 2304 / topk 2048, 1.39x at ctx 8192).
+    "VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT": lambda: float(
+        os.getenv("VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT", "2.0")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
