@@ -324,6 +324,35 @@ def _workspace(device, num_tokens, num_heads, num_splits, block_dv, head_blocks)
     return ws
 
 
+def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
+                                   index_topk: int) -> bool:
+    """Gate for vllm/ampere_prefill/sparse_prefill_mla.py.
+
+    Two conditions, both measured (CMP 170HX, 70 SMs, TP=4 so h_q = 16):
+
+      * num_tokens: below the threshold this is decode, where the upstream
+        schedule was tuned and where the captured CUDA graphs live.
+      * seq_kv vs index_topk: the tuned kernel wins by rotating each query's
+        start offset so concurrent CTAs stop marching through the cache in
+        lockstep, which turns the gather into L2 hits (1752 GB/s at ctx 99328,
+        above the 1.66 TB/s pure-read HBM ceiling). When the context is barely
+        larger than top-k, almost every row is selected by almost every query,
+        the working set is L2-resident anyway and the rotation only adds index
+        arithmetic: measured 0.93x at ctx 2304, 1.39x at ctx 8192, topk 2048.
+        The default multiple of 2.0 puts the gate at 4096 rows, between the two.
+    """
+    from vllm import envs
+    from vllm.platforms import current_platform
+
+    if not envs.VLLM_GLM5_PREFILL_KERNELS:
+        return False
+    if num_tokens < envs.VLLM_GLM5_PREFILL_MIN_TOKENS:
+        return False
+    if seq_kv < envs.VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT * index_topk:
+        return False
+    return current_platform.is_cuda() and current_platform.is_device_capability(80)
+
+
 def triton_mla_sparse_fwd(
     q: torch.Tensor,  # [num_tokens, num_heads_q, dim_qk]
     kv: torch.Tensor,  # [num_rows, num_heads_kv, dim_qk]
@@ -356,6 +385,13 @@ def triton_mla_sparse_fwd(
 
     if block_dpe is None:
         block_dpe = dim_qk - d_v
+
+    if _use_ampere_prefill_sparse_mla(num_tokens, kv.shape[0], index_topk):
+        from vllm.ampere_prefill.sparse_prefill_mla import sparse_mla_fwd
+
+        return sparse_mla_fwd(
+            q, kv, indices, sm_scale, d_v=d_v, block_dpe=block_dpe, out=out
+        )
 
     BLOCK_H, BLOCK_N, num_splits, num_warps = _pick_config(num_tokens, index_topk)
     BLOCK_DPE = block_dpe

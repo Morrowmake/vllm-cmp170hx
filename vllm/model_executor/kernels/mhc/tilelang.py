@@ -19,6 +19,23 @@ def _torch_hc_prenorm_gemm(
     sqrsum[0].copy_(x_float.square().sum(dim=-1))
 
 
+def _use_ampere_prefill_prenorm(num_tokens: int) -> bool:
+    """Gate for vllm/ampere_prefill/mhc_prenorm.py.
+
+    Resolved on the host, per call, outside any graph. At decode sizes the
+    upstream TileLang kernel is the one that was tuned, so the threshold keeps
+    every captured CUDA graph on it.
+    """
+    from vllm import envs
+    from vllm.platforms import current_platform
+
+    if not envs.VLLM_GLM5_PREFILL_KERNELS:
+        return False
+    if num_tokens < envs.VLLM_GLM5_PREFILL_MIN_TOKENS:
+        return False
+    return current_platform.is_cuda() and current_platform.is_device_capability(80)
+
+
 def _hc_prenorm_gemm_outputs(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -55,6 +72,16 @@ def _hc_prenorm_gemm_outputs(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+    elif _use_ampere_prefill_prenorm(num_tokens):
+        from vllm.ampere_prefill.mhc_prenorm import hc_prenorm_gemm
+
+        # NB: `fn` differs per (layer, attn|ffn) -- 90 distinct tensors per
+        # prefill chunk -- and hc_prenorm_gemm re-packs it to bf16 hi/mid/lo on
+        # every call by design. Its internal pack buffer is SCRATCH keyed by
+        # (device, K, BLOCK_N), not a memo: do not "optimise" it into a cache
+        # keyed by shape or every layer will silently reuse the previous
+        # layer's weights. See tests/kernels/test_ampere_prefill.py.
+        hc_prenorm_gemm(x, fn, out=out, sqrsum=sqrsum)
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _HC_PRENORM_GEMM_TILELANG_KERNEL,
