@@ -22,6 +22,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -62,6 +63,21 @@ def _circular_group() -> KVCacheGroupSpec:
             num_kv_heads=1,
             head_size=1,
             dtype=torch.float32,
+        ),
+    )
+
+
+def _kpool_tail_group() -> KVCacheGroupSpec:
+    """The kpool indexer's tail scratch: one circular block, forever."""
+    return KVCacheGroupSpec(
+        ["kpool_tail"],
+        KpoolTailSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=2,
+            head_size=1,
+            head_size_v=0,
+            dtype=torch.float32,
+            sliding_window=BLOCK_SIZE,
         ),
     )
 
@@ -241,6 +257,7 @@ def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
         kv_cache_groups=[
             _attention_group(),
             _circular_group(),
+            _kpool_tail_group(),
             _mamba_group("none"),
             _mamba_group("all"),
             _mamba_group("align"),
