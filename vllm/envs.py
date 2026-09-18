@@ -188,6 +188,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_DEBUG: bool = False
     VLLM_GLM5_PREFILL_OBSERVE: bool = False
+    VLLM_GLM5_HOST_ALLREDUCE: bool = False
+    VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1534,6 +1536,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unflagged path is byte-identical rather than merely equivalent.
     #
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
+    # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
+    # (the CMP 170HX case). Off by default; when on, it still only activates if
+    # `torch.cuda.can_device_access_peer` is false for every pair, so hardware
+    # with working P2P keeps using CustomAllreduce. See
+    # vllm/distributed/device_communicators/host_shm_all_reduce.py.
+    "VLLM_GLM5_HOST_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_GLM5_HOST_ALLREDUCE", "0"))
+    ),
+    # Largest message the host path serves; anything above goes to NCCL. 512 KiB
+    # is where the measured curve stops paying: at 8-256 KiB the host path is
+    # 1.06-2.04x NCCL, while prefill-sized messages (>= 2 MiB) already run near
+    # PCIe wire speed on the ring and must not be taken away from it.
+    "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": lambda: int(
+        os.getenv("VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE", str(512 * 1024))
+    ),
     # Never dispatch above this M (= num_seqs * (1 + num_spec)). 32 is measured,
     # and it is a cudagraph capture size, so the bound lands exactly on one.
     # Count-weighted over the whole shape table: M=32 is 1.157x with 0 of 16
