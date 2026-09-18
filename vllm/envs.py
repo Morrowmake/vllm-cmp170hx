@@ -185,6 +185,12 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
+    VLLM_GLM5_PREFILL_OVERLAP: bool = False
+    VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
+    VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS: int = 512
+    VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER: bool = False
+    VLLM_GLM5_PREFILL_OVERLAP_DEBUG: bool = False
+    VLLM_GLM5_PREFILL_OBSERVE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1556,6 +1562,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
     ),
+    # GLM-5.x TP prefill comm/compute overlap. These five are consumed by
+    # vllm/models/glm5next/common/overlap.py, which reads os.environ directly;
+    # they are declared here so validate_environ() recognises them (an
+    # undeclared VLLM_* name logs "Unknown vLLM environment variable detected"
+    # at every start) and so `envs.X` reports what the feature will actually
+    # do. overlap.py is unchanged -- see _glm5_overlap_flag on the accept-set.
+    #
+    # Splits the post-attention part of each mHC layer into SPLITS token
+    # micro-batches and runs the two per-layer all-reduces on a side stream.
+    # TP>1 only; measured +7.7% prefill at full 1152-token chunks, S=4 worse
+    # than S=2. Default OFF in code; serve.sh turns it on.
+    "VLLM_GLM5_PREFILL_OVERLAP": lambda: _glm5_overlap_flag(
+        "VLLM_GLM5_PREFILL_OVERLAP", False
+    ),
+    "VLLM_GLM5_PREFILL_OVERLAP_SPLITS": lambda: _glm5_overlap_int(
+        "VLLM_GLM5_PREFILL_OVERLAP_SPLITS", 2
+    ),
+    # Below this chunk size the overlap does not engage. Leave at 512: it
+    # measured NEGATIVE at small chunks, which is why the fair-prefill 384 cap
+    # deliberately switches it off under contention while the prefill kernels'
+    # own gate was lowered to 384.
+    "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS": lambda: _glm5_overlap_int(
+        "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS", 512
+    ),
+    # Carry the micro-batch split across the layer boundary. In tree with 11
+    # CPU tests, never validated on a GPU -- keep OFF until its own A/B.
+    "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER": lambda: _glm5_overlap_flag(
+        "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER", False
+    ),
+    "VLLM_GLM5_PREFILL_OVERLAP_DEBUG": lambda: _glm5_overlap_flag(
+        "VLLM_GLM5_PREFILL_OVERLAP_DEBUG", False
+    ),
+    # One-shot observer that logs the prefill chunk sizes actually seen, for
+    # checking the chunks clear _MIN_TOKENS. Diagnostic only.
+    "VLLM_GLM5_PREFILL_OBSERVE": lambda: _glm5_overlap_flag(
+        "VLLM_GLM5_PREFILL_OBSERVE", False
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
@@ -2375,6 +2418,41 @@ def is_set(name: str):
     if name in environment_variables:
         return name in os.environ
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _glm5_overlap_flag(name: str, default: bool) -> bool:
+    """Mirror of ``overlap.py``'s ``_env_flag``.
+
+    ``vllm/models/glm5next/common/overlap.py`` reads these five variables
+    straight from ``os.environ`` and is deliberately left alone, so the
+    accessors here must agree with it *exactly* or ``envs.X`` and the value the
+    feature actually uses could disagree. That rules out the
+    ``bool(int(os.getenv(...)))`` idiom the other GLM5 flags use: it raises on
+    ``VLLM_GLM5_PREFILL_OVERLAP=true``, which overlap.py accepts. Empty string
+    means "unset".
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _glm5_overlap_int(name: str, default: int) -> int:
+    """Mirror of ``overlap.py``'s ``_env_int`` (minus its minimum check, which
+    overlap.py still enforces at the point of use)."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw.strip())
+
+
+def validate_environ(hard_fail: bool) -> None:
+    for env in os.environ:
+        if env.startswith("VLLM_") and env not in environment_variables:
+            if hard_fail:
+                raise ValueError(f"Unknown vLLM environment variable detected: {env}")
+            else:
+                logger.warning("Unknown vLLM environment variable detected: %s", env)
 
 
 def compile_factors() -> dict[str, object]:
