@@ -88,6 +88,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
             FlashInferPcieIpcAllReduce,
         )
+        from vllm.distributed.device_communicators.host_shm_all_reduce import (
+            HostShmAllreduce,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -104,6 +107,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
+        self.hostshm_comm: HostShmAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -149,6 +153,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
             )
+
+        # Host-staged all-reduce for PCIe-only nodes without peer access.
+        # Opt-in, TP-only, and it disables itself unless P2P is genuinely
+        # unavailable -- where IPC works, ca_comm above is the better path.
+        if (
+            envs.VLLM_GLM5_HOST_ALLREDUCE
+            and unique_name.split(":")[0] == "tp"
+            and self.world_size > 1
+            and current_platform.is_cuda()
+        ):
+            self.hostshm_comm = HostShmAllreduce(
+                group=self.cpu_group,
+                device=self.device,
+                max_size=envs.VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE,
+            )
+            if self.hostshm_comm.disabled:
+                self.hostshm_comm = None
 
         # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine
         if (
@@ -267,6 +288,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "HOSTSHM",
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
@@ -277,6 +299,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.hostshm_comm is not None and not self.hostshm_comm.disabled:
+            enabled_ar_backends.append("HOSTSHM")
         if (
             self.fi_pcie_ipc_ar_comm is not None
             and not self.fi_pcie_ipc_ar_comm.disabled
@@ -375,6 +399,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and aiter_ar_comm.should_custom_ar(input_)
         ):
             out = aiter_ar_comm.custom_all_reduce(input_)
+            assert out is not None
+            return out
+        # Before ca_comm on purpose: hostshm only ever constructs itself when
+        # P2P is unavailable, in which case ca_comm is disabled anyway, and this
+        # ordering keeps real-P2P hardware on the device-memory path.
+        hostshm_comm = self.hostshm_comm
+        if hostshm_comm is not None and hostshm_comm.should_host_ar(input_):
+            out = hostshm_comm.host_all_reduce(input_)
             assert out is not None
             return out
         ca_comm = self.ca_comm
@@ -664,6 +696,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.hostshm_comm is not None:
+            self.hostshm_comm.close()
+            self.hostshm_comm = None
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None
