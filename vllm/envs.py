@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
+    VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_GLM5_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MHC: bool = True
@@ -1505,6 +1506,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ~7 % (measured 0.93x at ctx 2304 / topk 2048, 1.39x at ctx 8192).
     "VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT": lambda: float(
         os.getenv("VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT", "2.0")
+    ),
+    # Restore the previous launch schedule of the Triton sparse-MLA decode
+    # kernel (head tile 16/32 by query row count, 32 keys per tile, three
+    # pipeline stages, split count ramped against a hard-coded 64 heads).
+    # The current schedule measured 1.06x at 4 query rows and 1.19x at 16 on
+    # sm_80 with 16 heads per rank; this is the way back if a part outside
+    # that measurement regresses.
+    "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY": lambda: bool(
+        int(os.getenv("VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY", "0"))
     ),
     # GLM-5.x: sample a 1/TP slice of the batch on each rank instead of
     # all-gathering full-vocab logits to every rank. Turns the eager
