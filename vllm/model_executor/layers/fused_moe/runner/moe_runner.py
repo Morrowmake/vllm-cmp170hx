@@ -641,6 +641,16 @@ class MoERunner(MoERunnerInterface):
         if shared_experts_overlapping:
             assert self._shared_experts is not None
             self._shared_experts.wait()
+        else:
+            # Re-ordered aux-stream overlap: run the shared experts now, on
+            # the aux stream, behind the routed experts just enqueued; the
+            # call joins the aux stream before it returns. A no-op unless
+            # VLLM_GLM5_SHARED_EXPERT_REORDER is set and the overlap decision
+            # chose the multi-stream order, since every other order was
+            # already served by the NO_OVERLAP call above or by the kernel.
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -885,13 +895,21 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
-        # If using multi-stream overlap for shared experts, we must launch it
-        # before routed expert dispatch.
+        # Multi-stream overlap for the shared experts. Upstream launches them
+        # here, before the gate and the routed dispatch, and joins after the
+        # routed experts. Under VLLM_GLM5_SHARED_EXPERT_REORDER this call
+        # enqueues nothing and only marks the aux stream's start point; the
+        # shared experts are then run on the aux stream inside
+        # _apply_quant_method, after the routed experts have been enqueued.
         shared_experts_overlapping = False
         if self._shared_experts is not None:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
                 shared_experts_input
             )
+            if not shared_experts_overlapping and shared_experts_input is not None:
+                self._shared_experts.maybe_sync_shared_experts_stream(
+                    shared_experts_input
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the

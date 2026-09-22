@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_DEBUG: bool = False
     VLLM_GLM5_PREFILL_OBSERVE: bool = False
+    VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1536,6 +1537,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unflagged path is byte-identical rather than merely equivalent.
     #
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
+    # Re-order the multi-stream shared-expert overlap in the MoE runner.
+    # Upstream enqueues the shared experts on the aux stream *before* the gate
+    # and the routed dispatch, then joins after the routed kernels. Because the
+    # aux branch is submitted first it is already resident when the main stream
+    # finally reaches the routed Marlin kernels, so on CUDA under breakable
+    # cudagraphs almost none of it actually overlaps (a decode trace measured
+    # ~4%). With this on, the runner instead marks the aux stream's start point
+    # up front, enqueues the routed experts, and only then runs the shared
+    # experts on the aux stream, joining before the output is read.
+    # Enqueue order only: the same kernels read the same tensors and the join
+    # still precedes every read of the shared-expert output, so the numerics
+    # are unchanged. It engages only where the multi-stream order was already
+    # chosen, i.e. at or below VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+    # tokens (decode), never for the 1152-token prefill chunks.
+    # Default OFF until it has its own A/B on the cards.
+    "VLLM_GLM5_SHARED_EXPERT_REORDER": lambda: bool(
+        int(os.getenv("VLLM_GLM5_SHARED_EXPERT_REORDER", "0"))
+    ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default; when on, it still only activates if
     # `torch.cuda.can_device_access_peer` is false for every pair, so hardware
