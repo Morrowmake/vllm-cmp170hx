@@ -17,6 +17,8 @@ Layout conventions (shared with the other sparse MLA backends):
   (or any out-of-range row) is masked out of the softmax.
 """
 
+import functools
+
 import torch
 
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
@@ -279,30 +281,109 @@ def _mla_store_output(
     tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
 
 
-def _pick_config(num_tokens: int, index_topk: int) -> tuple[int, int, int, int]:
-    """(BLOCK_H, BLOCK_N, num_splits, num_warps).
+@functools.lru_cache
+def _smem_budget(device_index: int) -> int:
+    """Shared memory an sm_80 CTA may opt into, read from the device.
 
-    A CTA gathers every one of its BLOCK_N cache rows in full, so the 64 heads
-    of a token re-read the same rows once per head block: BLOCK_H=32 halves
-    that traffic against BLOCK_H=16 and is worth 1.25-1.38x wherever the
-    gather dominates (measured GPU time, sm_80, d=512: t=2048 10855 -> 7846 us,
-    t=300 1965 -> 1567, t=128 937 -> 580, t=24 209 -> 186). Only at <= 8 tokens
-    do the extra CTAs of BLOCK_H=16 pay more than the reuse (t=1 36 vs 73 us,
-    t=8 84 vs 96).
-
-    The top-k axis is then split across CTAs until the launch has ~110-160 CTAs;
-    beyond that the split-k merge tail costs more than the added parallelism
-    (t=24: 96 CTAs at 2 splits 186 us vs 192 CTAs at 4 splits 216 us). Splits
-    stay <= 8 because the last-CTA merge reads splits x BLOCK_H x 2 KB.
-    BLOCK_N=32 beats 16 and 64 on every shape; 8 warps is slower everywhere.
+    BLOCK_N=64 at two stages asks for 128 KB at dim_qk=512, which GA100 grants
+    and the 100 KB parts (sm_86 / sm_89) do not, so the tile is chosen against
+    the real limit rather than against a constant.
     """
-    BLOCK_N = 32
-    BLOCK_H = 16 if num_tokens <= 8 else 32
-    ctas = num_tokens * (64 // BLOCK_H)
+    try:
+        return torch.cuda.get_device_properties(
+            device_index
+        ).shared_memory_per_block_optin
+    except Exception:
+        return 101376
+
+
+@functools.lru_cache
+def _num_sms(device_index: int) -> int:
+    try:
+        return torch.cuda.get_device_properties(device_index).multi_processor_count
+    except Exception:
+        return 108
+
+
+def _pick_config(
+    num_tokens: int,
+    index_topk: int,
+    num_heads_q: int = 64,
+    dim_qk: int = 512,
+    device_index: int = 0,
+) -> tuple[int, int, int, int, int]:
+    """(BLOCK_H, BLOCK_N, num_splits, num_warps, num_stages).
+
+    Measured on sm_80 (GA100, 70 SMs) at the deployed shape -- 16 heads per
+    rank, top-k 2048, dim_qk 512 -- over 550 schedules at 4 and 16 query rows
+    and context 8K / 64K / 200K, each against this kernel's previous schedule
+    in the same run (graph replay, rotated caches, median of 20):
+
+        rows  previous            us     new                 us     gain
+        4     H16 N32 S8 W4 P3   32.1    H16 N64 S8 W4 P2   30.3    1.06x
+        16    H32 N32 S4 W4 P3   59.8    H16 N64 S4 W4 P2   50.2    1.19x
+
+    The previous schedule ranked 6th of 550 at 4 rows and 19th at 16. Three
+    things changed:
+
+    * **64 keys per tile, not 32.** Worth most of both numbers. This kernel is
+      issue-bound rather than gather-bound -- a 12x change in the KV working
+      set moves it under 1 % -- so what pays is halving the trip count over the
+      top-k list, not touching the bytes. It costs shared memory, which is why
+      the tile is sized against the device below.
+    * **Two pipeline stages, not three.** The gather is an indirect load that
+      Triton cannot pipeline, so a third stage double-buffers the wrong thing.
+    * **The head tile is sized to the heads that exist.** The old rule took 32
+      above 8 query rows, reasoning about a 64-head rank; a rank owning 16
+      heads then builds a 32-row tile with half its rows masked and throws away
+      half of every qk and pv dot. Worth 1.04x on its own at 16 rows (59.8 ->
+      57.4 us), and nothing at 4, where the old rule already chose 16.
+      Repartitioning heads across CTAs cannot change a result bit -- each
+      head's softmax reduction is independent.
+
+    The split ramp is also computed from the real head-block count rather than
+    from a hard-coded 64 heads, and fills one wave of SMs rather than a fixed
+    160 CTAs. At the two shapes above both forms agree (8 splits at 4 rows, 4
+    at 16); they differ at 8 query rows, where the old estimate double-counts
+    the CTAs and stops at 4. Splits stay <= 8 because the last-CTA merge reads
+    splits x BLOCK_H x 2 KB, and past the wave the merge tail costs more than
+    the parallelism it buys (16 rows: 4 splits 50.2 us, 8 splits 60.8, 16
+    splits 81.4).
+
+    Set VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY=1 to get the previous schedule back.
+    """
+    from vllm import envs
+
+    if envs.VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY:
+        BLOCK_N = 32
+        BLOCK_H = 16 if num_tokens <= 8 else 32
+        ctas = num_tokens * (64 // BLOCK_H)
+        num_splits = 1
+        while num_splits < 8 and ctas * num_splits * 2 <= 160:
+            num_splits *= 2
+        return BLOCK_H, BLOCK_N, min(num_splits, _cdiv(index_topk, BLOCK_N)), 4, 3
+
+    # Never build a head tile wider than the heads the rank holds; 32 stays the
+    # ceiling, so a rank with more than 16 heads keeps today's tile.
+    BLOCK_H = min(32, max(16, 1 << (num_heads_q - 1).bit_length()))
+
+    # stages * BLOCK_N * dim_qk * 2 B of staging must fit what the device will
+    # grant one CTA. Give up the wide tile before the second stage: the tile is
+    # worth more than the pipelining on a kernel whose loads are indirect.
+    smem = _smem_budget(device_index)
+    BLOCK_N, num_stages = 64, 2
+    while BLOCK_N > 16 and num_stages * BLOCK_N * dim_qk * 2 > smem:
+        BLOCK_N //= 2
+    while num_stages > 1 and num_stages * BLOCK_N * dim_qk * 2 > smem:
+        num_stages -= 1
+
+    head_blocks = _cdiv(num_heads_q, min(BLOCK_H, num_heads_q))
+    ctas = num_tokens * head_blocks
     num_splits = 1
-    while num_splits < 8 and ctas * num_splits * 2 <= 160:
+    while num_splits < 8 and ctas * num_splits * 2 <= _num_sms(device_index):
         num_splits *= 2
-    return BLOCK_H, BLOCK_N, min(num_splits, _cdiv(index_topk, BLOCK_N)), 4
+    num_splits = min(num_splits, _cdiv(index_topk, BLOCK_N))
+    return BLOCK_H, BLOCK_N, num_splits, 4, num_stages
 
 
 _WORKSPACE: dict[tuple, tuple[torch.Tensor, ...]] = {}
@@ -393,7 +474,9 @@ def triton_mla_sparse_fwd(
             q, kv, indices, sm_scale, d_v=d_v, block_dpe=block_dpe, out=out
         )
 
-    BLOCK_H, BLOCK_N, num_splits, num_warps = _pick_config(num_tokens, index_topk)
+    BLOCK_H, BLOCK_N, num_splits, num_warps, num_stages = _pick_config(
+        num_tokens, index_topk, num_heads_q, dim_qk, q.device.index or 0
+    )
     BLOCK_DPE = block_dpe
     BLOCK_DMODEL = dim_qk - BLOCK_DPE
     BLOCK_DV = d_v
@@ -487,7 +570,7 @@ def triton_mla_sparse_fwd(
         V_IS_K=(d_v == BLOCK_DMODEL),
         LOGE2=LOGE2,
         num_warps=num_warps,
-        num_stages=3,
+        num_stages=num_stages,
     )
 
     return out, max_logits, softmax_lse
