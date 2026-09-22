@@ -132,7 +132,7 @@ def _mla_sparse_kernel(
             # each row once in its natural [BLOCK_N, D] layout and reuse it for
             # both dots instead of reading the row twice from L2.
             offs_kn = (
-                indices[:, None] * stride_k_token
+                indices[:, None].to(tl.int64) * stride_k_token
                 + cur_kv_head_id * stride_k_head
                 + offs_d[None, :]
             )
@@ -142,7 +142,7 @@ def _mla_sparse_kernel(
             qk = tl.dot(q, tl.trans(kn))
         else:
             offs_k = (
-                indices[None, :] * stride_k_token
+                indices[None, :].to(tl.int64) * stride_k_token
                 + cur_kv_head_id * stride_k_head
                 + offs_d[:, None]
             )
@@ -155,7 +155,7 @@ def _mla_sparse_kernel(
         if BLOCK_DPE > 0:
             # q_rope @ k_rope
             offs_kpe = (
-                indices[None, :] * stride_k_token
+                indices[None, :].to(tl.int64) * stride_k_token
                 + cur_kv_head_id * stride_k_head
                 + offs_dpe[:, None]
             )
@@ -175,7 +175,7 @@ def _mla_sparse_kernel(
             # load v
             mask_v_d = offs_dv < dim_v
             offs_v = (
-                indices[:, None] * stride_v_token
+                indices[:, None].to(tl.int64) * stride_v_token
                 + cur_kv_head_id * stride_v_head
                 + offs_dv[None, :]
             )

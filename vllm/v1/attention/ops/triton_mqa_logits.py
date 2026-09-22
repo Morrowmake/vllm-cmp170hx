@@ -125,7 +125,9 @@ def _mqa_logits_kernel(
         cols = t * BLOCK_N + tl.arange(0, BLOCK_N)
         cmask = cols < N
         k_u8 = tl.load(
-            k_ptr + cols[:, None] * D + d[None, :], mask=cmask[:, None], other=0
+            k_ptr + cols[:, None].to(tl.int64) * D + d[None, :],
+            mask=cmask[:, None],
+            other=0,
         )
         k = e4m3_bits_to_bf16_raw(k_u8)  # [BLOCK_N, D], value * 2^-120
         acc = tl.dot(q, tl.trans(k))  # [BLOCK_M*H, BLOCK_N] fp32
