@@ -18,7 +18,7 @@ waiting.  The cure is fewer launches, not faster kernels.
 
 What is fused
 -------------
-Three sites account for 84 of the 116 kernels, and the GDN fusion also removes
+The Mamba and GDN sites are fused here. The GDN fusion also removes
 the four ``async_tensor_h2d`` copies those builds make:
 
 ==============================================================  ====  ======
@@ -26,23 +26,14 @@ site                                                            now   fused
 ==============================================================  ====  ======
 ``attention/backends/gdn_attn.py:build`` (x4 KDA groups)          44       4
 ``attention/backends/utils.py:mamba_get_block_table_tensor``      28       4
-``attention/backends/mla/indexer.py:kpool tail slot mapping``     12       1
 ``utils/torch_utils.py:async_tensor_h2d`` (the 4 GDN mask H2Ds)    4       0
 ==============================================================  ====  ======
-
-Net 116 -> 37 launches per step. The card measures 4.78 us for a torch eager
-launch (devcaps.json) and the prologue runs at 0.483 ms / 116 = 4.16 us per
-kernel on rank 0 and 5.74 us on rank 3, so removing 79 launches is worth
-~0.33 ms/step on rank 0 and ~0.45 ms on rank 3 -- and rank 3 is the critical
-path. A captured graph node costs 1.28 us, so capturing the *fused* prologue
-later is worth a further ~0.15 ms; see prologue_NOTES.md for why capture needs
-this fusion first (pinned-buffer churn and per-step device allocations).
 
 Exactness
 ---------
 Every fused op has a pure-torch reference (``*_ref``) that is a transcription
 of the upstream sequence, and the Triton kernel is a transcription of the
-reference.  All three produce **integer index tensors only** -- no reduction
+reference.  Both families produce **integer index tensors only** -- no reduction
 order, no floating point -- so "exact" here means bit-identical, and the CPU
 tests in ``tests/v1/worker/test_prologue_fuse.py`` assert exactly that against
 the upstream implementations.  On a non-CUDA tensor (i.e. in those tests) the
@@ -92,7 +83,6 @@ class PrologueFuseSettings:
     # Individually disable one fusion, for bisecting a regression.
     gdn: bool = True
     mamba_block_table: bool = True
-    kpool: bool = True
     debug: bool = False
 
 
@@ -104,7 +94,6 @@ def read_settings(env: dict[str, str] | None = None) -> PrologueFuseSettings:
         enabled=on,
         gdn=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_GDN", True),
         mamba_block_table=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT", True),
-        kpool=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_KPOOL", True),
         debug=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_DEBUG", False),
     )
 
@@ -114,10 +103,9 @@ def settings() -> PrologueFuseSettings:
     s = read_settings()
     if s.enabled:
         logger.info(
-            "GLM-5 decode prologue fusion active (gdn=%s mamba_bt=%s kpool=%s)",
+            "GLM-5 decode prologue fusion active (gdn=%s mamba_bt=%s)",
             s.gdn,
             s.mamba_block_table,
-            s.kpool,
         )
     return s
 
@@ -256,140 +244,7 @@ def mamba_tail_block_table(
 
 
 # --------------------------------------------------------------------------- #
-# 2. compute_kpool_tail_slot_mapping.                  12 kernels -> 1
-#
-# Upstream (vllm/v1/attention/backends/mla/indexer.py):
-#     out.copy_(slot_mapping)
-#     tokens = arange(n); req = searchsorted(qsl, tokens, right=True) - 1
-#     req.clamp_(0, num_reqs - 1)
-#     own = block_table[:num_reqs, 0].index_select(0, req).to(int64)
-#     pos = positions[:n].to(int64)
-#     out[:n] = own * kpool + remainder(pos, kpool)
-#
-# The in-kernel search is over query_start_loc[0 .. num_reqs] only.  Upstream
-# searches the whole (padded) buffer, but every token index is < qsl[num_reqs]
-# and the buffer is non-decreasing, so no padded entry can be <= a token index:
-# the two searches return the same value, and the clamp makes them agree even
-# at the boundary.
-# --------------------------------------------------------------------------- #
-
-if _HAS_TRITON:  # pragma: no cover - GPU only
-
-    @triton.jit
-    def _kpool_tail_slot_mapping_kernel(
-        slot_ptr,
-        out_ptr,
-        bt_ptr,
-        qsl_ptr,
-        pos_ptr,
-        numel,
-        num_actual,
-        num_reqs,
-        bt_stride,
-        KPOOL: tl.constexpr,
-        SEARCH_STEPS: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        t = pid * BLOCK + tl.arange(0, BLOCK)
-        in_buf = t < numel
-        src = tl.load(slot_ptr + t, mask=in_buf, other=0)
-        active = in_buf & (t < num_actual)
-
-        # last index i in [0, num_reqs] with query_start_loc[i] <= t
-        lo = tl.zeros([BLOCK], dtype=tl.int32)
-        hi = tl.zeros([BLOCK], dtype=tl.int32) + num_reqs
-        for _ in tl.static_range(SEARCH_STEPS):
-            mid = (lo + hi + 1) // 2
-            q = tl.load(qsl_ptr + mid).to(tl.int32)
-            take = q <= t
-            lo = tl.where(take, mid, lo)
-            hi = tl.where(take, hi, mid - 1)
-        req = tl.minimum(tl.maximum(lo, 0), num_reqs - 1)
-
-        own = tl.load(bt_ptr + req * bt_stride, mask=active, other=0).to(tl.int64)
-        pos = tl.load(pos_ptr + t, mask=active, other=0).to(tl.int64)
-        rem = pos % KPOOL
-        rem = tl.where(rem < 0, rem + KPOOL, rem)
-        val = own * KPOOL + rem
-        tl.store(out_ptr + t, tl.where(active, val, src), mask=in_buf)
-
-
-def kpool_tail_slot_mapping_ref(
-    slot_mapping: torch.Tensor,
-    block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    positions: torch.Tensor,
-    num_actual_tokens: int,
-    num_reqs: int,
-    kpool: int,
-    out: torch.Tensor,
-) -> torch.Tensor:
-    """Pure-torch transcription of the upstream sequence."""
-    out.copy_(slot_mapping)
-    if num_actual_tokens == 0:
-        return out
-    tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
-    req = torch.searchsorted(query_start_loc, tokens, right=True) - 1
-    req = req.clamp_(min=0, max=num_reqs - 1)
-    own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
-    pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
-    return out
-
-
-def kpool_tail_slot_mapping(
-    slot_mapping: torch.Tensor,
-    block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    positions: torch.Tensor,
-    num_actual_tokens: int,
-    num_reqs: int,
-    kpool: int,
-    out: torch.Tensor,
-) -> torch.Tensor:
-    """One kernel in place of clone/arange/searchsorted/clamp/gather/... ."""
-    if (
-        not _use_triton(slot_mapping)
-        or num_reqs <= 0
-        or block_table.dim() != 2
-        or not _flat(slot_mapping, out, positions, query_start_loc)
-        or query_start_loc.numel() < num_reqs + 1
-    ):
-        return kpool_tail_slot_mapping_ref(
-            slot_mapping,
-            block_table,
-            query_start_loc,
-            positions,
-            num_actual_tokens,
-            num_reqs,
-            kpool,
-            out,
-        )
-    numel = slot_mapping.numel()
-    if numel == 0:
-        return out
-    block = 256
-    grid = ((numel + block - 1) // block,)
-    _kpool_tail_slot_mapping_kernel[grid](
-        slot_mapping,
-        out,
-        block_table,
-        query_start_loc,
-        positions,
-        numel,
-        num_actual_tokens,
-        num_reqs,
-        block_table.stride(0),
-        KPOOL=kpool,  # type: ignore[arg-type]
-        SEARCH_STEPS=max(1, num_reqs.bit_length()),  # type: ignore[arg-type]
-        BLOCK=block,  # type: ignore[arg-type]
-    )
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# 3. GDNAttentionMetadataBuilder.build, pure spec-decode shape.
+# 2. GDNAttentionMetadataBuilder.build, pure spec-decode shape.
 #                                                      11 kernels -> 2 (x4)
 #
 # In steady DFlash decode every row is a spec-decode row and the padded rows
