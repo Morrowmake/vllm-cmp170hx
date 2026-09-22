@@ -22,6 +22,36 @@ from vllm.v1.worker.ubatching import (
 logger = init_logger(__name__)
 
 
+def _capture_underway() -> bool:
+    """True while the current stream is capturing a CUDA graph.
+
+    Returns False when CUDA is unavailable or not initialised, so the callers
+    below stay importable and testable on a host with no visible device.
+    """
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _log_shared_experts_order_once(reordered: bool) -> None:
+    """Announce which multi-stream enqueue order this process is using."""
+    if reordered:
+        logger.info_once(
+            "MoE shared experts: re-ordered aux-stream overlap "
+            "(mark aux stream, enqueue routed experts, then run shared "
+            "experts on the aux stream and join) "
+            "[VLLM_GLM5_SHARED_EXPERT_REORDER=1]"
+        )
+    else:
+        logger.info_once(
+            "MoE shared experts: upstream aux-stream overlap "
+            "(shared experts enqueued on the aux stream before routed "
+            "dispatch, joined after) "
+            "[VLLM_GLM5_SHARED_EXPERT_REORDER=0]"
+        )
+
+
 class SharedExpertsOrder(IntEnum):
     # No shared experts.
     NONE = (0,)
@@ -56,6 +86,17 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+
+        # Which way round the multi-stream overlap is enqueued. Upstream
+        # (#52033) submits the shared experts to the aux stream before the
+        # gate and the routed dispatch, which leaves the aux branch resident
+        # long before the routed kernels are submitted and so barely overlaps
+        # under breakable cudagraphs. With the flag on, the runner marks the
+        # aux stream's start point instead, enqueues the routed experts, and
+        # only then runs the shared experts on the aux stream before joining.
+        # Enqueue order only -- the same kernels read the same tensors, and
+        # the join still precedes every read of the shared-expert output.
+        self._reorder_after_routed = bool(envs.VLLM_GLM5_SHARED_EXPERT_REORDER)
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -125,13 +166,18 @@ class SharedExperts(torch.nn.Module):
 
         Returns true if the shared experts were enqueued, false otherwise. Call
         `wait` to wait for the shared experts to finish if this returns true.
+
+        Always returns false under VLLM_GLM5_SHARED_EXPERT_REORDER: that path
+        enqueues nothing here, it only marks the aux stream (see
+        `maybe_sync_shared_experts_stream`).
         """
-        if (
+        if self._reorder_after_routed or (
             self._determine_shared_experts_order(shared_experts_input)
             != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         ):
             return False
         assert self._stream is not None
+        _log_shared_experts_order_once(False)
         idx = self._output_idx
         assert self._output[idx] is None
         self._input_ready_event[idx].record(current_stream())
@@ -140,6 +186,41 @@ class SharedExperts(torch.nn.Module):
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
         return True
+
+    def maybe_sync_shared_experts_stream(
+        self, shared_experts_input: torch.Tensor
+    ) -> None:
+        """Mark the aux stream's start point for a later overlapped `forward`.
+
+        Nothing is enqueued on the aux stream here. The aux stream is only made
+        to wait for everything the main stream has already submitted, so that
+        the gate, the router and the routed experts -- submitted to the main
+        stream after this call -- do not have to complete before the shared
+        experts may start. `forward(..., MULTI_STREAM_OVERLAPPED)` then runs
+        the shared experts on the aux stream behind the routed kernels and
+        joins the main stream back onto it.
+
+        A no-op unless VLLM_GLM5_SHARED_EXPERT_REORDER is set and the overlap
+        decision already chose the multi-stream order (decode widths only).
+        """
+        if not self._reorder_after_routed or (
+            self._determine_shared_experts_order(shared_experts_input)
+            != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+        ):
+            return
+        assert self._stream is not None
+        _log_shared_experts_order_once(True)
+        # The aux stream reads the input after the main stream has queued
+        # more work, so hint the caching allocator not to hand the block to
+        # another main-stream allocation in the meantime. The caller holds
+        # the tensor alive across the whole region anyway, so this is belt
+        # and braces; it is skipped while a cudagraph is being captured,
+        # where it is an allocator hint with no counterpart in the replayed
+        # graph. The fork below, and the matching join, are ordinary event
+        # edges and are what actually order the two streams.
+        if not _capture_underway():
+            shared_experts_input.record_stream(self._stream)
+        self._stream.wait_stream(current_stream())
 
     def wait(self) -> None:
         """Block the main stream until `maybe_forward_async` output is ready."""
@@ -169,6 +250,21 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        self._output[self._output_idx] = self._layer(shared_experts_input)
+        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+            # Only the re-ordered path reaches forward() with this order: with
+            # the flag off `maybe_forward_async` already enqueued the work and
+            # the runner only awaits it.
+            assert self._reorder_after_routed and self._stream is not None
+            with torch.cuda.stream(self._stream):
+                output = self._layer(shared_experts_input)
+            # Join before the caller reads `output`. The output block belongs
+            # to the aux stream, exactly as in the `maybe_forward_async` path;
+            # the next layer's aux fork waits on the main stream, so a later
+            # aux-stream reuse of the block cannot precede the main stream's
+            # reads of it.
+            current_stream().wait_stream(self._stream)
+            self._output[self._output_idx] = output
+        else:
+            self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None
