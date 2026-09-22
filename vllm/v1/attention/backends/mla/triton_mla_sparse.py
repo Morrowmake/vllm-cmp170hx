@@ -224,6 +224,7 @@ class TritonMLASparseImpl(SparseMLACommonImpl[TritonMLASparseMetadata]):
                     self.index_group_index,
                     topk_indices[:num_decode_tokens],
                     attn_metadata,
+                    return_valid_counts=False,
                 )
                 outputs.append(
                     self._run_mqa_kernel(

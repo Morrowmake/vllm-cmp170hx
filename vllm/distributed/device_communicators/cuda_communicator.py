@@ -288,19 +288,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
-            "HOSTSHM",
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
             "AITER_CUSTOM",
+            "HOSTSHM",
             "CUSTOM",
             "SYMM_MEM",
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
-        if self.hostshm_comm is not None and not self.hostshm_comm.disabled:
-            enabled_ar_backends.append("HOSTSHM")
         if (
             self.fi_pcie_ipc_ar_comm is not None
             and not self.fi_pcie_ipc_ar_comm.disabled
@@ -340,6 +338,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not self.aiter_ar_comm.disabled
         ):
             enabled_ar_backends.append("AITER_CUSTOM")
+        if self.hostshm_comm is not None and not self.hostshm_comm.disabled:
+            enabled_ar_backends.append("HOSTSHM")
         if self.ca_comm is not None and not self.ca_comm.disabled:
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:

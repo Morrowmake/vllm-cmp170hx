@@ -372,6 +372,7 @@ class DraftModelSpeculator(BaseSpeculator):
             max_seq_len=self.draft_max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
+            positions=self.input_buffers.positions[:num_tokens],
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
