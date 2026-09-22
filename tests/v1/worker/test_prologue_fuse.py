@@ -3,7 +3,7 @@
 """CPU equivalence tests for the fused decode prologue (VLLM_GLM5_PROLOGUE_FUSE).
 
 Every fused op replaces a run of small upstream kernels with one.  The
-replacement must be *bit-identical*, which is checkable here because all three
+replacement must be *bit-identical*, which is checkable here because both families
 produce integer index tensors only.  These tests run the upstream code and the
 fused code on the same CPU inputs and assert equality; on CPU the fused
 wrapper dispatches to its pure-torch reference, which is the transcription the
@@ -14,7 +14,6 @@ covered by the phase-2 validation).
 import pytest
 import torch
 
-from vllm.v1.attention.backends.mla.indexer import compute_kpool_tail_slot_mapping
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     mamba_get_block_table_tensor,
@@ -50,9 +49,9 @@ def test_settings_parse(raw, expected):
 
 def test_settings_sub_flags():
     s = prologue_fuse.read_settings(
-        {"VLLM_GLM5_PROLOGUE_FUSE": "1", "VLLM_GLM5_PROLOGUE_FUSE_KPOOL": "0"}
+        {"VLLM_GLM5_PROLOGUE_FUSE": "1", "VLLM_GLM5_PROLOGUE_FUSE_GDN": "0"}
     )
-    assert s.enabled and s.gdn and s.mamba_block_table and not s.kpool
+    assert s.enabled and s.mamba_block_table and not s.gdn
 
 
 def test_settings_rejects_garbage():
@@ -122,84 +121,7 @@ def test_mamba_tail_block_table_ref_is_the_upstream_expression():
 
 
 # --------------------------------------------------------------------------- #
-# 2. compute_kpool_tail_slot_mapping
-# --------------------------------------------------------------------------- #
-
-
-def _kpool_inputs(num_reqs, query_lens, kpool, buffer_slack=7, seed=0):
-    torch.manual_seed(seed)
-    total = int(sum(query_lens))
-    qsl = torch.zeros(num_reqs + 1, dtype=torch.int32)
-    torch.cumsum(torch.tensor(query_lens, dtype=torch.int32), 0, out=qsl[1:])
-    numel = total + buffer_slack
-    slot_mapping = torch.randint(0, 5000, (numel,), dtype=torch.int64)
-    positions = torch.zeros(numel, dtype=torch.int64)
-    for r, n in enumerate(query_lens):
-        base = int(torch.randint(0, 3000, (1,)).item())
-        positions[int(qsl[r]) : int(qsl[r + 1])] = torch.arange(base, base + n)
-    block_table = torch.randint(1, 900, (num_reqs + 2, 4), dtype=torch.int32)
-    return slot_mapping, block_table, qsl, positions, total
-
-
-@pytest.mark.parametrize("kpool", [1, 4, 64])
-@pytest.mark.parametrize(
-    "query_lens", [[1], [4, 4, 4, 4], [1, 4, 0, 9], [3, 1, 1, 1, 1, 1, 1, 1]]
-)
-def test_kpool_tail_slot_mapping_matches_upstream(monkeypatch, kpool, query_lens):
-    num_reqs = len(query_lens)
-    args = _kpool_inputs(num_reqs, query_lens, kpool, seed=kpool + num_reqs)
-    slot_mapping, block_table, qsl, positions, total = args
-
-    expected = torch.empty_like(slot_mapping)
-    compute_kpool_tail_slot_mapping(
-        slot_mapping, block_table, qsl, positions, total, num_reqs, kpool, expected
-    )
-
-    monkeypatch.setattr(
-        prologue_fuse, "settings", lambda: PrologueFuseSettings(enabled=True)
-    )
-    got = torch.empty_like(slot_mapping)
-    compute_kpool_tail_slot_mapping(
-        slot_mapping, block_table, qsl, positions, total, num_reqs, kpool, got
-    )
-
-    assert got.dtype == expected.dtype
-    assert torch.equal(got, expected), (got - expected).nonzero()
-
-
-def test_kpool_tail_slot_mapping_zero_tokens(monkeypatch):
-    slot_mapping = torch.arange(6, dtype=torch.int64)
-    block_table = torch.ones(2, 3, dtype=torch.int32)
-    qsl = torch.zeros(3, dtype=torch.int32)
-    positions = torch.zeros(6, dtype=torch.int64)
-    monkeypatch.setattr(
-        prologue_fuse, "settings", lambda: PrologueFuseSettings(enabled=True)
-    )
-    out = torch.empty_like(slot_mapping)
-    compute_kpool_tail_slot_mapping(
-        slot_mapping, block_table, qsl, positions, 0, 2, 8, out
-    )
-    # Nothing to remap: the fused branch is skipped and the copy stands.
-    assert torch.equal(out, slot_mapping)
-
-
-def test_kpool_tail_preserves_the_buffer_tail(monkeypatch):
-    """The bytes past num_actual_tokens must survive the fused write."""
-    slot_mapping, block_table, qsl, positions, total = _kpool_inputs(
-        2, [3, 5], 16, buffer_slack=11, seed=5
-    )
-    monkeypatch.setattr(
-        prologue_fuse, "settings", lambda: PrologueFuseSettings(enabled=True)
-    )
-    out = torch.full_like(slot_mapping, -999)
-    compute_kpool_tail_slot_mapping(
-        slot_mapping, block_table, qsl, positions, total, 2, 16, out
-    )
-    assert torch.equal(out[total:], slot_mapping[total:])
-
-
-# --------------------------------------------------------------------------- #
-# 3. GDN spec-decode metadata
+# 2. GDN spec-decode metadata
 # --------------------------------------------------------------------------- #
 
 
@@ -428,29 +350,6 @@ def test_triton_mamba_tail_block_table(col_step, block_size, num_spec_blocks):
     )
     got = prologue_fuse.mamba_tail_block_table(
         block_table, seq_lens, block_size, num_spec_blocks
-    )
-    assert torch.equal(got, want)
-
-
-@cuda_only
-@pytest.mark.parametrize("kpool", [1, 4, 64])
-@pytest.mark.parametrize(
-    "query_lens", [[1], [4, 4, 4, 4], [1, 4, 0, 9], [3, 1, 1, 1, 1, 1, 1, 1]]
-)
-def test_triton_kpool_tail_slot_mapping(kpool, query_lens):
-    dev = torch.device("cuda")
-    num_reqs = len(query_lens)
-    sm, bt, qsl, pos, total = _kpool_inputs(
-        num_reqs, query_lens, kpool, seed=kpool + num_reqs
-    )
-    sm, bt, qsl, pos = (t.to(dev) for t in (sm, bt, qsl, pos))
-    want = torch.empty_like(sm)
-    prologue_fuse.kpool_tail_slot_mapping_ref(
-        sm, bt, qsl, pos, total, num_reqs, kpool, want
-    )
-    got = torch.empty_like(sm)
-    prologue_fuse.kpool_tail_slot_mapping(
-        sm, bt, qsl, pos, total, num_reqs, kpool, got
     )
     assert torch.equal(got, want)
 
