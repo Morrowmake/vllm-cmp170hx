@@ -1351,12 +1351,24 @@ def _get_kv_cache_groups_glm5_next(
 
     # The drafter group is appended LAST so the existing group ids (attn,
     # tail, mamba) keep their positions.
-    return (
+    groups = (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
         + ([draft_group] if draft_group is not None else [])
     )
+    if draft_group is not None:
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.use_eagle_block_drop():
+            draft_group.is_eagle_group = True
+    else:
+        _annotate_eagle_groups(
+            vllm_config,
+            kv_cache_spec,
+            groups,
+            use_trailing_layer_fallback=_uses_trailing_mtp_layers(vllm_config),
+        )
+    return groups
 
 
 def _glm5_next_draft_group(
@@ -2498,6 +2510,7 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
     elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+        _warn_if_unannotated_eagle_mamba(vllm_config, glm5_groups)
         return glm5_groups
 
     # Hidden-state layers use their own block table and must not be absorbed
