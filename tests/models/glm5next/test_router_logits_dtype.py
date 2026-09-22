@@ -23,6 +23,7 @@ CPU against a stubbed single-rank parallel state.
 
 import contextlib
 import json
+import os
 import pathlib
 from unittest import mock
 
@@ -32,7 +33,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
 
-CHECKPOINT = pathlib.Path("/home/ba/models/GLM-5.3-Flash-W4A16-MTP/config.json")
+CHECKPOINT = pathlib.Path(os.environ.get("GLM53_CHECKPOINT_DIR", "")) / "config.json"
 GATE_MODULE = "vllm.model_executor.layers.fused_moe.router.gate_linear"
 
 
