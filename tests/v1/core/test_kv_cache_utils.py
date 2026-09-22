@@ -4566,3 +4566,86 @@ def test_pool_concurrency_limit_edge_cases():
         assert new >= blocks / 45
     # Degenerate spec whose footprint is entirely scratch.
     assert limit(100, 4, 4, 8) == 25.0
+
+
+@pytest.mark.parametrize("block_drop", [True, False])
+@pytest.mark.parametrize("with_draft", [True, False])
+def test_glm5_dflash_group_annotation_preserves_layout(block_drop, with_draft):
+    """Only the fitted drafter drops blocks; target storage geometry is unchanged."""
+    config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    target_specs = _glm5_like_kv_cache_spec_with_tail()
+    target_groups = get_kv_cache_groups(config, target_specs)
+    mla_page = target_specs["layers.3.attn"].page_size_bytes
+    idx_page = target_specs["layers.3.indexer"].page_size_bytes
+    bytes_per_block = 11 * (mla_page + idx_page)
+    available_memory = bytes_per_block * 100 + 1
+    target_cache = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, target_groups, available_memory
+    )
+
+    config.speculative_config = _spec_decode_grouping_config(
+        method="dflash", model_type="glm5_next"
+    ).speculative_config
+    config.speculative_config.use_eagle_block_drop = lambda: block_drop
+    draft_names = ["draft.attn.0", "draft.attn.1"] if with_draft else []
+    specs = dict(target_specs)
+    for name in draft_names:
+        specs[name] = SlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=144,
+            dtype=torch.bfloat16,
+            sliding_window=512,
+        )
+    # Identification must not depend on the final registered layer being draft.
+    specs["layers.44.linear_attn"] = specs.pop("layers.44.linear_attn")
+    groups = get_kv_cache_groups(config, specs)
+    assert [g.layer_names for g in groups if g.is_eagle_group] == (
+        [draft_names] if with_draft and block_drop else []
+    )
+    names = [name for group in groups for name in group.layer_names]
+    assert len(names) == len(set(names)) == len(specs)
+    assert set(names) == set(specs)
+    assert [g.layer_names for g in groups[: len(target_groups)]] == [
+        g.layer_names for g in target_groups
+    ]
+    assert kv_cache_utils._pool_bytes_per_block(groups) == bytes_per_block
+
+    cache = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, available_memory
+    )
+    assert cache.num_blocks == target_cache.num_blocks == 100
+    tensors = _tensor_by_layer(cache)
+    for name, tensor in _tensor_by_layer(target_cache).items():
+        assert tensors[name] == tensor
+    layout = kv_cache_utils._glm5_next_tensor_layout(groups)
+    assert layout is not None
+    draft_group = layout[8]
+    if with_draft:
+        assert draft_group is not None
+        assert draft_group.layer_names == draft_names
+        for i, name in enumerate(draft_names):
+            spec = draft_group.kv_cache_spec.kv_cache_specs[name]
+            assert type(spec) is SlidingWindowSpec
+            assert spec.block_size == 2048
+            assert spec.page_size_padded is None
+            assert spec.page_size_bytes == mla_page
+            assert tensors[name] == replace(
+                tensors[f"layers.{4 * i + 3}.attn"], layers=[name]
+            )
+    else:
+        assert draft_group is None
+
+
+def test_glm5_mtp_group_annotated_before_early_return():
+    """GLM MTP uses upstream's positional annotation on the special layout."""
+    config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    config.speculative_config = _spec_decode_grouping_config(
+        method="mtp", model_type="glm5_next"
+    ).speculative_config
+    specs = _glm5_like_kv_cache_spec_with_tail()
+    specs["draft.attn"] = specs["layers.3.attn"]
+    groups = get_kv_cache_groups(config, specs)
+    flagged = [group for group in groups if group.is_eagle_group]
+    assert len(flagged) == 1
+    assert "draft.attn" in flagged[0].layer_names
