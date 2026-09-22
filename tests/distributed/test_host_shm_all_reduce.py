@@ -22,8 +22,10 @@ What is worth testing without hardware:
     reason;
   * the **OFF path** constructs nothing, so a run with the flag off is
     byte-identical to upstream;
-  * the communicator **stands aside where P2P works**, because vLLM's own
-    device-memory custom all-reduce is better there;
+  * the communicator **stands aside only when told to** -- the operator sets
+    VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE to hand the fast path to the
+    device-memory custom all-reduce; a driver that merely starts reporting
+    peer access must not silently turn this path into NCCL;
   * every early return leaves a usable, `disabled` object rather than a
     half-built one.
 """
@@ -145,6 +147,7 @@ class _FakeTensor:
 
 
 def _no_gpu_init(mp, *, is_cuda=True, world=4, same_node=True):
+    mp.delenv("VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE", raising=False)
     mp.setattr(torch.cuda, "can_device_access_peer", lambda a, b: False)
     mp.setattr(hsm.current_platform, "is_cuda", lambda: is_cuda)
     mp.setattr(hsm.dist, "get_backend", lambda group: "gloo")
@@ -283,34 +286,57 @@ def test_block_count_is_capped_and_size_only():
 
 
 # --------------------------------------------------------------------------
-# P2P standoff
+# P2P probe and the stand-aside policy built on it
 # --------------------------------------------------------------------------
-def test_stands_aside_when_p2p_works(monkeypatch):
+def test_probe_sees_p2p_when_it_works(monkeypatch):
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda a, b: True)
     assert hsm._p2p_unavailable(4) is False
 
 
-def test_takes_over_when_p2p_is_refused(monkeypatch):
+def test_probe_reports_no_p2p_when_refused(monkeypatch):
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda a, b: False)
     assert hsm._p2p_unavailable(4) is True
 
 
-def test_stands_aside_when_any_pair_can_peer(monkeypatch):
-    """Partial P2P is not our case; leave it alone."""
+def test_probe_sees_p2p_when_any_pair_can_peer(monkeypatch):
+    """Partial P2P is not our case; the probe must not call it absent."""
     monkeypatch.setattr(
         torch.cuda, "can_device_access_peer", lambda a, b: {a, b} == {0, 1}
     )
     assert hsm._p2p_unavailable(4) is False
 
 
-def test_p2p_probe_failure_does_not_take_over(monkeypatch):
-    """If the probe raises, do not assume no-P2P and hijack the chain."""
+def test_p2p_probe_failure_does_not_claim_no_p2p(monkeypatch):
+    """If the probe raises, do not assume no-P2P."""
 
     def boom(a, b):
         raise RuntimeError("no driver")
 
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", boom)
     assert hsm._p2p_unavailable(4) is False
+
+
+def test_stand_aside_needs_the_env_and_working_p2p(monkeypatch):
+    """The two fast paths are exclusive by the operator's choice.
+
+    Only VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE -- the same env that lets
+    CustomAllreduce count PCIe peer-to-peer as fully connected above two GPUs
+    -- hands the fast path over, and only where peer access is really there.
+    """
+    for env_on, peer, expected in (
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ):
+        mp = MonkeyPatch()
+        try:
+            mp.setenv("VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE", "1" if env_on else "0")
+            mp.setattr(torch.cuda, "can_device_access_peer", lambda a, b: peer)
+            got = hsm._stand_aside_for_custom_allreduce(4)
+            assert got is expected, (env_on, peer, got)
+        finally:
+            mp.undo()
 
 
 # --------------------------------------------------------------------------
@@ -345,10 +371,39 @@ def test_disabled_across_nodes(monkeypatch):
     assert hsm.HostShmAllreduce(group=object(), device="cuda:0").disabled is True
 
 
-def test_disabled_when_p2p_available(monkeypatch):
+def _counting_loader(mp):
+    """Replace the JIT build with a counter, so a test can assert it never ran
+    without needing nvcc."""
+    calls = {"n": 0}
+
+    def _load():
+        calls["n"] += 1
+        raise RuntimeError("the CPU tests never build the extension")
+
+    mp.setattr(hsm, "_load_module", _load)
+    return calls
+
+
+def test_disabled_when_p2p_available_and_handed_over(monkeypatch):
+    """With the env set and peer access present, stand aside -- and do not
+    compile the extension on the way out."""
     _no_gpu_init(monkeypatch)
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda a, b: True)
+    monkeypatch.setenv("VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE", "1")
+    calls = _counting_loader(monkeypatch)
     assert hsm.HostShmAllreduce(group=object(), device="cuda:0").disabled is True
+    assert calls["n"] == 0
+
+
+def test_p2p_availability_alone_does_not_stand_aside(monkeypatch):
+    """Installing a P2P-capable driver must not silently turn
+    VLLM_GLM5_HOST_ALLREDUCE=1 into NCCL: above two PCIe-only GPUs upstream's
+    CustomAllreduce refuses anyway unless the operator opts in."""
+    _no_gpu_init(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda a, b: True)
+    calls = _counting_loader(monkeypatch)
+    hsm.HostShmAllreduce(group=object(), device="cuda:0")
+    assert calls["n"] == 1, "the host path should have gone on to set itself up"
 
 
 def test_disabled_when_max_size_is_useless(monkeypatch):

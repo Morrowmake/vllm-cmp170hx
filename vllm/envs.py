@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
+    VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
@@ -1217,6 +1218,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    # Let the custom all-reduce treat *PCIe* peer-to-peer as "fully
+    # connected". Upstream only counts NVLink, so on a PCIe-only node with
+    # more than two GPUs CustomAllreduce disables itself before it ever runs
+    # the P2P probe. With this set, every pair must report NVML
+    # P2P_CAPS_INDEX_READ and _WRITE OK (or peer access both ways under
+    # torch) -- and the gpu_p2p_access_check probe, which is the only check
+    # that moves real bytes, becomes mandatory regardless of
+    # VLLM_SKIP_P2P_CHECK. It is also the switch that hands the fast path
+    # from the host-staged all-reduce to the device-memory one: see
+    # vllm/distributed/device_communicators/host_shm_all_reduce.py.
+    # Off by default; a driver that advertises peer access it cannot route
+    # turns a wrong answer here into a hang, so opt in only after measuring.
+    "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE", "0"))
+    ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
@@ -1566,9 +1582,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_GLM5_SHARED_EXPERT_REORDER", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
-    # (the CMP 170HX case). Off by default; when on, it still only activates if
-    # `torch.cuda.can_device_access_peer` is false for every pair, so hardware
-    # with working P2P keeps using CustomAllreduce. See
+    # (the CMP 170HX case). Off by default. When on it stands aside only if
+    # VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE is also set *and* peer access is
+    # really there, so the two fast paths are mutually exclusive by the
+    # operator's choice rather than by what the driver happens to report. See
     # vllm/distributed/device_communicators/host_shm_all_reduce.py.
     "VLLM_GLM5_HOST_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_GLM5_HOST_ALLREDUCE", "0"))
