@@ -366,6 +366,13 @@ def sparse_attn_indexer_kpool(
                 logits.stride(1),
                 select_k,
             )
+            # Free the fp32 logits before the next chunk allocates its own.
+            # The buffer is [chunk_rows, compressed_context] and the metadata
+            # builder sizes chunk_rows right up to
+            # VLLM_SPARSE_INDEXER_MAX_LOGITS_MB (512 MiB by default), so
+            # holding two of them live across the loop edge doubles the
+            # transient peak of the indexer at long context.
+            del logits
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
