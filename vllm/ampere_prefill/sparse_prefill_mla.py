@@ -204,7 +204,7 @@ def _sparse_mla_kernel(
         # Clamp instead of masking the gather: the rows of invalid entries are
         # read but their scores are forced to -1e30 below, so they contribute
         # exactly zero.  Row 0 is always in range whenever any row exists.
-        rows = tl.where(mask_kv, indices, 0) * stride_k_token \
+        rows = tl.where(mask_kv, indices, 0).to(tl.int64) * stride_k_token \
             + cur_kv_head_id * stride_k_head
 
         if V_IS_K:
