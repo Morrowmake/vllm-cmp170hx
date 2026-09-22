@@ -769,6 +769,179 @@ class CudaPlatformBase(Platform):
 # Note that NVML is not affected by `CUDA_VISIBLE_DEVICES`,
 # all the related functions work on real physical device ids.
 # the major benefit of using NVML is that it will not initialize CUDA
+
+def _nvml_nvlink_fully_connected(handles: list) -> bool:
+    """The upstream NVLink 1-hop test, unchanged, over already-open handles."""
+    for i, handle in enumerate(handles):
+        for j, peer_handle in enumerate(handles):
+            if i < j:
+                try:
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle,
+                        peer_handle,
+                        pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return False
+                except pynvml.NVMLError:
+                    logger.exception(
+                        "NVLink detection failed. This is normal if"
+                        " your machine has no NVLink equipped."
+                    )
+                    return False
+    return True
+
+
+def pcie_p2p_custom_allreduce_allowed() -> bool:
+    """Whether the opt-in PCIe peer-to-peer custom all-reduce may be used.
+
+    VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE asks for it. This also refuses when
+    PyTorch's expandable_segments allocator is on, because the two cannot work
+    together: CustomAllreduce takes legacy CUDA IPC handles on its captured
+    CUDA-graph buffers (``cudaIpcGetMemHandle`` in ``get_graph_buffer_ipc_meta``),
+    and that call returns ``cudaErrorInvalidValue`` for VMM-backed expandable
+    allocations. Left unguarded the combination kills every worker part-way
+    through startup, reporting only ``Cuda error ... 'invalid argument'`` from
+    custom_all_reduce.cuh with nothing to connect it to the allocator.
+
+    Refusing here instead leaves the host-staged path serving, so the flag is
+    safe to leave set: it simply does nothing until the allocator allows it.
+    """
+    if not envs.VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE:
+        return False
+    if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        logger.warning_once(
+            "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1 is ignored because "
+            "PYTORCH_CUDA_ALLOC_CONF contains expandable_segments:True. The "
+            "custom all-reduce needs legacy CUDA IPC handles for its captured "
+            "graph buffers and the VMM allocator cannot provide them. Unset "
+            "expandable_segments to use the device-memory path; until then the "
+            "host-staged all-reduce keeps serving."
+        )
+        return False
+    return True
+
+
+def _nvml_caps_index(name: str) -> int | None:
+    """The integer value of a pynvml P2P caps-index constant, or None.
+
+    ``nvmlDeviceGetP2PStatus`` passes this straight to ctypes, so it has to be
+    a real int. vLLM's vendored pynvml declares
+    ``NVML_P2P_CAPS_INDEX_READ = (0,)`` -- a 1-tuple, from a stray trailing
+    comma -- which ctypes refuses to convert. Unwrap that spelling rather than
+    depend on the typo being fixed, and treat anything else as absent so the
+    caller falls back to torch.
+    """
+    value = getattr(pynvml, name, None)
+    if isinstance(value, tuple) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _nvml_pcie_p2p_fully_connected(physical_device_ids: list[int]) -> bool:
+    """True when NVML reports READ *and* WRITE P2P OK for every ordered pair.
+
+    Returns False -- not an error -- when this pynvml does not expose the READ
+    and WRITE caps indices, so the caller can fall back to torch's peer query.
+    """
+    read_index = _nvml_caps_index("NVML_P2P_CAPS_INDEX_READ")
+    write_index = _nvml_caps_index("NVML_P2P_CAPS_INDEX_WRITE")
+    if read_index is None or write_index is None:
+        logger.debug(
+            "pynvml exposes no usable NVML_P2P_CAPS_INDEX_READ/_WRITE; using"
+            " torch.cuda.can_device_access_peer for the PCIe P2P check."
+        )
+        return False
+    try:
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i == j:
+                    continue
+                for caps_index in (read_index, write_index):
+                    status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle, peer_handle, caps_index
+                    )
+                    if status != pynvml.NVML_P2P_STATUS_OK:
+                        return False
+    except Exception as exc:
+        # Deliberately broad. Besides NVMLError this has to survive a pynvml
+        # whose constants or signatures do not match the loaded libnvidia-ml,
+        # which surfaces as ctypes.ArgumentError rather than NVMLError. The
+        # torch fallback below answers the same question; a driver quirk here
+        # must never be the reason a server fails to start.
+        logger.debug("NVML PCIe P2P query failed (%s).", exc)
+        return False
+    return True
+
+
+def _torch_p2p_fully_connected(physical_device_ids: list[int]) -> bool:
+    """True when torch reports peer access both ways for every pair.
+
+    ``can_device_access_peer`` takes visible ordinals, so the physical IDs are
+    translated back through the device-control env var first.
+    """
+    try:
+        physical_to_visible = {
+            CudaPlatformBase.visible_device_id_to_physical_device_id(visible): visible
+            for visible in range(_cuda_device_count_stateless())
+        }
+        ordinals = [physical_to_visible[pid] for pid in physical_device_ids]
+    except Exception as exc:
+        logger.debug("PCIe P2P check: cannot map physical device ids (%s).", exc)
+        return False
+    for i, a in enumerate(ordinals):
+        for j, b in enumerate(ordinals):
+            if i == j:
+                continue
+            try:
+                if not torch.cuda.can_device_access_peer(a, b):
+                    return False
+            except Exception as exc:
+                logger.debug("PCIe P2P check failed for %d->%d (%s).", a, b, exc)
+                return False
+    return True
+
+
+def _pcie_p2p_fully_connected(
+    physical_device_ids: list[int], *, use_nvml: bool
+) -> bool:
+    """The opt-in PCIe leg of ``is_fully_connected``.
+
+    Gated on VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE. A True here only says the
+    driver *advertises* peer access; it never stands alone. CustomAllreduce
+    still has to pass ``gpu_p2p_access_check``, the probe that actually moves
+    bytes between the cards, and the same env makes that probe mandatory.
+    """
+    if not pcie_p2p_custom_allreduce_allowed():
+        return False
+    if len(physical_device_ids) < 2:
+        return False
+    connected = use_nvml and _nvml_pcie_p2p_fully_connected(physical_device_ids)
+    if not connected:
+        connected = _torch_p2p_fully_connected(physical_device_ids)
+    # `*_once` de-duplicates on the arguments, so they have to be hashable.
+    device_list = ", ".join(str(i) for i in physical_device_ids)
+    if connected:
+        logger.info_once(
+            "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1 and every pair of devices"
+            " [%s] reports working PCIe peer-to-peer, so this group counts as"
+            " fully connected for the custom all-reduce. The"
+            " gpu_p2p_access_check probe still has to pass before it is used.",
+            device_list,
+        )
+    else:
+        logger.warning_once(
+            "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1, but PCIe peer-to-peer is not"
+            " available for every pair of devices [%s]. The custom all-reduce"
+            " stays disabled for more than two GPUs.",
+            device_list,
+        )
+    return connected
+
+
 class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @with_nvml_context
@@ -830,26 +1003,20 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @with_nvml_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
-        """Query if the set of gpus are fully connected by nvlink (1 hop)."""
+        """Query if the set of gpus are fully connected by nvlink (1 hop).
+
+        With ``VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1`` a set that is fully
+        connected by *PCIe* peer-to-peer counts too: every pair must report
+        NVML ``P2P_CAPS_INDEX_READ`` and ``_WRITE`` OK, or -- if this pynvml
+        does not expose those indices -- peer access both ways under torch.
+        That relaxation is what lets CustomAllreduce past its "more than two
+        PCIe-only GPUs" gate; it is not a correctness claim, and the
+        ``gpu_p2p_access_check`` probe stays mandatory behind it.
+        """
         handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
-                            handle,
-                            peer_handle,
-                            pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
-                        )
-                        if p2p_status != pynvml.NVML_P2P_STATUS_OK:
-                            return False
-                    except pynvml.NVMLError:
-                        logger.exception(
-                            "NVLink detection failed. This is normal if"
-                            " your machine has no NVLink equipped."
-                        )
-                        return False
-        return True
+        if _nvml_nvlink_fully_connected(handles):
+            return True
+        return _pcie_p2p_fully_connected(physical_device_ids, use_nvml=True)
 
     @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
@@ -1036,6 +1203,9 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
 
     @classmethod
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
+        if envs.VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE:
+            # No NVML context here, so the PCIe leg has only torch's peer query.
+            return _pcie_p2p_fully_connected(physical_device_ids, use_nvml=False)
         logger.exception(
             "NVLink detection not possible, as context support was"
             " not found. Assuming no NVLink available."
