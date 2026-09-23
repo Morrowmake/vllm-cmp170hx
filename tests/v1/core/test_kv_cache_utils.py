@@ -4620,9 +4620,11 @@ def test_glm5_dflash_group_annotation_preserves_layout(block_drop, with_draft):
         assert tensors[name] == tensor
     layout = kv_cache_utils._glm5_next_tensor_layout(groups)
     assert layout is not None
-    draft_group = layout[8]
+    draft_groups = layout[8]
     if with_draft:
-        assert draft_group is not None
+        # One stage: every drafter layer fits the MLA tensors in one group.
+        assert len(draft_groups) == 1
+        draft_group = draft_groups[0]
         assert draft_group.layer_names == draft_names
         for i, name in enumerate(draft_names):
             spec = draft_group.kv_cache_spec.kv_cache_specs[name]
@@ -4634,7 +4636,7 @@ def test_glm5_dflash_group_annotation_preserves_layout(block_drop, with_draft):
                 tensors[f"layers.{4 * i + 3}.attn"], layers=[name]
             )
     else:
-        assert draft_group is None
+        assert draft_groups == []
 
 
 def test_glm5_mtp_group_annotated_before_early_return():
@@ -4649,3 +4651,188 @@ def test_glm5_mtp_group_annotated_before_early_return():
     flagged = [group for group in groups if group.is_eagle_group]
     assert len(flagged) == 1
     assert "draft.attn" in flagged[0].layer_names
+
+
+def _glm5_pp_dflash_config(monkeypatch, partition: str, block_drop: bool = True):
+    monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    parts = [int(x) for x in partition.split(",")]
+    config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    # Set after construction: ParallelConfig validates the world size against
+    # the visible GPUs, and only the grouping arithmetic reads it here.
+    config.parallel_config.pipeline_parallel_size = len(parts)
+    spec_config = _spec_decode_grouping_config(
+        method="dflash", model_type="glm5_next"
+    ).speculative_config
+    spec_config.use_eagle_block_drop = lambda: block_drop
+    spec_config.use_multi_module_mtp = lambda: False
+    spec_config.parallel_drafting = True
+    spec_config.num_speculative_tokens = 3
+    config.speculative_config = spec_config
+    return config, parts
+
+
+def _glm5_specs_with_dflash(num_draft_layers: int) -> dict[str, KVCacheSpec]:
+    specs = _glm5_like_kv_cache_spec_with_tail()
+    for j in range(num_draft_layers):
+        # 576 B/token against the fixture's 1152 B/token MLA page: the
+        # exact-fit drafter block is 2048 tokens.
+        specs[f"draft.layers.{j}.attn"] = SlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=144,
+            dtype=torch.bfloat16,
+            sliding_window=512,
+        )
+    return specs
+
+
+def _split_specs_by_stage(
+    specs: dict[str, KVCacheSpec], parts: list[int]
+) -> list[dict[str, KVCacheSpec]]:
+    bounds = [sum(parts[:r]) for r in range(len(parts) + 1)]
+    workers: list[dict[str, KVCacheSpec]] = [{} for _ in parts]
+    for name, spec in specs.items():
+        if name.startswith("draft."):
+            workers[-1][name] = spec  # the drafter runs on the last stage
+            continue
+        index = int(name.split(".")[1])
+        rank = next(r for r in range(len(parts)) if index < bounds[r + 1])
+        workers[rank][name] = spec
+    return workers
+
+
+@pytest.mark.parametrize(
+    "partition,draft_layers,expected_split",
+    [
+        # GLM-5.3-Flash + DFlash2 under PP4: the last stage owns 3 MLA layers
+        # (35, 39, 43) and the drafter has 5 layers -> two groups.
+        ("13,11,11,10", 5, [3, 2]),
+        ("12,11,11,11", 5, [3, 2]),
+        # The last stage owns 2 MLA layers (39, 43) -> three groups.
+        ("14,12,11,8", 5, [2, 2, 1]),
+        # Enough MLA layers on the last stage -> a single group, as with PP=1.
+        ("12,11,11,11", 3, [3]),
+    ],
+)
+def test_glm5_dflash_groups_fit_last_pp_stage(
+    monkeypatch, partition, draft_layers, expected_split
+):
+    """Drafter layers are split so each group fits the last stage's MLA tensors;
+    every stage keeps the shared layout and its per-block cost."""
+    config, parts = _glm5_pp_dflash_config(monkeypatch, partition)
+    specs = _glm5_specs_with_dflash(draft_layers)
+    draft_names = [n for n in specs if n.startswith("draft.")]
+
+    groups = get_kv_cache_groups(config, specs)
+    draft_groups = [
+        g for g in groups if g.layer_names and g.layer_names[0].startswith("draft.")
+    ]
+    assert [len(g.layer_names) for g in draft_groups] == expected_split
+    assert [n for g in draft_groups for n in g.layer_names] == draft_names
+    assert all(g.is_eagle_group for g in draft_groups)
+    assert not any(g.is_eagle_group for g in groups if g not in draft_groups)
+    # Drafter groups come last so target group ids do not move.
+    assert groups[-len(draft_groups) :] == draft_groups
+
+    mla_page = specs["layers.3.attn"].page_size_bytes
+    idx_page = specs["layers.3.indexer"].page_size_bytes
+    workers = _split_specs_by_stage(specs, parts)
+    for worker in workers:
+        projected = kv_cache_utils._project_kv_cache_groups_to_worker(groups, worker)
+        layout = kv_cache_utils._glm5_next_tensor_layout(projected)
+        assert layout is not None
+        num_mla = sum(n.endswith(".attn") and "draft" not in n for n in worker)
+        # The drafter adds no bytes per block on any stage.
+        assert kv_cache_utils._pool_bytes_per_block(projected) == num_mla * (
+            mla_page + idx_page
+        )
+
+    num_blocks = 50
+    per_stage = [
+        sum(n.endswith(".attn") and "draft" not in n for n in w) * (mla_page + idx_page)
+        for w in workers
+    ]
+    available = [b * num_blocks + 1 for b in per_stage]
+    configs = get_kv_cache_configs(config, workers, available)
+    assert {c.num_blocks for c in configs} == {num_blocks}
+    last = _tensor_by_layer(configs[-1])
+    mla_names = [n for n in workers[-1] if n.endswith(".attn") and "draft" not in n]
+    for group in draft_groups:
+        for i, name in enumerate(group.layer_names):
+            # Drafter layer i of each group rides the last stage's MLA tensor i.
+            assert last[name] == replace(last[mla_names[i]], layers=[name])
+
+    # The scheduler keeps the drafter annotation although worker 0 (whose
+    # config it copies) owns no drafter layer.
+    sched = generate_scheduler_kv_cache_config(configs)
+    flagged = [i for i, g in enumerate(sched.kv_cache_groups) if g.is_eagle_group]
+    first = len(groups) - len(draft_groups)
+    assert flagged == list(range(first, len(groups)))
+
+
+def test_glm5_dflash_pp_without_block_drop_flags_nothing(monkeypatch):
+    config, parts = _glm5_pp_dflash_config(monkeypatch, "13,11,11,10", block_drop=False)
+    specs = _glm5_specs_with_dflash(5)
+    groups = get_kv_cache_groups(config, specs)
+    assert not any(g.is_eagle_group for g in groups)
+    workers = _split_specs_by_stage(specs, parts)
+    configs = get_kv_cache_configs(config, workers, [1 << 34] * len(parts))
+    sched = generate_scheduler_kv_cache_config(configs)
+    assert not any(g.is_eagle_group for g in sched.kv_cache_groups)
+
+
+def test_glm5_dflash_misaligned_block_falls_back_loudly(monkeypatch, caplog):
+    """A drafter block that is not a multiple of 64 leaves the shared layout,
+    and says so (it costs several times the KV capacity)."""
+    config, _ = _glm5_pp_dflash_config(monkeypatch, "13,11,11,10")
+    specs = _glm5_like_kv_cache_spec_with_tail()
+    for j in range(5):
+        # 1152 B/token MLA page of 1024 tokens / 1024 B/token -> 1152 tokens
+        # would fit; 4096 B/token -> 288 tokens, not a multiple of 64.
+        specs[f"draft.layers.{j}.attn"] = SlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=512,
+        )
+    mla_specs = {n: s for n, s in specs.items() if type(s) is MLAAttentionSpec}
+    mla_names = [n for n, s in mla_specs.items() if s.tokens_per_state == 1]
+    draft_specs = {n: s for n, s in specs.items() if n.startswith("draft.")}
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert (
+            kv_cache_utils._glm5_next_draft_groups(
+                config,
+                draft_specs,
+                mla_specs,
+                mla_names,
+                specs["layers.3.attn"].page_size_bytes,
+            )
+            == []
+        )
+    assert "not a multiple of 64" in caplog.text
+
+
+def test_scheduler_config_merges_eagle_flags_across_workers():
+    spec = new_kv_cache_spec()
+
+    def cfg(flags):
+        return KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    [f"l{i}"] if f is not None else [], spec, is_eagle_group=bool(f)
+                )
+                for i, f in enumerate(flags)
+            ],
+        )
+
+    configs = [cfg([False, None]), cfg([False, None]), cfg([False, True])]
+    sched = generate_scheduler_kv_cache_config(configs)
+    assert [g.is_eagle_group for g in sched.kv_cache_groups] == [False, True]
+    # The workers' own configs are untouched.
+    assert not configs[0].kv_cache_groups[1].is_eagle_group
