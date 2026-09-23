@@ -143,6 +143,11 @@ class TritonMLASparseMetadataBuilder(
 
 class TritonMLASparseImpl(SparseMLACommonImpl[TritonMLASparseMetadata]):
     can_return_lse_for_decode: bool = True
+    # VLLM_GLM5_DECODE_IDX_GLUE "cache": MLAAttention.update_kv_cache may hand
+    # the latent cache write to forward_mqa, which merges it with the index
+    # remap launch. Set only while a hand-off is outstanding.
+    supports_idx_glue_kv_defer: bool = True
+    _idx_glue_pending_kv: tuple | None = None
 
     def __init__(
         self,
@@ -214,7 +219,12 @@ class TritonMLASparseImpl(SparseMLACommonImpl[TritonMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
         index_group = self.index_group
+        pending_kv = self._idx_glue_pending_kv
+        if pending_kv is not None:
+            self._idx_glue_pending_kv = None
         if isinstance(index_group, HiSparseMLAIndexGroup):
+            if pending_kv is not None:
+                self.do_kv_cache_update(*pending_kv)
             num_decode_tokens = attn_metadata.num_decode_tokens
             outputs = []
             if num_decode_tokens:
@@ -276,14 +286,31 @@ class TritonMLASparseImpl(SparseMLACommonImpl[TritonMLASparseMetadata]):
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )
         # Per-request logical positions -> global cache rows; -1 stays -1.
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-        )
+        if pending_kv is not None:
+            # Same remap, plus the deferred latent cache write, in one launch.
+            from vllm.ampere_decode.idx_glue import remap_and_cache_mla
+
+            kv_c, k_pe, kv_cache_w, slots, _dtype, _k_scale = pending_kv
+            topk_indices = remap_and_cache_mla(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                kv_c,
+                k_pe,
+                kv_cache_w,
+                slots.flatten(),
+                attn_metadata.block_size,
+                block_stride_rows,
+            )
+        else:
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+            )
         out, lse = self._run_mqa_kernel(
             q,
             kv_rows,

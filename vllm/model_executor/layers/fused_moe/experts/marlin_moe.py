@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -888,6 +889,19 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         expert_map: torch.Tensor | None,
     ) -> None:
         from vllm.ampere_decode import use_ampere_moe_routing
+
+        if (
+            envs.VLLM_GLM5_DECODE_IDX_GLUE
+            and expert_map is None
+            and input.dim() == 3
+        ):
+            # VLLM_GLM5_DECODE_IDX_GLUE "moesum": when the MoE runner armed the
+            # hand-off it fuses this sum with the shared-expert add (same fp32
+            # slot-order sum as both branches below, then the same add).
+            from vllm.ampere_decode.idx_glue import MOE_SUM_DEFERRAL
+
+            if MOE_SUM_DEFERRAL.offer(input, output):
+                return
 
         _moe_cfg = getattr(self, "moe_config", None)
         if (

@@ -499,7 +499,7 @@ def _kpool_decode_update_batched_kernel(
     ape_ptr,
     ape_stride_0,
     slot_mapping_ptr,  # [B, NEXT_N] int32
-    positions_ptr,  # [B, NEXT_N] int32
+    positions_ptr,  # [B, NEXT_N] int32 or int64 (truncated to int32 on load)
     NEXT_N,  # runtime token count per request (no .item() needed)
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
@@ -531,7 +531,9 @@ def _kpool_decode_update_batched_kernel(
     for t in tl.range(0, NEXT_N):
         idx = req * NEXT_N + t
         cache_loc = tl.load(slot_mapping_ptr + idx)
-        pos = tl.load(positions_ptr + idx)
+        # A no-op for int32 positions; for int64 it is the int32 cast the
+        # caller used to launch separately.
+        pos = tl.load(positions_ptr + idx).to(tl.int32)
         safe_pos = tl.maximum(pos, 0)
         pos_valid = (cache_loc >= 0) & (pos >= 0)
 
@@ -689,7 +691,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         slot_score: ``[num_requests, next_n, head_dim]`` bf16.
         ape: ``[pool_size, head_dim]`` fp32.
         slot_mapping: ``[num_requests, next_n]`` int32.
-        positions: ``[num_requests, next_n]`` int32.
+        positions: ``[num_requests, next_n]`` int32 or int64.
         pool_size: Number of tokens compressed into one cache entry.
         head_dim: Indexer head dimension.
         round_scale: Round each fp8 scale down to a power of two.

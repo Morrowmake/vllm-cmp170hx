@@ -43,6 +43,7 @@ __all__ = [
     "marlin_block_size_m",
     "stash_fused_align",
     "take_fused_align",
+    "use_idx_glue",
 ]
 
 # Sentinel for "the caller has a norm_weight tensor". The mHC gate only needs
@@ -242,3 +243,18 @@ def take_fused_align(
         return None
     _PENDING = None
     return aligned
+
+
+def use_idx_glue(part: str) -> bool:
+    """Gate for one fold of vllm/ampere_decode/idx_glue.py.
+
+    Reads ``VLLM_GLM5_DECODE_IDX_GLUE`` first, so with the switch unset the
+    fold module is never imported and every call site keeps its code path.
+    """
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_DECODE_IDX_GLUE:
+        return False
+    from vllm.ampere_decode.idx_glue import idx_glue_part
+
+    return idx_glue_part(part)

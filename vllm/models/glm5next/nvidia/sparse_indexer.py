@@ -94,6 +94,49 @@ def _kpool_compress_insert(
     )
 
 
+def _use_glue_pos() -> bool:
+    from vllm.ampere_decode import use_idx_glue
+
+    return use_idx_glue("glue")
+
+
+def _use_glue_tail(
+    attn_metadata_narrowed,
+    has_decode: bool,
+    has_prefill: bool,
+    index_kpool: int,
+    positions: torch.Tensor | None,
+    use_fp4_cache: bool,
+    topk_tokens: int,
+) -> bool:
+    """True when the decode pool expansion can own the whole top-k fill.
+
+    Every condition is host metadata: a decode-only batch, the kpool path with
+    positions, the flat (unpadded) decode layout, and a context long enough
+    that the short-decode causal fill does not return early.
+    """
+    if (
+        not has_decode
+        or has_prefill
+        or index_kpool <= 1
+        or positions is None
+        or positions.numel() == 0
+        or use_fp4_cache
+    ):
+        return False
+    from vllm.ampere_decode import use_idx_glue
+
+    if not use_idx_glue("glue"):
+        return False
+    decode_metadata = attn_metadata_narrowed.decode
+    return (
+        decode_metadata is not None
+        and not decode_metadata.requires_padding
+        and attn_metadata_narrowed.max_seq_len > topk_tokens
+        and current_platform.is_cuda_alike()
+    )
+
+
 @eager_break_during_capture
 def sparse_attn_indexer_kpool(
     hidden_states: torch.Tensor,
@@ -240,7 +283,21 @@ def sparse_attn_indexer_kpool(
                 scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # VLLM_GLM5_DECODE_IDX_GLUE "glue": on a pure-decode batch whose rows all
+    # go through the pool expansion, one kernel writes every buffer row this
+    # fill covers (the expanded indices, -1 elsewhere), so the fill, the
+    # int64/int32 casts, the +1 and the copy below are folded into it.
+    fuse_tail = _use_glue_tail(
+        attn_metadata_narrowed,
+        has_decode,
+        has_prefill,
+        index_kpool,
+        positions,
+        use_fp4_cache,
+        topk_tokens,
+    )
+    if not fuse_tail:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -494,7 +551,13 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                if _use_glue_pos():
+                    # The kpool kernel truncates its position load to int32.
+                    dec_pos = positions[:num_decode_tokens].view(shape2)
+                else:
+                    dec_pos = (
+                        positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                    )
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -653,6 +716,18 @@ def sparse_attn_indexer_kpool(
         )
 
         # Resolve to token-level indices in the output buffer.
+        if fuse_tail:
+            from vllm.ampere_decode.idx_glue import expand_pools_into_buffer
+
+            assert positions is not None and not decode_metadata.requires_padding
+            expand_pools_into_buffer(
+                pool_topk,
+                positions[: pool_topk.shape[0]],
+                topk_indices_buffer,
+                hidden_states.shape[0],
+                index_kpool,
+            )
+            return topk_indices_buffer
         if index_kpool > 1:
             pool_ids = pool_topk.to(torch.int64)
             n = pool_topk.shape[0]
