@@ -742,10 +742,22 @@ def hidden_slice(tokens: int, hidden: int = 4096) -> torch.Tensor:
 # -- environment ------------------------------------------------------------ #
 
 
-def test_settings_under_ca_defaults_on_and_backend_defaults_auto():
+def test_settings_under_ca_defaults_on_and_backend_defaults_nccl():
     settings = ov.read_settings({})
     assert settings.under_ca is True
-    assert settings.backend == "auto"
+    # PyNccl, not CustomAllreduce, even where a ca_comm is live: it measured
+    # faster on the 4.7 MB halves (27.8-28.1 ms/step and 2253-2260 tok/s
+    # against 28.6 ms and 2236-2237 tok/s).
+    assert settings.backend == "nccl"
+
+
+def test_envs_declares_the_same_backend_default_as_the_parser(monkeypatch):
+    """envs.py mirrors the parser by hand; the two defaults must not drift."""
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_GLM5_PREFILL_OVERLAP_BACKEND", raising=False)
+    declared = envs.environment_variables["VLLM_GLM5_PREFILL_OVERLAP_BACKEND"]()
+    assert declared == ov.read_settings({}).backend == "nccl"
 
 
 @pytest.mark.parametrize("raw,expected", [("0", False), ("no", False), ("1", True)])
@@ -805,10 +817,12 @@ def test_select_split_backend_stands_down_only_when_the_knob_says_so():
     chosen, _ = ov.select_split_backend(off, ca_active=False)
     assert chosen == "nccl"
 
-    # And with the knob at its default the stand-down does not trigger at all.
+    # And with the knob at its default the stand-down does not trigger at
+    # all: the overlap runs, on PyNccl, alongside the live ca_comm.
     on = ov.OverlapSettings(enabled=True)
-    chosen, _ = ov.select_split_backend(on, ca_active=True)
-    assert chosen == "custom"
+    chosen, reason = ov.select_split_backend(on, ca_active=True)
+    assert chosen == "nccl"
+    assert "ca_comm" in reason and "custom" in reason
 
 
 @pytest.mark.parametrize("attribute", ov.UNANALYSED_BACKENDS)
@@ -907,10 +921,31 @@ def build_region(monkeypatch, communicator, env=None):
     return ov._build_region(ov.read_settings(env or {}))
 
 
-def test_build_region_drives_ca_comm_instead_of_standing_down(monkeypatch):
+def test_build_region_runs_beside_a_live_ca_comm_instead_of_standing_down(
+    monkeypatch,
+):
     region = build_region(monkeypatch, FakeCommunicator(ca_comm=FakeCA()))
     assert region is not None
-    assert region.executor.backend == "custom"
+    # The feature runs; the default backend for the slices is PyNccl.
+    assert region.executor.backend == "nccl"
+
+
+def test_build_region_drives_ca_comm_when_the_backend_asks_for_it(monkeypatch):
+    region = build_region(
+        monkeypatch,
+        FakeCommunicator(ca_comm=FakeCA()),
+        {"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "custom"},
+    )
+    assert region is not None and region.executor.backend == "custom"
+
+
+def test_build_region_auto_still_resolves_to_custom(monkeypatch):
+    region = build_region(
+        monkeypatch,
+        FakeCommunicator(ca_comm=FakeCA()),
+        {"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "auto"},
+    )
+    assert region is not None and region.executor.backend == "custom"
 
 
 def test_build_region_honours_the_stand_down_knob(monkeypatch):
@@ -926,13 +961,19 @@ def test_build_region_backend_override_reaches_the_executor(monkeypatch):
     region = build_region(
         monkeypatch,
         FakeCommunicator(ca_comm=FakeCA(), hostshm_comm=FakeHostShm()),
-        {"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "nccl"},
+        {"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "hostshm"},
     )
-    assert region is not None and region.executor.backend == "nccl"
+    assert region is not None and region.executor.backend == "hostshm"
 
 
 def test_build_region_ignores_a_disabled_ca_comm(monkeypatch):
-    region = build_region(monkeypatch, FakeCommunicator(ca_comm=FakeCA(disabled=True)))
+    # Asking for CUSTOM against a ca_comm that is off degrades to PyNccl
+    # rather than standing the feature down.
+    region = build_region(
+        monkeypatch,
+        FakeCommunicator(ca_comm=FakeCA(disabled=True)),
+        {"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "custom"},
+    )
     assert region is not None and region.executor.backend == "nccl"
 
 

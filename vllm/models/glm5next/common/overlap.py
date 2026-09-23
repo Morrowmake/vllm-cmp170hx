@@ -87,13 +87,20 @@ chain -- it needs a collective it can place on a named stream, and that chain
 takes the current stream and picks a backend per call. It therefore chooses a
 backend itself, once, at region build time:
 
-``VLLM_GLM5_PREFILL_OVERLAP_BACKEND`` = ``auto`` (default) | ``custom`` |
-``nccl`` | ``hostshm``.
+``VLLM_GLM5_PREFILL_OVERLAP_BACKEND`` = ``nccl`` (default) | ``custom`` |
+``auto`` | ``hostshm``.
 
-``auto`` means ``custom`` when the TP group has a live ``ca_comm`` and ``nccl``
-otherwise. Whatever is chosen, a slice the backend declines falls through to
-PyNccl for that slice, so the choice can never fail a forward -- it can only
-be slower.
+The default is ``nccl``: the split collectives go through PyNccl even where the
+TP group has a live ``ca_comm``. That is a measurement, not a preference. With
+the halves at 4.7 MB, PyNccl runs 27.8-28.1 ms/step at concurrency 4 and
+prefills at 2253-2260 tok/s, against 28.6 ms and 2236-2237 tok/s through
+CustomAllreduce: the two-shot kernel's staging copy does not pay for itself on
+a side stream at this message size. ``custom`` stays selectable and ``auto``
+still resolves to ``custom`` where a ``ca_comm`` is live and ``nccl``
+otherwise, so that arm is one env away.
+
+Whatever is chosen, a slice the backend declines falls through to PyNccl for
+that slice, so the choice can never fail a forward -- it can only be slower.
 
 This used to be a blanket refusal: if the TP group had *any* other active
 all-reduce backend the overlap switched itself off for the whole process, on
@@ -104,7 +111,10 @@ and ``CustomAllreduce.max_size`` is 8 MiB, while an unsplit 1152-token chunk is
 1152 x 4096 x 2 = 9.4 MB -- over the cap, so ``should_custom_ar`` rejects it and
 the "faster backend" the overlap was standing aside for never carried that
 message at all. The 4.7 MB halves the overlap issues are *under* the cap, so
-routing them through ``ca_comm`` is an upgrade rather than a bypass. Measured
+routing them through ``ca_comm`` is available rather than forbidden -- it
+simply turns out not to be faster, which is why the default is ``nccl`` and
+not ``auto``. What the stand-down cost was the overlap itself, not the
+backend. Measured
 cost of the old refusal: cold prefill 2222 -> 2083 tok/s (-6.3%) and TTFT@23K
 +9.6% (``p2p_tp4_validation.md`` section 3).
 
@@ -293,8 +303,10 @@ class OverlapSettings:
     # is the control arm of the A/B.
     under_ca: bool = True
     # Which communicator carries the split collectives; see the module
-    # docstring. "auto" -> "custom" with a live ca_comm, else "nccl".
-    backend: str = "auto"
+    # docstring. Default "nccl": PyNccl measured faster than CustomAllreduce
+    # on the 4.7 MB halves. "auto" -> "custom" with a live ca_comm, else
+    # "nccl"; "custom" forces it.
+    backend: str = "nccl"
 
     @property
     def active(self) -> bool:
@@ -313,7 +325,7 @@ def read_settings(env: dict[str, str] | None = None) -> OverlapSettings:
         debug=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_DEBUG", False),
         under_ca=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA", True),
         backend=_env_choice(
-            env, "VLLM_GLM5_PREFILL_OVERLAP_BACKEND", "auto", SPLIT_BACKENDS
+            env, "VLLM_GLM5_PREFILL_OVERLAP_BACKEND", "nccl", SPLIT_BACKENDS
         ),
     )
     if enabled and settings.splits == 1:
@@ -376,6 +388,13 @@ def select_split_backend(
     if choice == "auto":
         choice = "custom" if ca_active else "nccl"
         return choice, f"auto -> {choice}"
+    if choice == "nccl" and ca_active:
+        return choice, (
+            "nccl with a live 'ca_comm' present: PyNccl measured faster than "
+            "CustomAllreduce on the halves, so it is the default; "
+            "VLLM_GLM5_PREFILL_OVERLAP_BACKEND=custom routes them through "
+            "CustomAllreduce instead"
+        )
     if choice == "custom" and not ca_active:
         return "nccl", (
             "VLLM_GLM5_PREFILL_OVERLAP_BACKEND=custom but this TP group has no "
@@ -821,10 +840,12 @@ def _build_region(settings: OverlapSettings) -> PrefillOverlapRegion | None:
         logger.warning("GLM5 prefill overlap stays off: %s.", reason)
         return None
     logger.info(
-        "GLM5 prefill overlap: split collectives go through %s (%s); "
-        "anything that backend declines falls through to PyNccl.",
+        "GLM5 prefill overlap: split collectives go through %s (%s).%s",
         backend.upper(),
         reason,
+        ""
+        if backend == "nccl"
+        else " Anything that backend declines falls through to PyNccl.",
     )
     # A dedicated, low-priority-agnostic side stream. The collectives are the
     # long pole, so it is created with default priority and simply kept busy.

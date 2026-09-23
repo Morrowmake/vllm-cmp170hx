@@ -191,7 +191,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_DEBUG: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA: bool = True
-    VLLM_GLM5_PREFILL_OVERLAP_BACKEND: str = "auto"
+    VLLM_GLM5_PREFILL_OVERLAP_BACKEND: str = "nccl"
     VLLM_GLM5_PREFILL_OBSERVE: bool = False
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
@@ -1662,15 +1662,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA", True
     ),
     # Which communicator carries the overlap's split collectives on its side
-    # stream: auto (custom where a ca_comm is live, else nccl) | custom | nccl
-    # | hostshm. A slice the chosen backend declines falls through to PyNccl,
-    # so no setting here can fail a forward. It is not numerically neutral,
-    # though: each backend has its own summation order, so a change here moves
-    # the last BF16 bit and has to be judged against the same-server logprob
-    # floor like any other all-reduce change.
+    # stream: nccl (default) | custom | auto (custom where a ca_comm is live,
+    # else nccl) | hostshm. The default stays on PyNccl even where a
+    # CustomAllreduce is live, because that is what measured faster: 27.8-28.1
+    # ms/step at concurrency 4 and 2253-2260 tok/s of prefill through PyNccl,
+    # against 28.6 ms and 2236-2237 tok/s through CustomAllreduce, whose
+    # staging copy does not pay for itself on a side stream at 4.7 MB. custom
+    # and auto stay selectable, so the arm is one env away. A slice the chosen
+    # backend declines falls through to PyNccl, so no setting here can fail a
+    # forward. It is not numerically neutral, though: each backend has its own
+    # summation order, so a change here moves the last BF16 bit and has to be
+    # judged against the same-server logprob floor like any other all-reduce
+    # change.
     "VLLM_GLM5_PREFILL_OVERLAP_BACKEND": lambda: _glm5_overlap_choice(
         "VLLM_GLM5_PREFILL_OVERLAP_BACKEND",
-        "auto",
+        "nccl",
         ("auto", "custom", "nccl", "hostshm"),
     ),
     # One-shot observer that logs the prefill chunk sizes actually seen, for
