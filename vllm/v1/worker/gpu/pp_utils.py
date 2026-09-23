@@ -122,6 +122,12 @@ class PPHandler:
     ) -> dict[str, torch.Tensor] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
+
+        Besides the postprocess_sampled arguments, the dict carries
+        ``step_idx_mapping``: that step's unfiltered batch -> request mapping,
+        from which the caller can rebuild the step's batch-order block tables
+        (batch-indexed consumers such as the mamba align postprocess must not
+        read the rows of a later step's batch).
         """
         if not self.queue:
             return None
@@ -162,6 +168,7 @@ class PPHandler:
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
+            step_idx_mapping=slot.idx_mapping,
         )
 
     def broadcast_drafts(

@@ -1150,6 +1150,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens
             )
             if outputs is not None:
+                step_idx_mapping = outputs.pop("step_idx_mapping")
+                if getattr(self.model_state, "_align_mode", False):
+                    # The mamba align postprocess copies state through the
+                    # persistent batch-order block tables, row = batch index.
+                    # Those now hold the most recent step's batch, not the
+                    # batch these results belong to. The requests' own
+                    # (request-indexed) rows have not changed since that step
+                    # -- a decode request is not rescheduled before its
+                    # results arrive, and this runs before this step's block
+                    # updates -- so re-gathering them with that step's mapping
+                    # restores its batch-order rows. This step's prepare_attn
+                    # gathers its own rows afterwards.
+                    self.block_tables.gather_block_tables(
+                        step_idx_mapping,
+                        num_reqs_padded=step_idx_mapping.shape[0],
+                    )
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
