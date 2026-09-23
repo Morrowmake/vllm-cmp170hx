@@ -785,6 +785,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         cache = self.hisparse_cache
         if slot_mapping is None or (cache is not None and cache.dummy_batch):
             return
+        if envs.VLLM_GLM5_DECODE_IDX_GLUE and self._idx_glue_defer_kv(
+            kv_cache, attn_metadata, kv_cache_dtype
+        ):
+            # The sparse backend writes this cache in its index-remap launch,
+            # which runs before anything reads it (see _idx_glue_defer_kv).
+            self._idx_glue_flush_kv()
+            self.impl._idx_glue_pending_kv = (  # type: ignore[attr-defined]
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+            return
         kv_c_normed, k_pe, slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
             k_pe,
@@ -819,6 +834,52 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     kv_cache_dtype,
                     k_scale,
                 )
+
+    def _idx_glue_defer_kv(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata: "MLACommonMetadata | None",
+        kv_cache_dtype: str,
+    ) -> bool:
+        """VLLM_GLM5_DECODE_IDX_GLUE "cache": may the latent cache write move
+        into the sparse backend's index-remap launch?
+
+        Only for a decode-only batch (the MQA path is then the sole reader of
+        the cache, after the remap), a bf16 cache (the write is a copy), no
+        HiSparse/PCP/DCP, a backend that consumes the hand-off, and never
+        while a breakable piecewise graph is being captured: there the write
+        would be recorded while the backend runs eagerly on replay.
+        """
+        if (
+            self.hisparse_cache is not None
+            or self.use_pcp
+            or kv_cache_dtype != "auto"
+            or kv_cache.numel() == 0
+            or attn_metadata is None
+            or getattr(attn_metadata, "num_prefills", 1) != 0
+            or not getattr(self.impl, "supports_idx_glue_kv_defer", False)
+            or getattr(self.impl, "dcp_world_size", 1) > 1
+        ):
+            return False
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None and capture._capturing:
+            from vllm.config import CUDAGraphMode
+
+            if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
+                return False
+        from vllm.ampere_decode import use_idx_glue
+
+        return use_idx_glue("cache")
+
+    def _idx_glue_flush_kv(self) -> None:
+        """Write a deferred latent cache update now (no-op when none)."""
+        pending = getattr(self.impl, "_idx_glue_pending_kv", None)
+        if pending is None:
+            return
+        self.impl._idx_glue_pending_kv = None  # type: ignore[attr-defined]
+        self.impl.do_kv_cache_update(*pending)  # type: ignore[attr-defined]
 
     def prepare_kv_cache_update(
         self, attn_metadata: "MLACommonMetadata | None"
@@ -1009,6 +1070,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         if num_mha_tokens > 0:
+            if envs.VLLM_GLM5_DECODE_IDX_GLUE:
+                # The MHA path reads the cache itself; never leave it stale.
+                self._idx_glue_flush_kv()
             if mha_use_quant_output:
                 mha_output = quant_output
                 mha_output_scale = output_scale
