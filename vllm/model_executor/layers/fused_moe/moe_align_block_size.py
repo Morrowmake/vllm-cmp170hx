@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from typing import Literal, overload
 
 import torch
@@ -8,6 +9,142 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
+
+
+@functools.cache
+def use_deterministic_moe_align() -> bool:
+    """Whether to take the deterministic alignment. Cached: a boot-time
+    choice (tests call cache_clear)."""
+    from vllm import envs
+
+    return envs.VLLM_GLM5_DETERMINISTIC_MOE_ALIGN
+
+
+# ---------------------------------------------------------------------------
+# Deterministic alignment -- VLLM_GLM5_DETERMINISTIC_MOE_ALIGN
+# ---------------------------------------------------------------------------
+#
+# csrc/libtorch_stable/moe/moe_align_sum_kernels.cu takes its single-kernel
+# "small batch expert" path only when topk_ids.numel() < 1024 AND
+# num_experts <= 64. GLM-5.3-Flash has 288 routed experts, so every call goes
+# down the two-kernel path, and its second kernel
+# (count_and_sort_expert_tokens_kernel) computes each token's slot with
+#
+#     rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
+#
+# i.e. the order of tokens inside an expert segment is whatever order the
+# threads happened to arrive in. The fused Marlin MoE's per-expert
+# accumulation follows that order, so two identical calls differ in the low
+# bits. This path ranks by ascending flat routed-row index instead.
+#
+# There is no other deterministic option in this tree: there is no
+# moe_align_block_size_triton and no upstream determinism flag. The fused
+# sm_80 routing kernel (vllm/ampere_decode/moe_routing.py, behind
+# VLLM_GLM5_DECODE_KERNELS) does contain a count-based scatter that should
+# already be deterministic, but it is a different, separately gated code path
+# and it only covers M <= 8.
+
+
+def deterministic_moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    scatter_idx: torch.Tensor | None,
+) -> None:
+    """Drop-in replacement for ``ops.moe_align_block_size`` with a defined
+    within-segment order.
+
+    Writes the same three (four with scatter_idx) out-params with the same
+    conventions as the CUDA op:
+
+    * ``sorted_token_ids`` is pre-filled with ``topk_ids.numel()`` (the
+      padding sentinel) and then, for each valid routed row i, holds i at
+      ``cumsum[expert(i)] + rank(i)`` where ``cumsum`` is the exclusive
+      prefix sum of ``ceil(count[e] / block_size) * block_size``.
+    * ``rank(i)`` here is i's position among that expert's rows ordered by
+      ascending i -- this is the whole change.
+    * ``expert_ids[b]`` is the (local) expert owning block b, -1 past the end.
+    * ``num_tokens_post_pad`` is ``cumsum[num_experts]``.
+    * ``scatter_idx[i]`` is i for valid routes and -1 otherwise.
+
+    Every step is order-independent: ``bincount`` sums +1 integer atomics
+    (commutative), ``cumsum`` is a fixed-order scan, and ``argsort(stable)``
+    is a radix sort with a defined tie order.
+
+    Shapes are static and nothing is read back to the host -- no ``.item()``,
+    no boolean-mask indexing, and no op that sizes an output from device data
+    (which rules out ``torch.bincount``) -- so the path stays CUDA-graph
+    capturable, which the decode path requires.
+    """
+    device = topk_ids.device
+    numel = topk_ids.numel()
+    flat = topk_ids.reshape(-1).to(torch.int64)
+
+    # get_local_expert_id(): out-of-range ids are invalid, then the map is
+    # applied and may itself return -1.
+    valid = (flat >= 0) & (flat < num_experts)
+    eid = torch.where(valid, flat, torch.zeros_like(flat))
+    if expert_map is not None:
+        eid = expert_map.to(torch.int64)[eid]
+        valid = valid & (eid >= 0)
+    # Invalid routes go to a sentinel bucket that sorts after every expert.
+    eid = torch.where(valid, eid, torch.full_like(eid, num_experts))
+
+    # A scatter_add_ histogram, not torch.bincount: bincount sizes its output
+    # from the device data, which is a host sync and is therefore rejected
+    # during CUDA graph capture. Integer +1 accumulation is order-independent
+    # either way.
+    counts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, eid, torch.ones_like(eid))
+    counts = counts[:num_experts]
+    padded = ((counts + block_size - 1) // block_size) * block_size
+
+    cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    cumsum[1:] = torch.cumsum(padded, 0)
+    unpadded_start = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    unpadded_start[1:] = torch.cumsum(counts, 0)
+
+    # Ascending expert, then ascending flat routed-row index within it.
+    order = torch.argsort(eid, stable=True)
+    sorted_eid = eid[order]
+    pos = torch.arange(numel, device=device, dtype=torch.int64)
+    dest = cumsum[sorted_eid] + (pos - unpadded_start[sorted_eid])
+    keep = sorted_eid < num_experts
+
+    # Invalid routes land in the padded tail (cumsum[num_experts] onwards) and
+    # write the padding sentinel there, so the scatter is a no-op for them and
+    # the destination index needs only a clamp, not a mask.
+    buf_len = sorted_token_ids.numel()
+    sorted_token_ids.fill_(numel)
+    sorted_token_ids.reshape(-1).scatter_(
+        0,
+        dest.clamp_(min=0, max=buf_len - 1),
+        torch.where(keep, order, torch.full_like(order, numel)).to(
+            sorted_token_ids.dtype
+        ),
+    )
+
+    # Block b belongs to the last expert whose padded segment starts at or
+    # before b; blocks past the end are -1 (the CUDA op's inactive id).
+    block_start = cumsum // block_size
+    blocks = torch.arange(expert_ids.numel(), device=device, dtype=torch.int64)
+    owner = torch.searchsorted(block_start, blocks, right=True) - 1
+    expert_ids.reshape(-1).copy_(
+        torch.where(blocks < block_start[num_experts], owner, -1).to(expert_ids.dtype)
+    )
+
+    num_tokens_post_pad.reshape(-1)[:1] = cumsum[num_experts : num_experts + 1].to(
+        num_tokens_post_pad.dtype
+    )
+
+    if scatter_idx is not None:
+        scatter_idx.reshape(-1).copy_(
+            torch.where(valid, pos, torch.full_like(pos, -1)).to(scatter_idx.dtype)
+        )
 
 
 @overload
@@ -168,16 +305,28 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-        scatter_idx,
-    )
+    if use_deterministic_moe_align():
+        deterministic_moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+            scatter_idx,
+        )
+    else:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+            scatter_idx,
+        )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]
