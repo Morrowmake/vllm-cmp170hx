@@ -131,6 +131,145 @@ def deep_select_topk(
 
 
 # ---------------------------------------------------------------------------
+# Canonical (tie-stable) top-k -- VLLM_GLM5_TOPK_CANONICAL
+# ---------------------------------------------------------------------------
+#
+# Every stock top-k here selects the correct top-k *scores*, but none of them
+# defines which of several equal scores wins a contested slot: persistent_topk
+# and topKPerRowJob both place threshold-bin entries with an atomicAdd, so the
+# selected index SET is a per-call lottery whenever the row contains exact
+# ties. The DSA indexer logits are a dot product against an fp8-e4m3 K cache,
+# which quantises many keys onto the same grid point, so ties are common and
+# a different set means a different KV page set and a different attention
+# output for an identical prompt.
+#
+# The canonical order is (score descending, column index ascending). It is
+# realised without a full sort by packing both fields into one strictly
+# ordered int64 key and running an ordinary top-k on that: with no two keys
+# equal, every top-k implementation returns the same answer.
+
+
+# Widest row the composite key can address. 32 score bits + this must stay
+# below 63 so the key is always a positive int64.
+_MAX_INDEX_BITS = 30
+
+# Row budget for the int64 key buffer. A 1152-row prefill chunk over a 32768
+# wide logits tensor would otherwise allocate a single 302 MB temporary on top
+# of the 151 MB of logits.
+_CANONICAL_KEY_BUDGET_BYTES = 64 << 20
+
+
+@functools.cache
+def use_canonical_topk() -> bool:
+    """Whether to take the canonical tie-break. Cached: the flag is read once
+    per process because it is a boot-time choice (tests call cache_clear)."""
+    import vllm.envs as envs
+
+    return envs.VLLM_GLM5_TOPK_CANONICAL
+
+
+def _monotonic_int_key(logits: torch.Tensor) -> torch.Tensor:
+    """Map fp32 to int64 preserving order: a > b iff key(a) > key(b).
+
+    The standard IEEE-754 trick. Non-negative floats keep their bit pattern
+    with the high bit set; negative floats are inverted, which reverses their
+    magnitude ordering. -0.0 is folded onto +0.0 first, because the two are
+    equal under `==` and must therefore be one tie group, not two. NaN sorts
+    above +inf, matching torch.topk's own behaviour (the dummy/capture passes
+    that feed NaN logits are documented in deep_select_topk above).
+    """
+    src = logits if logits.is_contiguous() else logits.contiguous()
+    bits = src.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    bits = torch.where(bits == 0x80000000, torch.zeros_like(bits), bits)
+    return torch.where(bits >= 0x80000000, bits ^ 0xFFFFFFFF, bits | 0x80000000)
+
+
+def canonical_topk(
+    logits: torch.Tensor,
+    k: int,
+    *,
+    row_ends: torch.Tensor,
+    row_starts: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    relative: bool = False,
+    identity_when_short: bool = False,
+) -> torch.Tensor:
+    """Top-k column indices per row, broken canonically on exact ties.
+
+    Args:
+        logits: (num_rows, num_cols) fp32.
+        k: number of columns to select per row.
+        row_ends: (num_rows,) int, exclusive right boundary of each row.
+        row_starts: (num_rows,) int, inclusive left boundary; default 0.
+        out: optional (num_rows, >= k) int32 destination.
+        relative: emit indices relative to ``row_starts`` -- the convention
+            ``top_k_per_row_prefill`` uses (csrc/libtorch_stable/sampler.cu,
+            ``topKPerRowJob``'s store loop subtracts ``rowStart``).
+        identity_when_short: reproduce the same kernel's shortcut, which for a
+            window no longer than k emits 0..len-1 in *identity* order rather
+            than score order, then -1 fill. The selected set is the whole
+            window either way, so this only preserves byte-compatibility with
+            the incumbent on rows that were never ambiguous.
+
+    Returns:
+        ``out`` (int32), with -1 past each row's length.
+
+    """
+    assert logits.dim() == 2, "canonical_topk expects 2-D logits"
+    assert logits.dtype == torch.float32, f"expected fp32 logits, got {logits.dtype}"
+    num_rows, num_cols = logits.shape
+    assert k <= num_cols, f"k={k} exceeds row width {num_cols}"
+    assert num_cols < (1 << _MAX_INDEX_BITS), (
+        f"row width {num_cols} exceeds the composite key's index field"
+    )
+
+    device = logits.device
+    if out is None:
+        out = torch.empty((num_rows, k), dtype=torch.int32, device=device)
+
+    shift = max(1, (num_cols - 1).bit_length())
+    cols = torch.arange(num_cols, device=device, dtype=torch.int64)
+    inv_cols = (num_cols - 1) - cols
+    slot = torch.arange(k, device=device, dtype=torch.int64)
+
+    ends = row_ends.reshape(-1).to(torch.int64)
+    starts = (
+        torch.zeros_like(ends)
+        if row_starts is None
+        else row_starts.reshape(-1).to(torch.int64)
+    )
+    lengths = (ends - starts).clamp_(min=0)
+
+    rows_per_chunk = max(1, _CANONICAL_KEY_BUDGET_BYTES // (num_cols * 8))
+    for r0 in range(0, num_rows, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, num_rows)
+        blk_starts = starts[r0:r1].unsqueeze(1)
+        blk_ends = ends[r0:r1].unsqueeze(1)
+        blk_lengths = lengths[r0:r1].unsqueeze(1)
+
+        key = (_monotonic_int_key(logits[r0:r1]) << shift) | inv_cols
+        # Keys are non-negative, so -1 is strictly below every in-window key
+        # and needs no -inf sentinel in the score domain.
+        in_window = (cols.unsqueeze(0) >= blk_starts) & (cols.unsqueeze(0) < blk_ends)
+        key = torch.where(in_window, key, torch.full_like(key, -1))
+
+        idx = key.topk(k, dim=-1).indices
+        if relative:
+            idx = idx - blk_starts
+
+        filled = slot.unsqueeze(0) < blk_lengths
+        sel = torch.where(filled, idx, torch.full_like(idx, -1))
+        if identity_when_short:
+            ident = torch.where(
+                filled, slot.unsqueeze(0).expand_as(idx), torch.full_like(idx, -1)
+            )
+            sel = torch.where(blk_lengths <= k, ident, sel)
+        out[r0:r1, :k].copy_(sel.to(torch.int32))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Backend selection
 # ---------------------------------------------------------------------------
 
@@ -286,6 +425,17 @@ class SparseIndexerTopk(torch.nn.Module):
     ) -> None:
         """Run the resolved decode top-k implementation, writing into
         topk_indices (int32, -1 fill for rows shorter than topk_tokens)."""
+        if use_canonical_topk():
+            # Selection is done canonically rather than by any of the
+            # kernels below, all of which place tied entries by atomic
+            # arrival order. Same scores, defined set.
+            canonical_topk(
+                logits,
+                topk_tokens,
+                row_ends=self._row_ends(seq_lens, next_n, logits.shape[0]),
+                out=topk_indices,
+            )
+            return
         backend = self.resolve_backend(logits, topk_tokens, logits.shape[0])
         if backend == "deep_select":
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
