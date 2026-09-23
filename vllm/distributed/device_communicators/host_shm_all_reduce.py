@@ -62,11 +62,16 @@ side checks those words periodically and raises.
 
 Enabling
 --------
-Off by default. `VLLM_GLM5_HOST_ALLREDUCE=1` turns it on, and it then only
-activates when peer-to-peer is genuinely unavailable -- on hardware with working
-P2P, vLLM's own `CustomAllreduce` is better and is left to win. With the flag
-off, not one byte of this module's state is constructed and the dispatch chain
-in `CudaCommunicator.all_reduce` is byte-identical to upstream.
+Off by default. `VLLM_GLM5_HOST_ALLREDUCE=1` turns it on. It then stands
+aside for vLLM's own `CustomAllreduce` only when the operator has asked for
+that, by also setting `VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1` -- the same env
+that lets `CustomAllreduce` accept PCIe peer-to-peer above two GPUs -- and peer
+access is really present. The two fast paths are therefore mutually exclusive
+by choice, not by what the driver happens to report: installing a P2P-capable
+driver on its own does not silently turn `VLLM_GLM5_HOST_ALLREDUCE=1` into
+NCCL. With the flag off, not one byte of this module's state is constructed and
+the dispatch chain in `CudaCommunicator.all_reduce` is byte-identical to
+upstream.
 """
 
 from __future__ import annotations
@@ -80,6 +85,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -663,11 +669,10 @@ def _round_up(x: int, m: int) -> int:
 def _p2p_unavailable(world_size: int) -> bool:
     """True when no pair of the visible devices can access each other.
 
-    This communicator is a fallback for hardware where CUDA IPC does not work.
-    Where P2P *does* work, `CustomAllreduce` stages through device memory and is
-    strictly better, so we stand aside. Checked with
-    `torch.cuda.can_device_access_peer`, which is what `_can_p2p` in
-    custom_all_reduce.py trusts under VLLM_SKIP_P2P_CHECK.
+    A probe, not a policy: `_stand_aside_for_custom_allreduce` decides what to
+    do with the answer. Checked with `torch.cuda.can_device_access_peer`, which
+    is what `_can_p2p` in custom_all_reduce.py trusts under
+    VLLM_SKIP_P2P_CHECK.
     """
     try:
         for i in range(world_size):
@@ -682,6 +687,27 @@ def _p2p_unavailable(world_size: int) -> bool:
     except Exception as exc:  # a probe failure is not a reason to take over
         logger.debug("host-shm all-reduce: P2P probe failed (%s)", exc)
         return False
+
+
+def _stand_aside_for_custom_allreduce(world_size: int) -> bool:
+    """True when the operator has handed the fast path to `CustomAllreduce`.
+
+    `VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE` is that hand-over: it is the same
+    env that lets `CustomAllreduce` count PCIe peer-to-peer as fully connected
+    above two GPUs, so setting it means "use the device-memory path". Without
+    it this communicator keeps serving even where peer access is advertised,
+    because on a PCIe-only node above two GPUs upstream's `CustomAllreduce`
+    disables itself anyway and standing aside would only hand the messages to
+    NCCL. With it set, we stand aside only if peer access is genuinely there --
+    if it is not, `CustomAllreduce` will refuse too and something has to serve.
+    """
+    # Imported lazily: vllm.platforms.cuda pulls in the CUDA platform, and
+    # this module is imported from it indirectly at init time.
+    from vllm.platforms.cuda import pcie_p2p_custom_allreduce_allowed
+
+    if not pcie_p2p_custom_allreduce_allowed():
+        return False
+    return not _p2p_unavailable(world_size)
 
 
 class HostShmAllreduce:
@@ -745,11 +771,12 @@ class HostShmAllreduce:
             )
             return
 
-        if not _p2p_unavailable(self.world_size):
+        if _stand_aside_for_custom_allreduce(self.world_size):
             logger.info_once(
-                "Host-shm all-reduce stands aside: this platform has working "
-                "GPU peer-to-peer, so the device-memory custom all-reduce is "
-                "the better path."
+                "Host-shm all-reduce stands aside: "
+                "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1 and this platform has "
+                "working GPU peer-to-peer, so the device-memory custom "
+                "all-reduce owns the fast path."
             )
             return
 

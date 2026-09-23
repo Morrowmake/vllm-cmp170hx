@@ -347,12 +347,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             enabled_ar_backends.append("PYNCCL")
 
+        # HOSTSHM and CUSTOM are mutually exclusive by the operator's choice
+        # (see host_shm_all_reduce._stand_aside_for_custom_allreduce), so this
+        # one line says which of the two PCIe fast paths won.
+        pcie_p2p_note = ""
+        if envs.VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE:
+            pcie_p2p_note = (
+                " VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1: PCIe peer-to-peer counts"
+                " as fully connected for the custom all-reduce, and the"
+                " host-staged path stands aside wherever peer access is present."
+            )
         logger.info_once(
             "Using %s all-reduce backends (in dispatch order) for group "
-            "'%s' out of potential backends: %s.",
+            "'%s' out of potential backends: %s.%s",
             "[" + ", ".join(f"'{b}'" for b in enabled_ar_backends) + "]",
             self.unique_name or "<unnamed>",
             "[" + ", ".join(f"'{b}'" for b in all_potential_ar_backends) + "]",
+            pcie_p2p_note,
             scope="global",
         )
 

@@ -85,10 +85,20 @@ def _group_can_attempt_mnnvl(
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
+    # `gpu_p2p_access_check` is the only check that moves real bytes between
+    # the cards; `can_device_access_peer` is the driver's word for it, and
+    # VLLM_SKIP_P2P_CHECK trades one for the other. That trade is not on offer
+    # when PCIe P2P is what put us on this path at all: a driver that
+    # advertises peer access the root complex will not route turns a wrong
+    # answer into a hang, so the probe stays mandatory under
+    # VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE.
+    skip_check = (
+        envs.VLLM_SKIP_P2P_CHECK and not envs.VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE
+    )
     for i in range(world_size):
         if i == rank:
             continue
-        if envs.VLLM_SKIP_P2P_CHECK:
+        if skip_check:
             logger.debug("Skipping P2P check and trusting the driver's P2P report.")
             # can_device_access_peer takes visible device ordinals, while
             # rank and i are logical local IDs.
