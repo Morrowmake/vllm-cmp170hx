@@ -12,12 +12,15 @@ from vllm.utils.math_utils import round_up
 
 
 @functools.cache
-def use_deterministic_moe_align() -> bool:
-    """Whether to take the deterministic alignment. Cached: a boot-time
-    choice (tests call cache_clear)."""
+def deterministic_moe_align_mode() -> int:
+    """Boot-time choice: 0 = CUDA op, 1 = Triton, 2 = torch."""
     from vllm import envs
 
     return envs.VLLM_GLM5_DETERMINISTIC_MOE_ALIGN
+
+
+def use_deterministic_moe_align() -> bool:
+    return deterministic_moe_align_mode() != 0
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +40,7 @@ def use_deterministic_moe_align() -> bool:
 # accumulation follows that order, so two identical calls differ in the low
 # bits. This path ranks by ascending flat routed-row index instead.
 #
-# There is no other deterministic option in this tree: there is no
-# moe_align_block_size_triton and no upstream determinism flag. The fused
+# The chunked Triton implementation lives in moe_align_kernel.py. The fused
 # sm_80 routing kernel (vllm/ampere_decode/moe_routing.py, behind
 # VLLM_GLM5_DECODE_KERNELS) does contain a count-based scatter that should
 # already be deterministic, but it is a different, separately gated code path
@@ -305,8 +307,15 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    if use_deterministic_moe_align():
-        deterministic_moe_align_block_size(
+    mode = deterministic_moe_align_mode()
+    if mode != 0:
+        if mode == 1:
+            from .moe_align_kernel import kernel_moe_align_block_size
+
+            align_fn = kernel_moe_align_block_size
+        else:
+            align_fn = deterministic_moe_align_block_size
+        align_fn(
             topk_ids,
             num_experts,
             block_size,
