@@ -78,6 +78,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -890,13 +891,17 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextModel(nn.Module, EagleModelMixin):
-    # Auxiliary hidden states are collected on the last PP rank only: the mHC
-    # pipeline boundary carries the residual streams (see
-    # _make_empty_mhc_intermediate_tensors), not a hidden/residual pair, so
-    # there is no packed relay for the aux tensors. Leaving this False makes
-    # eagle3_utils.verify_supports_aux_hidden_states_over_pp() reject
-    # PP>1 + dflash/eagle3 with a clear message instead of failing later.
-    supports_aux_hidden_states_over_pp: ClassVar[bool] = False
+    # Auxiliary hidden states for EAGLE3/DFlash drafters cross pipeline stages
+    # as extra IntermediateTensors keys next to the mHC residual streams: each
+    # stage packs the states of its own aux layers
+    # (EagleModelMixin.pack_local_aux_hidden_states), middle stages forward
+    # the upstream ones unchanged (PPHandler.relay_aux_hidden_states), and the
+    # last stage prepends the received ones to its own
+    # (collect_remote_aux_hidden_states), so the drafter sees them in layer
+    # order exactly as with PP=1. Each captured state is already the
+    # contracted [num_tokens, hidden_size] tensor, which is the width the
+    # relay slots reserve (reserve_aux_intermediate_tensor_slots).
+    supports_aux_hidden_states_over_pp: ClassVar[bool] = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -930,7 +935,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
-        if get_pp_group().is_first_rank:
+        # The last stage also holds the table when an EAGLE/DFlash drafter
+        # runs there: those drafters ship no embedding of their own and alias
+        # the target's (maybe_share_target_embed), which a PPMissingLayer
+        # cannot provide.
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             # See use_replicated_embed(): VLLM_GLM5_REPLICATED_EMBED=1 trades
             # a full table per rank for no all-reduce on the lookup.
             self.embed_tokens = VocabParallelEmbedding(
@@ -1125,6 +1134,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
+        # Aux states captured on earlier pipeline stages (last stage only;
+        # empty without an aux-hidden-state drafter or with PP=1).
+        remote_aux_hidden_states = self.collect_remote_aux_hidden_states(
+            intermediate_tensors
+        )
         aux_hidden_states: list[torch.Tensor] = []
         # Prefill comm/compute overlap. Returns None -- and therefore changes
         # nothing -- unless VLLM_GLM5_PREFILL_OVERLAP=1 and this is a
@@ -1164,12 +1178,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             close_region(overlap_region)
 
         if not get_pp_group().is_last_rank:
-            if aux_hidden_states:
-                raise RuntimeError(
-                    "Glm5Next does not relay auxiliary hidden states across "
-                    "pipeline stages; run the aux-hidden-state drafters "
-                    "(dflash/eagle3) with pipeline_parallel_size=1."
-                )
+            # This stage's aux states travel with the boundary tensors; the
+            # receiver expects full-token rows, as for the streams below.
+            if self.is_sequence_parallel and aux_hidden_states:
+                aux_hidden_states = [
+                    sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
+                ]
+            aux_tensors = self.pack_local_aux_hidden_states(aux_hidden_states)
             if self.mhc:
                 # post/comb are the deferred hc_post inputs of this rank's
                 # last mHC layer (normally consumed by the next layer's
@@ -1191,23 +1206,27 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     hidden_states = sp_all_gather(hidden_states.flatten(1))[
                         :full_num_tokens
                     ].view(-1, n, h)
-                return IntermediateTensors({"hidden_states": hidden_states})
+                return IntermediateTensors(
+                    {"hidden_states": hidden_states, **aux_tensors}
+                )
             if self.is_sequence_parallel:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 residual = sp_all_gather(residual)[:full_num_tokens]
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {"hidden_states": hidden_states, "residual": residual, **aux_tensors}
             )
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        if self.is_sequence_parallel and aux_hidden_states:
+            aux_hidden_states = [
+                sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
+            ]
+        # Remote states come from earlier layers, so they go first.
+        aux_hidden_states = remote_aux_hidden_states + aux_hidden_states
         if aux_hidden_states:
-            if self.is_sequence_parallel:
-                aux_hidden_states = [
-                    sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
-                ]
             return hidden_states, aux_hidden_states
         return hidden_states
 
