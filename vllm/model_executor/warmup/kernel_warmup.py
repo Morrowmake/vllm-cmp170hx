@@ -212,6 +212,21 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
 
+    # The deterministic MoE block alignment (moe_align_kernel.py). Same reason:
+    # its per-(device, E) scratch is allocate-once and Triton compiles on first
+    # launch, neither of which may happen inside a capture. No-op unless
+    # VLLM_GLM5_DETERMINISTIC_MOE_ALIGN selects the kernel path.
+    from vllm.model_executor.layers.fused_moe.moe_align_kernel import (
+        warmup_from_worker as warmup_moe_align,
+    )
+
+    warmed_experts = warmup_moe_align(worker)
+    if warmed_experts:
+        logger.info(
+            "Warmed up the deterministic MoE alignment kernels for %d experts.",
+            warmed_experts,
+        )
+
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
