@@ -10,7 +10,11 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.model_executor.layers.indexer_topk import (
+    canonical_topk,
+    get_indexer_topk,
+    use_canonical_topk,
+)
 from vllm.models.glm5next.common.sparse_indexer import (
     RADIX_TOPK_WORKSPACE_SIZE,
     _build_decode_scatter_indices,
@@ -356,16 +360,32 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_dst,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                select_k,
-            )
+            if use_canonical_topk():
+                # The prefill selection decides what each prefill token
+                # attends to while the KV cache is being built, so a tie
+                # lottery here makes the cache itself irreproducible.
+                # relative/identity_when_short reproduce
+                # top_k_per_row_prefill's documented output convention.
+                canonical_topk(
+                    logits,
+                    select_k,
+                    row_starts=chunk.cu_seqlen_ks,
+                    row_ends=chunk.cu_seqlen_ke,
+                    out=topk_dst,
+                    relative=True,
+                    identity_when_short=True,
+                )
+            else:
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_dst,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    select_k,
+                )
             # Free the fp32 logits before the next chunk allocates its own.
             # The buffer is [chunk_rows, compressed_context] and the metadata
             # builder sizes chunk_rows right up to

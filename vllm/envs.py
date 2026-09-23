@@ -183,6 +183,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
+    VLLM_GLM5_TOPK_CANONICAL: bool = False
+    VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
@@ -1578,6 +1580,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dispatch_unquantized_gemm returns the upstream callable itself, so the
     # unflagged path is byte-identical rather than merely equivalent.
     #
+    # Break ties in the DSA indexer top-k canonically: score descending,
+    # column index ascending. The stock decode/prefill top-k kernels place
+    # tied and threshold-bin entries by atomic arrival order, so two
+    # identical calls on logits that contain exact ties -- which the
+    # fp8-quantised indexer K cache produces in quantity -- can return a
+    # different index SET, hence a different KV page set and a different
+    # attention output. Default OFF until the cost is measured; with it
+    # unset the dispatch below is byte-identical to upstream.
+    "VLLM_GLM5_TOPK_CANONICAL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TOPK_CANONICAL", "0"))
+    ),
+    # Rank tokens inside each expert segment of moe_align_block_size by
+    # ascending flat routed-row index instead of by atomic arrival order.
+    # num_experts is 288 for GLM-5.3-Flash, so the CUDA launcher always
+    # takes its two-kernel path, whose count_and_sort kernel ranks with a
+    # global atomicAdd; the fused Marlin MoE then accumulates each expert
+    # in whatever order that produced. Default OFF until the cost is
+    # measured.
+    "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DETERMINISTIC_MOE_ALIGN", "0"))
+    ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
