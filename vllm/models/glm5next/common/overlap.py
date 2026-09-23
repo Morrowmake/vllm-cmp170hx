@@ -79,6 +79,103 @@ all-reduce. Two second-order differences remain and are why the contract is
 Both are last-bit BF16 effects, of the same kind and size as vLLM's own custom
 all-reduce versus NCCL. No precision is reduced anywhere: dtypes, quantisation
 and the KV cache are untouched.
+
+Which backend carries the split collectives
+-------------------------------------------
+The interceptor does not go through ``CudaCommunicator.all_reduce``'s dispatch
+chain -- it needs a collective it can place on a named stream, and that chain
+takes the current stream and picks a backend per call. It therefore chooses a
+backend itself, once, at region build time:
+
+``VLLM_GLM5_PREFILL_OVERLAP_BACKEND`` = ``auto`` (default) | ``custom`` |
+``nccl`` | ``hostshm``.
+
+``auto`` means ``custom`` when the TP group has a live ``ca_comm`` and ``nccl``
+otherwise. Whatever is chosen, a slice the backend declines falls through to
+PyNccl for that slice, so the choice can never fail a forward -- it can only
+be slower.
+
+This used to be a blanket refusal: if the TP group had *any* other active
+all-reduce backend the overlap switched itself off for the whole process, on
+the grounds that going straight to PyNccl would silently bypass something
+faster. On this box that reasoning does not survive the numbers. With
+``VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1`` the group is ``['CUSTOM','PYNCCL']``
+and ``CustomAllreduce.max_size`` is 8 MiB, while an unsplit 1152-token chunk is
+1152 x 4096 x 2 = 9.4 MB -- over the cap, so ``should_custom_ar`` rejects it and
+the "faster backend" the overlap was standing aside for never carried that
+message at all. The 4.7 MB halves the overlap issues are *under* the cap, so
+routing them through ``ca_comm`` is an upgrade rather than a bypass. Measured
+cost of the old refusal: cold prefill 2222 -> 2083 tok/s (-6.3%) and TTFT@23K
++9.6% (``p2p_tp4_validation.md`` section 3).
+
+``VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA=0`` restores the old stand-down, so the
+three arms -- stand down, split via CUSTOM, split via PyNccl -- are an A/B and
+not a rewrite. Backends nobody has analysed on a side stream (``qr_comm``,
+``fi_ar_comm``, ``fi_pcie_ipc_ar_comm``, ``symm_mem_comm``, ``aiter_ar_comm``)
+still cause the old blanket stand-down; only ``ca_comm`` has been worked
+through.
+
+Why ``ca_comm`` is legal on the side stream
+-------------------------------------------
+* **Stream.** ``ops.all_reduce`` takes no stream argument; it reads
+  ``get_current_cuda_stream(device)``. Issuing it inside
+  ``torch.cuda.stream(comm_stream)`` therefore puts both the staging
+  ``cudaMemcpyAsync`` and the reduce kernel on the comm stream. There is no
+  hidden default-stream work.
+* **No ``capture()``.** ``CustomAllreduce.capture()`` exists only to collect
+  graph-buffer IPC handles during CUDA-graph capture. The overlap refuses to
+  open inside a capture (``maybe_open_region``), so the eager path is the only
+  one reached, and ``register_graph_buffers`` never sees these tensors.
+* **No IPC registration of the slices.** With ``registered=False`` the input is
+  copied into the pre-registered ``buffer_ptrs[rank]`` staging buffer first, so
+  an arbitrary weakly-contiguous input pointer is fine. Our slices are
+  contiguous (a leading-dim slice of a contiguous tensor), which satisfies
+  ``is_weak_contiguous``.
+* **Back-to-back slices on one stream are safe**, but the staging buffer and
+  the two-shot scratch are protected by *different* barriers, which is worth
+  separating:
+
+  - *Staging.* Call N+1's ``cudaMemcpyAsync`` into ``buffer_ptrs[rank]``
+    happens **before** its start barrier, so that barrier cannot be what
+    protects it. What protects it is call N's *end* barrier: in
+    ``cross_device_reduce_2stage`` every block finishes reading the peers'
+    staging buffers in stage 1 and only then publishes its end flag, so once
+    my own kernel N has retired -- which the stream guarantees before N+1's
+    memcpy is issued -- every peer has finished reading my staging buffer.
+    ``cross_device_reduce_1stage`` gives the same guarantee from its final
+    ``barrier_at_end``.
+  - *Two-shot scratch.* A peer may still be gathering from my scratch when my
+    kernel N retires; the two-shot kernel has no final barrier. But call N+1
+    writes scratch only **after** its start barrier, and a peer publishes its
+    N+1 start flag only once its own kernel N -- scratch reads included -- has
+    retired.
+
+  Both arguments need every rank to issue the same collectives in the same
+  order, which holds because every rank runs the same program and the backend
+  choice is a pure function of size and dtype.
+* **Two streams are NOT safe.** Precisely because that state is shared, a
+  ``ca_comm`` all-reduce on the main stream concurrent with one on the comm
+  stream would interleave the flag protocol. The interceptor owns every TP
+  all-reduce inside the region, but its own inline-fallback path (a message too
+  small to slice) does run on the main stream, so that path first drains the
+  comm stream (``PrefillOverlapRegion.drain``). The same drain removes a
+  pre-existing latent hazard on the PyNccl path, where two concurrent
+  collectives on one communicator can deadlock.
+* **The 8 MiB cap is the trap.** ``should_custom_ar`` is a strict ``<``, so at
+  2048 tokens with SPLITS=2 each half is *exactly* 8 MiB and is declined -- the
+  arm would quietly measure PyNccl. The executor counts what each slice
+  actually got and says so, once, rather than leaving that to a profiler.
+
+Exactness under ``custom``
+--------------------------
+``cross_device_reduce_2stage`` gives element ``i`` to rank ``i / (size/ngpus)``
+and that rank accumulates in the rotated order ``(rank + j) % ngpus``. The
+order is a fixed function of ``(size, world_size)``, so it is deterministic
+across calls and bitwise identical on every rank -- but it does change when a
+9.4 MB message becomes two 4.7 MB ones, because the ownership boundaries move.
+That is the same second-order BF16 effect as item 1 above, not a new class of
+difference, and it is judged the same way: against the same-server logprob
+floor. ``1stage`` has no such dependence (fixed order 0..N-1 at every size).
 """
 
 from __future__ import annotations
@@ -99,6 +196,9 @@ logger = init_logger(__name__)
 __all__ = [
     "SlicedMHCState",
     "OverlapSettings",
+    "SPLIT_BACKENDS",
+    "UNANALYSED_BACKENDS",
+    "select_split_backend",
     "read_settings",
     "split_bounds",
     "PrefillOverlapRegion",
@@ -115,6 +215,21 @@ __all__ = [
 # already multiples of 8, so this never bites at the production chunk size.
 TOKEN_ALIGN = 8
 
+# Backends the region knows how to drive on its own stream. "auto" resolves at
+# build time to "custom" when the TP group has a live ca_comm, else "nccl".
+SPLIT_BACKENDS = ("auto", "custom", "nccl", "hostshm")
+
+# Other all-reduce backends on the TP group. Nobody has worked out what these
+# do when driven from a side stream, so their presence still switches the whole
+# feature off, exactly as before. ``ca_comm`` is deliberately not in this list.
+UNANALYSED_BACKENDS = (
+    "qr_comm",
+    "fi_ar_comm",
+    "fi_pcie_ipc_ar_comm",
+    "symm_mem_comm",
+    "aiter_ar_comm",
+)
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -126,6 +241,18 @@ def _env_flag(env: dict[str, str], name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_choice(
+    env: dict[str, str], name: str, default: str, allowed: Sequence[str]
+) -> str:
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        raise ValueError(f"{name}={raw!r} must be one of {', '.join(allowed)}")
+    return value
 
 
 def _env_int(env: dict[str, str], name: str, default: int, minimum: int) -> int:
@@ -161,6 +288,13 @@ class OverlapSettings:
     min_tokens: int = 512
     # Emit a one-line summary of what the first overlapped chunk did.
     debug: bool = False
+    # Run the overlap even when the TP group has a live `ca_comm`, instead of
+    # standing the whole feature down. 0 restores the historic refusal, which
+    # is the control arm of the A/B.
+    under_ca: bool = True
+    # Which communicator carries the split collectives; see the module
+    # docstring. "auto" -> "custom" with a live ca_comm, else "nccl".
+    backend: str = "auto"
 
     @property
     def active(self) -> bool:
@@ -177,6 +311,10 @@ def read_settings(env: dict[str, str] | None = None) -> OverlapSettings:
         min_tokens=_env_int(env, "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS", 512, 1),
         cross_layer=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER", False),
         debug=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_DEBUG", False),
+        under_ca=_env_flag(env, "VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA", True),
+        backend=_env_choice(
+            env, "VLLM_GLM5_PREFILL_OVERLAP_BACKEND", "auto", SPLIT_BACKENDS
+        ),
     )
     if enabled and settings.splits == 1:
         logger.warning(
@@ -211,6 +349,46 @@ def split_bounds(
     return bounds
 
 
+def select_split_backend(
+    settings: OverlapSettings,
+    *,
+    ca_active: bool,
+    hostshm_active: bool = False,
+    unanalysed: str | None = None,
+) -> tuple[str | None, str]:
+    """Decide which communicator carries the region's split collectives.
+
+    Pure, so the policy can be tested without a TP group. Returns
+    ``(backend, reason)``; a ``None`` backend means stand the feature down and
+    ``reason`` says why, in words fit for the log line.
+    """
+    if unanalysed is not None:
+        return None, (
+            f"the TP group has an active '{unanalysed}' all-reduce backend, "
+            "which this path has not been analysed against"
+        )
+    if ca_active and not settings.under_ca:
+        return None, (
+            "the TP group has an active 'ca_comm' all-reduce backend and "
+            "VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA=0"
+        )
+    choice = settings.backend
+    if choice == "auto":
+        choice = "custom" if ca_active else "nccl"
+        return choice, f"auto -> {choice}"
+    if choice == "custom" and not ca_active:
+        return "nccl", (
+            "VLLM_GLM5_PREFILL_OVERLAP_BACKEND=custom but this TP group has no "
+            "active 'ca_comm'; the split collectives use PyNccl"
+        )
+    if choice == "hostshm" and not hostshm_active:
+        return "nccl", (
+            "VLLM_GLM5_PREFILL_OVERLAP_BACKEND=hostshm but this TP group has no "
+            "active host-shm all-reduce; the split collectives use PyNccl"
+        )
+    return choice, f"requested {choice}"
+
+
 # --------------------------------------------------------------------------- #
 # Stream / event plumbing (injectable so the ordering logic is CPU-testable)
 # --------------------------------------------------------------------------- #
@@ -243,13 +421,36 @@ class OverlapExecutor:
 
 
 class CudaOverlapExecutor(OverlapExecutor):
-    """Real implementation: one side stream plus the existing TP NCCL comm."""
+    """Real implementation: one side stream plus the TP group's communicators.
 
-    def __init__(self, comm_stream: Any, nccl: Any) -> None:
+    ``backend`` names the communicator the split collectives are *offered* to;
+    anything it declines (size cap, dtype, alignment) falls through to PyNccl
+    for that slice, which is always present -- the region refuses to build
+    without it. ``slice_backends`` records what each slice actually got, which
+    is the only way to tell a "ran on CUSTOM" leg from a "CUSTOM declined every
+    slice because they were 8 MiB" leg without a profiler. It is cumulative for
+    the life of the process -- ``close_region`` resets the per-forward counters
+    but deliberately not this one.
+    """
+
+    def __init__(
+        self,
+        comm_stream: Any,
+        nccl: Any,
+        *,
+        backend: str = "nccl",
+        ca: Any = None,
+        hostshm: Any = None,
+    ) -> None:
         self._comm_stream = comm_stream
         self._nccl = nccl
         self._events: list[Any] = []
         self._next_event = 0
+        self.backend = backend
+        self._ca = ca
+        self._hostshm = hostshm
+        self.slice_backends: dict[str, int] = {"custom": 0, "hostshm": 0, "nccl": 0}
+        self._declined_warned = False
 
     def reset_events(self) -> None:
         """Recycle the event pool. Only safe once every event has been joined."""
@@ -267,7 +468,51 @@ class CudaOverlapExecutor(OverlapExecutor):
         event.record(torch.cuda.current_stream())
         self._comm_stream.wait_event(event)
 
+    def choose(self, inp: torch.Tensor) -> str:
+        """Which backend will carry ``inp``. Pure; no CUDA calls."""
+        if self.backend == "custom":
+            ca = self._ca
+            if ca is not None and not getattr(ca, "disabled", False):
+                if ca.should_custom_ar(inp):
+                    return "custom"
+        elif self.backend == "hostshm":
+            hostshm = self._hostshm
+            if hostshm is not None and not getattr(hostshm, "disabled", False):
+                if hostshm.should_host_ar(inp):
+                    return "hostshm"
+        return "nccl"
+
+    def _note(self, inp: torch.Tensor, chosen: str) -> None:
+        self.slice_backends[chosen] = self.slice_backends.get(chosen, 0) + 1
+        if chosen == "nccl" and self.backend != "nccl" and not self._declined_warned:
+            self._declined_warned = True
+            logger.warning(
+                "GLM5 prefill overlap: the '%s' backend declined a %d-byte "
+                "slice, so this slice went to PyNccl. CustomAllreduce's cap is "
+                "a strict '< max_size' (8 MiB by default), so e.g. a 2048-token "
+                "chunk at SPLITS=2 is exactly at the cap and is refused. Raise "
+                "VLLM_GLM5_PREFILL_OVERLAP_SPLITS, or lower the chunk size, if "
+                "this arm was meant to measure '%s'.",
+                self.backend,
+                inp.numel() * inp.element_size(),
+                self.backend,
+            )
+
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+        chosen = self.choose(inp)
+        self._note(inp, chosen)
+        if chosen == "custom":
+            # ops.all_reduce reads the *current* stream, so the context manager
+            # is what puts the staging memcpy and the reduce kernel on the comm
+            # stream. registered=False -> the input is staged through the
+            # pre-registered IPC buffer, so no slice needs registering.
+            with torch.cuda.stream(self._comm_stream):
+                self._ca.all_reduce(inp, out=out, registered=False)
+            return
+        if chosen == "hostshm":
+            with torch.cuda.stream(self._comm_stream):
+                out.copy_(self._hostshm.host_all_reduce(inp))
+            return
         self._nccl.all_reduce(inp, out, stream=self._comm_stream)
 
     def signal(self) -> Any:
@@ -348,6 +593,10 @@ class PrefillOverlapRegion:
         self._fallback = fallback_all_reduce
         self._sink: list[PendingAllReduce] | None = None
         self._splits_now = 1
+        # The most recent signal the comm stream recorded. Joining it makes the
+        # main stream wait for every collective queued on the comm stream
+        # before it, because they are all on that one stream in issue order.
+        self._last_token: Any = None
         # Counters, for the debug line and for tests.
         self.submitted = 0
         self.async_submitted = 0
@@ -364,9 +613,26 @@ class PrefillOverlapRegion:
     # -- driver-facing API -------------------------------------------------- #
 
     def begin_layer(self) -> None:
+        self._last_token = None
         reset = getattr(self.executor, "reset_events", None)
         if reset is not None:
             reset()
+
+    def drain(self) -> None:
+        """Make the main stream wait for everything the comm stream holds.
+
+        Needed before any collective the main stream issues itself, because the
+        backends underneath are not safe to drive from two streams at once: the
+        custom all-reduce shares one staging buffer and one ``Signal`` block
+        between calls, and two concurrent PyNccl collectives on one
+        communicator can deadlock. In practice only the inline fallback below
+        reaches this, and only for a message too small to slice.
+        """
+        token = self._last_token
+        if token is None:
+            return
+        self._last_token = None
+        self.executor.join(token)
 
     @contextlib.contextmanager
     def capture(self, splits: int) -> Iterator[list[PendingAllReduce]]:
@@ -416,7 +682,10 @@ class PrefillOverlapRegion:
         splits = self._splits_now
         num_tokens = tensor.shape[0] if tensor.dim() >= 1 else 0
         if sink is None or num_tokens < splits:
-            # Not inside a capture (or nothing to slice): behave as before.
+            # Not inside a capture (or nothing to slice): reduce inline on the
+            # main stream, but only once the comm stream is clear -- see
+            # `drain`.
+            self.drain()
             out = self._fallback(tensor)
             if sink is not None:
                 sink.append(
@@ -440,6 +709,7 @@ class PrefillOverlapRegion:
             self.executor.all_reduce(tensor[lo:hi], out[lo:hi])
             tokens.append(self.executor.signal())
         self.executor.keepalive(tensor, out)
+        self._last_token = tokens[-1]
         self.async_submitted += 1
         self.slices += len(bounds)
         handle = PendingAllReduce(out=out, bounds=bounds, tokens=tokens, region=self)
@@ -527,30 +797,41 @@ def _build_region(settings: OverlapSettings) -> PrefillOverlapRegion | None:
             "PyNccl communicator; the feature stays off."
         )
         return None
-    # The interceptor goes straight to PyNccl, skipping CudaCommunicator's
-    # backend selection. On a no-P2P box that is exactly what the selector
-    # picks anyway ("Using ['PYNCCL'] all-reduce backends"), but if a faster
-    # backend is live we would silently downgrade it, so refuse instead.
-    for attribute in (
-        "ca_comm",
-        "qr_comm",
-        "fi_ar_comm",
-        "fi_pcie_ipc_ar_comm",
-        "symm_mem_comm",
-        "aiter_ar_comm",
-    ):
+    # The interceptor does not go through CudaCommunicator's dispatch chain --
+    # it needs a collective it can place on a named stream -- so it picks a
+    # backend itself. Backends nobody has analysed on a side stream still
+    # switch the whole feature off; `ca_comm` has been worked through (see the
+    # module docstring) and is driven directly.
+    def _live(attribute: str) -> Any:
         other = getattr(communicator, attribute, None)
         if other is not None and not getattr(other, "disabled", False):
-            logger.warning(
-                "GLM5 prefill overlap stays off: the TP group has an active "
-                "'%s' all-reduce backend, which this path would bypass.",
-                attribute,
-            )
-            return None
+            return other
+        return None
+
+    unanalysed = next((a for a in UNANALYSED_BACKENDS if _live(a) is not None), None)
+    ca = _live("ca_comm")
+    hostshm = _live("hostshm_comm")
+    backend, reason = select_split_backend(
+        settings,
+        ca_active=ca is not None,
+        hostshm_active=hostshm is not None,
+        unanalysed=unanalysed,
+    )
+    if backend is None:
+        logger.warning("GLM5 prefill overlap stays off: %s.", reason)
+        return None
+    logger.info(
+        "GLM5 prefill overlap: split collectives go through %s (%s); "
+        "anything that backend declines falls through to PyNccl.",
+        backend.upper(),
+        reason,
+    )
     # A dedicated, low-priority-agnostic side stream. The collectives are the
     # long pole, so it is created with default priority and simply kept busy.
     comm_stream = torch.cuda.Stream()
-    executor = CudaOverlapExecutor(comm_stream, nccl)
+    executor = CudaOverlapExecutor(
+        comm_stream, nccl, backend=backend, ca=ca, hostshm=hostshm
+    )
     return PrefillOverlapRegion(settings, executor, tp_group.all_reduce)
 
 
@@ -641,13 +922,20 @@ def close_region(region: PrefillOverlapRegion | None) -> None:
         return
     _ACTIVE = None
     if region.settings.debug:
+        counts = getattr(region.executor, "slice_backends", None)
         logger.info(
             "GLM5 prefill overlap: %d all-reduces intercepted, %d issued "
-            "asynchronously as %d slices%s",
+            "asynchronously as %d slices%s%s",
             region.submitted,
             region.async_submitted,
             region.slices,
             " (degraded)" if region.degraded else "",
+            ""
+            if counts is None
+            else (
+                "; slices by backend, cumulative: "
+                + ", ".join(f"{k}={v}" for k, v in counts.items())
+            ),
         )
     region.submitted = 0
     region.async_submitted = 0
