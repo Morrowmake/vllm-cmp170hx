@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import re
 from unittest.mock import patch
 
 import pytest
@@ -592,3 +593,85 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(VLLMValidationError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+# --------------------------------------------------------------------------- #
+# The operator launcher's variables
+# --------------------------------------------------------------------------- #
+
+# Where a production launcher script lives, if the caller wants it checked.
+SERVE_SCRIPT_ENV = "GLM5_SERVE_SH"
+
+_VLLM_NAME = re.compile(r"VLLM_[A-Z0-9_]+")
+
+
+def test_serve_script_uses_only_declared_variables():
+    """Every VLLM_* name the launcher mentions must be declared in envs.py.
+
+    validate_environ() logs "Unknown vLLM environment variable detected" for
+    every VLLM_* in the process environment that `environment_variables` has no
+    entry for, on each worker at start. Some of the GLM-5.x flags are parsed by
+    the feature that consumes them (overlap.py, prologue_fuse.py, and the C++
+    all-reduce kernel) instead of being read through `envs.X`, so declaring
+    them here is a separate step that is easy to forget; this is the check for
+    it.
+
+    Point GLM5_SERVE_SH at the launcher to run it. With the variable unset, or
+    naming a file that is not there, the test skips -- so it costs CI nothing
+    and still guards the deployment it is pointed at.
+    """
+    path = os.environ.get(SERVE_SCRIPT_ENV, "")
+    if not path or not os.path.isfile(path):
+        pytest.skip(f"set {SERVE_SCRIPT_ENV} to a launcher script to run this")
+
+    with open(path, encoding="utf-8") as f:
+        names = set(_VLLM_NAME.findall(f.read()))
+    assert names, f"{path} mentions no VLLM_* variable at all"
+
+    undeclared = sorted(n for n in names if n not in environment_variables)
+    assert not undeclared, (
+        f"{path} uses VLLM_* names that vllm/envs.py does not declare, so every"
+        f" worker logs 'Unknown vLLM environment variable detected' for them at"
+        f" start: {', '.join(undeclared)}"
+    )
+
+
+def test_custom_allreduce_algo_mirrors_the_kernel(monkeypatch: pytest.MonkeyPatch):
+    """csrc/custom_all_reduce.cuh compares the raw bytes; so does envs.py."""
+    getter = environment_variables["VLLM_CUSTOM_ALLREDUCE_ALGO"]
+
+    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raising=False)
+    assert getter() == ""
+
+    for raw in ("1stage", "oneshot", "2stage", "twoshot"):
+        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raw)
+        assert getter() == raw
+
+    # No case folding and no stripping, because the kernel does neither.
+    for raw in ("2STAGE", " 2stage", "3stage", ""):
+        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raw)
+        with pytest.raises(ValueError, match="Valid values"):
+            getter()
+
+
+def test_aux_hidden_tensor_mirrors_the_model(monkeypatch: pytest.MonkeyPatch):
+    getter = environment_variables["VLLM_GLM5_AUX_HIDDEN_TENSOR"]
+
+    monkeypatch.delenv("VLLM_GLM5_AUX_HIDDEN_TENSOR", raising=False)
+    assert getter() == "stream_mean"
+
+    monkeypatch.setenv("VLLM_GLM5_AUX_HIDDEN_TENSOR", "branch")
+    assert getter() == "branch"
+
+    monkeypatch.setenv("VLLM_GLM5_AUX_HIDDEN_TENSOR", "mean")
+    with pytest.raises(ValueError, match="is not one of"):
+        getter()
+
+
+def test_host_allreduce_build_dir_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Where the JIT extension is cached cannot affect a compiled graph."""
+    monkeypatch.setenv("VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR", "/tmp/somewhere")
+
+    assert "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR" not in envs.compile_factors()
