@@ -665,3 +665,360 @@ def test_maybe_open_region_can_suppress_cross_layer(monkeypatch):
     link(layer, FakeLayer())
     got = layer._forward_attn_ffn_overlapped(*make_inputs(1152), region)
     assert not isinstance(got[1], ov.SlicedMHCState)
+
+
+# --------------------------------------------------------------------------- #
+# Backend selection: which communicator carries the split collectives
+#
+# The overlap used to refuse to run at all whenever the TP group had another
+# active all-reduce backend, which on a PCIe-P2P box means CustomAllreduce and
+# cost 6.3% of cold prefill (p2p_tp4_validation.md). These cover the policy
+# that replaced the blanket refusal: a per-backend decision at build time and
+# a per-slice fallthrough to PyNccl.
+# --------------------------------------------------------------------------- #
+
+
+class FakeCA:
+    """Stand-in for CustomAllreduce: the size cap is the interesting part."""
+
+    def __init__(self, max_size: int = 8192 * 1024, disabled: bool = False) -> None:
+        self.max_size = max_size
+        self.disabled = disabled
+        self.calls: list[int] = []
+
+    def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        nbytes = inp.numel() * inp.element_size()
+        # Mirrors the real gate, including its strict '<'.
+        return nbytes % 16 == 0 and nbytes < self.max_size
+
+
+class FakeHostShm:
+    def __init__(self, host_cap: int = 512 * 1024, disabled: bool = False) -> None:
+        self.host_cap = host_cap
+        self.disabled = disabled
+
+    def should_host_ar(self, inp: torch.Tensor) -> bool:
+        nbytes = inp.numel() * inp.element_size()
+        return 0 < nbytes <= self.host_cap and nbytes % 16 == 0
+
+
+class FakeNccl:
+    disabled = False
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def all_reduce(self, inp, out, stream=None):
+        self.calls.append(int(inp.shape[0]))
+
+
+class FakeCommunicator:
+    def __init__(self, **backends) -> None:
+        self.pynccl_comm = FakeNccl()
+        self.ca_comm = None
+        self.hostshm_comm = None
+        self.qr_comm = None
+        self.fi_ar_comm = None
+        self.fi_pcie_ipc_ar_comm = None
+        self.symm_mem_comm = None
+        self.aiter_ar_comm = None
+        for name, value in backends.items():
+            setattr(self, name, value)
+
+
+class FakeTpGroup:
+    def __init__(self, communicator) -> None:
+        self.device_communicator = communicator
+
+    def all_reduce(self, tensor):
+        return tensor * WORLD
+
+
+def hidden_slice(tokens: int, hidden: int = 4096) -> torch.Tensor:
+    """A bf16 tensor the size of one production micro-batch."""
+    return torch.empty(tokens, hidden, dtype=torch.bfloat16)
+
+
+# -- environment ------------------------------------------------------------ #
+
+
+def test_settings_under_ca_defaults_on_and_backend_defaults_auto():
+    settings = ov.read_settings({})
+    assert settings.under_ca is True
+    assert settings.backend == "auto"
+
+
+@pytest.mark.parametrize("raw,expected", [("0", False), ("no", False), ("1", True)])
+def test_settings_under_ca_parses(raw, expected):
+    settings = ov.read_settings({"VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA": raw})
+    assert settings.under_ca is expected
+
+
+@pytest.mark.parametrize("raw", ["auto", "custom", "NCCL", " hostshm "])
+def test_settings_backend_accepts_every_known_value(raw):
+    settings = ov.read_settings({"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": raw})
+    assert settings.backend == raw.strip().lower()
+    assert settings.backend in ov.SPLIT_BACKENDS
+
+
+def test_settings_backend_rejects_an_unknown_value():
+    with pytest.raises(ValueError, match="must be one of"):
+        ov.read_settings({"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "quickreduce"})
+
+
+# -- the policy ------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "backend,ca_active,hostshm_active,expected",
+    [
+        # auto resolves on what is actually live
+        ("auto", True, False, "custom"),
+        ("auto", False, False, "nccl"),
+        ("auto", True, True, "custom"),
+        ("auto", False, True, "nccl"),
+        # explicit wins, including "keep using PyNccl while ca_comm is live"
+        ("nccl", True, False, "nccl"),
+        ("custom", True, False, "custom"),
+        ("hostshm", False, True, "hostshm"),
+        # asking for something that is not there degrades to PyNccl, never off
+        ("custom", False, False, "nccl"),
+        ("hostshm", False, False, "nccl"),
+    ],
+)
+def test_select_split_backend(backend, ca_active, hostshm_active, expected):
+    settings = ov.OverlapSettings(enabled=True, backend=backend)
+    chosen, reason = ov.select_split_backend(
+        settings, ca_active=ca_active, hostshm_active=hostshm_active
+    )
+    assert chosen == expected
+    assert reason
+
+
+def test_select_split_backend_stands_down_only_when_the_knob_says_so():
+    off = ov.OverlapSettings(enabled=True, under_ca=False)
+    chosen, reason = ov.select_split_backend(off, ca_active=True)
+    assert chosen is None
+    assert "UNDER_CA=0" in reason and "ca_comm" in reason
+
+    # The same knob is irrelevant when no ca_comm is live: the feature runs.
+    chosen, _ = ov.select_split_backend(off, ca_active=False)
+    assert chosen == "nccl"
+
+    # And with the knob at its default the stand-down does not trigger at all.
+    on = ov.OverlapSettings(enabled=True)
+    chosen, _ = ov.select_split_backend(on, ca_active=True)
+    assert chosen == "custom"
+
+
+@pytest.mark.parametrize("attribute", ov.UNANALYSED_BACKENDS)
+def test_select_split_backend_still_refuses_an_unanalysed_backend(attribute):
+    settings = ov.OverlapSettings(enabled=True)
+    chosen, reason = ov.select_split_backend(
+        settings, ca_active=True, unanalysed=attribute
+    )
+    assert chosen is None
+    assert attribute in reason
+
+
+def test_ca_comm_is_not_in_the_unanalysed_list():
+    # The whole point of the change: ca_comm is driven, not refused.
+    assert "ca_comm" not in ov.UNANALYSED_BACKENDS
+
+
+# -- per-slice dispatch ----------------------------------------------------- #
+
+
+def make_executor(backend: str, *, ca=None, hostshm=None):
+    return ov.CudaOverlapExecutor(
+        comm_stream=None, nccl=FakeNccl(), backend=backend, ca=ca, hostshm=hostshm
+    )
+
+
+def test_nccl_backend_never_consults_the_other_communicators():
+    executor = make_executor("nccl", ca=FakeCA(), hostshm=FakeHostShm())
+    assert executor.choose(hidden_slice(576)) == "nccl"
+
+
+def test_custom_backend_takes_the_production_half_chunk():
+    # 1152-token chunk, SPLITS=2 -> 576 x 4096 x 2 = 4,718,592 B, under the cap.
+    executor = make_executor("custom", ca=FakeCA())
+    assert executor.choose(hidden_slice(576)) == "custom"
+
+
+def test_custom_backend_declines_at_the_cap_and_falls_through_to_pynccl():
+    # 2048-token chunk, SPLITS=2 -> 1024 x 4096 x 2 = exactly 8 MiB, and the
+    # real gate is a strict '<'. This is the trap a phase-2 arm would fall into.
+    executor = make_executor("custom", ca=FakeCA())
+    assert hidden_slice(1024).numel() * 2 == 8192 * 1024
+    assert executor.choose(hidden_slice(1024)) == "nccl"
+    # SPLITS=4 on the same chunk fits.
+    assert executor.choose(hidden_slice(512)) == "custom"
+
+
+def test_custom_backend_falls_through_when_the_communicator_is_absent_or_off():
+    assert make_executor("custom").choose(hidden_slice(576)) == "nccl"
+    off = make_executor("custom", ca=FakeCA(disabled=True))
+    assert off.choose(hidden_slice(576)) == "nccl"
+
+
+def test_hostshm_backend_respects_its_own_cap():
+    executor = make_executor("hostshm", hostshm=FakeHostShm(host_cap=512 * 1024))
+    assert executor.choose(hidden_slice(32)) == "hostshm"      # 256 KiB
+    assert executor.choose(hidden_slice(576)) == "nccl"        # 4.7 MB, over cap
+    raised = make_executor("hostshm", hostshm=FakeHostShm(host_cap=8 << 20))
+    assert raised.choose(hidden_slice(576)) == "hostshm"
+
+
+def test_slice_backends_counts_what_each_slice_actually_got():
+    executor = make_executor("custom", ca=FakeCA())
+    for tokens in (576, 576, 1024):
+        executor._note(hidden_slice(tokens), executor.choose(hidden_slice(tokens)))
+    assert executor.slice_backends == {"custom": 2, "hostshm": 0, "nccl": 1}
+
+
+def test_the_real_custom_allreduce_gate_agrees_with_the_fake():
+    """The cap arithmetic above is only useful if it matches the real rule."""
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
+    class Stub:
+        disabled = False
+        world_size = WORLD
+        fully_connected = True
+        max_size = 8192 * 1024
+
+    for tokens, expected in ((576, True), (512, True), (1024, False), (2048, False)):
+        real = CustomAllreduce.should_custom_ar(Stub(), hidden_slice(tokens))
+        assert real is expected
+        assert FakeCA().should_custom_ar(hidden_slice(tokens)) is expected
+
+
+# -- region build ----------------------------------------------------------- #
+
+
+def build_region(monkeypatch, communicator, env=None):
+    """Drive the real ``_build_region`` with a fake TP group, on CPU."""
+    monkeypatch.setattr(ov.torch.cuda, "Stream", lambda *a, **k: object())
+    import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(ps, "get_tp_group", lambda: FakeTpGroup(communicator))
+    return ov._build_region(ov.read_settings(env or {}))
+
+
+def test_build_region_drives_ca_comm_instead_of_standing_down(monkeypatch):
+    region = build_region(monkeypatch, FakeCommunicator(ca_comm=FakeCA()))
+    assert region is not None
+    assert region.executor.backend == "custom"
+
+
+def test_build_region_honours_the_stand_down_knob(monkeypatch):
+    region = build_region(
+        monkeypatch,
+        FakeCommunicator(ca_comm=FakeCA()),
+        {"VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA": "0"},
+    )
+    assert region is None
+
+
+def test_build_region_backend_override_reaches_the_executor(monkeypatch):
+    region = build_region(
+        monkeypatch,
+        FakeCommunicator(ca_comm=FakeCA(), hostshm_comm=FakeHostShm()),
+        {"VLLM_GLM5_PREFILL_OVERLAP_BACKEND": "nccl"},
+    )
+    assert region is not None and region.executor.backend == "nccl"
+
+
+def test_build_region_ignores_a_disabled_ca_comm(monkeypatch):
+    region = build_region(monkeypatch, FakeCommunicator(ca_comm=FakeCA(disabled=True)))
+    assert region is not None and region.executor.backend == "nccl"
+
+
+def test_build_region_still_refuses_an_unanalysed_backend(monkeypatch):
+    region = build_region(monkeypatch, FakeCommunicator(qr_comm=FakeNccl()))
+    assert region is None
+
+
+def test_build_region_needs_a_pynccl_communicator(monkeypatch):
+    communicator = FakeCommunicator(ca_comm=FakeCA())
+    communicator.pynccl_comm = None
+    assert build_region(monkeypatch, communicator) is None
+
+
+# --------------------------------------------------------------------------- #
+# Two streams must never drive one backend at once
+# --------------------------------------------------------------------------- #
+
+
+def test_an_inline_fallback_drains_the_comm_stream_first():
+    """The custom all-reduce shares one staging buffer and one Signal block
+    between calls, so a main-stream collective issued while comm-stream ones
+    are in flight would interleave the flag protocol. The inline fallback is
+    the only main-stream collective inside a region; it must join first."""
+    region, executor = make_region(splits=2)
+    with region.capture(2):
+        region.submit(torch.ones(64, HIDDEN, dtype=torch.float64))
+        assert region._last_token is not None
+        executor.log.clear()
+        # One row: below `splits`, so this one is reduced inline.
+        region.submit(torch.ones(1, HIDDEN, dtype=torch.float64))
+    assert executor.log == [("join", 2)]
+    assert region._last_token is None
+
+
+def test_drain_is_a_no_op_with_nothing_in_flight():
+    region, executor = make_region(splits=2)
+    executor.log.clear()
+    region.drain()
+    region.drain()
+    assert executor.log == []
+
+
+def test_begin_layer_forgets_the_previous_layers_token():
+    region, executor = make_region(splits=2)
+    with region.capture(2):
+        region.submit(torch.ones(64, HIDDEN, dtype=torch.float64))
+    assert region._last_token is not None
+    region.begin_layer()
+    assert region._last_token is None
+    executor.log.clear()
+    region.drain()
+    assert executor.log == []
+
+
+def test_the_join_semantics_of_a_sliced_handle_are_unchanged():
+    """Regression guard: the backend knob must not change who waits for what."""
+    region, executor = make_region(splits=2)
+    with region.capture(2) as handles:
+        out = region.submit(torch.ones(64, HIDDEN, dtype=torch.float64))
+    handle = handles[0]
+    assert handle.synchronous is False and len(handle.tokens) == 2
+    assert torch.isnan(out).all()
+    handle.join(0)
+    assert not torch.isnan(out[:32]).any() and torch.isnan(out[32:]).all()
+    handle.join_all()
+    assert torch.allclose(out, torch.full_like(out, float(WORLD)))
+
+
+def test_custom_allreduce_max_size_knob_defaults_to_upstreams_value():
+    """The knob exists to raise the cap for an experiment, not to change it."""
+    import inspect
+
+    import vllm.envs as envs
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
+    upstream = inspect.signature(CustomAllreduce.__init__).parameters["max_size"]
+    assert envs.VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE == upstream.default == 8192 * 1024
+
+
+def test_the_cap_knob_is_what_lets_the_custom_arm_run_at_splits_two():
+    # A 2048-token chunk at SPLITS=2 sits exactly on the 8 MiB cap and is
+    # refused; raising the cap is the only way that arm reaches CUSTOM without
+    # also changing SPLITS.
+    assert make_executor("custom", ca=FakeCA()).choose(hidden_slice(1024)) == "nccl"
+    raised = make_executor("custom", ca=FakeCA(max_size=16 * 1024 * 1024))
+    assert raised.choose(hidden_slice(1024)) == "custom"

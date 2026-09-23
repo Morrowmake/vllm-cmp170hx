@@ -146,9 +146,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            # max_size is upstream's 8 MiB unless the operator raises it; see
+            # VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE in envs.py for why an 8 MiB
+            # cap refuses every prefill-sized message on this box.
+            ca_max_size = envs.VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE
+            if ca_max_size != 8192 * 1024:
+                logger.info_once(
+                    "CustomAllreduce max_size is %d bytes "
+                    "(VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE), not the 8 MiB "
+                    "default; this costs shared buffer out of the KV budget.",
+                    ca_max_size,
+                    scope="global",
+                )
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
+                max_size=ca_max_size,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),

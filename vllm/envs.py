@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE: bool = False
+    VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE: int = 8192 * 1024
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
@@ -189,6 +190,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS: int = 512
     VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_DEBUG: bool = False
+    VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA: bool = True
+    VLLM_GLM5_PREFILL_OVERLAP_BACKEND: str = "auto"
     VLLM_GLM5_PREFILL_OBSERVE: bool = False
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
@@ -1230,6 +1233,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vllm/distributed/device_communicators/host_shm_all_reduce.py.
     # Off by default; a driver that advertises peer access it cannot route
     # turns a wrong answer here into a hang, so opt in only after measuring.
+    # Largest message CustomAllreduce will serve, in bytes. Upstream hardcodes
+    # 8 MiB at the constructor's default and `should_custom_ar` is a strict
+    # '<', so on this box a 1152-token bf16 prefill chunk (1152 x 4096 x 2 =
+    # 9.4 MB) is refused, and a 2048-token chunk split in two is *exactly* at
+    # the cap and refused as well. Raising it is what lets the prefill overlap
+    # actually reach the custom path at SPLITS=2; it costs `max_size - 8 MiB`
+    # of extra uncached shared buffer per rank, out of the KV budget, and it
+    # must not be raised past what `car_integrity.py` has verified bitwise
+    # (32 MiB as of 2026-09-23). Default is upstream's value, so unset changes
+    # nothing.
+    "VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE": lambda: int(
+        os.getenv("VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE", str(8192 * 1024))
+    ),
     "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE", "0"))
     ),
@@ -1606,7 +1622,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
     ),
-    # GLM-5.x TP prefill comm/compute overlap. These five are consumed by
+    # GLM-5.x TP prefill comm/compute overlap. These seven are consumed by
     # vllm/models/glm5next/common/overlap.py, which reads os.environ directly;
     # they are declared here so validate_environ() recognises them (an
     # undeclared VLLM_* name logs "Unknown vLLM environment variable detected"
@@ -1637,6 +1653,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_PREFILL_OVERLAP_DEBUG": lambda: _glm5_overlap_flag(
         "VLLM_GLM5_PREFILL_OVERLAP_DEBUG", False
+    ),
+    # Run the overlap even when the TP group has a live CustomAllreduce
+    # (VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1), instead of standing the feature
+    # down for the whole process. 0 restores the historic refusal, which is the
+    # control arm of the A/B. Only meaningful when a ca_comm is live at all.
+    "VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA": lambda: _glm5_overlap_flag(
+        "VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA", True
+    ),
+    # Which communicator carries the overlap's split collectives on its side
+    # stream: auto (custom where a ca_comm is live, else nccl) | custom | nccl
+    # | hostshm. A slice the chosen backend declines falls through to PyNccl,
+    # so no setting here can fail a forward. It is not numerically neutral,
+    # though: each backend has its own summation order, so a change here moves
+    # the last BF16 bit and has to be judged against the same-server logprob
+    # floor like any other all-reduce change.
+    "VLLM_GLM5_PREFILL_OVERLAP_BACKEND": lambda: _glm5_overlap_choice(
+        "VLLM_GLM5_PREFILL_OVERLAP_BACKEND",
+        "auto",
+        ("auto", "custom", "nccl", "hostshm"),
     ),
     # One-shot observer that logs the prefill chunk sizes actually seen, for
     # checking the chunks clear _MIN_TOKENS. Diagnostic only.
@@ -2481,6 +2516,19 @@ def _glm5_overlap_flag(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _glm5_overlap_choice(
+    name: str, default: str, allowed: "tuple[str, ...]"
+) -> str:
+    """Mirror of ``overlap.py``'s ``_env_choice``."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        raise ValueError(f"{name}={raw!r} must be one of {', '.join(allowed)}")
+    return value
 
 
 def _glm5_overlap_int(name: str, default: int) -> int:
