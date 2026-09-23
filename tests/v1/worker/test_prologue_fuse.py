@@ -59,6 +59,47 @@ def test_settings_rejects_garbage():
         prologue_fuse.read_settings({"VLLM_GLM5_PROLOGUE_FUSE": "maybe"})
 
 
+@pytest.mark.parametrize(
+    "name,default",
+    [
+        ("VLLM_GLM5_PROLOGUE_FUSE", False),
+        ("VLLM_GLM5_PROLOGUE_FUSE_GDN", True),
+        ("VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT", True),
+        ("VLLM_GLM5_PROLOGUE_FUSE_DEBUG", False),
+    ],
+)
+@pytest.mark.parametrize("raw", [None, "", "1", "0", "true", "off", " On ", "YES"])
+def test_envs_declaration_agrees_with_the_parser(monkeypatch, name, default, raw):
+    """envs.py declares these four and mirrors this parser by hand.
+
+    They are declared so validate_environ() does not call them unknown -- the
+    launcher exports VLLM_GLM5_PROLOGUE_FUSE -- and the declaration is worth
+    nothing if ``envs.X`` and the value the fusion actually uses can drift
+    apart. The accept-set here is not overlap.py's: empty reads as false rather
+    than as unset, and anything unrecognised raises.
+    """
+    import vllm.envs as envs
+
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+        env: dict[str, str] = {}
+    else:
+        monkeypatch.setenv(name, raw)
+        env = {name: raw}
+
+    assert envs.environment_variables[name]() is prologue_fuse._env_flag(
+        env, name, default
+    )
+
+
+def test_envs_declaration_rejects_garbage(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.setenv("VLLM_GLM5_PROLOGUE_FUSE", "maybe")
+    with pytest.raises(ValueError):
+        envs.environment_variables["VLLM_GLM5_PROLOGUE_FUSE"]()
+
+
 # --------------------------------------------------------------------------- #
 # 1. mamba_get_block_table_tensor, "align" mode
 # --------------------------------------------------------------------------- #

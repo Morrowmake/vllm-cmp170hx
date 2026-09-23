@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE: bool = False
+    VLLM_CUSTOM_ALLREDUCE_ALGO: str = ""
     VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE: int = 8192 * 1024
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
@@ -198,9 +199,15 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_OVERLAP_UNDER_CA: bool = True
     VLLM_GLM5_PREFILL_OVERLAP_BACKEND: str = "nccl"
     VLLM_GLM5_PREFILL_OBSERVE: bool = False
+    VLLM_GLM5_PROLOGUE_FUSE: bool = False
+    VLLM_GLM5_PROLOGUE_FUSE_GDN: bool = True
+    VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT: bool = True
+    VLLM_GLM5_PROLOGUE_FUSE_DEBUG: bool = False
+    VLLM_GLM5_AUX_HIDDEN_TENSOR: Literal["stream_mean", "branch"] = "stream_mean"
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
+    VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1263,6 +1270,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE", "0"))
     ),
+    # Which CustomAllreduce kernel runs: unset (the default) leaves the
+    # in-kernel size heuristic alone, "1stage"/"oneshot" and
+    # "2stage"/"twoshot" force one. Nothing in Python consumes it -- it is
+    # read with std::getenv inside csrc/custom_all_reduce.cuh -- and
+    # upstream declares it nowhere, so an operator who sets it (serve.sh
+    # does, to 2stage) gets one 'Unknown vLLM environment variable
+    # detected' per worker at start. It is declared here for that reason
+    # alone. The accessor mirrors the C++ parse exactly: an exact byte
+    # compare against the four spellings, no case folding and no
+    # whitespace stripping, raising on anything else the way the kernel
+    # throws at its first all-reduce.
+    "VLLM_CUSTOM_ALLREDUCE_ALGO": lambda: _custom_allreduce_algo(),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
@@ -1655,6 +1674,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": lambda: int(
         os.getenv("VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE", str(512 * 1024))
     ),
+    # Where the host-staged all-reduce builds and caches its JIT extension.
+    # Read directly by host_shm_all_reduce.py:_build_dir(), which falls back
+    # to TORCH_EXTENSIONS_DIR and then ~/.cache/vllm/host_shm_all_reduce;
+    # None here means exactly that fallback chain, so unset changes nothing.
+    # Location only: it is in ignored_factors below for the same reason
+    # VLLM_CACHE_ROOT is.
+    "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR": lambda: os.getenv(
+        "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR", None
+    ),
     # Never dispatch above this M (= num_seqs * (1 + num_spec)). 32 is measured,
     # and it is a cudagraph capture size, so the bound lands exactly on one.
     # Count-weighted over the whole shape table: M=32 is 1.157x with 0 of 16
@@ -1726,6 +1754,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_PREFILL_OBSERVE": lambda: _glm5_overlap_flag(
         "VLLM_GLM5_PREFILL_OBSERVE", False
     ),
+    # GLM-5.x fused decode prologue. These four are consumed by
+    # vllm/v1/worker/gpu/prologue_fuse.py, which parses os.environ itself
+    # for the same reason overlap.py does: it has to import and be testable
+    # on a CPU-only box. They are declared here so validate_environ()
+    # recognises them -- serve.sh exports VLLM_GLM5_PROLOGUE_FUSE=1, which
+    # otherwise logs 'Unknown vLLM environment variable detected' on every
+    # worker at start -- and so `envs.X` reports what the feature will
+    # actually do. prologue_fuse.py is unchanged. _glm5_prologue_flag is a
+    # mirror of its _env_flag, whose accept-set is not overlap.py's: an
+    # unrecognised value raises instead of reading as false, and an empty
+    # string reads as false rather than as unset.
+    #
+    # One fused Triton kernel per site in place of the ~116 eager kernels a
+    # c1 DFlash decode step spends preparing indices. Default OFF; serve.sh
+    # turns it on.
+    "VLLM_GLM5_PROLOGUE_FUSE": lambda: _glm5_prologue_flag(
+        "VLLM_GLM5_PROLOGUE_FUSE", False
+    ),
+    # Per-site kill switches, for bisecting a regression down to one
+    # fusion. Both default ON and mean nothing unless the flag above is set.
+    "VLLM_GLM5_PROLOGUE_FUSE_GDN": lambda: _glm5_prologue_flag(
+        "VLLM_GLM5_PROLOGUE_FUSE_GDN", True
+    ),
+    "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT": lambda: _glm5_prologue_flag(
+        "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT", True
+    ),
+    # Diagnostic bit carried on the parsed settings object.
+    "VLLM_GLM5_PROLOGUE_FUSE_DEBUG": lambda: _glm5_prologue_flag(
+        "VLLM_GLM5_PROLOGUE_FUSE_DEBUG", False
+    ),
+    # Which per-layer tensor an EAGLE3/DFlash drafter is handed as an
+    # auxiliary layer's hidden state: 'stream_mean' (default, the
+    # contracted mHC residual streams, i.e. the model's own definition) or
+    # 'branch' (the raw FFN branch output, for a drafter trained on it).
+    # Read directly by glm5next/common/model.py:aux_hidden_state_mode();
+    # the accessor here mirrors it, empty string rejected included.
+    "VLLM_GLM5_AUX_HIDDEN_TENSOR": lambda: _glm5_aux_hidden_tensor(),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
@@ -2586,6 +2651,58 @@ def _glm5_overlap_int(name: str, default: int) -> int:
     return int(raw.strip())
 
 
+def _glm5_prologue_flag(name: str, default: bool) -> bool:
+    """Mirror of ``prologue_fuse.py``'s ``_env_flag``.
+
+    ``vllm/v1/worker/gpu/prologue_fuse.py`` reads these four variables straight
+    from a dict of ``os.environ`` and is deliberately left alone, so the
+    accessors here must agree with it exactly. Note that it is *not*
+    ``_glm5_overlap_flag``: an empty string reads as false rather than as
+    unset, and a value in neither accept-set raises instead of reading as
+    false.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off", ""):
+        return False
+    raise ValueError(f"{name}={raw!r} is not a boolean")
+
+
+def _glm5_aux_hidden_tensor() -> str:
+    """Mirror of ``glm5next/common/model.py``'s ``aux_hidden_state_mode``.
+
+    Exact membership, no stripping and no case folding, so an empty string is
+    rejected there and here alike.
+    """
+    modes = ("stream_mean", "branch")
+    mode = os.getenv("VLLM_GLM5_AUX_HIDDEN_TENSOR", "stream_mean")
+    if mode not in modes:
+        raise ValueError(f"VLLM_GLM5_AUX_HIDDEN_TENSOR={mode!r} is not one of {modes}")
+    return mode
+
+
+def _custom_allreduce_algo() -> str:
+    """Mirror of the ``std::getenv`` parse in ``csrc/custom_all_reduce.cuh``.
+
+    The C++ side compares the raw bytes against four spellings and throws on
+    anything else, so this neither strips nor lowercases. Unset is the empty
+    string, which is what the kernel's own size heuristic means.
+    """
+    raw = os.getenv("VLLM_CUSTOM_ALLREDUCE_ALGO")
+    if raw is None:
+        return ""
+    if raw not in ("1stage", "oneshot", "2stage", "twoshot"):
+        raise ValueError(
+            f"Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: {raw}. "
+            "Valid values: 1stage, oneshot, 2stage, twoshot"
+        )
+    return raw
+
+
 def validate_environ(hard_fail: bool) -> None:
     for env in os.environ:
         if env.startswith("VLLM_") and env not in environment_variables:
@@ -2618,6 +2735,7 @@ def compile_factors() -> dict[str, object]:
         # are already ignored for the same reason).
         "VLLM_XLA_CACHE_PATH",
         "VLLM_CONFIG_ROOT",
+        "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",
