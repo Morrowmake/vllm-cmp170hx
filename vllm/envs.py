@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT: bool = True
     VLLM_GLM5_AUX_HIDDEN_TENSOR: Literal["stream_mean", "branch"] = "stream_mean"
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
+    VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1816,6 +1817,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default OFF until it has its own A/B on the cards.
     "VLLM_GLM5_SHARED_EXPERT_REORDER": lambda: bool(
         int(os.getenv("VLLM_GLM5_SHARED_EXPERT_REORDER", "0"))
+    ),
+    # Pipeline parallelism: cap each scheduling step at ceil(decoding
+    # requests / pp_size) decode requests so the pp_size in-flight
+    # micro-batches share the decodes instead of one taking them all and the
+    # others idling (a decode request is ineligible until its results return
+    # pp_size steps later). No effect with pipeline_parallel_size 1 or with
+    # at most one decoding request. Default OFF until measured on the cards.
+    "VLLM_PP_SPREAD_DECODES": lambda: bool(
+        int(os.getenv("VLLM_PP_SPREAD_DECODES", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if

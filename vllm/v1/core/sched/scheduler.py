@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -352,6 +353,19 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # PP decode spreading (VLLM_PP_SPREAD_DECODES): a decode request is not
+        # eligible again until its results return pp_size steps later, so a
+        # step that takes every eligible decode leaves the next pp_size - 1
+        # micro-batches with none and the stages idle in turn. Capping each
+        # step at ceil(decoding / pp_size) decodes keeps every micro-batch
+        # busy with its share instead.
+        self.pp_spread_decodes = self.use_pp and envs.VLLM_PP_SPREAD_DECODES
+        if self.pp_spread_decodes:
+            logger.info(
+                "PP decode spreading on: at most ceil(decoding requests / %d) "
+                "decode requests per micro-batch",
+                self.parallel_config.pipeline_parallel_size,
+            )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -679,6 +693,15 @@ class Scheduler(SchedulerInterface):
         self.adaptive_k.maybe_log()
         return k_verify, k_draft
 
+    def _pp_decode_cap(self) -> int | None:
+        """Decode requests this micro-batch may take under PP decode spreading
+        (None: no cap). Counts every running request past its prefill,
+        including those whose previous step is still in flight."""
+        if not self.pp_spread_decodes:
+            return None
+        num_decoding = sum(1 for r in self.running if not r.is_prefill_chunk)
+        return max(1, cdiv(num_decoding, self.parallel_config.pipeline_parallel_size))
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -768,6 +791,9 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        pp_decode_cap = self._pp_decode_cap()
+        num_pp_decodes = 0
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -794,6 +820,16 @@ class Scheduler(SchedulerInterface):
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
+                req_index += 1
+                continue
+
+            if (
+                pp_decode_cap is not None
+                and not request.is_prefill_chunk
+                and num_pp_decodes >= pp_decode_cap
+            ):
+                # This micro-batch has its share of decodes; leave the request
+                # for the next one (it stays eligible).
                 req_index += 1
                 continue
 
@@ -978,6 +1014,8 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            if not request.is_prefill_chunk:
+                num_pp_decodes += 1
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
