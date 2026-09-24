@@ -332,3 +332,65 @@ def test_row_geometry_is_not_specialised(tiefix_mod):
         pytest.skip("kernel object exposes no parameter list here")
     dns = {params[i] if isinstance(i, int) else i for i in k.do_not_specialize}
     assert {"stride_l", "stride_i", "n_cols"} <= dns
+
+
+# --- in-launch sort (TIEFIX + SORTED) -------------------------------------
+
+
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("levels", [2, 8, 1000])
+@pytest.mark.parametrize("rows,cols,k", [(5, 300, 32), (8, 2048, 512)])
+def test_sort_in_launch_equals_separate_sort(tiefix, relative, levels, rows, cols, k):
+    logits = tied_logits(rows, cols, levels, seed=levels + rows)
+    ends = torch.tensor([cols - 3 * i for i in range(rows)], dtype=torch.int32)
+    ends[0] = min(k - 5, cols)  # a short row: identity + -1 fill
+    starts = (
+        torch.tensor([i for i in range(rows)], dtype=torch.int32) if relative else None
+    )
+    for seed in range(2):
+        fast = fast_topk_model(logits, k, ends, starts, relative, seed=seed)
+        a = tiefix(
+            logits, fast.clone(), row_ends=ends, row_starts=starts, relative=relative
+        )
+        a = indexer_topk.sort_selected_topk_(a)
+        b = tiefix(
+            logits,
+            fast.clone(),
+            row_ends=ends,
+            row_starts=starts,
+            relative=relative,
+            sort=True,
+        )
+        assert torch.equal(a, b)
+
+
+def test_forward_passes_sort_when_both_flags(monkeypatch):
+    seen = {}
+
+    def fake(logits, ids, **kw):
+        seen.update(kw)
+        return ids
+
+    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+    for f in (use_tiefix_topk, use_canonical_topk, indexer_topk.use_sorted_topk):
+        f.cache_clear()
+    monkeypatch.setattr(indexer_topk, "tiefix_topk_", fake)
+    monkeypatch.setattr(
+        indexer_topk.SparseIndexerTopk, "_run_backend", lambda self, *a, **k: None
+    )
+    try:
+        m = indexer_topk.SparseIndexerTopk.__new__(indexer_topk.SparseIndexerTopk)
+        logits = torch.zeros(2, 16)
+        m.forward(
+            logits,
+            torch.tensor([[16], [16]], dtype=torch.int32),
+            1,
+            torch.zeros(2, 8, dtype=torch.int32),
+            8,
+            16,
+        )
+        assert seen.get("sort") is True
+    finally:
+        for f in (use_tiefix_topk, use_canonical_topk, indexer_topk.use_sorted_topk):
+            f.cache_clear()

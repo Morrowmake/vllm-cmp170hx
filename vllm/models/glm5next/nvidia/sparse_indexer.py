@@ -399,8 +399,10 @@ def sparse_attn_indexer_kpool(
                         row_starts=chunk.cu_seqlen_ks,
                         row_ends=chunk.cu_seqlen_ke,
                         relative=True,
+                        sort=use_sorted_topk(),
                     )
-            if use_sorted_topk():
+            if use_sorted_topk() and not use_tiefix_topk():
+                # (with the tie fix the sort ran inside its launch)
                 sort_selected_topk_(topk_dst)
             # Free the fp32 logits before the next chunk allocates its own.
             # The buffer is [chunk_rows, compressed_context] and the metadata
@@ -668,7 +670,8 @@ def sparse_attn_indexer_kpool(
             attn_metadata_narrowed.max_seq_len,
         )
 
-        if use_sorted_topk():
+        if use_sorted_topk() and not use_tiefix_topk():
+            # (with the tie fix, SparseIndexerTopk sorted inside its launch)
             sort_selected_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.

@@ -216,9 +216,11 @@ def tiefix_topk_(
     row_ends: torch.Tensor,
     row_starts: torch.Tensor | None = None,
     relative: bool = False,
+    sort: bool = False,
 ) -> torch.Tensor:
     """Resolve boundary ties of an exact top-k to the lowest indices, in
-    place. See indexer_topk_tiefix.py; imported lazily so that with the flag
+    place; with ``sort`` also sort each row (VLLM_GLM5_TOPK_SORTED) in the
+    same launch. See indexer_topk_tiefix.py; imported lazily so that with the flag
     unset nothing new is loaded."""
     from vllm.model_executor.layers.indexer_topk_tiefix import topk_tiefix_
 
@@ -228,6 +230,7 @@ def tiefix_topk_(
         row_ends=row_ends,
         row_starts=row_starts,
         relative=relative,
+        sort=sort,
     )
 
 
@@ -519,6 +522,7 @@ class SparseIndexerTopk(torch.nn.Module):
                 logits,
                 topk_indices,
                 row_ends=self._row_ends(seq_lens, next_n, logits.shape[0]),
+                sort=use_sorted_topk(),
             )
 
     def _run_backend(

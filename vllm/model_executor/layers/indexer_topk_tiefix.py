@@ -65,6 +65,7 @@ def _topk_tiefix_kernel(
     BLOCK: tl.constexpr,
     HAS_STARTS: tl.constexpr,
     RELATIVE: tl.constexpr,
+    SORT: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     lrow = logits_ptr + row * stride_l
@@ -120,6 +121,18 @@ def _topk_tiefix_kernel(
             taken += tl.sum(is_eq.to(tl.int32), axis=0)
             c0 += BLOCK
 
+    # Optional: sort the row ascending with the -1 fill last, in registers
+    # (VLLM_GLM5_TOPK_SORTED together with the tie fix), so the order is a
+    # function of the set too; same bytes as sort_selected_topk_.
+    if SORT:
+        tl.debug_barrier()
+        big = 0x7FFFFFFF
+        v = tl.load(irow + slots, mask=in_k, other=big)
+        v = tl.where(v < 0, big, v)
+        v = tl.sort(v)
+        v = tl.where(v == big, -1, v)
+        tl.store(irow + slots, v, mask=in_k)
+
 
 _WARM_KS = (512, 2048)
 
@@ -137,14 +150,16 @@ def warm_tiefix() -> None:
         ends = torch.full((1,), k + 1, dtype=torch.int32, device=dev)
         starts = torch.zeros((1,), dtype=torch.int32, device=dev)
         for relative in (False, True):
-            ids = torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k)
-            topk_tiefix_(
-                logits,
-                ids,
-                row_ends=ends,
-                row_starts=starts if relative else None,
-                relative=relative,
-            )
+            for sort in (False, True):
+                ids = torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k)
+                topk_tiefix_(
+                    logits,
+                    ids,
+                    row_ends=ends,
+                    row_starts=starts if relative else None,
+                    relative=relative,
+                    sort=sort,
+                )
 
 
 def topk_tiefix_(
@@ -154,10 +169,13 @@ def topk_tiefix_(
     row_ends: torch.Tensor,
     row_starts: torch.Tensor | None = None,
     relative: bool = False,
+    sort: bool = False,
     block: int | None = None,
     num_warps: int | None = None,
 ) -> torch.Tensor:
     """Make a top-k selection's set canonical on exact ties, in place.
+    With ``sort`` each row is then sorted ascending, -1 fill last (the bytes
+    of ``sort_selected_topk_``), in the same launch.
 
     Args:
         logits: (num_rows, num_cols) fp32, stride(1) == 1. The scores the
@@ -199,6 +217,7 @@ def topk_tiefix_(
         BLOCK=block or TIEFIX_BLOCK,
         HAS_STARTS=row_starts is not None,
         RELATIVE=relative,
+        SORT=sort,
         num_warps=num_warps or TIEFIX_NUM_WARPS,
     )
     return topk_indices
