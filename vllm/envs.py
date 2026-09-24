@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TOPK_TIEFIX: bool = False
     VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS: int = 0
     VLLM_GLM5_MOE_MASK_PADDING: bool = False
+    VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
@@ -1741,6 +1742,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ran before. Uses the forward context's is_padding mask. Default OFF.
     "VLLM_GLM5_MOE_MASK_PADDING": lambda: bool(
         int(os.getenv("VLLM_GLM5_MOE_MASK_PADDING", "0"))
+    ),
+    # With VLLM_GLM5_MOE_MASK_PADDING=1 and the sm_80 fused router v2
+    # (VLLM_GLM5_DECODE_MOE_ROUTE_V2=1): route the padding rows to no expert
+    # inside the router's own launch (read from the device-side is_padding
+    # mask), so its block alignment is already that of the masked ids and is
+    # kept, instead of being dropped and recomputed on every padded batch of
+    # 9..32 rows. No effect unless both of those are on. Default ON; set 0
+    # for the recompute path.
+    "VLLM_GLM5_MOE_ROUTE_V2_MASK": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1"))
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
     # Size the DFlash drafter's RoPE cos/sin cache to the reachable positions

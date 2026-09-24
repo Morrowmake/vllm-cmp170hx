@@ -238,7 +238,11 @@ def _warmup_moe_route(worker, model, device, capture_sizes) -> None:
     scratch (split-K partials, bitmask columns, arrival counters) before any
     graph is captured."""
     from vllm import envs
-    from vllm.ampere_decode import marlin_block_size_m, moe_route
+    from vllm.ampere_decode import (
+        marlin_block_size_m,
+        moe_route,
+        route_v2_masks_padding,
+    )
 
     shape = _moe_shape(worker, model)
     if shape is None:
@@ -258,5 +262,7 @@ def _warmup_moe_route(worker, model, device, capture_sizes) -> None:
             num_experts=num_experts,
             hidden=hidden,
             device=device,
+            # the in-kernel padding mask variant (VLLM_GLM5_MOE_ROUTE_V2_MASK)
+            padded_ms=(m,) if route_v2_masks_padding(m) else (),
         )
     logger.info("Warmed up sm_80 fused MoE router for M in %s.", ms)

@@ -336,7 +336,8 @@ def _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, m0,
                 M: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
                 BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr,
                 EA: tl.constexpr, EB: tl.constexpr, BITONIC: tl.constexpr,
-                RENORM: tl.constexpr):
+                RENORM: tl.constexpr, pad_ptr=None,
+                HAS_PAD: tl.constexpr = False):
     """Route BLOCK_M tokens starting at m0: sigmoid, top-k, renormalize, scale.
 
     ONE REDUCTION PER SELECTED EXPERT.  The obvious top-k loop costs two block
@@ -358,10 +359,19 @@ def _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, m0,
     (the whole logit row is 1.2 KB and L1-resident) rather than a second block
     reduction.  Measured at M=4: 9.6 us for the two-reduction form, 7.7 us for
     this one.
+
+    PADDING ROWS (HAS_PAD).  `pad_ptr[m] != 0` marks row m as padding of a
+    CUDA-graph batch: its ids are stored as -1 (expert "none", exactly what
+    the padding mask writes) and it is dropped from the returned `keep`, so
+    the alignment never sees it.  Its weights are stored as computed, which
+    is what the mask leaves too.  Real rows are untouched.
     """
     offs_k = tl.arange(0, BLOCK_K)
     offs_m = m0 + tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
+    if HAS_PAD:
+        # issued first so its latency hides under the logits loads and tanh
+        is_pad = tl.load(pad_ptr + offs_m, mask=mask_m, other=0) != 0
 
     # THE EXPERT AXIS IS SPLIT, NOT PADDED.  E = 288 and `tl.arange` needs a
     # power of two, so a single tile is 512 wide and 44 % of every one of the
@@ -454,8 +464,14 @@ def _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, m0,
         w = w / (tl.sum(sel_v, axis=1)[:, None] + 1e-20)
     w = w * routed_scaling_factor
     off = offs_m[:, None] * TOPK + offs_k[None, :]
-    tl.store(topk_ids_ptr + off, sel_i, mask=keep)
-    tl.store(topk_w_ptr + off, w, mask=keep)
+    if HAS_PAD:
+        tl.store(topk_ids_ptr + off, tl.where(is_pad[:, None], -1, sel_i),
+                 mask=keep)
+        tl.store(topk_w_ptr + off, w, mask=keep)
+        keep = keep & ~is_pad[:, None]
+    else:
+        tl.store(topk_ids_ptr + off, sel_i, mask=keep)
+        tl.store(topk_w_ptr + off, w, mask=keep)
     return sel_i, keep
 
 
@@ -689,6 +705,7 @@ def _route_align_rows(
     BLOCK_N: tl.constexpr, FILL_P: tl.constexpr,
     EA: tl.constexpr, EB: tl.constexpr, BITONIC: tl.constexpr,
     RENORM: tl.constexpr, G: tl.constexpr, BLOCK_J: tl.constexpr,
+    pad_ptr=None, HAS_PAD: tl.constexpr = False,
 ):
     """Routing CTA `pid` of G = cdiv(M, BLOCK_M), and the alignment in
     whichever of them arrives last.
@@ -711,6 +728,11 @@ def _route_align_rows(
     arrives last, so the outputs are bitwise deterministic.  (The pairwise
     rank this replaces was O(pairs^2) in one CTA: 23.6 us at M=32.)  The last
     CTA leaves `col` and the arrival counter at zero.
+
+    HAS_PAD: padding rows (`pad_ptr`) set no column bit and their ids are -1
+    (`_route_tile`), so the counts, offsets and ranks are those of the real
+    rows alone and the last CTA places only pairs with an id >= 0: the
+    alignment of the masked ids, in the same launch.
     """
     NUMEL: tl.constexpr = M * TOPK
     NG: tl.constexpr = (M + 31) // 32
@@ -718,7 +740,8 @@ def _route_align_rows(
     sel_i, keep = _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr,
                               m0, stride_lm, stride_le,
                               routed_scaling_factor, M, E, TOPK, BLOCK_K,
-                              BLOCK_M, EA, EB, BITONIC, RENORM)
+                              BLOCK_M, EA, EB, BITONIC, RENORM, pad_ptr,
+                              HAS_PAD)
     p = pid * FILL_P + tl.arange(0, FILL_P)
     tl.store(sorted_ids_ptr + p, tl.full([FILL_P], NUMEL, tl.int32),
              mask=p < MNP)
@@ -741,6 +764,9 @@ def _route_align_rows(
         i = tl.arange(0, BLOCK_N)
         vi = i < NUMEL
         e = tl.load(topk_ids_ptr + i, mask=vi, other=0, cache_modifier=".cg")
+        if HAS_PAD:
+            vi = vi & (e >= 0)          # padding pairs (id -1) are not placed
+            e = tl.where(vi, e, 0)
         m = i // TOPK
         low = (tl.full([BLOCK_N], 1, tl.int32) << (m % 32)) - 1
         cnt = tl.zeros([BLOCK_E], tl.int32)
@@ -801,6 +827,7 @@ def _moe_route_kernel(
     BLOCK_K: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_N: tl.constexpr,
     FILL_P: tl.constexpr, EA: tl.constexpr, EB: tl.constexpr,
     BITONIC: tl.constexpr, RENORM: tl.constexpr, BLOCK_J: tl.constexpr,
+    pad_ptr=None, HAS_PAD: tl.constexpr = False,
 ):
     """THE WHOLE OP IN ONE LAUNCH.  grid (cdiv(E, GBE) * SPLIT + M,).
 
@@ -848,7 +875,7 @@ def _moe_route_kernel(
                           stride_lm, 1, routed_scaling_factor,
                           M, E, BS, MNP, NBLK, TOPK, BLOCK_K, 1, BLOCK_E,
                           BLOCK_N, FILL_P, EA, EB, BITONIC, RENORM, M,
-                          BLOCK_J)
+                          BLOCK_J, pad_ptr, HAS_PAD)
 
 
 # --- public API -------------------------------------------------------------
@@ -882,13 +909,19 @@ def align_sizes(numel, num_experts, block_size):
     return mnp, -(-mnp // block_size)
 
 
+def pad_supported(M, hidden=4096):
+    """Whether `moe_route(..., is_padding=...)` can mask padding at M rows."""
+    return _gemv_tc_config(M, hidden) is not None
+
+
 def launches(M, topk=8, hidden=4096):
     """In-graph kernel launches this op costs at M rows."""
     return 1 if _gemv_tc_config(M, hidden) is not None else 2
 
 
 def moe_route(x, weight, bias, topk=8, block_size=8, num_experts=288,
-              renormalize=True, routed_scaling_factor=2.5, out=None):
+              renormalize=True, routed_scaling_factor=2.5, out=None,
+              is_padding=None):
     """Router GEMV + sigmoid/bias top-k + Marlin block alignment.
 
     x [M, K] bf16 (row stride free, unit column stride), weight [E, K] bf16
@@ -897,6 +930,14 @@ def moe_route(x, weight, bias, topk=8, block_size=8, num_experts=288,
          sorted_ids [mnp] i32, expert_ids [nblk] i32, num_tokens_post_pad [1] i32)
     with the semantics of torch.mm(x, W.T, out_dtype=fp32) + fused_grouped_topk
     + moe_align_block_size. `out` may supply that 6-tuple (logits contiguous).
+
+    `is_padding` [M] bool (device, e.g. the forward context's mask) routes the
+    rows it marks to no expert inside the launch: their topk_ids are -1 and
+    the alignment is that of the masked ids, exactly what
+    `topk_ids.masked_fill_(is_padding[:, None], -1)` followed by a fresh
+    deterministic `moe_align_block_size` gives. It is read on the device only,
+    so a captured graph replays with whatever the runner wrote into it. Only
+    the one-launch path takes it; `pad_supported(M)` says where that is.
     """
     M, K = x.shape
     E = weight.shape[0]
@@ -923,8 +964,15 @@ def moe_route(x, weight, bias, topk=8, block_size=8, num_experts=288,
     (bm, be, bk, bn, bnk, bp, pw, ea, eb, bit,
      nw) = _config(M, topk, num_experts, block_size, mnp, nblk)
     s_lm, s_le = logits.stride(0), logits.stride(1)
-    col_s, excl_s, arrive_s = _scratch(dev, num_experts)
     tc = _gemv_tc_config(M, K)
+    pad = None
+    if is_padding is not None:
+        if tc is None:
+            raise ValueError(f"is_padding is not supported at M={M}")
+        assert tuple(is_padding.shape) == (M,) and is_padding.is_contiguous()
+        pad = (is_padding.view(torch.uint8)
+               if is_padding.dtype == torch.bool else is_padding)
+    col_s, excl_s, arrive_s = _scratch(dev, num_experts)
     if tc is not None:
         # ONE LAUNCH: tensor-core GEMV CTAs + one routing CTA per row.
         gbm, gbe, gbk, split, gnw, gns = tc
@@ -940,6 +988,7 @@ def moe_route(x, weight, bias, topk=8, block_size=8, num_experts=288,
             BLOCK_K=bk, BLOCK_E=be, BLOCK_N=bn, FILL_P=fill,
             EA=ea, EB=eb, BITONIC=bit, RENORM=bool(renormalize),
             BLOCK_J=_next_pow2(triton.cdiv(M, block_size)),
+            pad_ptr=pad, HAS_PAD=pad is not None,
             num_warps=gnw, num_stages=gns)
     else:
         # M = 1 (and M > 64, never a decode batch): the split-free FMA GEMV,
@@ -961,11 +1010,12 @@ def moe_route(x, weight, bias, topk=8, block_size=8, num_experts=288,
 
 
 def warmup(ms, block_sizes=(8,), topk=8, num_experts=288, hidden=4096,
-           device=None):
+           device=None, padded_ms=()):
     """Compile every variant the caller will use, and allocate the scratch.
 
     MUST run before CUDA-graph capture: Triton compiles on first launch, which
-    must not happen inside a capture. One variant per (M, topk, block_size, E).
+    must not happen inside a capture. One variant per (M, topk, block_size, E),
+    and the padding-mask variant as well for every M in `padded_ms`.
     """
     dev = device or torch.device("cuda:0")
     w = torch.zeros((num_experts, hidden), dtype=torch.bfloat16, device=dev)
@@ -975,5 +1025,10 @@ def warmup(ms, block_sizes=(8,), topk=8, num_experts=288, hidden=4096,
         for bs in sorted({int(v) for v in block_sizes}):
             moe_route(x, w, b, topk=topk, block_size=bs,
                       num_experts=num_experts)
+            if M in padded_ms and pad_supported(M, hidden):
+                moe_route(x, w, b, topk=topk, block_size=bs,
+                          num_experts=num_experts,
+                          is_padding=torch.zeros(M, dtype=torch.bool,
+                                                 device=dev))
     if torch.device(dev).type == "cuda":
         torch.cuda.synchronize(dev)

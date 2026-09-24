@@ -48,6 +48,8 @@ __all__ = [
     "stash_fused_align",
     "take_fused_align",
     "drop_fused_align",
+    "fused_align_is_masked",
+    "route_v2_masks_padding",
     "use_ampere_moe_route_v2",
     "maybe_moe_route_v2",
     "take_fused_routing",
@@ -311,10 +313,15 @@ def marlin_block_size_m(
 _PENDING: tuple | None = None
 
 
-def stash_fused_align(topk_ids, block_size, num_experts, aligned) -> None:
-    """Record the alignment the fused routing kernel already computed."""
+def stash_fused_align(
+    topk_ids, block_size, num_experts, aligned, is_padding=None
+) -> None:
+    """Record the alignment the fused routing kernel already computed.
+
+    `is_padding` is the padding mask the kernel already applied to these ids
+    (route v2 with VLLM_GLM5_MOE_ROUTE_V2_MASK), or None."""
     global _PENDING
-    _PENDING = (topk_ids, int(block_size), int(num_experts), aligned)
+    _PENDING = (topk_ids, int(block_size), int(num_experts), aligned, is_padding)
 
 
 def take_fused_align(
@@ -337,7 +344,7 @@ def take_fused_align(
     # ignore_invalid_experts=True is therefore covered by the expert_map test.
     if expert_map is not None or pad_sorted_ids:
         return None
-    ids, bs, ne, aligned = pending
+    ids, bs, ne, aligned, _ = pending
     if ids is not topk_ids or bs != int(block_size) or ne != int(num_experts):
         return None
     _PENDING = None
@@ -360,6 +367,21 @@ def drop_fused_align(topk_ids) -> bool:
         return False
     _PENDING = None
     return True
+
+
+def fused_align_is_masked(topk_ids, is_padding) -> bool:
+    """Whether the stashed alignment for exactly this `topk_ids` was computed
+    by a kernel that already routed the rows of exactly this `is_padding`
+    mask to no expert (ids -1, alignment of the masked ids). The padding mask
+    then has nothing left to do: the ids and the alignment are already what
+    it would produce. Host-side identity checks only."""
+    pending = _PENDING
+    return (
+        pending is not None
+        and pending[0] is topk_ids
+        and pending[4] is not None
+        and pending[4] is is_padding
+    )
 
 
 # --- router GEMV + routing + alignment (moe_route.py) -----------------------
@@ -425,6 +447,64 @@ def use_ampere_moe_route_v2(num_tokens: int, gate, router, x) -> bool:
     return _is_sm80()
 
 
+def route_v2_masks_padding(num_tokens: int) -> bool:
+    """Whether route v2 applies the padding mask inside its launch at this
+    batch size: VLLM_GLM5_MOE_MASK_PADDING=1 and VLLM_GLM5_MOE_ROUTE_V2_MASK=1
+    (default), a batch the mask covers (above VLLM_GLM5_DECODE_MOE_MAX_TOKENS
+    rows when the decode kernels are on) and the one-launch kernel's range.
+    Outside it the mask edits the ids afterwards and drops the stash
+    (`drop_fused_align`), as before. A static function of the shape, so eager
+    runs, warmup and captured graphs agree."""
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_MOE_MASK_PADDING or not envs.VLLM_GLM5_MOE_ROUTE_V2_MASK:
+        return False
+    min_rows = (
+        int(envs.VLLM_GLM5_DECODE_MOE_MAX_TOKENS)
+        if envs.VLLM_GLM5_DECODE_KERNELS
+        else 0
+    )
+    if num_tokens <= min_rows:
+        return False
+    from vllm.ampere_decode.moe_route import pad_supported
+
+    return pad_supported(num_tokens)
+
+
+_V2_MASK_ANNOUNCED = False
+
+
+def _route_v2_padding(num_tokens: int):
+    """The forward context's padding mask for a route v2 call of this size
+    when the mask is applied inside the kernel, else None. The same
+    conditions as `mask_padding_topk_ids`, which then finds the ids masked."""
+    if not route_v2_masks_padding(num_tokens):
+        return None
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if not is_forward_context_available():
+        return None
+    is_padding = get_forward_context().is_padding
+    if is_padding is None or tuple(is_padding.shape) != (num_tokens,):
+        return None
+    if not is_padding.is_contiguous():
+        return None
+    global _V2_MASK_ANNOUNCED
+    if not _V2_MASK_ANNOUNCED:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "sm_80 fused MoE router masks padding rows in-kernel: padded "
+            "batches keep the fused block alignment "
+            "[VLLM_GLM5_MOE_ROUTE_V2_MASK=1; set 0 for the re-align path]"
+        )
+        _V2_MASK_ANNOUNCED = True
+    return is_padding
+
+
 def maybe_moe_route_v2(gate, router, x):
     """Run the fused router for `x` if the gate allows it.
 
@@ -440,6 +520,7 @@ def maybe_moe_route_v2(gate, router, x):
     num_experts = int(gate.weight.shape[0])
     topk = int(router.top_k)
     block_size = marlin_block_size_m(num_tokens, topk, num_experts)
+    is_padding = _route_v2_padding(num_tokens)
     logits, topk_w, topk_ids, sorted_ids, expert_ids, ntpp = moe_route(
         x,
         gate.weight,
@@ -449,11 +530,12 @@ def maybe_moe_route_v2(gate, router, x):
         num_experts=num_experts,
         renormalize=True,
         routed_scaling_factor=float(router.routed_scaling_factor),
+        is_padding=is_padding,
     )
     global _PENDING_ROUTING, _V2_ANNOUNCED
     _PENDING_ROUTING = (logits, (topk_w, topk_ids))
     stash_fused_align(topk_ids, block_size, num_experts,
-                      (sorted_ids, expert_ids, ntpp))
+                      (sorted_ids, expert_ids, ntpp), is_padding=is_padding)
     if not _V2_ANNOUNCED:
         from vllm import envs
         from vllm.logger import init_logger
