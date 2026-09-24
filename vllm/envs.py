@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_TOPK_SORTED: bool = False
+    VLLM_GLM5_TOPK_TIEFIX: bool = False
     VLLM_GLM5_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
@@ -1632,6 +1633,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # byte-identical to upstream.
     "VLLM_GLM5_TOPK_SORTED": lambda: bool(
         int(os.getenv("VLLM_GLM5_TOPK_SORTED", "0"))
+    ),
+    # Keep the fast indexer top-k kernels but make the selected SET a function
+    # of the scores alone: where entries tied with the k-th score straddle the
+    # selection boundary, the tied slots go to the lowest column indices, the
+    # set VLLM_GLM5_TOPK_CANONICAL selects. The stock kernels resolve such
+    # ties by atomic arrival order, and which kernel runs depends on the row
+    # count and length, so the set otherwise depends on batch shape. One
+    # extra read of the logits per row; uncontested rows are left untouched.
+    # Default OFF: unset, the indexer is byte-identical to upstream.
+    "VLLM_GLM5_TOPK_TIEFIX": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TOPK_TIEFIX", "0"))
     ),
     # Route the padding rows of a padded batch (CUDA-graph sizes) to no
     # expert (topk_ids = -1) before the fused MoE. Their hidden states come
