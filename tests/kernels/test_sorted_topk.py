@@ -120,6 +120,8 @@ def test_indexer_calls_the_sort_on_both_paths():
 
     src = inspect.getsource(si.sparse_attn_indexer_kpool)
     assert src.count("elif use_sorted_topk():") == 2
+    # With the tie fix on, the sort runs inside the tie-fix launch.
+    assert src.count("elif use_tiefix_topk():") == 2
     assert src.count("sort_selected_topk_(topk_dst)") == 2
     assert src.count("elif use_topk_tie_repair():") == 2
     assert src.count("repair_topk_ties_(") == 2

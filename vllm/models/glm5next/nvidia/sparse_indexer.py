@@ -459,9 +459,12 @@ def sparse_attn_indexer_kpool(
                         row_starts=chunk.cu_seqlen_ks,
                         row_ends=chunk.cu_seqlen_ke,
                         relative=True,
+                        sort=use_sorted_topk(),
                     )
             if use_canonical_topk():
                 pass  # already the canonical set, in canonical order
+            elif use_tiefix_topk():
+                pass  # tie fix above (sorted inside its launch when SORTED)
             elif use_topk_tie_repair():
                 repair_topk_ties_(
                     topk_dst,
@@ -748,6 +751,8 @@ def sparse_attn_indexer_kpool(
 
         if use_canonical_topk():
             pass  # SparseIndexerTopk already took the canonical path
+        elif use_tiefix_topk():
+            pass  # SparseIndexerTopk ran the tie fix (and sort when SORTED)
         elif use_topk_tie_repair():
             repair_topk_ties_(
                 topk_dst,
