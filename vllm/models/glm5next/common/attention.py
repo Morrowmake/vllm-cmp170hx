@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -35,6 +36,7 @@ from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -157,11 +159,29 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         )
 
 
+def kpool_tail_ring_size(
+    index_kpool: int, num_speculative_tokens: int, legacy: bool = False
+) -> int:
+    """Slots in each request's kpool tail ring.
+
+    The open pool's committed keys plus a speculative step's rows, in whole
+    pools: a spec step stashes 1 + num_spec rows before acceptance, and a
+    rejected pool-completing draft must not leave the drafts behind it
+    overwriting the committed keys its redo reads. ``legacy`` keeps exactly
+    ``index_kpool`` slots (the layout before speculative sizing).
+    """
+    if legacy:
+        return index_kpool
+    span = index_kpool + max(num_speculative_tokens, 0)
+    return index_kpool * cdiv(span, index_kpool)
+
+
 class Glm5NextTailCache(DeepseekV32IndexerCache):
     """Paged circular buffer for the kpool indexer's in-progress (tail) pool.
 
     Holds the trailing incomplete pool's raw K + gate score: one block of
-    ``index_kpool`` slots per request, overwritten in place by ``pos % kpool``
+    ring slots per request (``index_kpool`` rounded up to cover a speculative
+    step's rows, see ``get_kv_cache_spec``), overwritten in place by ``pos % ring``
     as decode/spec-decode advances. Prefill seeds it (instead of discarding the
     tail raw K+gate); the connector transfers it across PD; decode reads it to
     compress the boundary pool correctly. ``KpoolTailSpec`` /
@@ -191,13 +211,32 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         # The two head slots form [K, gate score] in the generic
         # [block, head, state, content] cache view.
+        num_spec = vllm_config.num_speculative_tokens
+        legacy = envs.VLLM_GLM5_KPOOL_TAIL_LEGACY_RING
+        ring = kpool_tail_ring_size(self._index_kpool, num_spec, legacy=legacy)
+        if legacy and num_spec > 0:
+            logger.warning_once(
+                "GLM-5.3-Flash kpool tail ring: VLLM_GLM5_KPOOL_TAIL_LEGACY_RING=1, "
+                "ring = index_kpool = %d slots with %d speculative tokens; "
+                "rejected pool-completing drafts can corrupt pool keys",
+                ring,
+                num_spec,
+            )
+        elif ring > self._index_kpool:
+            logger.info_once(
+                "GLM-5.3-Flash kpool tail ring active: %d slots "
+                "(index_kpool %d, %d speculative tokens)",
+                ring,
+                self._index_kpool,
+                num_spec,
+            )
         return KpoolTailSpec(
-            block_size=self._index_kpool,
+            block_size=ring,
             num_kv_heads=2,
             head_size=self.head_dim,
             head_size_v=0,
             dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
+            sliding_window=ring,
         )
 
     def get_attn_backend(self):

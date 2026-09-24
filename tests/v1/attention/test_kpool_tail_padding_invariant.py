@@ -71,7 +71,7 @@ def test_the_tail_seed_kernel_skips_negative_slots():
     ) or inspect.getsource(kpool_compress._kpool_tail_seed_kernel)
     body = src[src.index("t = tl.load(tslot_ptr") :]
     assert "if t < 0:" in body
-    assert body.index("return") < body.index("blk = t // KPOOL")
+    assert body.index("return") < body.index("blk = t // RING")
 
 
 def test_the_helper_copies_padding_through_verbatim():
