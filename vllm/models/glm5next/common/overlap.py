@@ -862,6 +862,7 @@ def maybe_open_region(
     mhc: bool,
     sequence_parallel: bool,
     allow_cross_layer: bool = True,
+    unsafe_reason: Callable[[], str | None] | None = None,
 ) -> PrefillOverlapRegion | None:
     """Activate the overlap for this forward, or return ``None``.
 
@@ -870,6 +871,13 @@ def maybe_open_region(
     parallelism (its reduce-scatter/all-gather pair is a different collective
     schedule), TP > 1, and not inside a CUDA-graph capture -- decode is
     captured and must stay untouched.
+
+    ``unsafe_reason`` is asked once, before the region is first built. If it
+    returns a reason (a layer reads one of its own TP all-reduce results
+    before returning, e.g. an MoE whose kernel reports ``output_is_reduced``),
+    the feature stays off for the process: the interceptor would hand that
+    layer a buffer that is still in flight, which is wrong values, not an
+    error.
     """
     global _ACTIVE, _REGION, _LOGGED, _SETTINGS
 
@@ -891,6 +899,16 @@ def maybe_open_region(
         return None
 
     if _REGION is None:
+        reason = unsafe_reason() if unsafe_reason is not None else None
+        if reason is not None:
+            logger.warning(
+                "GLM5 prefill overlap stays off: %s. The overlap defers every "
+                "TP all-reduce in a layer and joins it afterwards, which such "
+                "a layer cannot tolerate.",
+                reason,
+            )
+            _SETTINGS = OverlapSettings(enabled=False)
+            return None
         _REGION = _build_region(settings)
         if _REGION is None:
             # Permanently disable rather than retrying every chunk.
