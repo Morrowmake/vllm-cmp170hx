@@ -350,6 +350,40 @@ class _MonkeyPatch:
         self._env, self._attr = [], []
 
 
+
+# ------------------------------------------------- sparse-MLA prefill schedule
+def test_sparse_mla_prefill_schedule_by_head_count():
+    """16 heads (TP=4) keep the measured 2-warp schedule; a 32-row head tile
+    (all 64 heads on one card) takes 4 warps so its accumulator does not spill."""
+    from vllm.ampere_prefill.sparse_prefill_mla import _select_config
+
+    for tokens in (384, 1152, 2304):
+        assert _select_config(tokens, 2048, 16, 512, 70) == (16, 32, 1, 2, 2)
+        assert _select_config(tokens, 2048, 64, 512, 70) == (32, 32, 1, 4, 2)
+
+
+# --------------------------------------------------- sparse-MLA decode schedule
+def test_sparse_mla_decode_schedule_by_head_count(monkeypatch):
+    """16 heads (TP=4) keep the retuned schedule exactly; 64 heads on one card
+    take the measured wide-head table up to 16 rows and the rule past it."""
+    import vllm.v1.attention.ops.triton_mla_sparse as m
+
+    monkeypatch.setattr(m, "_smem_budget", lambda _d: 166912)
+    monkeypatch.setattr(m, "_num_sms", lambda _d: 70)
+    tp4 = {1: (16, 64, 8, 4, 2), 2: (16, 64, 8, 4, 2), 4: (16, 64, 8, 4, 2),
+           8: (16, 64, 8, 4, 2), 12: (16, 64, 4, 4, 2), 16: (16, 64, 4, 4, 2),
+           24: (16, 64, 2, 4, 2), 32: (16, 64, 2, 4, 2), 64: (16, 64, 1, 4, 2)}
+    for rows, cfg in tp4.items():
+        assert m._pick_config(rows, 2048, 16, 512, 0) == cfg, rows
+    wide = {1: (16, 64, 4, 4, 2), 4: (16, 64, 4, 4, 2), 8: (16, 32, 4, 4, 2),
+            12: (32, 32, 4, 4, 2), 16: (32, 32, 4, 4, 2), 32: (32, 64, 1, 4, 2)}
+    for rows, cfg in wide.items():
+        assert m._pick_config(rows, 2048, 64, 512, 0) == cfg, rows
+    # A part that cannot stage 64 keys twice falls back to the rule.
+    monkeypatch.setattr(m, "_smem_budget", lambda _d: 101376)
+    assert m._pick_config(4, 2048, 64, 512, 0)[:2] == (32, 32)
+
+
 def _main():
     import os
     import sys

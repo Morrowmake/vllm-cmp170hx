@@ -305,6 +305,28 @@ def _num_sms(device_index: int) -> int:
         return 108
 
 
+# Decode schedules for a card holding more than 16 query heads (all 64 when
+# one card runs whole layers under pipeline parallel), keyed by the largest
+# query-row count each covers: (BLOCK_H, BLOCK_N, num_splits, num_warps,
+# num_stages). Measured at h_q = 64, top-k 2048, over 640 schedules per row
+# count against the 16-head rule below applied to 64 heads (graph replay,
+# rotated caches, median of 20):
+#
+#     rows  16-head rule at 64 heads   us     measured best       us     gain
+#     4     H32 N64 S8 W4 P2         65.6    H16 N64 S4 W4 P2   48.5    1.35x
+#     8     H32 N64 S4 W4 P2         95.2    H16 N32 S4 W4 P2   71.9    1.32x
+#     16    H32 N64 S2 W4 P2        142.9    H32 N32 S4 W4 P2   97.4    1.47x
+#     32    H32 N64 S1 W4 P2        159.4    (same)                       -
+#
+# (context 8K at 4 rows, 64K otherwise.) The rule's CTA ramp stops at two
+# CTAs per SM, which leaves a 64-head grid with too few splits; one wave of
+# 16-head blocks with four splits is what these shapes want. Past 16 rows the
+# rule already picks the measured best.
+_WIDE_HEAD_DECODE = ((4, (16, 64, 4, 4, 2)),
+                     (8, (16, 32, 4, 4, 2)),
+                     (16, (32, 32, 4, 4, 2)))
+
+
 def _pick_config(
     num_tokens: int,
     index_topk: int,
@@ -363,6 +385,15 @@ def _pick_config(
             num_splits *= 2
         return BLOCK_H, BLOCK_N, min(num_splits, _cdiv(index_topk, BLOCK_N)), 4, 3
 
+    smem = _smem_budget(device_index)
+    if num_heads_q > 16:
+        for max_rows, cfg in _WIDE_HEAD_DECODE:
+            if num_tokens <= max_rows:
+                bh, bn, splits, warps, stages = cfg
+                if stages * bn * dim_qk * 2 <= smem:
+                    return bh, bn, min(splits, _cdiv(index_topk, bn)), warps, stages
+                break
+
     # Never build a head tile wider than the heads the rank holds; 32 stays the
     # ceiling, so a rank with more than 16 heads keeps today's tile.
     BLOCK_H = min(32, max(16, 1 << (num_heads_q - 1).bit_length()))
@@ -370,7 +401,6 @@ def _pick_config(
     # stages * BLOCK_N * dim_qk * 2 B of staging must fit what the device will
     # grant one CTA. Give up the wide tile before the second stage: the tile is
     # worth more than the pipelining on a kernel whose loads are indirect.
-    smem = _smem_budget(device_index)
     BLOCK_N, num_stages = 64, 2
     while BLOCK_N > 16 and num_stages * BLOCK_N * dim_qk * 2 > smem:
         BLOCK_N //= 2

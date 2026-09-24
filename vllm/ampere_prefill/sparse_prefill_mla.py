@@ -299,6 +299,13 @@ def _select_config(num_tokens, index_topk, h_q, dim_qk, sms):
     # stages * BLOCK_N * dim_qk * 2 B of shared memory must stay inside the
     # 164 KB an sm_80 CTA can be given - 96 KB at dim_qk = 512.
     BLOCK_N, num_warps, num_stages = 32, 2, 2
+    # A 32-row head tile (more than 16 heads on the card, e.g. all 64 under
+    # pipeline parallel) holds a [32, 512] fp32 accumulator: 256 registers a
+    # thread at 2 warps, which spills. 4 warps halves it. Measured at h_q = 64,
+    # context 64K, over 197 schedules: 16.87 -> 8.34 ms at 2304 tokens and
+    # 8.60 -> 4.25 ms at 1152 (2.02x), the best 32-key schedule at both.
+    if BLOCK_H > 16:
+        num_warps = 4
     while num_stages > 1 and num_stages * BLOCK_N * dim_qk * 2 > 100 * 1024:
         num_stages -= 1
     head_blocks = _cdiv(h_q, min(BLOCK_H, h_q))
