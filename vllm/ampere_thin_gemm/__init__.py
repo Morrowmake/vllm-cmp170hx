@@ -95,6 +95,13 @@ def dispatch_threshold() -> int:
     return envs.VLLM_GLM5_THIN_GEMM_MAX_TOKENS
 
 
+# (N, K) -> smallest M sent to cuBLAS instead. Measured under pipeline
+# parallel, where kda_o_proj runs at full width (K = 64 heads * 128): past
+# M = 16 no thin-M schedule beats cuBLAS on it (M=24 46.7 vs 46.0 us, M=32
+# 49.3 vs 46.3 us, best of the sweep). No TP=4 shape is listed.
+_CUBLAS_FROM_M: dict[tuple[int, int], int] = {(4096, 8192): 17}
+
+
 def thin_gemm_supported(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
 ) -> bool:
@@ -117,6 +124,7 @@ def thin_gemm_supported(
         and x.shape[1] == weight.shape[1]
         and x.shape[1] >= _MIN_K
         and x.shape[0] <= dispatch_threshold()
+        and x.shape[0] < _CUBLAS_FROM_M.get(tuple(weight.shape), 1 << 30)
     )
 
 

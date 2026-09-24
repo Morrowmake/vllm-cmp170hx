@@ -176,6 +176,25 @@ def test_kda_f_b_proj_sits_on_the_min_k_boundary():
     assert thin_gemm_supported(x, w, None)
 
 
+
+def test_full_width_kda_o_proj_takes_cublas_past_16_rows():
+    """Pipeline parallel runs kda_o_proj at full width (N=4096, K=8192); past
+    M=16 cuBLAS wins it. The same M on every TP=4 shape stays on the kernel."""
+    for M in (1, 4, 8, 16):
+        x, w = _xw(M, 4096, 8192)
+        assert thin_gemm_supported(x, w, None), M
+    for M in (17, 24, 32):
+        x, w = _xw(M, 4096, 8192)
+        assert not thin_gemm_supported(x, w, None), M
+    from vllm.ampere_thin_gemm.warmup import _TABLE_NK
+
+    for N, K in _TABLE_NK:
+        if K < 128:
+            continue
+        x, w = _xw(32, N, K)
+        assert thin_gemm_supported(x, w, None), (N, K)
+
+
 # ------------------------------------------------------------- fallthrough
 def test_falls_back_without_touching_the_kernel():
     """An unsupported shape must take F.linear and never import triton."""

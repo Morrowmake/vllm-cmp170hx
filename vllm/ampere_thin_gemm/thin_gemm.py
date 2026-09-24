@@ -251,6 +251,54 @@ _CONFIG_OVERRIDES: dict = {
     (2048, 128, 16): (32, 128, 1, 4, 2),  # 2.66 us vs cuBLAS 3.59 (1.349x), separate timing 2.70 us
     (2048, 128, 32): (32, 128, 1, 4, 4),  # 2.85 us vs cuBLAS 3.60 (1.262x), separate timing 2.90 us
     (2048, 128, None): (32, 128, 1, 4, 3),
+    #
+    # Pipeline parallel (TP=1): one card runs whole layers, so the column- and
+    # row-parallel projections are at full width. Only the (N, K) that exist
+    # under PP alone are listed; an (N, K) shared with TP=4 keeps its rows
+    # above. Same sweep and acceptance rule (>= 2.5 % over the fallback
+    # schedule); an M not listed keeps the heuristic.
+    # PP4 lm_head_verify+lm_head_dflash_draft  N=154880 K=4096
+    (154880, 4096, 1): (128, 128, 1, 4, 4),  # 747.39 us vs cuBLAS 948.35 (1.269x), was 887.94
+    (154880, 4096, 32): (128, 256, 1, 4, 2),  # 793.34 us vs cuBLAS 1051.52 (1.325x), was 1491.46
+    # PP4 kda_in_proj_qkvbfg_a  N=24896 K=4096
+    (24896, 4096, 1): (128, 128, 2, 4, 3),  # 129.15 us vs cuBLAS 144.77 (1.121x), was 132.48
+    (24896, 4096, 8): (128, 128, 1, 4, 4),  # 130.43 us vs cuBLAS 130.69 (1.002x), was 134.66
+    (24896, 4096, 16): (128, 128, 1, 4, 4),  # 131.20 us vs cuBLAS 132.99 (1.014x), was 136.96
+    (24896, 4096, 24): (128, 128, 1, 4, 2),  # 132.99 us vs cuBLAS 148.48 (1.116x), was 141.70
+    (24896, 4096, 32): (128, 128, 1, 4, 2),  # 133.89 us vs cuBLAS 149.76 (1.119x), was 144.51
+    # PP4 dense_mlp_gate_up+dflash_gate_up  N=24576 K=4096
+    (24576, 4096, 1): (128, 128, 1, 4, 4),  # 126.85 us vs cuBLAS 141.44 (1.115x), was 131.07
+    (24576, 4096, 4): (128, 128, 1, 4, 4),  # 128.00 us vs cuBLAS 128.38 (1.003x), was 132.22
+    (24576, 4096, 8): (128, 128, 1, 4, 2),  # 129.02 us vs cuBLAS 129.79 (1.006x), was 132.99
+    (24576, 4096, 16): (128, 128, 1, 4, 4),  # 129.41 us vs cuBLAS 131.20 (1.014x), was 136.58
+    (24576, 4096, 24): (128, 128, 1, 4, 2),  # 131.33 us vs cuBLAS 147.07 (1.120x), was 140.16
+    (24576, 4096, 32): (128, 128, 1, 4, 2),  # 131.84 us vs cuBLAS 148.61 (1.127x), was 142.59
+    # PP4 mla_o_proj  N=4096 K=16384
+    (4096, 16384, 24): (32, 128, 1, 4, 4),  # 88.32 us vs cuBLAS 118.78 (1.345x), was 105.09
+    (4096, 16384, 32): (128, 64, 2, 4, 4),  # 91.01 us vs cuBLAS 119.17 (1.309x), was 114.69
+    # PP4 dense_mlp_down+dflash_down  N=4096 K=12288
+    (4096, 12288, 24): (128, 128, 2, 4, 4),  # 70.14 us vs cuBLAS 96.90 (1.381x), was 80.00
+    (4096, 12288, 32): (128, 128, 2, 4, 3),  # 70.40 us vs cuBLAS 98.05 (1.393x), was 87.55
+    # PP4 dflash_ctx_kv  N=10240 K=4096
+    (10240, 4096, 1): (32, 128, 1, 2, 2),  # 54.91 us vs cuBLAS 64.90 (1.182x), was 62.72
+    (10240, 4096, 2): (32, 128, 1, 2, 2),  # 55.30 us vs cuBLAS 65.54 (1.185x), was 64.90
+    (10240, 4096, 4): (32, 128, 1, 2, 2),  # 55.81 us vs cuBLAS 66.43 (1.190x), was 65.41
+    (10240, 4096, 8): (32, 128, 1, 2, 2),  # 55.81 us vs cuBLAS 67.07 (1.202x), was 65.79
+    (10240, 4096, 16): (32, 128, 1, 2, 3),  # 56.58 us vs cuBLAS 69.12 (1.222x), was 66.94
+    (10240, 4096, 24): (64, 128, 1, 4, 3),  # 59.78 us vs cuBLAS 76.54 (1.281x), was 76.80
+    (10240, 4096, 32): (64, 128, 1, 4, 3),  # 60.42 us vs cuBLAS 75.90 (1.256x), was 75.39
+    # PP4 mla_q_b_proj  N=16384 K=1536
+    (16384, 1536, 8): (128, 128, 1, 4, 4),  # 35.10 us vs cuBLAS 39.66 (1.130x), was 36.03
+    # PP4 mla_kv_b_proj  N=32768 K=512
+    (32768, 512, 4): (64, 256, 1, 4, 3),  # 24.90 us vs cuBLAS 29.06 (1.167x), was 25.54
+    (32768, 512, 8): (64, 256, 1, 4, 3),  # 25.22 us vs cuBLAS 29.57 (1.173x), was 26.05
+    (32768, 512, 16): (128, 128, 1, 4, 3),  # 26.05 us vs cuBLAS 30.21 (1.160x), was 27.07
+    (32768, 512, 24): (128, 128, 1, 4, 3),  # 27.58 us vs cuBLAS 31.42 (1.139x), was 28.99
+    (32768, 512, 32): (128, 128, 1, 4, 3),  # 27.52 us vs cuBLAS 30.85 (1.121x), was 29.50
+    # PP4 kda_f_b_proj+kda_g_b_proj  N=8192 K=128
+    (8192, 128, 1): (64, 32, 1, 4, 4),  # 3.84 us vs cuBLAS 5.08 (1.320x), was 3.95
+    (8192, 128, 24): (128, 32, 1, 4, 4),  # 4.29 us vs cuBLAS 5.43 (1.265x), was 4.65
+    (8192, 128, 32): (128, 32, 1, 4, 4),  # 4.42 us vs cuBLAS 5.48 (1.240x), was 4.74
 }
 
 _num_sms_cache = None
