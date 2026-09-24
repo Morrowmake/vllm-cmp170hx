@@ -40,6 +40,7 @@ __all__ = [
     "use_ampere_mhc_decode",
     "use_ampere_moe_routing",
     "use_ampere_kda_decode",
+    "use_ampere_kda_decode_v2",
     "marlin_block_size_m",
     "stash_fused_align",
     "take_fused_align",
@@ -174,6 +175,60 @@ def use_ampere_kda_decode(
     # One int32 arrival counter per (sequence, head); _CTR_SLOTS is 8192.
     if num_seqs * num_heads > 8192:
         return False
+    return _is_sm80()
+
+
+# Shapes the fused v2 kernel is validated for (vllm/ampere_decode/
+# kda_decode_v2.py): the TP=4 GLM-5.3-Flash rank shape, up to 5 tokens per
+# sequence (its gate workspace holds 8 token rows) and up to 8 sequences.
+_KDA_V2_HEADS = 16
+_KDA_V2_HEAD_DIM = 128
+_KDA_V2_MAX_TOKENS_PER_SEQ = 5
+_KDA_V2_MAX_SEQS = 8
+
+
+def use_ampere_kda_decode_v2(
+    num_seqs: int,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    w_f: torch.Tensor | None = None,
+    w_g: torch.Tensor | None = None,
+) -> bool:
+    """Gate for vllm/ampere_decode/kda_decode_v2.py::kda_decode_v2.
+
+    Resolved on the host, once per layer call, before any launch. Outside the
+    covered shapes, or with any condition unmet, the caller keeps the
+    f_b/g_b GEMMs + kda_decode path. ``w_f``/``w_g`` are the f_b_proj and
+    g_b_proj weights: the kernel reads them directly, so they must be plain
+    bf16 [H * D, D] row-major tensors (unquantized, as in the W4A16
+    checkpoint).
+    """
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_KDA_V2:
+        return False
+    if num_seqs < 1 or num_seqs > _KDA_V2_MAX_SEQS:
+        return False
+    if num_tokens < num_seqs or num_tokens % num_seqs:
+        return False
+    if num_tokens // num_seqs > _KDA_V2_MAX_TOKENS_PER_SEQ:
+        return False
+    if num_tokens > envs.VLLM_GLM5_DECODE_KDA_MAX_TOKENS:
+        return False
+    if num_heads != _KDA_V2_HEADS or head_dim != _KDA_V2_HEAD_DIM:
+        return False
+    for w in (w_f, w_g):
+        if w is None:
+            continue
+        if (
+            not isinstance(w, torch.Tensor)
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or tuple(w.shape) != (num_heads * head_dim, head_dim)
+            or w.stride(1) != 1
+        ):
+            return False
     return _is_sm80()
 
 

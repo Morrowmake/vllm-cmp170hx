@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
+    VLLM_GLM5_DECODE_KDA_V2: bool = False
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_THIN_GEMM: bool = False
@@ -1591,6 +1592,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DECODE_KDA_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_KDA_MAX_TOKENS", "64")
+    ),
+    # Opt in to the second-generation fused KDA decode step
+    # (vllm/ampere_decode/kda_decode_v2.py): f_b_proj + g_b_proj + conv + gated
+    # delta rule + gated RMSNorm in ONE launch instead of two thin GEMMs plus
+    # the fused decode kernel. Needs VLLM_GLM5_DECODE_KERNELS=1; takes
+    # precedence over VLLM_GLM5_DECODE_KDA where its shapes are covered and
+    # falls back to the existing path elsewhere. Off by default.
+    "VLLM_GLM5_DECODE_KDA_V2": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_KDA_V2", "0"))
     ),
     # Opt in to the sm_80 thin-M BF16 GEMM in vllm/ampere_thin_gemm/ for the
     # layers GLM-5.3-Flash's W4A16 recipe leaves unquantized (GA100-class parts
