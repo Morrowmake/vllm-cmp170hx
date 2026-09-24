@@ -305,7 +305,10 @@ def canonical_topk(
     assert logits.dim() == 2, "canonical_topk expects 2-D logits"
     assert logits.dtype == torch.float32, f"expected fp32 logits, got {logits.dtype}"
     num_rows, num_cols = logits.shape
-    assert k <= num_cols, f"k={k} exceeds row width {num_cols}"
+    # A prefill chunk holding only short requests can be narrower than k
+    # while a longer request in the same step takes the long-prefill path:
+    # select the whole width and -1 fill, as top_k_per_row_prefill does.
+    k_sel = min(k, num_cols)
     assert num_cols < (1 << _MAX_INDEX_BITS), (
         f"row width {num_cols} exceeds the composite key's index field"
     )
@@ -313,6 +316,10 @@ def canonical_topk(
     device = logits.device
     if out is None:
         out = torch.empty((num_rows, k), dtype=torch.int32, device=device)
+
+    if num_cols == 0:
+        out[:, :k].fill_(-1)
+        return out
 
     shift = max(1, (num_cols - 1).bit_length())
     cols = torch.arange(num_cols, device=device, dtype=torch.int64)
@@ -340,7 +347,10 @@ def canonical_topk(
         in_window = (cols.unsqueeze(0) >= blk_starts) & (cols.unsqueeze(0) < blk_ends)
         key = torch.where(in_window, key, torch.full_like(key, -1))
 
-        idx = key.topk(k, dim=-1).indices
+        idx = key.topk(k_sel, dim=-1).indices
+        if k_sel < k:
+            # Slots past the width are past every row length: -1 below.
+            idx = torch.nn.functional.pad(idx, (0, k - k_sel), value=-1)
         if relative:
             idx = idx - blk_starts
 
