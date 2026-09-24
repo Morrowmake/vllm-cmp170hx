@@ -296,6 +296,15 @@ class GroupedTopKRouter(BaseRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
 
+        if envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2 and indices_type in (None, torch.int32):
+            # The fused sm_80 router already routed these exact logits at the
+            # gate's call site (vllm/ampere_decode/moe_route.py).
+            from vllm.ampere_decode import take_fused_routing
+
+            _pre = take_fused_routing(router_logits)
+            if _pre is not None:
+                return _pre
+
         def valid_grouping() -> bool:
             # Check if num_experts is greater than num_expert_group
             # and is divisible by num_expert_group
