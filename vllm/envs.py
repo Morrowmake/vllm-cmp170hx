@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_IDX_GLUE: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_GLM5_TOPK_CANONICAL: bool = False
+    VLLM_GLM5_KPOOL_TAIL_LEGACY_RING: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_TOPK_SORTED: bool = False
     VLLM_GLM5_TOPK_TIE_REPAIR: bool = False
@@ -1669,6 +1670,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset the dispatch below is byte-identical to upstream.
     "VLLM_GLM5_TOPK_CANONICAL": lambda: bool(
         int(os.getenv("VLLM_GLM5_TOPK_CANONICAL", "0"))
+    ),
+    # Size the GLM-5.3-Flash kpool tail ring as exactly index_kpool slots, the
+    # layout before the ring was widened for speculative decoding. With
+    # speculative decoding, the rows stashed for a rejected pool-completing
+    # draft can then overwrite committed keys of the open pool, and the redone
+    # completion compresses a wrong pool key. Kill switch only; default 0 keeps
+    # index_kpool * cdiv(index_kpool + num_speculative_tokens, index_kpool).
+    "VLLM_GLM5_KPOOL_TAIL_LEGACY_RING": lambda: bool(
+        int(os.getenv("VLLM_GLM5_KPOOL_TAIL_LEGACY_RING", "0"))
     ),
     # Rank tokens inside each expert segment of moe_align_block_size by
     # ascending flat routed-row index instead of by atomic arrival order.
