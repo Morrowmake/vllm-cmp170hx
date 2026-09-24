@@ -65,12 +65,11 @@ def test_settings_rejects_garbage():
         ("VLLM_GLM5_PROLOGUE_FUSE", False),
         ("VLLM_GLM5_PROLOGUE_FUSE_GDN", True),
         ("VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT", True),
-        ("VLLM_GLM5_PROLOGUE_FUSE_DEBUG", False),
     ],
 )
 @pytest.mark.parametrize("raw", [None, "", "1", "0", "true", "off", " On ", "YES"])
 def test_envs_declaration_agrees_with_the_parser(monkeypatch, name, default, raw):
-    """envs.py declares these four and mirrors this parser by hand.
+    """envs.py declares these three and mirrors this parser by hand.
 
     They are declared so validate_environ() does not call them unknown -- the
     launcher exports VLLM_GLM5_PROLOGUE_FUSE -- and the declaration is worth
@@ -432,3 +431,25 @@ def test_triton_gdn_spec_decode_meta(num_spec, nreal, npad):
     prologue_fuse._gdn_spec_decode_meta(block_table, qsl, acc, *got.values(), *args)
     for name in want:
         assert torch.equal(got[name], want[name]), name
+
+
+def test_debug_flag_is_retired():
+    """VLLM_GLM5_PROLOGUE_FUSE_DEBUG was parsed into a field nothing read.
+
+    It is gone from both readers: envs.py no longer declares it (so setting it
+    draws the usual unknown-variable warning instead of silently doing
+    nothing) and the settings object has no ``debug`` field.
+    """
+    import dataclasses
+
+    import vllm.envs as envs
+
+    assert "VLLM_GLM5_PROLOGUE_FUSE_DEBUG" not in envs.environment_variables
+    fields = {f.name for f in dataclasses.fields(prologue_fuse.PrologueFuseSettings)}
+    assert fields == {"enabled", "gdn", "mamba_block_table"}
+    # A stale export of the retired name must not change the parsed settings.
+    base = prologue_fuse.read_settings({"VLLM_GLM5_PROLOGUE_FUSE": "1"})
+    stale = prologue_fuse.read_settings(
+        {"VLLM_GLM5_PROLOGUE_FUSE": "1", "VLLM_GLM5_PROLOGUE_FUSE_DEBUG": "1"}
+    )
+    assert base == stale
