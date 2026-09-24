@@ -70,13 +70,25 @@ def test_on_masks_padding_rows_in_place(fake_ctx, monkeypatch):
     assert (ids[25:] == -1).all()
 
 
-def test_longer_mask_buffer_is_sliced(fake_ctx, monkeypatch):
+def test_mask_view_of_the_persistent_buffer(fake_ctx, monkeypatch):
     monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "1")
     monkeypatch.setenv("VLLM_GLM5_DECODE_KERNELS", "0")
-    fake_ctx["is_padding"] = _pad(10, 64)[:16]   # view of the persistent buffer
+    fake_ctx["is_padding"] = _pad(10, 64)[:16]   # the runner passes [:padded]
     ids = _ids(16)
     mr.mask_padding_topk_ids(ids)
     assert (ids[10:] == -1).all() and (ids[:10] >= 0).all()
+
+
+def test_row_slice_of_the_batch_is_not_masked(fake_ctx, monkeypatch):
+    # The prefill overlap calls the MoE on row slices; the batch mask does
+    # not line up with a slice, so the call is left alone.
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "1")
+    monkeypatch.setenv("VLLM_GLM5_DECODE_KERNELS", "0")
+    fake_ctx["is_padding"] = _pad(30, 32)
+    ids = _ids(16)
+    ref = ids.clone()
+    mr.mask_padding_topk_ids(ids)
+    assert torch.equal(ids, ref)
 
 
 @pytest.mark.parametrize("case", ["no_ctx", "no_mask", "short_mask"])
@@ -87,7 +99,7 @@ def test_no_usable_mask_is_a_no_op(fake_ctx, monkeypatch, case):
         fake_ctx["available"] = False
         fake_ctx["is_padding"] = _pad(1, 16)
     elif case == "short_mask":
-        fake_ctx["is_padding"] = _pad(1, 8)
+        fake_ctx["is_padding"] = _pad(1, 8)     # shorter than the call
     ids = _ids(16)
     ref = ids.clone()
     mr.mask_padding_topk_ids(ids)
