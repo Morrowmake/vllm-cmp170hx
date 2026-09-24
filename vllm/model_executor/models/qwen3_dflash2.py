@@ -5,9 +5,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -20,6 +27,8 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -287,6 +296,29 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         return hidden_states, residual
 
 
+def _predecessor_ids(
+    candidate_ids: torch.Tensor, anchor_token_ids: torch.Tensor, top_k: int
+) -> torch.Tensor:
+    return torch.cat(
+        (
+            anchor_token_ids[:, None, None].expand(-1, 1, top_k),
+            candidate_ids[:, :-1],
+        ),
+        dim=1,
+    )
+
+
+def _combine_edges(
+    predecessors: torch.Tensor,
+    successors: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
+    )
+
+
 def _score_edges(
     predecessor_table: torch.Tensor,
     successor_table: torch.Tensor,
@@ -297,17 +329,29 @@ def _score_edges(
     top_k: int,
 ) -> torch.Tensor:
     successors = successor_table[candidate_ids]
-    predecessor_ids = torch.cat(
-        (
-            anchor_token_ids[:, None, None].expand(-1, 1, top_k),
-            candidate_ids[:, :-1],
-        ),
-        dim=1,
-    )
+    predecessor_ids = _predecessor_ids(candidate_ids, anchor_token_ids, top_k)
     predecessors = predecessor_table[predecessor_ids]
-    return unary_logits[:, :, None] + torch.einsum(
-        "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
-    )
+    return _combine_edges(predecessors, successors, unary_logits, hidden)
+
+
+def selector_vocab_shard(
+    vocab_size: int, tp_rank: int, tp_size: int
+) -> tuple[int, int, int]:
+    """(first row, end row, padded rows per rank) of a contiguous vocab shard."""
+    per_rank = -(-vocab_size // tp_size)
+    start = min(vocab_size, tp_rank * per_rank)
+    end = min(vocab_size, start + per_rank)
+    return start, end, per_rank
+
+
+def local_codebook_rows(
+    table: torch.Tensor, ids: torch.Tensor, start: int, end: int
+) -> torch.Tensor:
+    """Rows of a vocab shard for global ids, zero where another rank owns
+    the id. Summing this over all ranks gives ``full_table[ids]`` exactly."""
+    owned = (ids >= start) & (ids < end)
+    local = torch.where(owned, ids - start, torch.zeros_like(ids))
+    return table[local].masked_fill(~owned[..., None], 0)
 
 
 @support_torch_compile
@@ -323,12 +367,32 @@ class CandidateSelector(nn.Module):
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        tp_size = get_tensor_model_parallel_world_size()
+        self.shard_vocab = envs.VLLM_GLM5_DRAFTER_SELECTOR_SHARD and tp_size > 1
+        rows = vocab_size
+        self.vocab_start, self.vocab_end = 0, vocab_size
+        if self.shard_vocab:
+            self.vocab_start, self.vocab_end, rows = selector_vocab_shard(
+                vocab_size, get_tensor_model_parallel_rank(), tp_size
+            )
+            elem = torch.tensor([], dtype=params_dtype).element_size()
+            logger.info_once(
+                "VLLM_GLM5_DRAFTER_SELECTOR_SHARD: selector codebooks %d -> %d "
+                "rows per rank (%.1f -> %.1f MiB for both).",
+                vocab_size,
+                rows,
+                2 * vocab_size * rank * elem / 2**20,
+                2 * rows * rank * elem / 2**20,
+            )
         self.predecessor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+            torch.empty(rows, rank, dtype=params_dtype), requires_grad=False
         )
         self.successor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+            torch.empty(rows, rank, dtype=params_dtype), requires_grad=False
         )
+        if self.shard_vocab:
+            for param in (self.predecessor_codebook, self.successor_codebook):
+                param.weight_loader = self._load_codebook_shard
         self.hidden_projection = ReplicatedLinear(
             hidden_size,
             rank,
@@ -339,6 +403,13 @@ class CandidateSelector(nn.Module):
             return_bias=False,
         )
 
+    def _load_codebook_shard(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        n = self.vocab_end - self.vocab_start
+        param.data[:n].copy_(loaded_weight[self.vocab_start : self.vocab_end])
+        param.data[n:].zero_()
+
     def forward(
         self,
         candidate_ids: torch.Tensor,
@@ -347,6 +418,29 @@ class CandidateSelector(nn.Module):
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden = self.hidden_projection(hidden_states)
+        if self.shard_vocab:
+            predecessor_ids = _predecessor_ids(
+                candidate_ids, anchor_token_ids, self.top_k
+            )
+            rows = torch.stack(
+                (
+                    local_codebook_rows(
+                        self.predecessor_codebook,
+                        predecessor_ids,
+                        self.vocab_start,
+                        self.vocab_end,
+                    ),
+                    local_codebook_rows(
+                        self.successor_codebook,
+                        candidate_ids,
+                        self.vocab_start,
+                        self.vocab_end,
+                    ),
+                )
+            )
+            # One rank holds each row and the others add zeros: exact.
+            rows = tensor_model_parallel_all_reduce(rows)
+            return _combine_edges(rows[0], rows[1], unary_logits, hidden)
         return _score_edges(
             self.predecessor_codebook,
             self.successor_codebook,
