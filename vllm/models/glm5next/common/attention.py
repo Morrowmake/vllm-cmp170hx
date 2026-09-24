@@ -299,9 +299,20 @@ class Indexer(nn.Module):
         )
         self.max_pool_len = vllm_config.model_config.max_model_len // self.index_kpool
         self.prefix = prefix
-        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+        from vllm.v1.attention.backends.mla.indexer import (
+            get_indexer_gather_workspace_size,
+        )
 
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        # The gathered index-K is pool-granular (compress_ratio ==
+        # index_kpool), and one prefill chunk spans at most max_num_seqs
+        # requests. Sizing the shared gather workspace by the raw
+        # 40 * max_model_len heuristic reserves 40 full-context requests'
+        # worth of token-granular rows -- 19x what this config can gather at
+        # max_num_seqs=8, index_kpool=4. The metadata builder clamps its
+        # chunk limit with the same helper, so chunks still fit.
+        self.max_total_seq_len = get_indexer_gather_workspace_size(
+            vllm_config, self.index_kpool
+        )
         self.indexer_op = SparseAttnIndexerKpool(
             self.k_cache,
             self.quant_block_size,
