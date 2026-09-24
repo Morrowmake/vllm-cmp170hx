@@ -183,6 +183,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_KDA: bool = True
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
+    VLLM_GLM5_DECODE_MOE_ROUTE_V2: bool = False
+    VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
@@ -1588,6 +1590,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
+    ),
+    # Opt in to vllm/ampere_decode/moe_route.py: the MoE router GEMV, the
+    # sigmoid/bias top-k and the Marlin block alignment as one op (one launch
+    # for 2 <= M <= 64), replacing GateLinear's cuBLAS split-K GEMM + reduce and
+    # the routing kernels. Needs VLLM_GLM5_DECODE_KERNELS=1 as well. Default
+    # OFF: with it unset nothing in moe_route.py is imported or called.
+    "VLLM_GLM5_DECODE_MOE_ROUTE_V2": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2", "0"))
+    ),
+    # Upper token bound for VLLM_GLM5_DECODE_MOE_ROUTE_V2: the largest decode
+    # batch it was validated and timed at (M = 1..32, 33 validated).
+    "VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "32")
     ),
     "VLLM_GLM5_DECODE_KDA_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_KDA_MAX_TOKENS", "64")

@@ -63,6 +63,8 @@ def warmup_ampere_decode(worker, capture_sizes) -> None:
         _warmup_moe(worker, model, device, capture_sizes, use_ampere_moe_routing)
     if envs.VLLM_GLM5_DECODE_KDA:
         _warmup_kda(worker, model, device, capture_sizes, use_ampere_kda_decode)
+    if envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2:
+        _warmup_moe_route(worker, model, device, capture_sizes)
 
 
 def _warmup_mhc(model, device, capture_sizes, gate) -> None:
@@ -161,3 +163,32 @@ def _warmup_kda(worker, model, device, capture_sizes, gate) -> None:
         return
     kda_decode.warmup(plans=tuple(plans), device=torch.device(device))
     logger.info("Warmed up sm_80 KDA decode kernel for (nseq, T) in %s.", plans)
+
+
+def _warmup_moe_route(worker, model, device, capture_sizes) -> None:
+    """Compile every (M, block size) variant of moe_route.py and allocate its
+    scratch (split-K partials, bitmask columns, arrival counters) before any
+    graph is captured."""
+    from vllm import envs
+    from vllm.ampere_decode import marlin_block_size_m, moe_route
+
+    shape = _moe_shape(worker, model)
+    if shape is None:
+        return
+    num_experts, topk = shape
+    hidden = int(worker.vllm_config.model_config.get_hidden_size())
+    if (num_experts, topk, hidden) != (288, 8, 4096):
+        return
+    ms = _token_sizes(capture_sizes, envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS)
+    if not ms:
+        return
+    for m in ms:
+        moe_route.warmup(
+            (m,),
+            block_sizes=(marlin_block_size_m(m, topk, num_experts),),
+            topk=topk,
+            num_experts=num_experts,
+            hidden=hidden,
+            device=device,
+        )
+    logger.info("Warmed up sm_80 fused MoE router for M in %s.", ms)

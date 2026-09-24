@@ -7,6 +7,8 @@ Vendored decode kernels. Three families:
   ``mhc_decode``   the fused mHC post + pre sublayer boundary, 90 calls/step
   ``moe_routing``  routing + block alignment in one kernel, plus ``moe_sum``
   ``kda_decode``   conv + gated delta rule + gated RMSNorm in one kernel
+  ``moe_route``    router GEMV + top-k + block alignment, one launch for
+                   2 <= M <= 64 (``VLLM_GLM5_DECODE_MOE_ROUTE_V2``)
 
 Every one of these is gated behind ``VLLM_GLM5_DECODE_KERNELS`` plus a
 per-family switch; with the master flag unset nothing in this package is
@@ -43,6 +45,9 @@ __all__ = [
     "marlin_block_size_m",
     "stash_fused_align",
     "take_fused_align",
+    "use_ampere_moe_route_v2",
+    "maybe_moe_route_v2",
+    "take_fused_routing",
 ]
 
 # Sentinel for "the caller has a norm_weight tensor". The mHC gate only needs
@@ -242,3 +247,122 @@ def take_fused_align(
         return None
     _PENDING = None
     return aligned
+
+
+# --- router GEMV + routing + alignment (moe_route.py) -----------------------
+# `moe_route` computes the router logits, the top-k and the Marlin alignment in
+# one launch at the gate's call site (moe_runner.py). The router and the Marlin
+# experts run later and far away, so the results are handed over through two
+# single-slot stashes keyed by tensor IDENTITY: the routing by the
+# `router_logits` tensor returned in place of the gate's, the alignment by the
+# `topk_ids` (the existing `stash_fused_align`). A consumer that sees a
+# different tensor misses and computes its own result from the logits, which
+# are the same logits either way.
+_PENDING_ROUTING: tuple | None = None
+_V2_ANNOUNCED = False
+
+
+def use_ampere_moe_route_v2(num_tokens: int, gate, router, x) -> bool:
+    """Gate for vllm/ampere_decode/moe_route.py, evaluated on the host.
+
+    Pinned to what the kernel was validated for: GLM-5.x noaux_tc sigmoid
+    routing, one expert group, renormalised, fp32 correction bias, 288 experts,
+    top-8, hidden 4096, bf16 gate weight with fp32 logits, no gate bias.
+    """
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2:
+        return False
+    if num_tokens < 1 or num_tokens > envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS:
+        return False
+    if gate is None or router is None:
+        return False
+    if getattr(router, "scoring_func", None) != "sigmoid":
+        return False
+    if getattr(router, "num_expert_group", None) != 1:
+        return False
+    if getattr(router, "topk_group", None) != 1:
+        return False
+    if not getattr(router, "renormalize", False):
+        return False
+    if getattr(router, "top_k", None) != 8:
+        return False
+    if getattr(router, "num_fused_shared_experts", 0) != 0:
+        return False
+    if getattr(router, "skip_padding", False):
+        return False
+    if getattr(router, "eplb_state", None) is not None:
+        return False
+    bias = getattr(router, "e_score_correction_bias", None)
+    if bias is None or bias.dtype != torch.float32 or tuple(bias.shape) != (288,):
+        return False
+    w = getattr(gate, "weight", None)
+    if w is None or w.dtype != torch.bfloat16 or tuple(w.shape) != (288, 4096):
+        return False
+    if not w.is_contiguous():
+        return False
+    if getattr(gate, "bias", None) is not None:
+        return False
+    if getattr(gate, "out_dtype", None) != torch.float32:
+        return False
+    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != 4096:
+        return False
+    if x.stride(1) != 1:
+        return False
+    return _is_sm80()
+
+
+def maybe_moe_route_v2(gate, router, x):
+    """Run the fused router for `x` if the gate allows it.
+
+    Returns the fp32 router logits (in place of `gate(x)[0]`) and stashes the
+    top-k and the alignment for the router and the Marlin experts, or returns
+    None, in which case the caller runs the gate exactly as before.
+    """
+    num_tokens = x.shape[0]
+    if not use_ampere_moe_route_v2(num_tokens, gate, router, x):
+        return None
+    from vllm.ampere_decode.moe_route import moe_route
+
+    num_experts = int(gate.weight.shape[0])
+    topk = int(router.top_k)
+    block_size = marlin_block_size_m(num_tokens, topk, num_experts)
+    logits, topk_w, topk_ids, sorted_ids, expert_ids, ntpp = moe_route(
+        x,
+        gate.weight,
+        router.e_score_correction_bias.data,
+        topk=topk,
+        block_size=block_size,
+        num_experts=num_experts,
+        renormalize=True,
+        routed_scaling_factor=float(router.routed_scaling_factor),
+    )
+    global _PENDING_ROUTING, _V2_ANNOUNCED
+    _PENDING_ROUTING = (logits, (topk_w, topk_ids))
+    stash_fused_align(topk_ids, block_size, num_experts,
+                      (sorted_ids, expert_ids, ntpp))
+    if not _V2_ANNOUNCED:
+        from vllm import envs
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "sm_80 fused MoE router active: gate GEMV + top-k + block "
+            "alignment in one op for M <= %d "
+            "[VLLM_GLM5_DECODE_MOE_ROUTE_V2=1]",
+            envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS,
+        )
+        _V2_ANNOUNCED = True
+    return logits
+
+
+def take_fused_routing(router_logits):
+    """(topk_weights, topk_ids) computed with exactly these logits, or None."""
+    global _PENDING_ROUTING
+    pending = _PENDING_ROUTING
+    if pending is None:
+        return None
+    logits, routing = pending
+    if logits is not router_logits:
+        return None
+    _PENDING_ROUTING = None
+    return routing
