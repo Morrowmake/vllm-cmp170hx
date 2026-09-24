@@ -25,7 +25,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
     native_next_n_supported,
 )
-from vllm.utils.math_utils import round_down
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -801,6 +801,45 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * 40
 
 
+def get_indexer_gather_workspace_size(
+    vllm_config: VllmConfig, compress_ratio: int = 1
+) -> int:
+    """Rows of index-K a single prefill chunk can ever gather.
+
+    ``get_max_prefill_buffer_size`` is a hardware heuristic (40 *
+    ``max_model_len``), not a bound on what a step can produce. A prefill chunk
+    never spans more requests than the model runner has slots for
+    (``max_num_seqs``: the scheduler asserts ``len(running) <= max_num_seqs``
+    and validates ``max_num_active_seqs`` to be no larger), and each request
+    contributes at most ``cdiv(max_model_len, compress_ratio)`` compressed
+    entries. Clamping the heuristic to that product leaves chunk formation
+    unchanged whenever the clamp still exceeds what a step can gather, and it
+    stops the O(N) gather workspace being sized for requests that cannot exist.
+
+    The clamp is never below ``cdiv(max_model_len, compress_ratio)``, so the
+    single-request escape hatch in ``_split_indexer_prefill_chunks`` (which
+    admits one request whatever the limit) still fits the workspace.
+
+    ``VLLM_GLM5_INDEXER_GATHER_CLAMP=0`` returns the heuristic unchanged.
+    """
+    legacy = get_max_prefill_buffer_size(vllm_config)
+    if not envs.VLLM_GLM5_INDEXER_GATHER_CLAMP:
+        return legacy
+    clamped = min(
+        legacy,
+        vllm_config.scheduler_config.max_num_seqs
+        * cdiv(vllm_config.model_config.max_model_len, compress_ratio),
+    )
+    logger.info_once(
+        "VLLM_GLM5_INDEXER_GATHER_CLAMP: indexer gather rows %d -> %d "
+        "(compress_ratio %d).",
+        legacy,
+        clamped,
+        compress_ratio,
+    )
+    return clamped
+
+
 def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
@@ -882,8 +921,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.use_pcp = self.pcp_world_size > 1
         self.pcp_rank = get_pcp_group().rank_in_group if self.use_pcp else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
-        self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config
@@ -953,8 +990,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.dcp_rank_tensor = torch.tensor(
             self.dcp_rank, dtype=torch.int32, device=self.device
         )
+        # Rows of the two decode block-table buffers (this one and the lazy
+        # indexer_decode_block_table_buffer). They only ever hold decode rows:
+        # a request is a decode when its query is at most decode_threshold =
+        # next_n tokens, and a step has at most max_num_seqs requests. The
+        # varlen (SM100) metadata kernel is handed the full seq-lens capacity,
+        # so it keeps the max_num_batched_tokens sizing.
+        self._decode_block_table_rows = scheduler_config.max_num_batched_tokens
+        if envs.VLLM_GLM5_INDEXER_DECODE_ROWS and not self.supports_varlen:
+            self._decode_block_table_rows = min(
+                scheduler_config.max_num_batched_tokens,
+                scheduler_config.max_num_seqs * next_n,
+            )
+            logger.info_once(
+                "VLLM_GLM5_INDEXER_DECODE_ROWS: indexer decode block-table rows "
+                "%d -> %d (max_num_seqs %d x next_n %d), width %d.",
+                scheduler_config.max_num_batched_tokens,
+                self._decode_block_table_rows,
+                scheduler_config.max_num_seqs,
+                next_n,
+                block_table_width,
+            )
+        # Buffers replaced by _ensure_decode_block_table_rows stay referenced:
+        # a CUDA graph captured earlier may still read them.
+        self._retired_decode_buffers: list[torch.Tensor] = []
         self.expanded_block_table_buffer = torch.zeros(
-            (scheduler_config.max_num_batched_tokens, block_table_width),
+            (self._decode_block_table_rows, block_table_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -979,6 +1040,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 f"(compress_ratio={self.compress_ratio})."
             )
 
+        # NOTE(Chen):an estimated max size of flattened_kv. Need to double
+        # check. Clamped to what one step can actually gather; this must
+        # stay in step with the indexer op's gather workspace, which is
+        # sized by the same helper.
+        self.max_prefill_buffer_size = get_indexer_gather_workspace_size(
+            self.vllm_config, self.compress_ratio
+        )
+
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
             # compress_ratio > 1 (DeepseekV4)
@@ -996,6 +1065,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         self.indexer_decode_block_table_buffer: torch.Tensor | None = None
         self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+    def _ensure_decode_block_table_rows(self, rows: int) -> None:
+        """Grow the decode block-table buffers if a step needs more rows than
+        they were sized for (only possible with VLLM_GLM5_INDEXER_DECODE_ROWS).
+        The replaced buffers stay referenced, so a CUDA graph that captured
+        them keeps valid memory."""
+        if rows <= self._decode_block_table_rows:
+            return
+        new_rows = max(rows, self._max_num_batched_tokens)
+        logger.warning_once(
+            "Indexer decode block-table rows %d < %d needed; growing to %d. "
+            "Set VLLM_GLM5_INDEXER_DECODE_ROWS=0 to keep the full sizing.",
+            self._decode_block_table_rows,
+            rows,
+            new_rows,
+        )
+        self._retired_decode_buffers.append(self.expanded_block_table_buffer)
+        self.expanded_block_table_buffer = torch.zeros(
+            (new_rows, self.expanded_block_table_buffer.shape[1]),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if self.indexer_decode_block_table_buffer is not None:
+            self._retired_decode_buffers.append(self.indexer_decode_block_table_buffer)
+            self.indexer_decode_block_table_buffer = None
+        self._decode_block_table_rows = new_rows
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1457,6 +1552,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             min_decode_len = int(decode_lens_cpu.min().item())
+            self._ensure_decode_block_table_rows(
+                max(num_decode_tokens, num_decodes * max_decode_len)
+            )
             write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
             # The kernel sees max_decode_len Q rows, not the configured next_n,
@@ -1552,7 +1650,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     rows, cols = compressed.shape
                     if self.indexer_decode_block_table_buffer is None:
                         self.indexer_decode_block_table_buffer = torch.zeros(
-                            (self._max_num_batched_tokens, cols),
+                            (self._decode_block_table_rows, cols),
                             dtype=torch.int32,
                             device=self.device,
                         )

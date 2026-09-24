@@ -200,6 +200,10 @@ if TYPE_CHECKING:
     VLLM_GLM5_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
+    VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
+    VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
+    VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
+    VLLM_GLM5_MEM_ATTRIBUTION: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1736,6 +1740,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # row is unchanged; the unreachable tail is simply not allocated.
     "VLLM_GLM5_DRAFTER_ROPE_FIT": lambda: bool(
         int(os.getenv("VLLM_GLM5_DRAFTER_ROPE_FIT", "0"))
+    ),
+    # Size the sparse indexer's K-gather workspace (and the metadata builder's
+    # chunk limit) by what one step can gather, max_num_seqs *
+    # cdiv(max_model_len, compress_ratio), instead of the 40 * max_model_len
+    # heuristic alone. 0 restores the heuristic.
+    "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
+        int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "1"))
+    ),
+    # Size the sparse indexer's two decode block-table buffers by the decode
+    # rows a step can hold (max_num_seqs * (1 + num_speculative_tokens))
+    # instead of max_num_batched_tokens. A larger decode batch grows them back
+    # to the old size with a warning, keeping the old buffers alive.
+    "VLLM_GLM5_INDEXER_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_INDEXER_DECODE_ROWS", "0"))
+    ),
+    # Shard the DFlash2 candidate selector's two (vocab, rank) codebooks by
+    # vocab rows across the tensor-parallel ranks instead of replicating them.
+    # Each rank looks up the rows it owns, zero elsewhere, and one all-reduce
+    # of the two gathered row sets rebuilds them exactly (x + 0 = x).
+    "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DRAFTER_SELECTOR_SHARD", "0"))
+    ),
+    # Log where device memory goes at start-up: resident bytes per module
+    # group after loading, the peak of each profile_run stage, the KV sizing
+    # terms, and what the attention metadata builders allocate after the KV
+    # cache is sized. Logging only; the KV cache size is unchanged.
+    "VLLM_GLM5_MEM_ATTRIBUTION": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MEM_ATTRIBUTION", "0"))
     ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
