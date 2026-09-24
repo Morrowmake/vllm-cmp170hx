@@ -119,8 +119,10 @@ def test_indexer_calls_the_sort_on_both_paths():
     from vllm.models.glm5next.nvidia import sparse_indexer as si
 
     src = inspect.getsource(si.sparse_attn_indexer_kpool)
-    assert src.count("if use_sorted_topk():") == 2
+    assert src.count("elif use_sorted_topk():") == 2
     assert src.count("sort_selected_topk_(topk_dst)") == 2
+    assert src.count("elif use_topk_tie_repair():") == 2
+    assert src.count("repair_topk_ties_(") == 2
     pre = src.index("torch.ops._C.top_k_per_row_prefill")
     first = src.index("sort_selected_topk_(topk_dst)")
     expand = src.index("expand_pools_and_append_tail")

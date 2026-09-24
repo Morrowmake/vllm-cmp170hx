@@ -11,11 +11,14 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.indexer_topk import (
+    SparseIndexerTopk,
     canonical_topk,
     get_indexer_topk,
+    repair_topk_ties_,
     sort_selected_topk_,
     use_canonical_topk,
     use_sorted_topk,
+    use_topk_tie_repair,
 )
 from vllm.models.glm5next.common.sparse_indexer import (
     RADIX_TOPK_WORKSPACE_SIZE,
@@ -388,7 +391,18 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
-            if use_sorted_topk():
+            if use_canonical_topk():
+                pass  # already the canonical set, in canonical order
+            elif use_topk_tie_repair():
+                repair_topk_ties_(
+                    topk_dst,
+                    logits,
+                    select_k,
+                    row_ends=chunk.cu_seqlen_ke,
+                    row_starts=chunk.cu_seqlen_ks,
+                    relative=True,
+                )
+            elif use_sorted_topk():
                 sort_selected_topk_(topk_dst)
             # Free the fp32 logits before the next chunk allocates its own.
             # The buffer is [chunk_rows, compressed_context] and the metadata
@@ -656,7 +670,17 @@ def sparse_attn_indexer_kpool(
             attn_metadata_narrowed.max_seq_len,
         )
 
-        if use_sorted_topk():
+        if use_canonical_topk():
+            pass  # SparseIndexerTopk already took the canonical path
+        elif use_topk_tie_repair():
+            repair_topk_ties_(
+                topk_dst,
+                logits,
+                select_k,
+                row_ends=SparseIndexerTopk._row_ends(seq_lens, next_n, logits.shape[0]),
+                relative=False,
+            )
+        elif use_sorted_topk():
             sort_selected_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
