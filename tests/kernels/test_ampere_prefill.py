@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-side tests for the opt-in sm_80 prefill kernels (vllm/ampere_prefill/).
 
-Everything here runs without a GPU: the dispatch gates are pure host logic, and
-the bf16 hi/mid/lo split the mHC pre-norm GEMM relies on is exercised against a
-CPU reference. The GPU correctness of the kernels themselves is covered by
-the standalone GPU correctness suite (37 checks, three families).
+Everything but the GPU tests at the end runs without a GPU: the dispatch gates
+are pure host logic, and the bf16 hi/mid/lo split the mHC pre-norm GEMM relies
+on is exercised against a CPU reference. The GPU tests (skipped without a GPU;
+the standalone runner below hides the GPU unless CUDA_VISIBLE_DEVICES is set)
+gate the pre-norm GEMM's error against an fp64 recomputation relative to the
+TileLang kernel it replaces, with no ulp floor, and its CUDA-graph replay. The
+full GPU correctness of the kernels is covered by the standalone GPU
+correctness suite.
 
     pytest -q tests/kernels/test_ampere_prefill.py
 """
@@ -200,6 +204,112 @@ def test_distinct_fn_give_distinct_results_on_gpu():
     assert torch.equal(ya, ya2)
 
 
+def _prenorm_cases(dev):
+    """(name, x, fn) inputs shaped like the prefill calls: unnormalised residual
+    streams with a per-token scale spread, and the same with a few massive
+    channels (real activations have them); fn ~ N(0, 1/K)."""
+    g = torch.Generator(device=dev).manual_seed(11)
+    K = 16384
+    fn = torch.randn(24, K, generator=g, device=dev, dtype=torch.float32) / K ** 0.5
+    cases = []
+    for M in (384, 1152, 3456):
+        scale = 0.25 * 16.0 ** torch.rand(M, 1, generator=g, device=dev)
+        x = torch.randn(M, K, generator=g, device=dev, dtype=torch.float32) * scale
+        cases.append((f"spread_m{M}", x.to(torch.bfloat16), fn))
+        xo = x.clone()
+        ch = torch.randint(0, K, (8,), generator=g, device=dev)
+        xo[:, ch] *= 200.0
+        cases.append((f"outlier_m{M}", xo.to(torch.bfloat16), fn))
+    return cases
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_prenorm_accuracy_vs_tilelang_no_floor():
+    """Error against fp64 relative to TileLang's, NO ulp floor.
+
+    The first version chained every k block through the tensor-core mma
+    accumulator, which truncates on sm_80: 23x TileLang's mean error on the
+    mixes of a real 16K-token prefill (9-31x here), while passing every
+    absolute-tolerance check. Gate, for the mixes and for sqrsum: per case mean
+    <= 1.10x TileLang's and max <= 1.50x; summed over the spread cases, max
+    <= 1.10x. The outlier cases' max is looser on purpose: a 200x channel in
+    a 16-wide mma k group sets the alignment the other 15 products are
+    truncated to, which a scalar FMA chain does not do, so this kernel's
+    worst element there is up to ~1.4x TileLang's (its mean stays <= 1.0x).
+    On real inputs the per-element tail is 0.83x on average and is gated at
+    1.25x by the standalone suite's real-input check.
+    """
+    from vllm.ampere_prefill.mhc_prenorm import hc_prenorm_gemm
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        _HC_PRENORM_GEMM_TILELANG_KERNEL,
+    )
+
+    dev = torch.device("cuda")
+    bad = []
+    sums = {"out": [0.0, 0.0], "sqrsum": [0.0, 0.0]}
+    for name, x, fn in _prenorm_cases(dev):
+        M, N = x.shape[0], fn.shape[0]
+        o_t = torch.empty(1, M, N, dtype=torch.float32, device=dev)
+        s_t = torch.empty(1, M, dtype=torch.float32, device=dev)
+        _HC_PRENORM_GEMM_TILELANG_KERNEL(x, fn, o_t, s_t, 4096, 4)
+        o_k, s_k = hc_prenorm_gemm(x, fn)
+        torch.cuda.synchronize()
+        xd = x.double()
+        ref = {"out": xd @ fn.double().t(), "sqrsum": xd.square().sum(-1)}
+        for key, got, tl_ in (("out", o_k[0], o_t[0]), ("sqrsum", s_k[0], s_t[0])):
+            e_k = (got.double() - ref[key]).abs()
+            e_t = (tl_.double() - ref[key]).abs()
+            r_mean = float(e_k.mean() / e_t.mean())
+            r_max = float(e_k.max() / e_t.max())
+            if name.startswith("spread"):
+                sums[key][0] += float(e_k.max())
+                sums[key][1] += float(e_t.max())
+            if r_mean > 1.10 or r_max > 1.50:
+                bad.append(f"{name} {key}: mean {r_mean:.2f}x max {r_max:.2f}x")
+    for key, (k_sum, t_sum) in sums.items():
+        if k_sum > 1.10 * t_sum:
+            bad.append(f"{key}: summed max {k_sum / t_sum:.2f}x")
+    assert not bad, "; ".join(bad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_prenorm_graph_replay():
+    """Captured in a CUDA graph, replayed on new inputs: bitwise equal to the
+    eager call, and replays allocate nothing."""
+    from vllm.ampere_prefill.mhc_prenorm import hc_prenorm_gemm, warmup
+
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(12)
+    K, N = 16384, 24
+    for M in (384, 1152):
+        warmup((M,), K=K, N=N, device=str(dev))
+        x = torch.zeros(M, K, dtype=torch.bfloat16, device=dev)
+        fn = torch.zeros(N, K, dtype=torch.float32, device=dev)
+        out = torch.empty(1, M, N, dtype=torch.float32, device=dev)
+        sq = torch.empty(1, M, dtype=torch.float32, device=dev)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            hc_prenorm_gemm(x, fn, out=out, sqrsum=sq)
+        torch.cuda.current_stream().wait_stream(s)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hc_prenorm_gemm(x, fn, out=out, sqrsum=sq)
+        torch.cuda.synchronize()
+        for _ in range(3):
+            x.copy_((torch.randn(M, K, generator=g, device=dev) * 3.0).to(torch.bfloat16))
+            fn.copy_(torch.randn(N, K, generator=g, device=dev) / K ** 0.5)
+            torch.cuda.synchronize()
+            mem0 = torch.cuda.memory_allocated(dev)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated(dev) == mem0, M
+            e_out, e_sq = hc_prenorm_gemm(x, fn)
+            torch.cuda.synchronize()
+            assert torch.equal(out, e_out), M
+            assert torch.equal(sq, e_sq), M
+
+
 # --------------------------------------------------------------------------
 # Standalone runner: `python tests/kernels/test_ampere_prefill.py`.
 # The vllm-dev venv has no pytest and this suite must be runnable there, so
@@ -259,11 +369,14 @@ def _main():
         cases.append((fn.__name__, lambda mp, f=fn: f(_as_sm80(mp))))
     for fn in (test_split3_reconstructs_fp32, test_split3_is_injective_for_distinct_fn):
         cases.append((fn.__name__, lambda mp, f=fn: f()))
-    if torch.cuda.is_available():
-        cases.append((test_distinct_fn_give_distinct_results_on_gpu.__name__,
-                      lambda mp: test_distinct_fn_give_distinct_results_on_gpu()))
-    else:
-        print("SKIP test_distinct_fn_give_distinct_results_on_gpu (no GPU visible)")
+    gpu_tests = (test_distinct_fn_give_distinct_results_on_gpu,
+                 test_gpu_prenorm_accuracy_vs_tilelang_no_floor,
+                 test_gpu_prenorm_graph_replay)
+    for fn in gpu_tests:
+        if torch.cuda.is_available():
+            cases.append((fn.__name__, lambda mp, f=fn: f()))
+        else:
+            print(f"SKIP {fn.__name__} (no GPU visible)")
 
     failed = 0
     for name, run in cases:
