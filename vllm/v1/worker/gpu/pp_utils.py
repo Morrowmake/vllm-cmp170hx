@@ -33,6 +33,20 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+    # VLLM_PP_SPLIT_DRAFT_EVENT: recorded after the draft-token broadcast
+    # (``event`` then covers only the sampled tokens and counts).
+    draft_event: torch.cuda.Event | None = None
+
+
+@dataclass
+class PendingDrafts:
+    """Draft tokens consumed from a slot whose values may still be in flight."""
+
+    event: torch.cuda.Event
+    draft_tokens: torch.Tensor  # [num_reqs, num_speculative_steps]
+    idx_mapping_np: np.ndarray  # [num_reqs]
+    keep_np: np.ndarray  # [num_reqs] bool: rows to scatter
+    gen_at_consume_np: np.ndarray  # [num_reqs]
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -90,6 +104,16 @@ class PPHandler:
             group_desc="pp_broadcast"
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+        # VLLM_PP_SPLIT_DRAFT_EVENT (non-last ranks with speculative decoding):
+        # wait for the draft tokens separately and as late as possible.
+        import vllm.envs as envs
+
+        self.split_draft_event = (
+            envs.VLLM_PP_SPLIT_DRAFT_EVENT
+            and not self.is_last_rank
+            and num_speculative_steps > 0
+        )
+        self.pending_drafts: PendingDrafts | None = None
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -151,7 +175,23 @@ class PPHandler:
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
-        if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+        if (
+            slot.draft_event is not None
+            and slot.draft_tokens is not None
+            and draft_tokens_to_update is not None
+        ):
+            # Split draft event: defer the draft scatter to
+            # apply_pending_drafts (right before the forward). A pending entry
+            # left by a step that never reached its forward is applied first.
+            self.apply_pending_drafts(draft_tokens_to_update)
+            self.pending_drafts = PendingDrafts(
+                event=slot.draft_event,
+                draft_tokens=slot.draft_tokens,
+                idx_mapping_np=slot.idx_mapping_np,
+                keep_np=~exclude_mask,
+                gen_at_consume_np=self.req_idx_gen_np[slot.idx_mapping_np].copy(),
+            )
+        elif slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
             draft_idx_mapping = slot.idx_mapping
             if exclude_mask.any():
@@ -170,6 +210,33 @@ class PPHandler:
             idx_mapping=idx_mapping,
             step_idx_mapping=slot.idx_mapping,
         )
+
+    def has_pending_drafts(self) -> bool:
+        return self.pending_drafts is not None
+
+    def apply_pending_drafts(self, draft_tokens_to_update: torch.Tensor) -> None:
+        """Wait (on the main stream) for the deferred draft tokens and scatter
+        them into the request state. Rows whose request was freed since the
+        results were consumed are skipped, so a re-used row keeps the state
+        its new request wrote."""
+        pending = self.pending_drafts
+        if pending is None:
+            return
+        self.pending_drafts = None
+        freed = self.req_idx_gen_np[pending.idx_mapping_np] != pending.gen_at_consume_np
+        keep = pending.keep_np & ~freed
+        if not keep.any():
+            return
+        self.main_stream.wait_event(pending.event)
+        draft_tokens = pending.draft_tokens
+        if keep.all():
+            idx_mapping_np = pending.idx_mapping_np
+        else:
+            keep_t = torch.as_tensor(keep, device=draft_tokens.device)
+            draft_tokens = draft_tokens[keep_t]
+            idx_mapping_np = pending.idx_mapping_np[keep]
+        idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
+        draft_tokens_to_update[idx_mapping] = draft_tokens
 
     def broadcast_drafts(
         self, draft_tokens: torch.Tensor, input_batch: InputBatch
@@ -215,6 +282,11 @@ class PPHandler:
                 combined, src=self.last_rank, group=self.broadcast_group
             )
             draft_tokens = None
+            draft_event = None
+            if self.split_draft_event:
+                # The sampled tokens and counts are all the next step's input
+                # preparation needs; the draft values come after the drafter.
+                event = self.broadcast_stream.record_event()
             if self.num_speculative_steps > 0:
                 draft_tokens = torch.empty(
                     num_reqs,
@@ -225,7 +297,10 @@ class PPHandler:
                 torch.distributed.broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
-            event = self.broadcast_stream.record_event()
+            if self.split_draft_event:
+                draft_event = self.broadcast_stream.record_event()
+            else:
+                event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
@@ -243,6 +318,7 @@ class PPHandler:
             need_sampled_mask,
             gen_at_receive_np,
             draft_tokens,
+            draft_event,
         )
         return bool(need_sampled_mask.all())
 

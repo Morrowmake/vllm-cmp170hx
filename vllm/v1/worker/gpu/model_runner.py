@@ -323,6 +323,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         self.fast_prefill: FastPrefillHelper | None = None
+        # Arguments of this step's combine_sampled_and_draft_tokens, kept when
+        # the draft-token values arrive late (VLLM_PP_SPLIT_DRAFT_EVENT).
+        self._late_combine_args: tuple | None = None
         if self.use_pp:
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
@@ -1156,6 +1159,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
         return scheduler_output.total_num_scheduled_tokens
 
+    def apply_late_drafts(self) -> None:
+        """VLLM_PP_SPLIT_DRAFT_EVENT: once the previous step's draft tokens
+        have landed, scatter them into the request state and rebuild this
+        step's input ids. The stream waits only here, so the input preparation
+        and attention metadata before it overlap the last stage's drafter."""
+        if self.pp_handler is None or not self.pp_handler.has_pending_drafts():
+            return
+        self.pp_handler.apply_pending_drafts(self.req_states.draft_tokens)
+        if self._late_combine_args is not None:
+            combine_sampled_and_draft_tokens(*self._late_combine_args)
+            self._late_combine_args = None
+
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
@@ -1450,7 +1465,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
+        combine_args = (
             self.input_buffers.input_ids,
             idx_mapping,
             self.req_states.last_sampled_tokens,
@@ -1462,6 +1477,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        logits_indices = combine_sampled_and_draft_tokens(*combine_args)
+        if self.pp_handler is not None and self.pp_handler.has_pending_drafts():
+            # The previous step's draft values are still in flight from the
+            # last stage; this call wrote stale ones. apply_late_drafts()
+            # re-runs it (a pure function of the request state) once they land.
+            self._late_combine_args = combine_args
 
         fast_prefill = None
         if self.fast_prefill is not None:
@@ -1907,6 +1928,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
 
+        if not dummy_run:
+            self.apply_late_drafts()
         input_ids = input_batch.input_ids
         inputs_embeds = None
         ec_connector_output = None

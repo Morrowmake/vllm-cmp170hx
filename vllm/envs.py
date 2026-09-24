@@ -225,6 +225,7 @@ if TYPE_CHECKING:
     VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_PP_PACKED_HOP: bool = False
     VLLM_PP_HOP_NO_METADATA: bool = False
+    VLLM_PP_SPLIT_DRAFT_EVENT: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1840,6 +1841,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default OFF.
     "VLLM_PP_HOP_NO_METADATA": lambda: bool(
         int(os.getenv("VLLM_PP_HOP_NO_METADATA", "0"))
+    ),
+    # Pipeline parallelism with speculative decoding: the first stages wait
+    # only for the sampled tokens and counts before preparing the next step,
+    # and for the draft tokens (sent after the drafter ran) only right before
+    # the forward. Default OFF.
+    "VLLM_PP_SPLIT_DRAFT_EVENT": lambda: bool(
+        int(os.getenv("VLLM_PP_SPLIT_DRAFT_EVENT", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
