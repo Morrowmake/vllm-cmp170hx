@@ -153,6 +153,10 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
+    mark_drafter_aux_fc_folded,
+    maybe_configure_aux_fc_fold,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -323,6 +327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         self.fast_prefill: FastPrefillHelper | None = None
+        self.aux_fc_folded = False
         # Arguments of this step's combine_sampled_and_draft_tokens, kept when
         # the draft-token values arrive late (VLLM_PP_SPLIT_DRAFT_EVENT).
         self._late_combine_args: tuple | None = None
@@ -409,12 +414,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     assert self.pp_handler is not None
                     self.pp_handler.configure_aux_hidden_state_relay(self.model)
+                    # VLLM_GLM5_PP_FOLD_DRAFT_FC: each stage applies its slice
+                    # of the drafter's input projection and forwards one fp32
+                    # partial sum instead of relaying the aux states.
+                    self.aux_fc_folded = maybe_configure_aux_fc_fold(
+                        self.model,
+                        self.speculative_config,
+                        self.pp_handler,
+                        load_dummy_weights=load_dummy_weights,
+                    )
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+                if self.aux_fc_folded:
+                    mark_drafter_aux_fc_folded(self.speculator)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

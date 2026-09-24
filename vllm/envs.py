@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     VLLM_PP_PACKED_HOP: bool = False
     VLLM_PP_HOP_NO_METADATA: bool = False
     VLLM_PP_SPLIT_DRAFT_EVENT: bool = False
+    VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1848,6 +1849,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the forward. Default OFF.
     "VLLM_PP_SPLIT_DRAFT_EVENT": lambda: bool(
         int(os.getenv("VLLM_PP_SPLIT_DRAFT_EVENT", "0"))
+    ),
+    # GLM-5.3-Flash + DFlash under PP: each stage multiplies its own aux
+    # hidden states by their slice of the drafter's input projection (fc) and
+    # forwards one fp32 partial sum instead of relaying the aux states; the
+    # last stage uses the sum as the fc output. Same arithmetic up to the fp32
+    # summation order. Default OFF.
+    "VLLM_GLM5_PP_FOLD_DRAFT_FC": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if

@@ -914,6 +914,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     ) -> torch.Tensor:
         if not self.model.use_aux_hidden_state:
             return hidden_states
+        if getattr(self, "aux_fc_folded", False):
+            # Pipeline stages already applied fc (VLLM_GLM5_PP_FOLD_DRAFT_FC):
+            # this is its fp32 output; round once to the model dtype.
+            assert hidden_states.shape[-1] == self.model.fc.output_size, (
+                hidden_states.shape
+            )
+            return hidden_states.to(self.model.fc.weight.dtype)
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)

@@ -133,6 +133,14 @@ def aux_hidden_state_mode() -> str:
     return mode
 
 
+def _mm_fp32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``x @ w.T`` with fp32 output (fp32 accumulation, no rounding to the
+    input dtype), as the drafter fc accumulates before its single rounding."""
+    if x.is_cuda:
+        return torch.mm(x, w.t(), out_dtype=torch.float32)
+    return torch.mm(x.float(), w.float().t())
+
+
 def use_replicated_embed() -> bool:
     """Whether to replicate the input embedding table on every TP rank.
 
@@ -902,6 +910,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     # contracted [num_tokens, hidden_size] tensor, which is the width the
     # relay slots reserve (reserve_aux_intermediate_tensor_slots).
     supports_aux_hidden_states_over_pp: ClassVar[bool] = True
+    # Drafter fc fold under PP (enable_aux_fc_fold); None when off.
+    aux_fc_blocks: dict[int, torch.Tensor] | None = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1012,6 +1022,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         # Only consulted when a drafter asks for auxiliary hidden states.
         self.aux_hidden_state_mode = aux_hidden_state_mode()
+        # Drafter fc fold under PP (aux_fc_fold.py): aux slot -> this stage's
+        # [hidden, hidden] block of the drafter's fc.weight. None when off.
+        self.aux_fc_blocks: dict[int, torch.Tensor] | None = None
 
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, (
@@ -1040,6 +1053,34 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def enable_aux_fc_fold(self, blocks: dict[int, torch.Tensor]) -> None:
+        """Fold the drafter's fc into this stage (VLLM_GLM5_PP_FOLD_DRAFT_FC):
+        ``blocks`` maps each local aux slot to its fc.weight column block. The
+        boundary then carries one fp32 partial sum instead of aux states."""
+        self.aux_fc_blocks = blocks
+        # Nothing to collect as separate aux states on the last stage.
+        self._aux_upstream_total_cached = 0
+
+    def _fold_aux_fc(
+        self,
+        partial: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor],
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Return partial + sum_j aux_j @ W_(base+j)^T (products in fp32)."""
+        assert self.aux_fc_blocks is not None
+        if partial is None:
+            ref = aux_hidden_states[0] if aux_hidden_states else None
+            partial = torch.zeros(
+                (num_tokens, self.config.hidden_size),
+                dtype=torch.float32,
+                device=ref.device if ref is not None else self.device,
+            )
+        base = self._aux_slot_base_cached
+        for j, aux in enumerate(aux_hidden_states):
+            partial = partial + _mm_fp32(aux, self.aux_fc_blocks[base + j])
+        return partial
 
     def _capture_aux_hidden_state(
         self,
@@ -1139,6 +1180,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         remote_aux_hidden_states = self.collect_remote_aux_hidden_states(
             intermediate_tensors
         )
+        fold_partial_in: torch.Tensor | None = None
+        if self.aux_fc_blocks is not None and not get_pp_group().is_first_rank:
+            from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
+                AUX_FC_PARTIAL_KEY,
+            )
+
+            assert intermediate_tensors is not None
+            fold_partial_in = intermediate_tensors[AUX_FC_PARTIAL_KEY]
         aux_hidden_states: list[torch.Tensor] = []
         # Prefill comm/compute overlap. Returns None -- and therefore changes
         # nothing -- unless VLLM_GLM5_PREFILL_OVERLAP=1 and this is a
@@ -1184,7 +1233,18 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 aux_hidden_states = [
                     sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
                 ]
-            aux_tensors = self.pack_local_aux_hidden_states(aux_hidden_states)
+            if self.aux_fc_blocks is not None:
+                from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
+                    AUX_FC_PARTIAL_KEY,
+                )
+
+                aux_tensors = {
+                    AUX_FC_PARTIAL_KEY: self._fold_aux_fc(
+                        fold_partial_in, aux_hidden_states, full_num_tokens
+                    )
+                }
+            else:
+                aux_tensors = self.pack_local_aux_hidden_states(aux_hidden_states)
             if self.mhc:
                 # post/comb are the deferred hc_post inputs of this rank's
                 # last mHC layer (normally consumed by the next layer's
@@ -1223,6 +1283,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.is_sequence_parallel and aux_hidden_states:
             aux_hidden_states = [
                 sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
+            ]
+        if self.aux_fc_blocks is not None:
+            # The drafter receives the finished fc output (fp32) in place of
+            # the concatenated aux states.
+            return hidden_states, [
+                self._fold_aux_fc(fold_partial_in, aux_hidden_states, full_num_tokens)
             ]
         # Remote states come from earlier layers, so they go first.
         aux_hidden_states = remote_aux_hidden_states + aux_hidden_states
