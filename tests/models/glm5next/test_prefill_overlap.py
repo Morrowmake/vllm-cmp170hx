@@ -1063,3 +1063,54 @@ def test_the_cap_knob_is_what_lets_the_custom_arm_run_at_splits_two():
     assert make_executor("custom", ca=FakeCA()).choose(hidden_slice(1024)) == "nccl"
     raised = make_executor("custom", ca=FakeCA(max_size=16 * 1024 * 1024))
     assert raised.choose(hidden_slice(1024)) == "custom"
+
+
+# --------------------------------------------------------------------------- #
+# envs.py and overlap.py agree on the two integer knobs
+# --------------------------------------------------------------------------- #
+
+
+_INT_KNOBS = {
+    "VLLM_GLM5_PREFILL_OVERLAP_SPLITS": "splits",
+    "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS": "min_tokens",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_INT_KNOBS))
+@pytest.mark.parametrize("raw", [None, "", "1", " 2 ", "4", "1024", "+3"])
+def test_int_knobs_envs_agrees_on_good_values(monkeypatch, name, raw):
+    import vllm.envs as envs
+
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+        env: dict[str, str] = {}
+    else:
+        monkeypatch.setenv(name, raw)
+        env = {name: raw}
+    declared = envs.environment_variables[name]()
+    parsed = getattr(ov.read_settings(env), _INT_KNOBS[name])
+    assert declared == parsed
+    assert type(declared) is int
+
+
+@pytest.mark.parametrize("name", sorted(_INT_KNOBS))
+@pytest.mark.parametrize("raw", ["0", "-1", "-512", "zero", "1.5", "2x"])
+@pytest.mark.parametrize("overlap_on", ["0", "1"])
+def test_int_knobs_envs_agrees_on_bad_values(monkeypatch, name, raw, overlap_on):
+    """Both readers refuse the same values, with the same message.
+
+    Before, envs.py returned 0 or a negative number where overlap.py raised,
+    so ``envs.X`` reported a setting the feature would refuse. A bad explicit
+    value now fails the same way through either reader, whether the overlap
+    is on or off.
+    """
+    import vllm.envs as envs
+
+    monkeypatch.setenv(name, raw)
+    env = {name: raw, "VLLM_GLM5_PREFILL_OVERLAP": overlap_on}
+    with pytest.raises(ValueError) as from_envs:
+        envs.environment_variables[name]()
+    with pytest.raises(ValueError) as from_overlap:
+        ov.read_settings(env)
+    assert str(from_envs.value) == str(from_overlap.value)
+    assert name in str(from_envs.value)
