@@ -209,6 +209,31 @@ def use_tiefix_topk() -> bool:
     return on
 
 
+@functools.cache
+def tiefix_split_rows() -> int:
+    """Row bound of the split tie fix + sort (VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS;
+    0 = off). Only meaningful with the tie fix and the sort both on. Read
+    once per process; tests call cache_clear."""
+    import vllm.envs as envs
+
+    rows = max(0, int(envs.VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS))
+    if rows and not (use_tiefix_topk() and use_sorted_topk()):
+        logger.info_once(
+            "GLM-5 split tie-fix scan NOT active: VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS "
+            "needs VLLM_GLM5_TOPK_TIEFIX=1 and VLLM_GLM5_TOPK_SORTED=1"
+        )
+        return 0
+    if rows:
+        logger.info_once(
+            "GLM-5 split tie-fix scan active: batches of at most %d rows over "
+            "wide logits run the tie fix + sort over (row, chunk) programs "
+            "(VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS=%d; set 0 to disable)",
+            rows,
+            rows,
+        )
+    return rows
+
+
 def tiefix_topk_(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -222,8 +247,14 @@ def tiefix_topk_(
     place; with ``sort`` also sort each row (VLLM_GLM5_TOPK_SORTED) in the
     same launch. See indexer_topk_tiefix.py; imported lazily so that with the flag
     unset nothing new is loaded."""
-    from vllm.model_executor.layers.indexer_topk_tiefix import topk_tiefix_
+    from vllm.model_executor.layers.indexer_topk_tiefix import (
+        topk_tiefix_,
+        use_split,
+    )
 
+    split = sort and use_split(
+        topk_indices.shape[0], logits.shape[1], tiefix_split_rows()
+    )
     return topk_tiefix_(
         logits,
         topk_indices,
@@ -231,6 +262,7 @@ def tiefix_topk_(
         row_starts=row_starts,
         relative=relative,
         sort=sort,
+        split=split,
     )
 
 
@@ -448,7 +480,10 @@ def canonical_topk(
     assert logits.dim() == 2, "canonical_topk expects 2-D logits"
     assert logits.dtype == torch.float32, f"expected fp32 logits, got {logits.dtype}"
     num_rows, num_cols = logits.shape
-    assert k <= num_cols, f"k={k} exceeds row width {num_cols}"
+    # A prefill chunk holding only short requests can be narrower than k
+    # while a longer request in the same step takes the long-prefill path:
+    # select the whole width and -1 fill, as top_k_per_row_prefill does.
+    k_sel = min(k, num_cols)
     assert num_cols < (1 << _MAX_INDEX_BITS), (
         f"row width {num_cols} exceeds the composite key's index field"
     )
@@ -456,6 +491,10 @@ def canonical_topk(
     device = logits.device
     if out is None:
         out = torch.empty((num_rows, k), dtype=torch.int32, device=device)
+
+    if num_cols == 0:
+        out[:, :k].fill_(-1)
+        return out
 
     shift = max(1, (num_cols - 1).bit_length())
     cols = torch.arange(num_cols, device=device, dtype=torch.int64)
@@ -483,7 +522,10 @@ def canonical_topk(
         in_window = (cols.unsqueeze(0) >= blk_starts) & (cols.unsqueeze(0) < blk_ends)
         key = torch.where(in_window, key, torch.full_like(key, -1))
 
-        idx = key.topk(k, dim=-1).indices
+        idx = key.topk(k_sel, dim=-1).indices
+        if k_sel < k:
+            # Slots past the width are past every row length: -1 below.
+            idx = torch.nn.functional.pad(idx, (0, k - k_sel), value=-1)
         if relative:
             idx = idx - blk_starts
 

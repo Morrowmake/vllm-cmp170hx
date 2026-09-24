@@ -134,6 +134,298 @@ def _topk_tiefix_kernel(
         tl.store(irow + slots, v, mask=in_k)
 
 
+# ---------------------------------------------------------------------------
+# Split path for small batches of wide rows (tie fix + sort only)
+# ---------------------------------------------------------------------------
+#
+# One program per row leaves most SMs idle when a decode batch has a handful
+# of rows over a long context (4 rows x 32,768 pools at 131K), and the
+# contested-row repair then scans the row serially. With ``sort`` the result
+# is fully determined by the row's threshold T (the smallest selected score),
+# the selected count and ``need`` (selected entries equal to T): the canonical
+# set is every entry above T plus the ``need`` lowest-index entries equal to
+# T, and in ascending order each entry's slot is its running count. So two
+# launches over (row, chunk) produce the sorted canonical row directly:
+#
+#   count  per chunk: entries above / equal to T (chunk 0 also records T,
+#          the selected count and need); reads only.
+#   write  per chunk: exclusive prefix of the counts, then one ascending scan
+#          writing each chunk entry at its final slot (one int32 cumsum per
+#          tile carries both running counts); chunk 0 writes the -1 tail.
+#          Never reads the selection, so it may overwrite it.
+#
+# Rows whose window is no longer than k and fully selected are written as the
+# identity. The bytes equal the one-program kernel with SORT (and so
+# topk_tiefix_ + sort_selected_topk_). Taken only when enabled with
+# VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS and the batch has at most that many rows.
+
+# Split geometry: at most SPLIT_MAX_CHUNKS chunks per row, each a power of
+# two >= SPLIT_CHUNK_MIN columns; tile and warps per chunk program.
+SPLIT_CHUNK_MIN = 1024
+SPLIT_MAX_CHUNKS = 64
+SPLIT_BLOCK = 1024
+SPLIT_NUM_WARPS = 4
+# Narrower logits never split (one program per row is cheaper there).
+SPLIT_MIN_COLS = 16384
+_SCRATCH_INFO = 4  # thr, n_valid, need, length
+
+
+@triton.jit
+def _row_window(starts_ptr, ends_ptr, row, n_cols, HAS_STARTS: tl.constexpr):
+    end = tl.load(ends_ptr + row).to(tl.int32)
+    if HAS_STARTS:
+        start = tl.maximum(tl.load(starts_ptr + row).to(tl.int32), 0)
+    else:
+        start = end * 0
+    end = tl.maximum(tl.minimum(end, n_cols), start)
+    return start, end
+
+
+@triton.jit
+def _selection_count(irow, K: tl.constexpr, K_P2: tl.constexpr):
+    slots = tl.arange(0, K_P2)
+    sel = tl.load(irow + slots, mask=slots < K, other=-1)
+    return tl.sum(((slots < K) & (sel >= 0)).to(tl.int32), axis=0)
+
+
+@triton.jit
+def _selection_threshold(
+    lrow, irow, start, K: tl.constexpr, K_P2: tl.constexpr, RELATIVE: tl.constexpr
+):
+    """(T, n_valid, need): the smallest selected key, the selected count and
+    how many selected entries equal T."""
+    slots = tl.arange(0, K_P2)
+    in_k = slots < K
+    sel = tl.load(irow + slots, mask=in_k, other=-1)
+    valid = in_k & (sel >= 0)
+    col = sel + start if RELATIVE else sel
+    key = _ordered_key(tl.load(lrow + col, mask=valid, other=0.0))
+    thr = tl.min(tl.where(valid, key, 0x7FFFFFFF), axis=0)
+    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+    n_gt = tl.sum((valid & (key > thr)).to(tl.int32), axis=0)
+    return thr, n_valid, n_valid - n_gt
+
+
+@triton.jit
+def _scan_write(
+    lrow,
+    irow,
+    start,
+    c_lo,
+    c_hi,
+    thr,
+    n_valid,
+    need,
+    gt_seen,
+    eq_seen,
+    BLOCK: tl.constexpr,
+    RELATIVE: tl.constexpr,
+):
+    """Write the canonical entries of columns [c_lo, c_hi) at their final
+    ascending slots, given the above/equal counts of the columns before c_lo.
+    Returns the counts including this range."""
+    c0 = c_lo
+    while (c0 < c_hi) & (gt_seen + tl.minimum(eq_seen, need) < n_valid):
+        cols = c0 + tl.arange(0, BLOCK)
+        m = cols < c_hi
+        key = _ordered_key(tl.load(lrow + cols, mask=m, other=0.0))
+        gt = m & (key > thr)
+        eq = m & (key == thr)
+        packed = gt.to(tl.int32) + (eq.to(tl.int32) << 16)
+        inc = tl.cumsum(packed, axis=0)
+        eq_run = eq_seen + (inc >> 16)
+        pos = gt_seen + (inc & 0xFFFF) + tl.minimum(eq_run, need) - 1
+        take = gt | (eq & (eq_run <= need))
+        out = cols - start if RELATIVE else cols
+        tl.store(irow + pos, out, mask=take & (pos < n_valid))
+        tot = tl.sum(packed, axis=0)
+        gt_seen += tot & 0xFFFF
+        eq_seen += tot >> 16
+        c0 += BLOCK
+    return gt_seen, eq_seen
+
+
+@triton.jit(do_not_specialize=["stride_l", "stride_i", "n_cols", "chunk"])
+def _topk_tiefix_split_count_kernel(
+    logits_ptr,
+    idx_ptr,
+    starts_ptr,
+    ends_ptr,
+    scratch_ptr,
+    stride_l,
+    stride_i,
+    n_cols,
+    chunk,
+    K: tl.constexpr,
+    K_P2: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NCH: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    RELATIVE: tl.constexpr,
+):
+    """Split pass 1, grid (rows, NCH): per chunk, entries above and equal to
+    T; chunk 0 also records (T, n_valid, need, length). Reads only."""
+    row = tl.program_id(0).to(tl.int64)
+    ch = tl.program_id(1)
+    lrow = logits_ptr + row * stride_l
+    irow = idx_ptr + row * stride_i
+    srow = scratch_ptr + row * (2 * NCH + 4)
+    start, end = _row_window(starts_ptr, ends_ptr, row, n_cols, HAS_STARTS)
+    length = end - start
+    c_lo = start + ch * chunk
+    c_hi = tl.minimum(c_lo + chunk, end)
+
+    n_gt = length * 0
+    n_eq = length * 0
+    if c_lo < end:
+        n_sel = _selection_count(irow, K, K_P2)
+        if (length <= K) & (n_sel == length):
+            # Whole window selected (only chunk 0 is non-empty, chunk >= K):
+            # the write pass emits the identity.
+            tl.store(srow + 2 * NCH + 3, -1)
+        else:
+            thr, n_valid, need = _selection_threshold(
+                lrow, irow, start, K, K_P2, RELATIVE
+            )
+            if ch == 0:
+                tl.store(srow + 2 * NCH + 0, thr)
+                tl.store(srow + 2 * NCH + 1, n_valid)
+                tl.store(srow + 2 * NCH + 2, need)
+                tl.store(srow + 2 * NCH + 3, length)
+            for c0 in range(c_lo, c_hi, BLOCK):
+                cols = c0 + tl.arange(0, BLOCK)
+                m = cols < c_hi
+                key = _ordered_key(tl.load(lrow + cols, mask=m, other=0.0))
+                n_gt += tl.sum((m & (key > thr)).to(tl.int32), axis=0)
+                n_eq += tl.sum((m & (key == thr)).to(tl.int32), axis=0)
+    elif ch == 0:
+        # Empty window: nothing selected.
+        tl.store(srow + 2 * NCH + 0, 0x7FFFFFFF)
+        tl.store(srow + 2 * NCH + 1, 0)
+        tl.store(srow + 2 * NCH + 2, 0)
+        tl.store(srow + 2 * NCH + 3, 0)
+    tl.store(srow + ch, n_gt)
+    tl.store(srow + NCH + ch, n_eq)
+
+
+@triton.jit(
+    do_not_specialize=["stride_l", "stride_i", "n_cols", "chunk", "n_chunks"]
+)
+def _topk_tiefix_split_write_kernel(
+    logits_ptr,
+    idx_ptr,
+    starts_ptr,
+    ends_ptr,
+    scratch_ptr,
+    stride_l,
+    stride_i,
+    n_cols,
+    chunk,
+    n_chunks,
+    K: tl.constexpr,
+    K_P2: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NCH: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    RELATIVE: tl.constexpr,
+):
+    """Split pass 2, grid (rows, NCH): write each chunk's entries at their
+    final slots from the exclusive prefix of pass 1's counts; chunk 0 writes
+    the identity rows and the -1 tail. Never reads the selection."""
+    row = tl.program_id(0).to(tl.int64)
+    ch = tl.program_id(1)
+    lrow = logits_ptr + row * stride_l
+    irow = idx_ptr + row * stride_i
+    srow = scratch_ptr + row * (2 * NCH + 4)
+    start, end = _row_window(starts_ptr, ends_ptr, row, n_cols, HAS_STARTS)
+    slots = tl.arange(0, K_P2)
+    in_k = slots < K
+    thr = tl.load(srow + 2 * NCH + 0)
+    n_valid = tl.load(srow + 2 * NCH + 1)
+    need = tl.load(srow + 2 * NCH + 2)
+    length = tl.load(srow + 2 * NCH + 3)
+
+    if length < 0:
+        if ch == 0:
+            n = end - start
+            ident = slots if RELATIVE else slots + start
+            tl.store(irow + slots, tl.where(slots < n, ident, -1), mask=in_k)
+    else:
+        chs = tl.arange(0, NCH)
+        live = chs < n_chunks
+        cgt = tl.load(srow + chs, mask=live, other=0)
+        ceq = tl.load(srow + NCH + chs, mask=live, other=0)
+        before = chs < ch
+        gt_before = tl.sum(tl.where(before, cgt, 0), axis=0)
+        eq_before = tl.sum(tl.where(before, ceq, 0), axis=0)
+        c_lo = start + ch * chunk
+        c_hi = tl.minimum(c_lo + chunk, end)
+        if c_lo < end:
+            _scan_write(
+                lrow, irow, start, c_lo, c_hi, thr, n_valid, need,
+                gt_before, eq_before, BLOCK, RELATIVE,
+            )
+        if ch == 0:
+            tot_gt = tl.sum(cgt, axis=0)
+            tot_eq = tl.sum(ceq, axis=0)
+            written = tl.minimum(tot_gt + tl.minimum(tot_eq, need), n_valid)
+            tl.store(irow + slots, -1, mask=in_k & (slots >= written))
+
+
+
+def _split_chunk(n_cols: int, k: int) -> int:
+    """Chunk width: a power of two, at least SPLIT_CHUNK_MIN, at least k (a
+    fully selected short row must sit in chunk 0) and wide enough that the
+    row fits in SPLIT_MAX_CHUNKS chunks."""
+    per = triton.next_power_of_2(triton.cdiv(n_cols, SPLIT_MAX_CHUNKS))
+    return max(SPLIT_CHUNK_MIN, triton.next_power_of_2(k), per)
+
+
+def _topk_tiefix_sorted_split(
+    logits, topk_indices, starts, ends, has_starts, relative, block, num_warps
+):
+    num_rows, k = topk_indices.shape
+    n_cols = logits.shape[1]
+    chunk = _split_chunk(n_cols, k)
+    assert chunk >= k, f"split chunk {chunk} narrower than k={k}"
+    nch = SPLIT_MAX_CHUNKS
+    grid = (num_rows, triton.cdiv(n_cols, chunk))
+    assert grid[1] <= nch
+    scratch = torch.empty(
+        (num_rows, 2 * nch + _SCRATCH_INFO), dtype=torch.int32, device=logits.device
+    )
+    common = dict(
+        K=k,
+        K_P2=triton.next_power_of_2(k),
+        BLOCK=block or SPLIT_BLOCK,
+        NCH=nch,
+        HAS_STARTS=has_starts,
+        RELATIVE=relative,
+        num_warps=num_warps or SPLIT_NUM_WARPS,
+    )
+    args = (
+        logits,
+        topk_indices,
+        starts,
+        ends,
+        scratch,
+        logits.stride(0),
+        topk_indices.stride(0),
+        n_cols,
+        chunk,
+    )
+    _topk_tiefix_split_count_kernel[grid](*args, **common)
+    # Chunks past grid[1] are never launched; the write pass masks them.
+    _topk_tiefix_split_write_kernel[grid](*args, grid[1], **common)
+    return topk_indices
+
+
+def use_split(num_rows: int, n_cols: int, split_rows: int) -> bool:
+    """Whether the tie fix + sort takes the split path: enabled (split_rows
+    > 0), at most split_rows rows, and logits at least SPLIT_MIN_COLS wide."""
+    return 0 < num_rows <= split_rows and n_cols >= SPLIT_MIN_COLS
+
+
 _WARM_KS = (512, 2048)
 
 
@@ -150,7 +442,7 @@ def warm_tiefix() -> None:
         ends = torch.full((1,), k + 1, dtype=torch.int32, device=dev)
         starts = torch.zeros((1,), dtype=torch.int32, device=dev)
         for relative in (False, True):
-            for sort in (False, True):
+            for sort, split in ((False, False), (True, False), (True, True)):
                 ids = torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k)
                 topk_tiefix_(
                     logits,
@@ -159,6 +451,7 @@ def warm_tiefix() -> None:
                     row_starts=starts if relative else None,
                     relative=relative,
                     sort=sort,
+                    split=split,
                 )
 
 
@@ -170,6 +463,7 @@ def topk_tiefix_(
     row_starts: torch.Tensor | None = None,
     relative: bool = False,
     sort: bool = False,
+    split: bool = False,
     block: int | None = None,
     num_warps: int | None = None,
 ) -> torch.Tensor:
@@ -186,8 +480,12 @@ def topk_tiefix_(
         row_starts: (num_rows,) int, inclusive left boundary; default 0.
         relative: the indices are relative to ``row_starts`` (the
             ``top_k_per_row_prefill`` convention).
-        block: scan tile override (default TIEFIX_BLOCK).
-        num_warps: warps per row program override (default TIEFIX_NUM_WARPS).
+        sort: also sort each row ascending, -1 last.
+        split: with ``sort``, run the two-launch (row, chunk) split path
+            instead of one program per row (same bytes); see ``use_split``.
+        block: scan tile override (default TIEFIX_BLOCK, SPLIT_BLOCK).
+        num_warps: warps per program override (default TIEFIX_NUM_WARPS,
+            SPLIT_NUM_WARPS).
 
     Returns:
         ``topk_indices``. Rows whose boundary is not contested are unchanged.
@@ -204,6 +502,17 @@ def topk_tiefix_(
     ends = row_ends.reshape(-1)
     assert ends.numel() >= num_rows
     starts = ends if row_starts is None else row_starts.reshape(-1)
+    if split and sort:
+        return _topk_tiefix_sorted_split(
+            logits,
+            topk_indices,
+            starts,
+            ends,
+            row_starts is not None,
+            relative,
+            block,
+            num_warps,
+        )
     _topk_tiefix_kernel[(num_rows,)](
         logits,
         topk_indices,

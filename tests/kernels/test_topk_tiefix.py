@@ -394,3 +394,72 @@ def test_forward_passes_sort_when_both_flags(monkeypatch):
     finally:
         for f in (use_tiefix_topk, use_canonical_topk, indexer_topk.use_sorted_topk):
             f.cache_clear()
+
+
+# --- prefill chunk narrower than k ------------------------------------------
+
+
+def _narrow_chunk():
+    """A prefill chunk of short requests whose pool-granular logits are
+    narrower than k = 512, while another, long request in the same step took
+    the long-prefill path (so the short-prefill fill did not run)."""
+    rows, cols, k = 7, 250, 512
+    logits = tied_logits(rows, cols, 3, seed=4)
+    starts = torch.tensor([0, 0, 0, 100, 100, 100, 249], dtype=torch.int32)
+    ends = torch.tensor([1, 60, 100, 101, 180, 250, 250], dtype=torch.int32)
+    return logits, k, starts, ends
+
+
+def test_canonical_accepts_a_chunk_narrower_than_k():
+    logits, k, starts, ends = _narrow_chunk()
+    out = canonical_topk(
+        logits,
+        k,
+        row_ends=ends,
+        row_starts=starts,
+        relative=True,
+        identity_when_short=True,
+    )
+    assert out.shape == (logits.shape[0], k)
+    for r, n in enumerate((ends - starts).tolist()):
+        assert out[r, :n].tolist() == list(range(n))
+        assert bool((out[r, n:] == -1).all())
+    # Absolute ids, score order: the set is still the whole window.
+    out = canonical_topk(logits, k, row_ends=ends, row_starts=starts)
+    for r, (s, e) in enumerate(zip(starts.tolist(), ends.tolist())):
+        assert sorted(v for v in out[r].tolist() if v >= 0) == list(range(s, e))
+
+
+def test_canonical_zero_width_chunk():
+    out = canonical_topk(
+        torch.empty(3, 0), 8, row_ends=torch.zeros(3, dtype=torch.int32)
+    )
+    assert bool((out == -1).all())
+
+
+@pytest.mark.parametrize("sort", [False, True])
+def test_tiefix_on_a_chunk_narrower_than_k(tiefix, sort):
+    logits, k, starts, ends = _narrow_chunk()
+    ref = canonical_topk(
+        logits,
+        k,
+        row_ends=ends,
+        row_starts=starts,
+        relative=True,
+        identity_when_short=True,
+    )
+    for seed in range(3):
+        fast = fast_topk_model(logits, k, ends, starts, True, seed=seed)
+        fixed = tiefix(
+            logits,
+            fast.clone(),
+            row_ends=ends,
+            row_starts=starts,
+            relative=True,
+            sort=sort,
+        )
+        assert row_sets(fixed) == row_sets(ref)
+        if sort:
+            assert torch.equal(fixed, ref)
+        else:
+            assert torch.equal(fixed, fast)  # every row uncontested
