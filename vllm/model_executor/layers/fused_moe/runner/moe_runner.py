@@ -88,9 +88,12 @@ def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     if not is_forward_context_available():
         return topk_ids
     is_padding = get_forward_context().is_padding
-    if is_padding is None or is_padding.shape[0] < topk_ids.shape[0]:
+    # Only a call that sees the whole (padded) batch can be masked row for
+    # row: the prefill overlap runs the MoE on row slices of an unpadded
+    # batch, and a slice must not take the first rows of the batch's mask.
+    if is_padding is None or is_padding.shape[0] != topk_ids.shape[0]:
         return topk_ids
-    topk_ids.masked_fill_(is_padding[: topk_ids.shape[0]].unsqueeze(1), -1)
+    topk_ids.masked_fill_(is_padding.unsqueeze(1), -1)
     return topk_ids
 
 
