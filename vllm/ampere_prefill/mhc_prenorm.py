@@ -62,6 +62,34 @@ instead costs 47 us at M=1152 (every one of the 18 M-tiles re-loads `fn` as
 fp32, re-splits it and re-transposes it); the packing kernel costs 6 us, and
 the GEMM's B loads then halve in bytes as well.
 
+ACCUMULATION - NEVER THROUGH THE MMA ACCUMULATOR (2026-09-25)
+-------------------------------------------------------------
+The products are exact; the sums are not. An sm_80 tensor-core mma adds its
+products into a non-zero accumulator with truncation, so the first version,
+which chained hi, mid and lo of every k block through ONE running accumulator,
+carried 22.8x TileLang's mean error vs fp64 on real prefill inputs (12 calls
+of a 16K-token prompt, M = 3456: mean |err| 4.1e-6 vs 1.8e-7, relative
+~1.5e-6 vs ~1e-7). Measured on that capture (error vs fp64 / TileLang's):
+
+    schedule                                         mean   avg max  worst
+    one running mma accumulator (first version)     22.8    17.4     28.4
+    fresh per BLOCK_K block, fp32 register sum        1.31    1.35     1.77
+      + Kahan-compensated split-K reduce (this)       0.93    0.83     0.92
+      + Kahan in the k loop as well                   0.66    0.55     0.61
+    fresh per 16-wide / 8-wide k slice of hi         1.42 / 1.68  (worse)
+
+This file: each BLOCK_K block is formed from a zero accumulator (lo, mid, hi,
+small terms first), added to the running sum with `_add_rn` in fp32, and the
+split-K partials are summed with Kahan compensation. sqrsum (no mma involved)
+is Kahan-compensated in the k loop and in the reduce: its plain fp32 running
+sum was 1.36x TileLang's average max error at M = 3456, now 0.95x (mean 0.52x).
+Per call, end to end, real inputs: M = 3456 154 -> 164 us (+6 %, TileLang
+~1175 us, 7.2x), M = 1152 70 -> 75 us (+7 %), M = 384 and 512 unchanged.
+Kahan on the mixes in the k loop as well costs another ~13 % at M = 3456 and is
+not needed to match TileLang. Finer fresh slices of the big term lose: more
+fp32 roundings in the register sum outweigh the mma truncation they avoid.
+num_stages 2 / 4 lose to 3 on the new loop as on the old one.
+
 WHERE THE 80 us GO, AND WHAT IS ALREADY EXHAUSTED
 -------------------------------------------------
 Amortised over 60 calls at M=1152 (incumbent ~400 us in the same process):
@@ -111,6 +139,14 @@ _FN_PACK: dict[tuple, torch.Tensor] = {}
 
 def num_sms(device=0):
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@triton.jit
+def _add_rn(a, b):
+    # a + b in fp32, round to nearest. Written as PTX so that no compiler pass
+    # can fold the add back into the preceding tl.dot's accumulator.
+    return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b],
+                                     dtype=tl.float32, is_pure=True, pack=1)
 
 
 @triton.jit
@@ -175,6 +211,7 @@ def _prenorm_gemm_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sqc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
     for k0 in range(k_begin, k_end, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
@@ -190,20 +227,34 @@ def _prenorm_gemm_kernel(
             cache_modifier=".cg",
         )
         bp = ft_ptr + offs_k[:, None] * stride_tk + offs_n[None, :] * stride_tn
-        # hi, then mid, then lo: fixed order, so the fp32 accumulation is
-        # bitwise reproducible.
-        acc = tl.dot(xb, tl.load(bp, mask=mask_k[:, None], other=0.0), acc)
-        acc = tl.dot(xb, tl.load(bp + stride_tt, mask=mask_k[:, None], other=0.0), acc)
-        acc = tl.dot(xb, tl.load(bp + 2 * stride_tt, mask=mask_k[:, None], other=0.0), acc)
+        # One BLOCK_K block of the product from a ZERO mma accumulator (lo, then
+        # mid, then hi: the small terms first, so the big one lands on a small
+        # accumulator), then added to the running sum in fp32 registers. Never
+        # chain the running sum through the mma: an sm_80 tensor-core mma
+        # truncates when it adds products into a non-zero accumulator, and at the
+        # running sum's magnitude that cost 23x TileLang's error vs fp64 on real
+        # prefill inputs (ACCUMULATION in the module docstring).
+        # Fixed order, so the fp32 accumulation is bitwise reproducible.
+        blk = tl.dot(xb, tl.load(bp + 2 * stride_tt, mask=mask_k[:, None], other=0.0))
+        blk = tl.dot(xb, tl.load(bp + stride_tt, mask=mask_k[:, None], other=0.0), blk)
+        blk = tl.dot(xb, tl.load(bp, mask=mask_k[:, None], other=0.0), blk)
+        acc = _add_rn(acc, blk)
         xf = xb.to(tl.float32)
-        sq += tl.sum(xf * xf, axis=1)
+        # Kahan-compensated, like the split-K reduce: a plain fp32 running sum
+        # over 32 k blocks (M = 3456, SPLIT_K = 16) was 1.36x TileLang's
+        # average max error vs fp64 on real inputs.  BLOCK_M values per CTA:
+        # free next to the x stream.
+        y = tl.sum(xf * xf, axis=1) - sqc
+        t = sq + y
+        sqc = (t - sq) - y
+        sq = t
 
     tl.store(
         part_ptr + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
         + pid_k * stride_ps,
         acc, mask=mask_m[:, None] & mask_n[None, :],
     )
-    tl.store(psq_ptr + offs_m * stride_qm + pid_k * stride_qs, sq, mask=mask_m)
+    tl.store(psq_ptr + offs_m * stride_qm + pid_k * stride_qs, sq - sqc, mask=mask_m)
 
 
 @triton.jit
@@ -224,18 +275,30 @@ def _prenorm_reduce_kernel(
     mask_n = offs_n < N
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    comp = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    # Fixed ascending order over splits: deterministic, no atomics.
+    sqc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    # Fixed ascending order over splits: deterministic, no atomics. Mixes and
+    # sqrsum are summed with Kahan compensation: SPLIT_K partials, each a sizeable
+    # fraction of the result, added in plain fp32 carried most of the error
+    # left once the GEMM stopped chaining through the mma accumulator.
     for s in tl.static_range(SPLIT_K):
-        acc += tl.load(
+        v = tl.load(
             part_ptr + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
             + s * stride_ps, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-        sq += tl.load(psq_ptr + offs_m * stride_qm + s * stride_qs,
-                      mask=mask_m, other=0.0)
+        y = v - comp
+        t = acc + y
+        comp = (t - acc) - y
+        acc = t
+        y = tl.load(psq_ptr + offs_m * stride_qm + s * stride_qs,
+                    mask=mask_m, other=0.0) - sqc
+        t = sq + y
+        sqc = (t - sq) - y
+        sq = t
 
     tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-             acc, mask=mask_m[:, None] & mask_n[None, :])
-    tl.store(sqrsum_ptr + offs_m, sq, mask=mask_m)
+             acc - comp, mask=mask_m[:, None] & mask_n[None, :])
+    tl.store(sqrsum_ptr + offs_m, sq - sqc, mask=mask_m)
 
 
 # Measured on this part (70 SMs), M=1152, K=16384, N=24, packed-fn bf16x3,
