@@ -63,6 +63,8 @@ def warmup_ampere_decode(worker, capture_sizes) -> None:
         _warmup_moe(worker, model, device, capture_sizes, use_ampere_moe_routing)
     if envs.VLLM_GLM5_DECODE_KDA:
         _warmup_kda(worker, model, device, capture_sizes, use_ampere_kda_decode)
+    if envs.VLLM_GLM5_DECODE_KDA_V2:
+        _warmup_kda_v2(worker, model, device, capture_sizes)
 
 
 def _warmup_mhc(model, device, capture_sizes, gate) -> None:
@@ -161,3 +163,40 @@ def _warmup_kda(worker, model, device, capture_sizes, gate) -> None:
         return
     kda_decode.warmup(plans=tuple(plans), device=torch.device(device))
     logger.info("Warmed up sm_80 KDA decode kernel for (nseq, T) in %s.", plans)
+
+
+def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
+    """Compile kda_decode_v2 for every (nseq, T) a decode graph can hold and
+    allocate its arrival counters and gate workspace, before capture."""
+    from vllm.ampere_decode import kda_decode_v2, use_ampere_kda_decode_v2
+
+    layer = _find_module(model, "_conv_state_dim_first")
+    if layer is None:
+        return
+    heads = int(layer.local_num_heads)
+    head_dim = int(layer.head_dim)
+    num_spec = int(getattr(layer, "num_spec", 0) or 0)
+    tokens_per_seq = num_spec + 1
+    max_seqs = int(worker.vllm_config.scheduler_config.max_num_seqs)
+    nseqs = {
+        max(1, int(s) // tokens_per_seq) for s in capture_sizes if int(s) >= 1
+    }
+    nseqs.update(range(1, max_seqs + 1))
+    plans = [
+        (n, tokens_per_seq)
+        for n in sorted(nseqs)
+        if use_ampere_kda_decode_v2(
+            n,
+            n * tokens_per_seq,
+            heads,
+            head_dim,
+            layer.f_b_proj.weight,
+            layer.g_b_proj.weight,
+        )
+    ]
+    if not plans:
+        return
+    kda_decode_v2.warmup(plans=tuple(plans), device=torch.device(device))
+    logger.info(
+        "Warmed up sm_80 KDA decode v2 kernel for (nseq, T) in %s.", plans
+    )
