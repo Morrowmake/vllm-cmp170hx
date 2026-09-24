@@ -56,6 +56,44 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
+_MASK_PADDING: bool | None = None
+_MASK_MIN_ROWS = 0
+
+
+def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
+    """With VLLM_GLM5_MOE_MASK_PADDING=1, set the expert ids of padding rows
+    (forward context is_padding) to -1, in place, so the alignment drops them;
+    the real rows then get the same expert blocks whatever the padding rows
+    hold. In place keeps the tensor's identity, which the sm_80 fused decode
+    routing uses to hand over its own alignment; batches it covers
+    (<= VLLM_GLM5_DECODE_MOE_MAX_TOKENS rows, captured at exact sizes) are
+    skipped. Returns topk_ids."""
+    global _MASK_PADDING, _MASK_MIN_ROWS
+    if _MASK_PADDING is None:
+        import vllm.envs as envs
+
+        _MASK_PADDING = bool(envs.VLLM_GLM5_MOE_MASK_PADDING)
+        _MASK_MIN_ROWS = (
+            int(envs.VLLM_GLM5_DECODE_MOE_MAX_TOKENS)
+            if envs.VLLM_GLM5_DECODE_KERNELS
+            else 0
+        )
+        if _MASK_PADDING:
+            logger.info_once(
+                "GLM-5 MoE padding mask active: padding rows are routed to no "
+                "expert (VLLM_GLM5_MOE_MASK_PADDING=1; set 0 to disable)"
+            )
+    if not _MASK_PADDING or topk_ids.shape[0] <= _MASK_MIN_ROWS:
+        return topk_ids
+    if not is_forward_context_available():
+        return topk_ids
+    is_padding = get_forward_context().is_padding
+    if is_padding is None or is_padding.shape[0] < topk_ids.shape[0]:
+        return topk_ids
+    topk_ids.masked_fill_(is_padding[: topk_ids.shape[0]].unsqueeze(1), -1)
+    return topk_ids
+
+
 def register_layer_for_moe_forward_op(
     vllm_config: VllmConfig,
     layer: "MoERunner",
@@ -629,6 +667,8 @@ class MoERunner(MoERunnerInterface):
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+
+            topk_ids = mask_padding_topk_ids(topk_ids)
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
