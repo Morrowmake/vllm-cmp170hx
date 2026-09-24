@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -925,7 +926,17 @@ class MoERunner(MoERunnerInterface):
                     self, hidden_states, self._combined_gate_weight, None
                 )
             else:
-                router_logits, _ = self.gate(hidden_states)
+                router_logits = None
+                if envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2:
+                    # sm_80: gate GEMV + top-k + alignment in one op; the
+                    # router and Marlin pick up the stashed results.
+                    from vllm.ampere_decode import maybe_moe_route_v2
+
+                    router_logits = maybe_moe_route_v2(
+                        self.gate, self.router, hidden_states
+                    )
+                if router_logits is None:
+                    router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
