@@ -735,6 +735,16 @@ class SparseAttnIndexerKpool(CustomOp):
                 "DeepGEMM is not usable on this device; the sparse attention "
                 "indexer will use the Triton fp8 MQA-logits kernels."
             )
+        # The prefill logits budget sets both the profiled transient (the
+        # sentinel in the profile branch) and the row chunking of long
+        # prefills; print it so a boot log shows which budget was measured.
+        logger.info_once(
+            "Sparse indexer: prefill logits budget %d MiB, gather workspace "
+            "%d rows (VLLM_SPARSE_INDEXER_MAX_LOGITS_MB, "
+            "VLLM_GLM5_INDEXER_GATHER_CLAMP).",
+            envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB,
+            max_total_seq_len,
+        )
         _cfg = get_current_vllm_config_or_none()
         self.topk_backend = (
             _cfg.kernel_config.sparse_indexer_topk_backend
