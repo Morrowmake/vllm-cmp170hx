@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
+    VLLM_GLM5_MEM_ATTRIBUTION: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1769,6 +1770,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the two gathered row sets rebuilds them exactly (x + 0 = x).
     "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": lambda: bool(
         int(os.getenv("VLLM_GLM5_DRAFTER_SELECTOR_SHARD", "0"))
+    ),
+    # Log where device memory goes at start-up: resident bytes per module
+    # group after loading, the peak of each profile_run stage, the KV sizing
+    # terms, and what the attention metadata builders allocate after the KV
+    # cache is sized. Logging only; the KV cache size is unchanged.
+    "VLLM_GLM5_MEM_ATTRIBUTION": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MEM_ATTRIBUTION", "0"))
     ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
