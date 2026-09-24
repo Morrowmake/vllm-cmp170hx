@@ -29,12 +29,25 @@ the faster of the v1 kernel and TileLang at each M:
 The Triton kernels below are the fallback for other hc / hidden and are not
 reached by the gate.
 
-NO PRECISION REDUCTION. bf16 in / fp32 accumulate / bf16 out, fp32 `fn`. The
-prenorm GEMM on the tensor cores is split into three TF32 terms (>= 24 mantissa
-bits), and the Sinkhorn normalisations use `rcp.approx` (<= 1 ulp); both were
-gated at max and mean error <= 1.5x the more accurate of the v1 kernel and
-TileLang against an FP64 recomputation, bitwise determinism, and CUDA-graph
-capture. The two bf16 rounding points of the op are kept exactly:
+NO PRECISION REDUCTION. bf16 in / fp32 accumulate / bf16 out, fp32 `fn`. On
+real activations every output is as close to an FP64 recomputation as the
+TileLang kernel's (mean and max error within ~1.05x of it at M = 4..25), and
+`residual_cur` is bitwise equal to TileLang's. Three things make that true:
+  * the prenorm GEMM on the tensor cores is split into three TF32 terms
+    (hi*hi + hi*lo + lo*hi), and the big hi*hi term is accumulated OUTSIDE the
+    tensor core, one fresh mma per 8-wide k block added into fp32 registers.
+    An sm_80 TF32 mma truncates when it adds a product block into a non-zero
+    accumulator, so chaining the big term through the mma accumulator cost 11x
+    TileLang's error on the mixes (3x at one fresh mma per 32-wide block, 1.6x
+    per 16-wide block, 1.05x per 8-wide block);
+  * `residual_cur` is formed in TileLang's exact FMA order,
+    fma(post, x, comb[0] * res[0]) then + comb[k] * res[k], k = 1..3;
+  * the Sinkhorn normalisations use `rcp.approx`, except the final row and
+    column normalisation, whose quotient gets one FMA correction (rounding
+    errors of the earlier normalisations are absorbed by the later ones; the
+    last one's are not), and the sigmoids use a Newton-refined reciprocal.
+Gated as before on bitwise determinism and CUDA-graph capture. The two bf16
+rounding points of the op are kept exactly:
   * `mixes` and `sqrsum` are accumulated from the pre-rounding fp32
     `residual_cur`, while the collapse reads the stored bf16 `residual_cur`;
   * the RMSNorm squared sum is taken from the fp32 collapse and the scale is
@@ -261,28 +274,45 @@ def _tf32_hi(x):
 
 
 @gluon.jit
-def _mma3(a, b, acc_s, acc_t, acc_b):
-    """a @ b to fp32 accuracy on the tensor cores: the three-pass split that
-    tl.dot's "tf32x3" mode uses (hi*hi + hi*lo + lo*hi), the big term and the
-    two small terms each in their own accumulator (summed as b + (s + t) at the
-    end).  Separate small/big accumulators: one accumulator measured 2-3x the
-    error on post/comb; separate s and t: three independent HMMA chains
-    (dependent HMMA.1688.TF32 latency is ~28 cycles on this part)."""
+def _mma3(a, b, acc_s, acc_t, acc_b, z, K: gl.constexpr):
+    """a @ b to fp32 accuracy on the tensor cores, for the transposed kernel
+    (a = fn^T [2, NP2, K], b = residual_cur^T [2, K, BT], K = 16): the three-pass
+    split (hi*hi + hi*lo + lo*hi), each term in its own accumulator (summed as
+    b + (s + t) at the end).  The two small terms chain through the mma
+    accumulator (their truncation is 2^-11 below the result).  The big term is
+    formed per 8-wide k block from a zero accumulator and added in fp32: a K=16
+    mma is two chained m16n8k8 mmas, so b's hi part is split into its two k
+    halves, each paired with a zero half (the second, all-zero mma adds nothing
+    and truncates nothing)."""
     ah = _tf32_hi(a)
     bh = _tf32_hi(b)
     acc_s = mma_v2(a - ah, bh, acc_s)
     acc_t = mma_v2(ah, b - bh, acc_t)
-    acc_b = mma_v2(ah, bh, acc_b)
+    kk = gl.arange(0, K, layout=gl.SliceLayout(0, gl.SliceLayout(2, b.type.layout)))
+    lo8 = (kk < 8)[None, :, None]
+    acc_b = acc_b + mma_v2(ah, gl.where(lo8, bh, 0.0), z)
+    acc_b = acc_b + mma_v2(ah, gl.where(lo8, 0.0, bh), z)
     return acc_s, acc_t, acc_b
 
 
 @gluon.jit
-def _mma3p(ah, al, b, acc_s, acc_t, acc_b):
-    """_mma3 with operand A already split into (hi, lo) - the same products."""
-    bh = _tf32_hi(b)
-    acc_s = mma_v2(al, bh, acc_s)
-    acc_t = mma_v2(ah, b - bh, acc_t)
-    acc_b = mma_v2(ah, bh, acc_b)
+def _mma3_smem(hsh, hsl, sb, acc_s, acc_t, acc_b, z, LA: gl.constexpr, LB: gl.constexpr,
+               HB: gl.constexpr):
+    """The same product for `_glu_post_prenorm_kernel`: operand A (residual_cur)
+    already split into (hi, lo) in shared memory, operand B (fn) in shared
+    memory, contracted in 16-wide k slices; the big term per 8-wide k block from a
+    zero accumulator (A's hi part masked to one k half per mma), see `_mma3`."""
+    kk = gl.arange(0, 16, layout=gl.SliceLayout(0, LA))
+    lo8 = (kk < 8)[None, :]
+    for kc in gl.static_range(HB // 16):
+        ah = hsh.slice(kc * 16, 16, dim=1).load(LA)
+        al = hsl.slice(kc * 16, 16, dim=1).load(LA)
+        b = sb.slice(kc * 16, 16, dim=0).load(LB)
+        bh = _tf32_hi(b)
+        acc_s = mma_v2(al, bh, acc_s)
+        acc_t = mma_v2(ah, b - bh, acc_t)
+        acc_b = acc_b + mma_v2(gl.where(lo8, ah, 0.0), bh, z)
+        acc_b = acc_b + mma_v2(gl.where(lo8, 0.0, ah), bh, z)
     return acc_s, acc_t, acc_b
 
 
@@ -312,7 +342,8 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
         splitting it in the dot-operand layout cost every warp 48 ALU ops per
         stream, and the mma phase is per-warp issue bound;
       * per stream j: wait for its fn group, then the 3-pass (tf32x3-equivalent)
-        product [BM, HB] x [HB, NP2] into three accumulators.
+        product [BM, HB] x [HB, NP2] into three accumulators, the big term per
+        8-wide k block (`_mma3_smem`).
     """
     HC: gl.constexpr = 4
     L2: gl.constexpr = gl.BlockedLayout([1, 4], [BM // NW, 32 * NW // BM], [NW, 1], [1, 0])
@@ -380,31 +411,32 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     # ... and the mix after the fn copies (else ptxas hoists it above them)
     pin = _clk_now()
     xf = gl.where(pin >= 0, xv.to(gl.float32), 0.0)
-    rf0 = r0.to(gl.float32)
+    rf0 = gl.where(pin >= 0, r0.to(gl.float32), 0.0)
     rf1 = r1.to(gl.float32)
     rf2 = r2.to(gl.float32)
     rf3 = r3.to(gl.float32)
-    # residual_cur[j] = post[j]*x + sum_k comb[k, j] * residual[k]
-    n0 = p0[:, None] * xf
-    n0 = n0 + c00[:, None] * rf0
-    n0 = n0 + c10[:, None] * rf1
-    n0 = n0 + c20[:, None] * rf2
-    n0 = n0 + c30[:, None] * rf3
-    n1 = p1[:, None] * xf
-    n1 = n1 + c01[:, None] * rf0
-    n1 = n1 + c11[:, None] * rf1
-    n1 = n1 + c21[:, None] * rf2
-    n1 = n1 + c31[:, None] * rf3
-    n2 = p2[:, None] * xf
-    n2 = n2 + c02[:, None] * rf0
-    n2 = n2 + c12[:, None] * rf1
-    n2 = n2 + c22[:, None] * rf2
-    n2 = n2 + c32[:, None] * rf3
-    n3 = p3[:, None] * xf
-    n3 = n3 + c03[:, None] * rf0
-    n3 = n3 + c13[:, None] * rf1
-    n3 = n3 + c23[:, None] * rf2
-    n3 = n3 + c33[:, None] * rf3
+    # residual_cur[j] = post[j]*x + sum_k comb[k, j] * residual[k], in TileLang's FMA
+    # order (bitwise-equal output): comb[0,j]*res0, + post[j]*x, + comb[k,j]*res_k
+    n0 = c00[:, None] * rf0
+    n0 = gl.fma(p0[:, None], xf, n0)
+    n0 = gl.fma(c10[:, None], rf1, n0)
+    n0 = gl.fma(c20[:, None], rf2, n0)
+    n0 = gl.fma(c30[:, None], rf3, n0)
+    n1 = c01[:, None] * rf0
+    n1 = gl.fma(p1[:, None], xf, n1)
+    n1 = gl.fma(c11[:, None], rf1, n1)
+    n1 = gl.fma(c21[:, None], rf2, n1)
+    n1 = gl.fma(c31[:, None], rf3, n1)
+    n2 = c02[:, None] * rf0
+    n2 = gl.fma(p2[:, None], xf, n2)
+    n2 = gl.fma(c12[:, None], rf1, n2)
+    n2 = gl.fma(c22[:, None], rf2, n2)
+    n2 = gl.fma(c32[:, None], rf3, n2)
+    n3 = c03[:, None] * rf0
+    n3 = gl.fma(p3[:, None], xf, n3)
+    n3 = gl.fma(c13[:, None], rf1, n3)
+    n3 = gl.fma(c23[:, None], rf2, n3)
+    n3 = gl.fma(c33[:, None], rf3, n3)
 
     ob = rc_ptr + mi[:, None] * (HC * HIDDEN) + h[None, :]
     gl.store(ob, n0.to(gl.bfloat16), mask=m2)
@@ -417,6 +449,7 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     acc_s = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     acc_b = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     acc_t = gl.zeros([BM, NP2], gl.float32, layout=MMA)
+    z = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     # operand A split hi/lo once here (4 elements per thread) - see the docstring
     SA: gl.constexpr = gl.SwizzledSharedLayout(4, 1, 8, [1, 0])
     hs0 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
@@ -441,16 +474,16 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     hs7.store(n3 - h3)
     async_copy.wait_group(3)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3p(hs0.load(LA), hs1.load(LA), s0.load(LB), acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3_smem(hs0, hs1, s0, acc_s, acc_t, acc_b, z, LA, LB, HB)
     async_copy.wait_group(2)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3p(hs2.load(LA), hs3.load(LA), s1.load(LB), acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3_smem(hs2, hs3, s1, acc_s, acc_t, acc_b, z, LA, LB, HB)
     async_copy.wait_group(1)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3p(hs4.load(LA), hs5.load(LA), s2.load(LB), acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3_smem(hs4, hs5, s2, acc_s, acc_t, acc_b, z, LA, LB, HB)
     async_copy.wait_group(0)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3p(hs6.load(LA), hs7.load(LA), s3.load(LB), acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3_smem(hs6, hs7, s3, acc_s, acc_t, acc_b, z, LA, LB, HB)
     acc = acc_b + (acc_s + acc_t)
 
     mo = pm * BM + gl.arange(0, BM, layout=gl.SliceLayout(1, MMA))
@@ -546,30 +579,31 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     # ... and the mix after the fn copies (else ptxas hoists it above them)
     pin = _clk_now()
     xf = gl.where(pin >= 0, xv.to(gl.float32), 0.0)
-    rf0 = r0.to(gl.float32)
+    rf0 = gl.where(pin >= 0, r0.to(gl.float32), 0.0)
     rf1 = r1.to(gl.float32)
     rf2 = r2.to(gl.float32)
     rf3 = r3.to(gl.float32)
-    n0 = p0 * xf
-    n0 = n0 + c00 * rf0
-    n0 = n0 + c10 * rf1
-    n0 = n0 + c20 * rf2
-    n0 = n0 + c30 * rf3
-    n1 = p1 * xf
-    n1 = n1 + c01 * rf0
-    n1 = n1 + c11 * rf1
-    n1 = n1 + c21 * rf2
-    n1 = n1 + c31 * rf3
-    n2 = p2 * xf
-    n2 = n2 + c02 * rf0
-    n2 = n2 + c12 * rf1
-    n2 = n2 + c22 * rf2
-    n2 = n2 + c32 * rf3
-    n3 = p3 * xf
-    n3 = n3 + c03 * rf0
-    n3 = n3 + c13 * rf1
-    n3 = n3 + c23 * rf2
-    n3 = n3 + c33 * rf3
+    # TileLang's FMA order, see _glu_post_prenorm_kernel
+    n0 = c00 * rf0
+    n0 = gl.fma(p0, xf, n0)
+    n0 = gl.fma(c10, rf1, n0)
+    n0 = gl.fma(c20, rf2, n0)
+    n0 = gl.fma(c30, rf3, n0)
+    n1 = c01 * rf0
+    n1 = gl.fma(p1, xf, n1)
+    n1 = gl.fma(c11, rf1, n1)
+    n1 = gl.fma(c21, rf2, n1)
+    n1 = gl.fma(c31, rf3, n1)
+    n2 = c02 * rf0
+    n2 = gl.fma(p2, xf, n2)
+    n2 = gl.fma(c12, rf1, n2)
+    n2 = gl.fma(c22, rf2, n2)
+    n2 = gl.fma(c32, rf3, n2)
+    n3 = c03 * rf0
+    n3 = gl.fma(p3, xf, n3)
+    n3 = gl.fma(c13, rf1, n3)
+    n3 = gl.fma(c23, rf2, n3)
+    n3 = gl.fma(c33, rf3, n3)
 
     ob = rc_ptr + t3 * (HC * HIDDEN) + h3
     gl.store(ob, n0.to(gl.bfloat16), mask=m3)
@@ -582,22 +616,23 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     acc_s = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
     acc_t = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
     acc_b = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
+    z = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
     b0 = gl.convert_layout(n0, LB)
     b1 = gl.convert_layout(n1, LB)
     b2 = gl.convert_layout(n2, LB)
     b3 = gl.convert_layout(n3, LB)
     async_copy.wait_group(3)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s0.permute([0, 2, 1]).load(LA), b0, acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3(s0.permute([0, 2, 1]).load(LA), b0, acc_s, acc_t, acc_b, z, KH)
     async_copy.wait_group(2)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s1.permute([0, 2, 1]).load(LA), b1, acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3(s1.permute([0, 2, 1]).load(LA), b1, acc_s, acc_t, acc_b, z, KH)
     async_copy.wait_group(1)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s2.permute([0, 2, 1]).load(LA), b2, acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3(s2.permute([0, 2, 1]).load(LA), b2, acc_s, acc_t, acc_b, z, KH)
     async_copy.wait_group(0)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s3.permute([0, 2, 1]).load(LA), b3, acc_s, acc_t, acc_b)
+    acc_s, acc_t, acc_b = _mma3(s3.permute([0, 2, 1]).load(LA), b3, acc_s, acc_t, acc_b, z, KH)
     # the two k-half partials meet in shared memory (one barrier); gl.sum over the
     # warp-distributed batch dim lowers to a longer shuffle + smem sequence.
     SR: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
@@ -622,8 +657,26 @@ def _rcp_g(s):
 
 
 @gluon.jit
+def _rcp_nr(s):
+    # rcp.approx refined by one Newton step, r + r * (1 - s * r): ~0.5 ulp.
+    r = _rcp_g(s)
+    return gl.fma(gl.fma(-s, r, 1.0), r, r)
+
+
+@gluon.jit
+def _div_c(x, s):
+    # x / s as x * rcp.approx(s) plus one FMA correction of the quotient,
+    # q + (x - s * q) * r: within rounding of the IEEE quotient.  A div.rn per
+    # element cost ~12 us per call in the Sinkhorn loop, this ~1 us; it is used
+    # only in the last iteration (see the finish kernel).
+    r = _rcp_g(s)
+    q = x * r
+    return gl.fma(gl.fma(-s, q, x), r, q)
+
+
+@gluon.jit
 def _sigmoid_g(x):
-    return 1.0 / (1.0 + gl.exp(-x))
+    return _rcp_nr(1.0 + gl.exp(-x))
 
 
 @gluon.jit
@@ -687,9 +740,17 @@ def _glu_finish_kernel(mix_ptr, sqr_ptr, scale_ptr, base_ptr, rc_ptr, nw_ptr,
         e = gl.exp(cm - gl.max(cm, axis=1)[:, None])
         cm = e * _rcp_g(gl.sum(e, axis=1))[:, None] + hc_sink_eps
         cm = cm * _rcp_g(gl.sum(cm, axis=0) + hc_sink_eps)[None, :]
-        for _ in range(SINK - 1):
+        # The rounding of every normalisation but the last is absorbed by the
+        # ones after it (it acts as a row or column rescaling); the last one's
+        # is not, so only the final row and column normalisation divides with a
+        # corrected quotient.  All iterations corrected measured the same error
+        # at +1 us per call; none corrected, 1.09-1.14x TileLang's comb error.
+        for _ in range(SINK - 2):
             cm = cm * _rcp_g(gl.sum(cm, axis=1) + hc_sink_eps)[:, None]
             cm = cm * _rcp_g(gl.sum(cm, axis=0) + hc_sink_eps)[None, :]
+        if SINK >= 2:
+            cm = _div_c(cm, (gl.sum(cm, axis=1) + hc_sink_eps)[:, None] + gl.zeros_like(cm))
+            cm = _div_c(cm, (gl.sum(cm, axis=0) + hc_sink_eps)[None, :] + gl.zeros_like(cm))
         r4 = gl.arange(0, 4, layout=gl.SliceLayout(1, L44))
         c4 = gl.arange(0, 4, layout=gl.SliceLayout(0, L44))
         gl.store(comb_out_ptr + m * (HC * HC) + r4[:, None] * HC + c4[None, :], cm)
