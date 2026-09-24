@@ -819,12 +819,25 @@ def get_indexer_gather_workspace_size(
     The clamp is never below ``cdiv(max_model_len, compress_ratio)``, so the
     single-request escape hatch in ``_split_indexer_prefill_chunks`` (which
     admits one request whatever the limit) still fits the workspace.
+
+    ``VLLM_GLM5_INDEXER_GATHER_CLAMP=0`` returns the heuristic unchanged.
     """
-    return min(
-        get_max_prefill_buffer_size(vllm_config),
+    legacy = get_max_prefill_buffer_size(vllm_config)
+    if not envs.VLLM_GLM5_INDEXER_GATHER_CLAMP:
+        return legacy
+    clamped = min(
+        legacy,
         vllm_config.scheduler_config.max_num_seqs
         * cdiv(vllm_config.model_config.max_model_len, compress_ratio),
     )
+    logger.info_once(
+        "VLLM_GLM5_INDEXER_GATHER_CLAMP: indexer gather rows %d -> %d "
+        "(compress_ratio %d).",
+        legacy,
+        clamped,
+        compress_ratio,
+    )
+    return clamped
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
