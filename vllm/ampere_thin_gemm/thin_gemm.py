@@ -27,8 +27,11 @@ ceil(N/BLOCK_N) CTAs; for the narrow shapes in shapes.json that is 1..8 CTAs on
 a 70-SM part.  Splitting K across CTAs multiplies the CTA count without reading
 any weight byte twice - each CTA owns a disjoint set of K-blocks.
 
-The partial sums are FP32 and are reduced by a second kernel in a fixed order,
-so the result is bitwise deterministic run to run (atomics would not be).
+The partial sums are FP32 and are reduced in the same launch: each CTA stores
+its partial and bumps a per-output-tile arrival counter, and the CTA that
+arrives last sums the SPLIT_K partials in fixed order 0..SPLIT_K-1 and writes
+the output.  No CTA spins, and the counter only elects the reducer (it never
+accumulates values), so the result is bitwise deterministic run to run.
 
 Constraints (see ../README.md): sm_80 only, Triton 3.7.1, no TMA/wgmma, no fp8,
 must be CUDA-graph capturable (see `warmup()`).

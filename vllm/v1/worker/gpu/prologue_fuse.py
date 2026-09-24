@@ -83,7 +83,6 @@ class PrologueFuseSettings:
     # Individually disable one fusion, for bisecting a regression.
     gdn: bool = True
     mamba_block_table: bool = True
-    debug: bool = False
 
 
 def read_settings(env: dict[str, str] | None = None) -> PrologueFuseSettings:
@@ -94,7 +93,6 @@ def read_settings(env: dict[str, str] | None = None) -> PrologueFuseSettings:
         enabled=on,
         gdn=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_GDN", True),
         mamba_block_table=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT", True),
-        debug=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_DEBUG", False),
     )
 
 

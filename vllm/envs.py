@@ -199,7 +199,6 @@ if TYPE_CHECKING:
     VLLM_GLM5_PROLOGUE_FUSE: bool = False
     VLLM_GLM5_PROLOGUE_FUSE_GDN: bool = True
     VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT: bool = True
-    VLLM_GLM5_PROLOGUE_FUSE_DEBUG: bool = False
     VLLM_GLM5_AUX_HIDDEN_TENSOR: Literal["stream_mean", "branch"] = "stream_mean"
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
@@ -1688,14 +1687,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_GLM5_PREFILL_OVERLAP", False
     ),
     "VLLM_GLM5_PREFILL_OVERLAP_SPLITS": lambda: _glm5_overlap_int(
-        "VLLM_GLM5_PREFILL_OVERLAP_SPLITS", 2
+        "VLLM_GLM5_PREFILL_OVERLAP_SPLITS", 2, 1
     ),
     # Below this chunk size the overlap does not engage. Leave at 512: it
     # measured NEGATIVE at small chunks, which is why the fair-prefill 384 cap
     # deliberately switches it off under contention while the prefill kernels'
     # own gate was lowered to 384.
     "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS": lambda: _glm5_overlap_int(
-        "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS", 512
+        "VLLM_GLM5_PREFILL_OVERLAP_MIN_TOKENS", 512, 1
     ),
     # Carry the micro-batch split across the layer boundary. In tree with 11
     # CPU tests, never validated on a GPU -- keep OFF until its own A/B.
@@ -1735,7 +1734,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_PREFILL_OBSERVE": lambda: _glm5_overlap_flag(
         "VLLM_GLM5_PREFILL_OBSERVE", False
     ),
-    # GLM-5.x fused decode prologue. These four are consumed by
+    # GLM-5.x fused decode prologue. These three are consumed by
     # vllm/v1/worker/gpu/prologue_fuse.py, which parses os.environ itself
     # for the same reason overlap.py does: it has to import and be testable
     # on a CPU-only box. They are declared here so validate_environ()
@@ -1760,10 +1759,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT": lambda: _glm5_prologue_flag(
         "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT", True
-    ),
-    # Diagnostic bit carried on the parsed settings object.
-    "VLLM_GLM5_PROLOGUE_FUSE_DEBUG": lambda: _glm5_prologue_flag(
-        "VLLM_GLM5_PROLOGUE_FUSE_DEBUG", False
     ),
     # Which per-layer tensor an EAGLE3/DFlash drafter is handed as an
     # auxiliary layer's hidden state: 'stream_mean' (default, the
@@ -2625,19 +2620,29 @@ def _glm5_overlap_choice(
     return value
 
 
-def _glm5_overlap_int(name: str, default: int) -> int:
-    """Mirror of ``overlap.py``'s ``_env_int`` (minus its minimum check, which
-    overlap.py still enforces at the point of use)."""
+def _glm5_overlap_int(name: str, default: int, minimum: int) -> int:
+    """Mirror of ``overlap.py``'s ``_env_int``, minimum check included.
+
+    Both readers accept the same values and raise the same ``ValueError`` on
+    the rest (a non-integer, or a value below ``minimum``), so ``envs.X`` never
+    reports a setting the feature would refuse.
+    """
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
-    return int(raw.strip())
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} is not an integer") from exc
+    if value < minimum:
+        raise ValueError(f"{name}={value} must be >= {minimum}")
+    return value
 
 
 def _glm5_prologue_flag(name: str, default: bool) -> bool:
     """Mirror of ``prologue_fuse.py``'s ``_env_flag``.
 
-    ``vllm/v1/worker/gpu/prologue_fuse.py`` reads these four variables straight
+    ``vllm/v1/worker/gpu/prologue_fuse.py`` reads these three variables straight
     from a dict of ``os.environ`` and is deliberately left alone, so the
     accessors here must agree with it exactly. Note that it is *not*
     ``_glm5_overlap_flag``: an empty string reads as false rather than as
