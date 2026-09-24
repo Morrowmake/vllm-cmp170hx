@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
+    VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1636,6 +1637,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the old size with a warning, keeping the old buffers alive.
     "VLLM_GLM5_INDEXER_DECODE_ROWS": lambda: bool(
         int(os.getenv("VLLM_GLM5_INDEXER_DECODE_ROWS", "0"))
+    ),
+    # Shard the DFlash2 candidate selector's two (vocab, rank) codebooks by
+    # vocab rows across the tensor-parallel ranks instead of replicating them.
+    # Each rank looks up the rows it owns, zero elsewhere, and one all-reduce
+    # of the two gathered row sets rebuilds them exactly (x + 0 = x).
+    "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DRAFTER_SELECTOR_SHARD", "0"))
     ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
