@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -54,6 +55,67 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+# Alignment of the fitted drafter RoPE cache length.
+_ROPE_FIT_ALIGN = 64
+
+
+def dflash_rope_max_position(vllm_config: VllmConfig, config: Qwen3Config) -> int:
+    """Number of RoPE cache rows the draft attention needs.
+
+    By default this is the draft config's ``max_position_embeddings``. With
+    ``VLLM_GLM5_DRAFTER_ROPE_FIT=1`` it is cut to the positions the draft can
+    reach. Context positions are the target's (always < max_model_len). Query
+    positions are the last context position + 1 + offset, with offset below
+    1 + num_speculative_tokens; one input path clamps them to max_model_len - 1,
+    the other does not, so the largest index is max_model_len +
+    num_speculative_tokens. The cache keeps max_model_len + 1 +
+    num_speculative_tokens rows, rounded up to ``_ROPE_FIT_ALIGN``.
+
+    Only plain RoPE is fitted: there each row depends on its position and the
+    base alone, so every kept row is identical to the unfitted cache. Scaled
+    variants keep the configured size.
+    """
+    configured = int(config.max_position_embeddings)
+    if not envs.VLLM_GLM5_DRAFTER_ROPE_FIT:
+        return configured
+
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    if (
+        rope_parameters.get("rope_type", "default") != "default"
+        or "mrope_section" in rope_parameters
+        or rope_parameters.get("use_fope", False)
+        or getattr(config, "dual_chunk_attention_config", None) is not None
+    ):
+        logger.info_once(
+            "VLLM_GLM5_DRAFTER_ROPE_FIT: draft RoPE is not plain (%s); "
+            "keeping %d positions.",
+            rope_parameters.get("rope_type", "default"),
+            configured,
+        )
+        return configured
+
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    speculative_config = vllm_config.speculative_config
+    num_query_per_req = 1
+    if speculative_config is not None:
+        num_query_per_req += int(speculative_config.num_speculative_tokens or 0)
+        target_model_config = speculative_config.target_model_config
+        if target_model_config is not None:
+            max_model_len = max(max_model_len, int(target_model_config.max_model_len))
+
+    reach = max_model_len + num_query_per_req
+    fitted = -(-reach // _ROPE_FIT_ALIGN) * _ROPE_FIT_ALIGN
+    fitted = min(configured, fitted)
+    logger.info_once(
+        "VLLM_GLM5_DRAFTER_ROPE_FIT: draft RoPE cache %d -> %d positions "
+        "(max_model_len %d, %d query tokens per request).",
+        configured,
+        fitted,
+        max_model_len,
+        num_query_per_req,
+    )
+    return fitted
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -311,7 +373,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            max_position=config.max_position_embeddings,
+            max_position=dflash_rope_max_position(vllm_config, config),
             num_kv_heads=config.num_key_value_heads,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
