@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_TOPK_SORTED: bool = False
+    VLLM_GLM5_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
@@ -1706,6 +1707,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # byte-identical to upstream.
     "VLLM_GLM5_TOPK_SORTED": lambda: bool(
         int(os.getenv("VLLM_GLM5_TOPK_SORTED", "0"))
+    ),
+    # Route the padding rows of a padded batch (CUDA-graph sizes) to no
+    # expert (topk_ids = -1) before the fused MoE. Their hidden states come
+    # from stale input buffers, and where they land in the expert blocks
+    # changes how Marlin splits K for the real rows next to them, so the same
+    # request otherwise gets last-bit different MoE outputs depending on what
+    # ran before. Uses the forward context's is_padding mask. Default OFF.
+    "VLLM_GLM5_MOE_MASK_PADDING": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MOE_MASK_PADDING", "0"))
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
     # Size the DFlash drafter's RoPE cos/sin cache to the reachable positions
