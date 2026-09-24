@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
+    VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1628,6 +1629,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # heuristic alone. 0 restores the heuristic.
     "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
         int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "1"))
+    ),
+    # Size the sparse indexer's two decode block-table buffers by the decode
+    # rows a step can hold (max_num_seqs * (1 + num_speculative_tokens))
+    # instead of max_num_batched_tokens. A larger decode batch grows them back
+    # to the old size with a warning, keeping the old buffers alive.
+    "VLLM_GLM5_INDEXER_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_INDEXER_DECODE_ROWS", "0"))
     ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
