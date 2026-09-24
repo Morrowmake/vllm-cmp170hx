@@ -209,6 +209,31 @@ def use_tiefix_topk() -> bool:
     return on
 
 
+@functools.cache
+def tiefix_split_rows() -> int:
+    """Row bound of the split tie fix + sort (VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS;
+    0 = off). Only meaningful with the tie fix and the sort both on. Read
+    once per process; tests call cache_clear."""
+    import vllm.envs as envs
+
+    rows = max(0, int(envs.VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS))
+    if rows and not (use_tiefix_topk() and use_sorted_topk()):
+        logger.info_once(
+            "GLM-5 split tie-fix scan NOT active: VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS "
+            "needs VLLM_GLM5_TOPK_TIEFIX=1 and VLLM_GLM5_TOPK_SORTED=1"
+        )
+        return 0
+    if rows:
+        logger.info_once(
+            "GLM-5 split tie-fix scan active: batches of at most %d rows over "
+            "wide logits run the tie fix + sort over (row, chunk) programs "
+            "(VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS=%d; set 0 to disable)",
+            rows,
+            rows,
+        )
+    return rows
+
+
 def tiefix_topk_(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -222,8 +247,14 @@ def tiefix_topk_(
     place; with ``sort`` also sort each row (VLLM_GLM5_TOPK_SORTED) in the
     same launch. See indexer_topk_tiefix.py; imported lazily so that with the flag
     unset nothing new is loaded."""
-    from vllm.model_executor.layers.indexer_topk_tiefix import topk_tiefix_
+    from vllm.model_executor.layers.indexer_topk_tiefix import (
+        topk_tiefix_,
+        use_split,
+    )
 
+    split = sort and use_split(
+        topk_indices.shape[0], logits.shape[1], tiefix_split_rows()
+    )
     return topk_tiefix_(
         logits,
         topk_indices,
@@ -231,6 +262,7 @@ def tiefix_topk_(
         row_starts=row_starts,
         relative=relative,
         sort=sort,
+        split=split,
     )
 
 

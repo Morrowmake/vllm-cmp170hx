@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_TOPK_SORTED: bool = False
     VLLM_GLM5_TOPK_TIEFIX: bool = False
+    VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS: int = 0
     VLLM_GLM5_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
@@ -1644,6 +1645,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default OFF: unset, the indexer is byte-identical to upstream.
     "VLLM_GLM5_TOPK_TIEFIX": lambda: bool(
         int(os.getenv("VLLM_GLM5_TOPK_TIEFIX", "0"))
+    ),
+    # With VLLM_GLM5_TOPK_TIEFIX and VLLM_GLM5_TOPK_SORTED both set: for
+    # batches of at most this many rows over wide logits (decode at small
+    # concurrency over a long context), run the tie fix + sort as two launches
+    # over (row, chunk) instead of one program per row, so a few long rows
+    # use many SMs. Same bytes. 0 (default) = off: one program per row.
+    "VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS": lambda: int(
+        os.getenv("VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS", "0")
     ),
     # Route the padding rows of a padded batch (CUDA-graph sizes) to no
     # expert (topk_ids = -1) before the fused MoE. Their hidden states come
