@@ -66,6 +66,9 @@ def env(monkeypatch):
     monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
     monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2", "1")
     monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "32")
+    # These tests cover the re-align fallback; the in-kernel mask
+    # (VLLM_GLM5_MOE_ROUTE_V2_MASK) is tested in test_moe_route_v2_mask.py.
+    monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "0")
     # 2 = the torch deterministic alignment (same order as the Triton one).
     monkeypatch.setattr(mab, "deterministic_moe_align_mode", lambda: 2)
     return state
@@ -83,7 +86,8 @@ def _route_v2(monkeypatch, m, seed):
     logits = torch.randn(m, E, generator=g)
 
     def fake_moe_route(x, weight, bias, *, topk, block_size, num_experts,
-                       renormalize, routed_scaling_factor):
+                       renormalize, routed_scaling_factor, is_padding=None):
+        assert is_padding is None          # the re-align fallback path
         s, e, n = _align(ids, block_size)
         return logits, w, ids, s, e, n
 
@@ -161,6 +165,95 @@ def test_fused_decode_sizes_keep_the_handoff(env, monkeypatch):
     mr.mask_padding_topk_ids(ids)
     assert torch.equal(ids, ref)
     assert mab.moe_align_block_size(ids, bs, E) is stashed
+
+
+def _route_v2_in_kernel_mask(monkeypatch, m, seed, state):
+    """maybe_moe_route_v2 with the in-kernel mask on: the stand-in applies
+    the is_padding it is given the way the kernel does (ids -1, alignment of
+    the masked ids) and records what it was passed."""
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.stack(
+        [torch.randperm(E, generator=g)[:TOPK] for _ in range(m)]
+    ).to(torch.int32)
+    w = torch.full((m, TOPK), 1.0 / TOPK)
+    logits = torch.randn(m, E, generator=g)
+    seen = {}
+
+    def fake_moe_route(x, weight, bias, *, topk, block_size, num_experts,
+                       renormalize, routed_scaling_factor, is_padding=None):
+        seen["is_padding"] = is_padding
+        if is_padding is not None:
+            ids.masked_fill_(is_padding.unsqueeze(1), -1)
+        s, e, n = _align(ids, block_size)
+        return logits, w, ids, s, e, n
+
+    import vllm.ampere_decode.moe_route as mrt
+
+    monkeypatch.setattr(mrt, "moe_route", fake_moe_route)
+    monkeypatch.setattr(ad, "use_ampere_moe_route_v2", lambda *a: True)
+    import vllm.forward_context as fc
+
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        fc, "get_forward_context",
+        lambda: SimpleNamespace(is_padding=state["is_padding"]),
+    )
+    router = SimpleNamespace(top_k=TOPK, e_score_correction_bias=SimpleNamespace(
+        data=torch.zeros(E)), routed_scaling_factor=1.0)
+    gate = SimpleNamespace(weight=torch.empty(E, 16))
+    out = ad.maybe_moe_route_v2(gate, router, torch.empty(m, 16))
+    assert out is logits
+    w_ids = ad.take_fused_routing(logits)
+    assert w_ids is not None and w_ids[1] is ids
+    return ids, seen
+
+
+@pytest.mark.parametrize("m", list(range(9, 33)))
+def test_in_kernel_mask_keeps_the_handoff(env, monkeypatch, m):
+    monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1")
+    n_real = max(1, m - 1 - (m % 5))
+    env["is_padding"] = torch.arange(m) >= n_real
+    ids, seen = _route_v2_in_kernel_mask(monkeypatch, m, m, env)
+    assert seen["is_padding"] is env["is_padding"]
+    bs = ad.marlin_block_size_m(m, TOPK, E)
+    stashed = ad._PENDING[3]
+    before = ids.clone()
+    out = mr.mask_padding_topk_ids(ids)
+    assert out is ids and torch.equal(ids, before)   # nothing left to mask
+    assert (ids[n_real:] == -1).all()
+    got = mab.moe_align_block_size(ids, bs, E)
+    assert got is stashed                             # handoff taken
+    assert _same(got, _align(ids.clone(), bs), bs)    # = fresh masked align
+
+
+def test_in_kernel_mask_skips_fused_decode_sizes(env, monkeypatch):
+    # <= 8 rows: neither the kernel nor the mask touches the batch.
+    monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1")
+    env["is_padding"] = torch.arange(8) >= 5
+    ids, seen = _route_v2_in_kernel_mask(monkeypatch, 8, 5, env)
+    assert seen["is_padding"] is None
+    assert (ids >= 0).all()
+
+
+def test_in_kernel_mask_other_mask_object_falls_back(env, monkeypatch):
+    # The mask call sees a different is_padding object than the kernel did:
+    # it must not trust the handoff; it masks and drops it.
+    monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1")
+    env["is_padding"] = torch.arange(16) >= 12
+    ids, _ = _route_v2_in_kernel_mask(monkeypatch, 16, 6, env)
+    env["is_padding"] = torch.arange(16) >= 10
+    mr.mask_padding_topk_ids(ids)
+    assert ad._PENDING is None
+    assert (ids[10:] == -1).all()
+
+
+def test_in_kernel_mask_off_when_mask_padding_off(env, monkeypatch):
+    monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1")
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "0")
+    env["is_padding"] = torch.arange(16) >= 12
+    ids, seen = _route_v2_in_kernel_mask(monkeypatch, 16, 8, env)
+    assert seen["is_padding"] is None
+    assert (ids >= 0).all()
 
 
 def test_drop_only_touches_its_own_ids():
