@@ -47,6 +47,7 @@ __all__ = [
     "marlin_block_size_m",
     "stash_fused_align",
     "take_fused_align",
+    "drop_fused_align",
     "use_ampere_moe_route_v2",
     "maybe_moe_route_v2",
     "take_fused_routing",
@@ -341,6 +342,24 @@ def take_fused_align(
         return None
     _PENDING = None
     return aligned
+
+
+def drop_fused_align(topk_ids) -> bool:
+    """Forget the stashed alignment for exactly this `topk_ids`, if any.
+
+    The alignment was computed from the ids as routed. A caller that edits
+    them in place afterwards (the padding mask sets padding rows to -1 and
+    keeps the tensor's identity) must drop it, or the handoff would return an
+    alignment of ids that no longer exist and the experts would run on the
+    unmasked layout. The next alignment request then misses and computes a
+    fresh one from the edited ids. Host-side only; returns whether a stash
+    was dropped."""
+    global _PENDING
+    pending = _PENDING
+    if pending is None or pending[0] is not topk_ids:
+        return False
+    _PENDING = None
+    return True
 
 
 # --- router GEMV + routing + alignment (moe_route.py) -----------------------
