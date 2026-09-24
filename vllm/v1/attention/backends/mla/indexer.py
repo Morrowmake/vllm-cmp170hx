@@ -990,8 +990,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.dcp_rank_tensor = torch.tensor(
             self.dcp_rank, dtype=torch.int32, device=self.device
         )
+        # Rows of the two decode block-table buffers (this one and the lazy
+        # indexer_decode_block_table_buffer). They only ever hold decode rows:
+        # a request is a decode when its query is at most decode_threshold =
+        # next_n tokens, and a step has at most max_num_seqs requests. The
+        # varlen (SM100) metadata kernel is handed the full seq-lens capacity,
+        # so it keeps the max_num_batched_tokens sizing.
+        self._decode_block_table_rows = scheduler_config.max_num_batched_tokens
+        if envs.VLLM_GLM5_INDEXER_DECODE_ROWS and not self.supports_varlen:
+            self._decode_block_table_rows = min(
+                scheduler_config.max_num_batched_tokens,
+                scheduler_config.max_num_seqs * next_n,
+            )
+            logger.info_once(
+                "VLLM_GLM5_INDEXER_DECODE_ROWS: indexer decode block-table rows "
+                "%d -> %d (max_num_seqs %d x next_n %d), width %d.",
+                scheduler_config.max_num_batched_tokens,
+                self._decode_block_table_rows,
+                scheduler_config.max_num_seqs,
+                next_n,
+                block_table_width,
+            )
+        # Buffers replaced by _ensure_decode_block_table_rows stay referenced:
+        # a CUDA graph captured earlier may still read them.
+        self._retired_decode_buffers: list[torch.Tensor] = []
         self.expanded_block_table_buffer = torch.zeros(
-            (scheduler_config.max_num_batched_tokens, block_table_width),
+            (self._decode_block_table_rows, block_table_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -1041,6 +1065,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         self.indexer_decode_block_table_buffer: torch.Tensor | None = None
         self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+    def _ensure_decode_block_table_rows(self, rows: int) -> None:
+        """Grow the decode block-table buffers if a step needs more rows than
+        they were sized for (only possible with VLLM_GLM5_INDEXER_DECODE_ROWS).
+        The replaced buffers stay referenced, so a CUDA graph that captured
+        them keeps valid memory."""
+        if rows <= self._decode_block_table_rows:
+            return
+        new_rows = max(rows, self._max_num_batched_tokens)
+        logger.warning_once(
+            "Indexer decode block-table rows %d < %d needed; growing to %d. "
+            "Set VLLM_GLM5_INDEXER_DECODE_ROWS=0 to keep the full sizing.",
+            self._decode_block_table_rows,
+            rows,
+            new_rows,
+        )
+        self._retired_decode_buffers.append(self.expanded_block_table_buffer)
+        self.expanded_block_table_buffer = torch.zeros(
+            (new_rows, self.expanded_block_table_buffer.shape[1]),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if self.indexer_decode_block_table_buffer is not None:
+            self._retired_decode_buffers.append(self.indexer_decode_block_table_buffer)
+            self.indexer_decode_block_table_buffer = None
+        self._decode_block_table_rows = new_rows
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1502,6 +1552,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             min_decode_len = int(decode_lens_cpu.min().item())
+            self._ensure_decode_block_table_rows(
+                max(num_decode_tokens, num_decodes * max_decode_len)
+            )
             write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
             # The kernel sees max_decode_len Q rows, not the configured next_n,
@@ -1597,7 +1650,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     rows, cols = compressed.shape
                     if self.indexer_decode_block_table_buffer is None:
                         self.indexer_decode_block_table_buffer = torch.zeros(
-                            (self._max_num_batched_tokens, cols),
+                            (self._decode_block_table_rows, cols),
                             dtype=torch.int32,
                             device=self.device,
                         )
