@@ -9,6 +9,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -49,6 +50,9 @@ else:
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
     )
+
+
+logger = init_logger(__name__)
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -320,6 +324,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Set by the fused sm_80 KDA decode path in _forward, read in
         # forward to skip the o_norm that kernel has already applied.
         self._ampere_kda_normed = False
+        # VLLM_GLM5_DECODE_KDA_V2: resolved once. When set, forward() defers
+        # f_b_proj / g_b_proj to _forward so the fused sm_80 v2 kernel can
+        # consume f_a / g_a directly; every other path computes them there.
+        from vllm import envs as _envs
+
+        self._kda_v2 = bool(
+            _envs.VLLM_GLM5_DECODE_KERNELS and _envs.VLLM_GLM5_DECODE_KDA_V2
+        )
+        if self._kda_v2:
+            logger.info_once(
+                "sm_80 KDA decode v2 active: f_b_proj + g_b_proj + conv + "
+                "gated delta rule + gated RMSNorm in one kernel "
+                "(VLLM_GLM5_DECODE_KDA_V2=1)."
+            )
 
         additional_config = vllm_config.additional_config
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
@@ -400,6 +418,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         return out, final_state
 
+    def _fill_deferred_g2(self, g_a: torch.Tensor, g2: torch.Tensor) -> None:
+        """g_b_proj(g_a) into the caller's g2 buffer (VLLM_GLM5_DECODE_KDA_V2
+        paths that do not fuse the norm): the same GEMM the unfused forward
+        runs, copied bitwise into the buffer o_norm reads."""
+        g2.copy_(
+            self.g_b_proj(g_a)[0].reshape(-1, self.local_num_heads, self.head_dim)
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -424,12 +450,28 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
-        g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+        if self._kda_v2:
+            # Deferred to _forward: the fused v2 kernel reads f_a / g_a itself.
+            # g1 is only consumed inside _forward, so it is computed there when
+            # needed. g2 is also read by o_norm below, so it is a buffer
+            # allocated here and filled in _forward on every path that does
+            # not fuse the norm (the same static-buffer contract as
+            # core_attn_out).
+            g1 = None
+            g2 = torch.empty(
+                (num_tokens, self.local_num_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            f_a_in, g_a_in = f_a, g_a
+        else:
+            g1 = self.f_b_proj(f_a)[0]
+            g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
-        g_proj_states = self.g_b_proj(g_a)[0]
-        # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
-        g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+            g_proj_states = self.g_b_proj(g_a)[0]
+            # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
+            g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+            f_a_in = g_a_in = None
 
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
@@ -444,6 +486,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
             g2=g2,
+            f_a=f_a_in,
+            g_a=g_a_in,
         )
         if self._ampere_kda_normed:
             # o_norm is fused into the sm_80 kernel; skip the second pass.
@@ -457,23 +501,32 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     def _forward(
         self,
         qkv_proj_states: torch.Tensor,
-        g1: torch.Tensor,
+        g1: torch.Tensor | None,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
         g2: torch.Tensor | None = None,
+        f_a: torch.Tensor | None = None,
+        g_a: torch.Tensor | None = None,
     ) -> None:
-        # Cleared on every call; set only by the fused sm_80 path below.
+        # Cleared on every call; set only by the fused sm_80 paths below.
         self._ampere_kda_normed = False
+        # f_a / g_a are passed only with VLLM_GLM5_DECODE_KDA_V2 (see forward):
+        # g1 is then None and g2 an unfilled buffer.
+        deferred = f_a is not None
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
         if attn_metadata_raw is None:
+            if deferred:
+                self._fill_deferred_g2(g_a, g2)
             return
 
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata_narrowed = attn_metadata_raw.get(self.prefix)
         if attn_metadata_narrowed is None:
             # Profile/warmup dummy runs may omit mamba-family metadata.
+            if deferred:
+                self._fill_deferred_g2(g_a, g2)
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         has_initial_state = attn_metadata_narrowed.has_initial_state
@@ -497,7 +550,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         constant_caches = self.kv_cache
 
         qkv_proj_states = qkv_proj_states[:num_actual_tokens]
-        g1 = g1[:, :num_actual_tokens]
+        if g1 is not None:
+            g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
         (conv_state, recurrent_state) = constant_caches
@@ -524,6 +578,70 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             ).contiguous()
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
+
+        # --- fused sm_80 spec-decode path, v2: f_b/g_b fused in too ---
+        # ONE kernel for f_b_proj + g_b_proj + causal_conv1d_update +
+        # fused_recurrent_kda + o_norm, under the same pure-spec-verify
+        # conditions as the path below, within the shapes the kernel is
+        # validated for (use_ampere_kda_decode_v2). Otherwise the deferred
+        # projections are materialised here and everything below runs as
+        # without the switch. See vllm/ampere_decode/kda_decode_v2.py.
+        if deferred:
+            from vllm.ampere_decode import use_ampere_kda_decode_v2
+
+            w_f = getattr(self.f_b_proj, "weight", None)
+            w_g = getattr(self.g_b_proj, "weight", None)
+            if (
+                use_spec
+                and w_f is not None
+                and w_g is not None
+                and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)
+                and attn_metadata_narrowed.num_prefills == 0
+                and attn_metadata_narrowed.num_decodes == 0
+                and spec_state_indices_tensor is not None
+                and num_accepted_tokens is not None
+                and spec_query_start_loc is not None
+                and recurrent_state.dtype == torch.float32
+                and use_ampere_kda_decode_v2(
+                    num_spec_decodes,
+                    num_actual_tokens,
+                    self.local_num_heads,
+                    self.head_dim,
+                    w_f,
+                    w_g,
+                )
+            ):
+                from vllm.ampere_decode.kda_decode_v2 import kda_decode_v2
+
+                kda_decode_v2(
+                    qkv_proj_states,
+                    beta,
+                    f_a[:num_actual_tokens],
+                    g_a[:num_actual_tokens],
+                    w_f,
+                    w_g,
+                    conv_state,
+                    conv_weights,
+                    conv_bias,
+                    self.o_norm.weight,
+                    recurrent_state,
+                    spec_state_indices_tensor[:, 0][:num_spec_decodes],
+                    spec_state_indices_tensor,
+                    num_accepted_tokens,
+                    spec_query_start_loc[: num_spec_decodes + 1],
+                    spec_state_indices_tensor.size(-1),
+                    self.A_log.view(-1),
+                    self.dt_bias,
+                    lower_bound=lower_bound,
+                    eps=self.o_norm.eps,
+                    out=core_attn_out[0, :num_actual_tokens].unsqueeze(0),
+                )
+                self._ampere_kda_normed = True
+                return
+            g1 = self.f_b_proj(f_a)[0]
+            g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+            g1 = g1[:, :num_actual_tokens]
+            self._fill_deferred_g2(g_a, g2)
 
         # --- fused sm_80 spec-decode path ---
         # ONE kernel for causal_conv1d_update + fused_recurrent_kda + o_norm
