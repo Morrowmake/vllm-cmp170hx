@@ -193,6 +193,9 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
+    VLLM_GLM5_TOPK_SORTED: bool = False
+    VLLM_GLM5_TOPK_TIE_REPAIR: bool = False
+    VLLM_GLM5_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
@@ -1675,6 +1678,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1 = deterministic Triton kernel, 2 = deterministic torch path for A/B.
     "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": lambda: int(
         os.getenv("VLLM_GLM5_DETERMINISTIC_MOE_ALIGN", "0")
+    ),
+    # Put each row of the sparse indexer's selected top-k (token or pool ids)
+    # in ascending order before attention reads it. The stock top-k kernels
+    # return the right set in an arrival-dependent order, and the sparse MLA
+    # kernel accumulates its online softmax in index order, so the same
+    # prompt otherwise gets a different attention output from run to run
+    # (last-bit differences that the rest of the model amplifies). Only the
+    # order changes, never the set. Default OFF: unset, the indexer is
+    # byte-identical to upstream.
+    "VLLM_GLM5_TOPK_SORTED": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TOPK_SORTED", "0"))
+    ),
+    # Keep the stock sparse-indexer top-k but re-pick its tied part: the
+    # entries equal to the smallest selected score are taken lowest column
+    # first (the canonical set), then each row is sorted ascending. The stock
+    # kernels place exactly-tied entries by atomic arrival, so the selected
+    # SET differs between identical calls when the fp8 index cache produces
+    # ties at the k-th score. Default OFF.
+    "VLLM_GLM5_TOPK_TIE_REPAIR": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TOPK_TIE_REPAIR", "0"))
+    ),
+    # Route the padding rows of a padded batch (CUDA-graph sizes) to no
+    # expert (topk_ids = -1) before the fused MoE. Their hidden states come
+    # from stale input buffers, and where they land in the expert blocks
+    # changes how Marlin splits K for the real rows next to them, so the same
+    # request otherwise gets last-bit different MoE outputs depending on what
+    # ran before. Uses the forward context's is_padding mask. Default OFF.
+    "VLLM_GLM5_MOE_MASK_PADDING": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MOE_MASK_PADDING", "0"))
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
     # Size the DFlash drafter's RoPE cos/sin cache to the reachable positions

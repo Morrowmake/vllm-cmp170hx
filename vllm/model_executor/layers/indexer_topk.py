@@ -8,9 +8,12 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
@@ -166,6 +169,186 @@ def use_canonical_topk() -> bool:
     import vllm.envs as envs
 
     return envs.VLLM_GLM5_TOPK_CANONICAL
+
+
+@functools.cache
+def use_sorted_topk() -> bool:
+    """Whether the indexer sorts its selected indices (VLLM_GLM5_TOPK_SORTED).
+    Read once per process; tests call cache_clear."""
+    import vllm.envs as envs
+
+    on = bool(envs.VLLM_GLM5_TOPK_SORTED)
+    if on:
+        logger.info_once(
+            "GLM-5 sorted top-k active: the sparse indexer's selected indices "
+            "are put in ascending order before attention "
+            "(VLLM_GLM5_TOPK_SORTED=1; set 0 to disable)"
+        )
+    return on
+
+
+_SORT_FILL = 2**31 - 1
+
+
+def sort_selected_topk_(ids: torch.Tensor) -> torch.Tensor:
+    """Sort each row of a selected-index tensor in place, ascending, with the
+    -1 fill kept at the end of the row.
+
+    ``ids`` is (rows, k) int32 or int64 and may be a strided view (a column
+    slice of the persistent top-k buffer). The selected set of every row is
+    unchanged; only its order becomes a function of the set, so consumers
+    that accumulate in index order give the same result for the same set.
+    Static shapes and no host reads: safe inside CUDA graph capture.
+    """
+    if ids.numel() == 0:
+        return ids
+    key = ids.masked_fill(ids < 0, _SORT_FILL)
+    key = torch.sort(key, dim=-1).values
+    ids.copy_(key.masked_fill(key == _SORT_FILL, -1))
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Tie repair -- VLLM_GLM5_TOPK_TIE_REPAIR
+# ---------------------------------------------------------------------------
+# The stock top-k kernels return every entry above the k-th score, but place
+# the entries EQUAL to it (the threshold bin) by atomic arrival, so which of
+# several exactly-tied indices survive is a lottery. The repair keeps the
+# stock selection and only re-picks the tied part: with t the smallest
+# selected score and r the number of selected entries equal to t, the r slots
+# holding t are refilled with the r lowest-index columns of the row window
+# whose score is exactly t. That is the canonical (score desc, index asc)
+# set whenever the stock kernel is correct, at one O(row) pass per row
+# instead of a full re-selection.
+
+
+@functools.cache
+def use_topk_tie_repair() -> bool:
+    """VLLM_GLM5_TOPK_TIE_REPAIR, read once per process (tests cache_clear)."""
+    import vllm.envs as envs
+
+    on = bool(envs.VLLM_GLM5_TOPK_TIE_REPAIR)
+    if on:
+        logger.info_once(
+            "GLM-5 top-k tie repair active: tied threshold entries are taken "
+            "lowest index first and each row is sorted "
+            "(VLLM_GLM5_TOPK_TIE_REPAIR=1; set 0 to disable)"
+        )
+        _warm_tie_repair()
+    return on
+
+
+def _warm_tie_repair() -> None:
+    """Compile the kernel variants before any CUDA graph capture (Triton
+    compiles on first launch). Called once, from the first indexer forward,
+    which is the profiling run; a no-op without CUDA or inside a capture."""
+    if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
+        return
+    dev = torch.device("cuda", torch.cuda.current_device())
+    for k in (512, 2048):
+        logits = torch.zeros((1, k + 1), dtype=torch.float32, device=dev)
+        ends = torch.full((1,), k + 1, dtype=torch.int32, device=dev)
+        starts = torch.zeros((1,), dtype=torch.int32, device=dev)
+        for relative in (True, False):
+            ids = torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k)
+            repair_topk_ties_(ids, logits, k, ends, starts if relative else None,
+                              relative=relative)
+
+
+def _tie_repair_kernel_src():
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit(do_not_specialize=["K", "C", "l_s0", "i_s0"])
+    def _tie_repair_kernel(
+        logits_ptr, l_s0, ids_ptr, i_s0, starts_ptr, ends_ptr, scratch_ptr,
+        K, C,
+        HAS_STARTS: tl.constexpr, RELATIVE: tl.constexpr,
+        BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        kk = tl.arange(0, BLOCK_K)
+        km = kk < K
+        sel = tl.load(ids_ptr + row * i_s0 + kk, mask=km, other=-1)
+        valid = (sel >= 0) & km
+        if HAS_STARTS:
+            start = tl.load(starts_ptr + row).to(tl.int32)
+        else:
+            start = tl.zeros((), dtype=tl.int32)
+        end = tl.load(ends_ptr + row).to(tl.int32)
+        if RELATIVE:
+            col = sel + start
+        else:
+            col = sel
+        lg = tl.load(logits_ptr + row * l_s0 + col, mask=valid, other=float("inf"))
+        t = tl.min(tl.where(valid, lg, float("inf")), axis=0)
+        tied = valid & (lg == t)
+        r = tl.sum(tied.to(tl.int32), axis=0)
+        running = tl.zeros((), dtype=tl.int32)
+        for c0 in range(0, C, BLOCK_C):
+            cc = c0 + tl.arange(0, BLOCK_C)
+            inw = (cc >= start) & (cc < end) & (cc < C)
+            v = tl.load(logits_ptr + row * l_s0 + cc, mask=inw, other=0.0)
+            eq = inw & (v == t)
+            e32 = eq.to(tl.int32)
+            rank = tl.cumsum(e32, axis=0) + running
+            keep = eq & (rank <= r)
+            tl.store(scratch_ptr + row * BLOCK_K + (rank - 1), cc.to(tl.int32), mask=keep)
+            running += tl.sum(e32, axis=0)
+        slot = tl.cumsum(tied.to(tl.int32), axis=0) - 1
+        repl = tl.load(scratch_ptr + row * BLOCK_K + slot, mask=tied, other=0)
+        newcol = tl.where(tied, repl, col)
+        if RELATIVE:
+            out = newcol - start
+        else:
+            out = newcol
+        out = tl.where(valid, out, -1)
+        tl.store(ids_ptr + row * i_s0 + kk, out, mask=km)
+
+    return _tie_repair_kernel
+
+
+_TIE_REPAIR_KERNEL = None
+
+
+def repair_topk_ties_(
+    ids: torch.Tensor,
+    logits: torch.Tensor,
+    k: int,
+    row_ends: torch.Tensor,
+    row_starts: torch.Tensor | None = None,
+    relative: bool = False,
+) -> torch.Tensor:
+    """Make the tied part of a stock top-k selection canonical, in place, then
+    sort each row ascending (-1 fill last).
+
+    ids: (rows, >= k) int32, possibly a strided view; its first k columns are
+    the selection, -1 filled. logits: (rows, cols) fp32, the scores the
+    selection was taken from. row_ends / row_starts: per-row window
+    [start, end) in logits columns (start 0 when None). relative: the ids are
+    offsets from row_starts (top_k_per_row_prefill's convention).
+    """
+    global _TIE_REPAIR_KERNEL
+    rows = ids.shape[0]
+    if rows == 0 or k == 0:
+        return ids
+    assert logits.dtype == torch.float32 and logits.stride(-1) == 1
+    assert ids.dtype == torch.int32 and ids.stride(-1) == 1
+    if _TIE_REPAIR_KERNEL is None:
+        _TIE_REPAIR_KERNEL = _tie_repair_kernel_src()
+    from vllm.triton_utils import triton
+
+    block_k = triton.next_power_of_2(k)
+    scratch = torch.empty((rows, block_k), dtype=torch.int32, device=ids.device)
+    ends = row_ends.reshape(-1)
+    starts = row_starts.reshape(-1) if row_starts is not None else ends
+    _TIE_REPAIR_KERNEL[(rows,)](
+        logits, logits.stride(0), ids, ids.stride(0), starts, ends, scratch,
+        k, logits.shape[1],
+        HAS_STARTS=row_starts is not None, RELATIVE=relative,
+        BLOCK_K=block_k, BLOCK_C=1024,
+    )
+    sort_selected_topk_(ids[:, :k])
+    return ids
 
 
 def _monotonic_int_key(logits: torch.Tensor) -> torch.Tensor:
