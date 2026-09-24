@@ -13,7 +13,9 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.indexer_topk import (
     canonical_topk,
     get_indexer_topk,
+    sort_selected_topk_,
     use_canonical_topk,
+    use_sorted_topk,
 )
 from vllm.models.glm5next.common.sparse_indexer import (
     RADIX_TOPK_WORKSPACE_SIZE,
@@ -386,6 +388,8 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+            if use_sorted_topk():
+                sort_selected_topk_(topk_dst)
             # Free the fp32 logits before the next chunk allocates its own.
             # The buffer is [chunk_rows, compressed_context] and the metadata
             # builder sizes chunk_rows right up to
@@ -651,6 +655,9 @@ def sparse_attn_indexer_kpool(
             select_k,
             attn_metadata_narrowed.max_seq_len,
         )
+
+        if use_sorted_topk():
+            sort_selected_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:

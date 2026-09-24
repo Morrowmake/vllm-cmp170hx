@@ -8,9 +8,12 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
@@ -166,6 +169,43 @@ def use_canonical_topk() -> bool:
     import vllm.envs as envs
 
     return envs.VLLM_GLM5_TOPK_CANONICAL
+
+
+@functools.cache
+def use_sorted_topk() -> bool:
+    """Whether the indexer sorts its selected indices (VLLM_GLM5_TOPK_SORTED).
+    Read once per process; tests call cache_clear."""
+    import vllm.envs as envs
+
+    on = bool(envs.VLLM_GLM5_TOPK_SORTED)
+    if on:
+        logger.info_once(
+            "GLM-5 sorted top-k active: the sparse indexer's selected indices "
+            "are put in ascending order before attention "
+            "(VLLM_GLM5_TOPK_SORTED=1; set 0 to disable)"
+        )
+    return on
+
+
+_SORT_FILL = 2**31 - 1
+
+
+def sort_selected_topk_(ids: torch.Tensor) -> torch.Tensor:
+    """Sort each row of a selected-index tensor in place, ascending, with the
+    -1 fill kept at the end of the row.
+
+    ``ids`` is (rows, k) int32 or int64 and may be a strided view (a column
+    slice of the persistent top-k buffer). The selected set of every row is
+    unchanged; only its order becomes a function of the set, so consumers
+    that accumulate in index order give the same result for the same set.
+    Static shapes and no host reads: safe inside CUDA graph capture.
+    """
+    if ids.numel() == 0:
+        return ids
+    key = ids.masked_fill(ids < 0, _SORT_FILL)
+    key = torch.sort(key, dim=-1).values
+    ids.copy_(key.masked_fill(key == _SORT_FILL, -1))
+    return ids
 
 
 def _monotonic_int_key(logits: torch.Tensor) -> torch.Tensor:
