@@ -16,8 +16,10 @@ from vllm.model_executor.layers.indexer_topk import (
     get_indexer_topk,
     repair_topk_ties_,
     sort_selected_topk_,
+    tiefix_topk_,
     use_canonical_topk,
     use_sorted_topk,
+    use_tiefix_topk,
     use_topk_tie_repair,
 )
 from vllm.models.glm5next.common.sparse_indexer import (
@@ -448,6 +450,16 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+                if use_tiefix_topk():
+                    # Same scores, but the boundary ties now go to the lowest
+                    # indices whatever the chunk shape, as canonical would.
+                    tiefix_topk_(
+                        logits,
+                        topk_dst,
+                        row_starts=chunk.cu_seqlen_ks,
+                        row_ends=chunk.cu_seqlen_ke,
+                        relative=True,
+                    )
             if use_canonical_topk():
                 pass  # already the canonical set, in canonical order
             elif use_topk_tie_repair():

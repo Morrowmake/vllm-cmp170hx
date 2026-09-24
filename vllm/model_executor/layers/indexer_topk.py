@@ -187,6 +187,45 @@ def use_sorted_topk() -> bool:
     return on
 
 
+@functools.cache
+def use_tiefix_topk() -> bool:
+    """Whether the indexer repairs boundary ties of the fast top-k kernels
+    (VLLM_GLM5_TOPK_TIEFIX). Read once per process; tests call cache_clear.
+    VLLM_GLM5_TOPK_CANONICAL, when also set, takes precedence."""
+    import vllm.envs as envs
+
+    on = bool(envs.VLLM_GLM5_TOPK_TIEFIX) and not use_canonical_topk()
+    if on:
+        logger.info_once(
+            "GLM-5 tie-consistent top-k active: the sparse indexer's selected "
+            "set breaks ties at the k-th score by lowest index "
+            "(VLLM_GLM5_TOPK_TIEFIX=1; set 0 to disable)"
+        )
+    return on
+
+
+def tiefix_topk_(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    *,
+    row_ends: torch.Tensor,
+    row_starts: torch.Tensor | None = None,
+    relative: bool = False,
+) -> torch.Tensor:
+    """Resolve boundary ties of an exact top-k to the lowest indices, in
+    place. See indexer_topk_tiefix.py; imported lazily so that with the flag
+    unset nothing new is loaded."""
+    from vllm.model_executor.layers.indexer_topk_tiefix import topk_tiefix_
+
+    return topk_tiefix_(
+        logits,
+        topk_indices,
+        row_ends=row_ends,
+        row_starts=row_starts,
+        relative=relative,
+    )
+
+
 _SORT_FILL = 2**31 - 1
 
 
@@ -607,7 +646,28 @@ class SparseIndexerTopk(torch.nn.Module):
         max_seq_len: int,
     ) -> None:
         """Run the resolved decode top-k implementation, writing into
-        topk_indices (int32, -1 fill for rows shorter than topk_tokens)."""
+        topk_indices (int32, -1 fill for rows shorter than topk_tokens).
+        With VLLM_GLM5_TOPK_TIEFIX the selected set is then made canonical
+        on boundary ties."""
+        self._run_backend(
+            logits, seq_lens, next_n, topk_indices, topk_tokens, max_seq_len
+        )
+        if use_tiefix_topk():
+            tiefix_topk_(
+                logits,
+                topk_indices,
+                row_ends=self._row_ends(seq_lens, next_n, logits.shape[0]),
+            )
+
+    def _run_backend(
+        self,
+        logits: torch.Tensor,
+        seq_lens: torch.Tensor,
+        next_n: int,
+        topk_indices: torch.Tensor,
+        topk_tokens: int,
+        max_seq_len: int,
+    ) -> None:
         if use_canonical_topk():
             # Selection is done canonically rather than by any of the
             # kernels below, all of which place tied entries by atomic
