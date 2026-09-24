@@ -9,7 +9,9 @@ The gate tests are pure host logic and run anywhere:
 The GPU tests (skipped without an sm_80 device) check, through the real
 dispatch in `mhc_fused_post_pre_tilelang`: that V2 on routes M <= 32 to the v2
 kernels and nothing else, that V2 off never touches them, the error against an
-FP64 recomputation relative to TileLang's own, bitwise determinism, and CUDA
+FP64 recomputation relative to TileLang's own (per case with a one-ulp floor, and
+summed over many cases with NO floor, on random and on outlier-channel inputs,
+with `residual_cur` bitwise equal to TileLang's), bitwise determinism, and CUDA
 graph capture + replay with zero allocation growth.
 """
 
@@ -280,6 +282,60 @@ def test_gpu_dispatch_and_accuracy():
     finally:
         mhc_decode_v2.mhc_fused_post_pre = real
         _restore(env)
+
+
+def _case_outliers(M, seed, dev="cuda"):
+    """Production-like residual magnitudes: most channels O(1), a few hidden
+    positions ~1e3 larger (real residual streams reach ~5e3 there).  This is
+    where the accumulation of the 24 mixes loses precision if it truncates."""
+    c = _case(M, seed, dev)
+    g = torch.Generator(device=dev).manual_seed(seed + 7)
+    idx = torch.randint(0, HIDDEN, (16,), generator=g, device=dev)
+    res = c["residual"].float()
+    res[:, :, idx] *= 1000.0
+    c["residual"] = res.to(torch.bfloat16)
+    return c
+
+
+@pytest.mark.skipif(not _gpu_ok(), reason="needs an sm_80 GPU")
+def test_gpu_accuracy_vs_tilelang_no_floor():
+    """Error against FP64 no worse than TileLang's, with no ulp floor: summed over
+    7 token counts x 2 input kinds x 3 seeds, mean error <= 1.2x TileLang's and
+    max error <= 1.25x TileLang's on post_mix, comb_mix and layer_input, and
+    residual_cur bitwise equal to TileLang's.  (A per-case one-ulp floor let a
+    2.8x mean-error regression on the fp32 mixes through.)"""
+    from vllm.ampere_decode import mhc_decode_v2
+    from vllm.model_executor.kernels.mhc import tilelang as tlmod
+    env = _Env()
+    ms = (1, 4, 8, 16, 17, 25, 32)
+    sums = {i: [0.0, 0.0, 0.0, 0.0] for i in (1, 2, 3)}  # got mean, tl mean, got max, tl max
+    try:
+        mhc_decode_v2.warmup(ms)
+        for M in ms:
+            for kind, make in (("randn", _case), ("outliers", _case_outliers)):
+                for seed in range(3):
+                    c = make(M, seed=1000 * M + seed)
+                    env.setenv("VLLM_GLM5_DECODE_KERNELS", "0")
+                    tl_out = tlmod.mhc_fused_post_pre_tilelang(**_kw(c))
+                    _restore(env)
+                    got = mhc_decode_v2.mhc_fused_post_pre(**_kw(c))
+                    torch.cuda.synchronize()
+                    assert torch.equal(got[0], tl_out[0]), (M, kind, seed, "residual_cur")
+                    ref = _ref64(c)
+                    for i in (1, 2, 3):
+                        g_max, g_mean = _err(got[i], ref[i])
+                        t_max, t_mean = _err(tl_out[i], ref[i])
+                        s = sums[i]
+                        s[0] += g_mean
+                        s[1] += t_mean
+                        s[2] = max(s[2], g_max)
+                        s[3] = max(s[3], t_max)
+    finally:
+        _restore(env)
+    for i, name in ((1, "post_mix"), (2, "comb_mix"), (3, "layer_input")):
+        gm, tm, gx, tx = sums[i]
+        assert gm <= 1.2 * tm, (name, "mean", gm / tm)
+        assert gx <= 1.25 * tx, (name, "max", gx / tx)
 
 
 @pytest.mark.skipif(not _gpu_ok(), reason="needs an sm_80 GPU")
