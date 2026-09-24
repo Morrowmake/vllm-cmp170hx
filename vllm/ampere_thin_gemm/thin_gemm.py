@@ -100,6 +100,7 @@ _CONFIG_OVERRIDES: dict = {
     (6416, 4096, 4): (32, 128, 1, 2, 3),  # 35.28 us vs cuBLAS 38.35 (1.087x), separate timing 35.28 us
     (6416, 4096, 8): (32, 128, 1, 2, 3),  # 35.75 us vs cuBLAS 38.82 (1.086x), separate timing 35.75 us
     (6416, 4096, 16): (32, 128, 1, 2, 3),  # 36.03 us vs cuBLAS 39.19 (1.088x), separate timing 36.03 us
+    (6416, 4096, 24): (128, 128, 1, 4, 3),  # 37.33 us vs cuBLAS 44.78 (1.200x), fallback was 38.73
     (6416, 4096, 32): (128, 128, 1, 4, 3),  # 37.42 us vs cuBLAS 45.71 (1.221x), separate timing 37.42 us
     (6416, 4096, None): (32, 128, 1, 2, 3),
     # dense_mlp_gate_up  N=6144 K=4096
@@ -108,6 +109,7 @@ _CONFIG_OVERRIDES: dict = {
     (6144, 4096, 4): (32, 128, 1, 2, 3),  # 34.44 us vs cuBLAS 37.70 (1.095x), separate timing 34.44 us
     (6144, 4096, 8): (128, 128, 1, 4, 3),  # 34.54 us vs cuBLAS 37.79 (1.094x), separate timing 34.54 us
     (6144, 4096, 16): (128, 128, 1, 4, 3),  # 34.72 us vs cuBLAS 38.07 (1.097x), separate timing 34.72 us
+    (6144, 4096, 24): (128, 128, 1, 4, 3),  # 35.56 us vs cuBLAS 44.22 (1.243x), fallback was 37.89
     (6144, 4096, 32): (128, 128, 1, 4, 3),  # 36.40 us vs cuBLAS 44.78 (1.230x), separate timing 36.40 us
     (6144, 4096, None): (32, 128, 1, 2, 3),
     # mla_o_proj  N=4096 K=4096
@@ -116,6 +118,7 @@ _CONFIG_OVERRIDES: dict = {
     (4096, 4096, 4): (32, 128, 1, 4, 4),  # 23.42 us vs cuBLAS 25.66 (1.096x), separate timing 24.19 us
     (4096, 4096, 8): (32, 128, 1, 4, 4),  # 23.68 us vs cuBLAS 25.79 (1.089x), separate timing 24.51 us
     (4096, 4096, 16): (32, 128, 1, 4, 4),  # 24.13 us vs cuBLAS 26.05 (1.080x), separate timing 24.19 us
+    (4096, 4096, 24): (64, 128, 1, 8, 5),  # 24.45 us vs cuBLAS 25.73 (1.052x), fallback was 25.79
     (4096, 4096, 32): (64, 128, 1, 8, 5),  # 24.58 us vs cuBLAS 25.98 (1.057x), separate timing 27.97 us
     (4096, 4096, None): (32, 128, 1, 4, 4),
     # dense_mlp_down  N=4096 K=3072
@@ -124,6 +127,7 @@ _CONFIG_OVERRIDES: dict = {
     (4096, 3072, 4): (64, 256, 1, 4, 3),  # 18.71 us vs cuBLAS 20.53 (1.097x), separate timing 19.60 us
     (4096, 3072, 8): (32, 128, 1, 4, 4),  # 19.08 us vs cuBLAS 20.81 (1.090x), separate timing 19.97 us
     (4096, 3072, 16): (32, 128, 1, 4, 4),  # 19.55 us vs cuBLAS 21.09 (1.079x), separate timing 19.69 us
+    (4096, 3072, 24): (64, 128, 1, 8, 4),  # 20.15 us vs cuBLAS 20.99 (1.042x), fallback was 21.18
     (4096, 3072, 32): (64, 128, 1, 8, 4),  # 20.48 us vs cuBLAS 21.22 (1.036x), separate timing 20.53 us
     (4096, 3072, None): (32, 128, 1, 4, 4),
     # mla_fused_qkv_a_proj  N=2048 K=4096
@@ -140,6 +144,7 @@ _CONFIG_OVERRIDES: dict = {
     (4096, 2048, 4): (16, 128, 1, 2, 4),  # 13.70 us vs cuBLAS 15.01 (1.096x), separate timing 13.70 us
     (4096, 2048, 8): (64, 256, 1, 4, 4),  # 13.86 us vs cuBLAS 15.17 (1.095x), separate timing 13.89 us
     (4096, 2048, 16): (64, 128, 1, 8, 4),  # 13.66 us vs cuBLAS 15.20 (1.112x), separate timing 13.76 us
+    (4096, 2048, 24): (64, 128, 1, 8, 4),  # 14.66 us vs cuBLAS 15.39 (1.050x), separate timing 14.53 us, fallback was 19.55
     (4096, 2048, 32): (64, 128, 1, 4, 4),  # 14.50 us vs cuBLAS 15.52 (1.071x), separate timing 14.50 us
     (4096, 2048, None): (16, 128, 1, 2, 4),
     # mla_q_b_proj+idx_wq_b  N=4096 K=1536
@@ -148,6 +153,7 @@ _CONFIG_OVERRIDES: dict = {
     (4096, 1536, 4): (64, 256, 1, 4, 3),  # 11.10 us vs cuBLAS 12.53 (1.129x), separate timing 11.10 us
     (4096, 1536, 8): (64, 256, 1, 4, 3),  # 11.24 us vs cuBLAS 12.69 (1.129x), separate timing 11.24 us
     (4096, 1536, 16): (64, 128, 1, 8, 4),  # 11.31 us vs cuBLAS 12.91 (1.141x), separate timing 11.43 us
+    (4096, 1536, 24): (64, 128, 1, 8, 4),  # 12.12 us vs cuBLAS 12.88 (1.063x), fallback was 12.69
     (4096, 1536, 32): (64, 128, 1, 4, 4),  # 12.15 us vs cuBLAS 13.00 (1.071x), separate timing 12.15 us
     (4096, 1536, None): (64, 256, 1, 4, 3),
     # shared_gate_up  N=1024 K=4096
@@ -156,6 +162,7 @@ _CONFIG_OVERRIDES: dict = {
     (1024, 4096, 4): (64, 64, 4, 4, 5),  # 9.68 us vs cuBLAS 10.82 (1.117x), separate timing 9.98 us
     (1024, 4096, 8): (64, 64, 4, 4, 5),  # 9.89 us vs cuBLAS 11.02 (1.115x), separate timing 10.02 us
     (1024, 4096, 16): (32, 64, 4, 2, 5),  # 9.94 us vs cuBLAS 11.23 (1.130x), separate timing 9.94 us
+    (1024, 4096, 24): (64, 256, 4, 4, 3),  # 10.51 us vs cuBLAS 11.38 (1.082x), fallback was 11.42
     (1024, 4096, 32): (64, 64, 4, 4, 5),  # 11.36 us vs cuBLAS 11.65 (1.025x), separate timing 12.54 us
     (1024, 4096, None): (64, 64, 4, 4, 5),
     # mla_kv_b_proj  N=8192 K=512
@@ -172,6 +179,7 @@ _CONFIG_OVERRIDES: dict = {
     (4096, 512, 4): (32, 64, 1, 2, 5),  # 5.50 us vs cuBLAS 6.60 (1.201x), separate timing 5.50 us
     (4096, 512, 8): (32, 64, 1, 2, 5),  # 5.60 us vs cuBLAS 6.70 (1.196x), separate timing 5.60 us
     (4096, 512, 16): (32, 64, 1, 2, 5),  # 5.71 us vs cuBLAS 6.80 (1.190x), separate timing 5.71 us
+    (4096, 512, 24): (64, 64, 1, 8, 5),  # 6.02 us vs cuBLAS 7.04 (1.169x), fallback was 6.53
     (4096, 512, 32): (64, 64, 1, 8, 5),  # 6.19 us vs cuBLAS 7.20 (1.163x), separate timing 6.37 us
     (4096, 512, None): (32, 64, 1, 2, 5),
     # moe_router_gate  N=288 K=4096
@@ -180,6 +188,7 @@ _CONFIG_OVERRIDES: dict = {
     (288, 4096, 4): (16, 64, 8, 2, 5),  # 5.82 us vs cuBLAS 7.98 (1.371x), separate timing 6.39 us
     (288, 4096, 8): (16, 64, 8, 2, 5),  # 5.79 us vs cuBLAS 8.12 (1.401x), separate timing 6.01 us
     (288, 4096, 16): (16, 64, 8, 2, 5),  # 6.00 us vs cuBLAS 8.35 (1.391x), separate timing 6.51 us
+    (288, 4096, 24): (32, 256, 4, 4, 3),  # 7.01 us vs cuBLAS 8.36 (1.193x), fallback was 7.25
     (288, 4096, 32): (32, 256, 4, 4, 3),  # 7.16 us vs cuBLAS 8.65 (1.208x), separate timing 7.50 us
     (288, 4096, None): (16, 64, 8, 2, 5),
     # idx_wk_weights_proj  N=160 K=4096
@@ -198,6 +207,39 @@ _CONFIG_OVERRIDES: dict = {
     (128, 4096, 16): (16, 128, 8, 4, 4),  # 5.03 us vs cuBLAS 6.62 (1.315x), separate timing 5.20 us
     (128, 4096, 32): (16, 128, 8, 4, 4),  # 5.76 us vs cuBLAS 7.11 (1.233x), separate timing 6.14 us
     (128, 4096, None): (16, 128, 8, 4, 4),
+    # dflash_fc  N=4096 K=20480 (DFlash drafter input projection, replicated).
+    # One schedule wins or ties at every M; M=16 is within noise of the old
+    # fallback but kept equal to the any-M row below.
+    (4096, 20480, 1): (128, 128, 2, 4, 4),  # 105.73 us vs cuBLAS 111.23 (1.052x), separate timing 105.86 us, fallback was 109.31
+    (4096, 20480, 2): (128, 128, 2, 4, 4),  # 106.50 us vs cuBLAS 112.64 (1.058x), separate timing 106.50 us, fallback was 110.98
+    (4096, 20480, 4): (128, 128, 2, 4, 4),  # 107.01 us vs cuBLAS 112.77 (1.054x), separate timing 107.01 us, fallback was 110.21
+    (4096, 20480, 8): (128, 128, 2, 4, 4),  # 107.52 us vs cuBLAS 113.02 (1.051x), separate timing 107.65 us, fallback was 111.23
+    (4096, 20480, 16): (128, 128, 2, 4, 4),  # 108.54 us vs cuBLAS 113.66 (1.047x), separate timing 108.54 us, fallback was 109.95
+    (4096, 20480, 24): (128, 128, 2, 4, 4),  # 112.51 us vs cuBLAS 150.78 (1.340x), separate timing 112.64 us, fallback was 130.05
+    (4096, 20480, 32): (128, 128, 2, 4, 4),  # 112.77 us vs cuBLAS 151.94 (1.347x), separate timing 112.64 us, fallback was 142.59
+    (4096, 20480, None): (128, 128, 2, 4, 4),
+    # lm_head_verify+lm_head_dflash_draft  N=38720 K=4096
+    (38720, 4096, 1): (64, 256, 1, 4, 3),  # 193.66 us vs cuBLAS 213.89 (1.104x), fallback was 199.94
+    (38720, 4096, 2): (64, 256, 1, 4, 3),  # 193.79 us vs cuBLAS 211.71 (1.092x), fallback was 200.06
+    (38720, 4096, 4): (64, 256, 1, 4, 3),  # 195.07 us vs cuBLAS 214.27 (1.098x), fallback was 201.47
+    (38720, 4096, 8): (64, 256, 1, 4, 3),  # 196.86 us vs cuBLAS 218.50 (1.110x), fallback was 203.26
+    (38720, 4096, 16): (128, 128, 1, 4, 4),  # 199.68 us vs cuBLAS 223.74 (1.121x), fallback was 208.26
+    (38720, 4096, 24): (64, 128, 1, 4, 3),  # 202.75 us vs cuBLAS 216.58 (1.068x), fallback was 213.38
+    (38720, 4096, 32): (64, 128, 1, 4, 4),  # 210.56 us vs cuBLAS 220.16 (1.046x), fallback was 216.83
+    (38720, 4096, None): (64, 256, 1, 4, 3),
+    # dflash_qkv  N=1536 K=4096 (M <= 8 keeps the fallback schedule, which ties)
+    (1536, 4096, 16): (32, 64, 4, 2, 5),  # 12.93 us vs cuBLAS 15.05 (1.164x), fallback was 14.19
+    (1536, 4096, 24): (32, 64, 4, 4, 4),  # 14.19 us vs cuBLAS 15.38 (1.084x), fallback was 17.46
+    (1536, 4096, 32): (32, 128, 4, 2, 3),  # 14.91 us vs cuBLAS 15.55 (1.043x), fallback was 19.00
+    # dflash_o  N=4096 K=1024
+    (4096, 1024, 1): (64, 128, 1, 4, 4),  # 7.74 us vs cuBLAS 9.09 (1.174x), fallback was 8.00
+    (4096, 1024, 2): (32, 64, 1, 2, 5),  # 8.16 us vs cuBLAS 9.42 (1.155x), fallback was 8.51
+    (4096, 1024, 4): (32, 64, 1, 2, 5),  # 8.22 us vs cuBLAS 9.47 (1.152x), fallback was 8.54
+    (4096, 1024, 8): (32, 64, 1, 2, 5),  # 8.32 us vs cuBLAS 9.54 (1.146x), fallback was 8.72
+    (4096, 1024, 16): (64, 128, 1, 4, 4),  # 8.42 us vs cuBLAS 9.73 (1.156x), fallback was 8.80
+    (4096, 1024, 24): (64, 64, 1, 8, 4),  # 9.20 us vs cuBLAS 9.89 (1.075x), fallback was 10.88
+    (4096, 1024, 32): (64, 128, 1, 4, 3),  # 9.25 us vs cuBLAS 10.05 (1.087x), fallback was 11.49
+    (4096, 1024, None): (64, 128, 1, 4, 4),
     # kda_f_b_proj+kda_g_b_proj  N=2048 K=128
     (2048, 128, 1): (32, 64, 1, 2, 5),  # 2.50 us vs cuBLAS 3.39 (1.353x), separate timing 2.50 us
     (2048, 128, 2): (32, 128, 1, 4, 2),  # 2.55 us vs cuBLAS 3.49 (1.370x), separate timing 2.57 us
