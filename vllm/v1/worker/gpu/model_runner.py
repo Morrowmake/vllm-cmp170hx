@@ -1142,6 +1142,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
+    def pp_hop_rows(self, scheduler_output: SchedulerOutput) -> int | None:
+        """Rows a packed PP hop carries this step without metadata: the
+        scheduled token count, which every stage reads from the same scheduler
+        output. None where a stage may run a different token count (adaptive
+        verification, prefill context parallelism, micro-batching); the hop
+        then sends the metadata for the step."""
+        if (
+            self.adaptive_verification is not None
+            or self.pcp_manager is not None
+            or self.ubatch_runner is not None
+        ):
+            return None
+        return scheduler_output.total_num_scheduled_tokens
+
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
@@ -1942,12 +1956,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
+            received = None if dummy_run else intermediate_tensors.tensors
+            new_tensors = {}
+            for k, v in self.intermediate_tensors.tensors.items():
+                if received is not None:
+                    # A packed hop without metadata sends only the scheduled
+                    # rows; the CUDA-graph padding rows keep what the buffer
+                    # holds (their outputs are never read).
+                    m = min(n, received[k].shape[0])
+                    v[:m].copy_(received[k][:m])
+                new_tensors[k] = v[:n]
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 

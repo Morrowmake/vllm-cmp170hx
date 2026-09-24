@@ -223,6 +223,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_AUX_HIDDEN_TENSOR: Literal["stream_mean", "branch"] = "stream_mean"
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_PP_SPREAD_DECODES: bool = False
+    VLLM_PP_PACKED_HOP: bool = False
+    VLLM_PP_HOP_NO_METADATA: bool = False
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1826,6 +1828,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at most one decoding request. Default OFF until measured on the cards.
     "VLLM_PP_SPREAD_DECODES": lambda: bool(
         int(os.getenv("VLLM_PP_SPREAD_DECODES", "0"))
+    ),
+    # Pipeline parallelism (V2 runner, TP=1): send each stage hand-off as one
+    # flat device transfer instead of one per tensor (the GLM-5.3-Flash
+    # boundary carries the residual streams plus drafter aux states). The
+    # per-step metadata still travels and is checked. Default OFF.
+    "VLLM_PP_PACKED_HOP": lambda: bool(int(os.getenv("VLLM_PP_PACKED_HOP", "0"))),
+    # With VLLM_PP_PACKED_HOP: after a first-hop handshake, send no per-step
+    # metadata; the receiver's persistent buffer gives the layout and the
+    # scheduler output gives the row count (only the scheduled rows travel).
+    # Default OFF.
+    "VLLM_PP_HOP_NO_METADATA": lambda: bool(
+        int(os.getenv("VLLM_PP_HOP_NO_METADATA", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if

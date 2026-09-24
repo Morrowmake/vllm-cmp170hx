@@ -179,6 +179,40 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _resolve_pp_hop(worker: Any) -> Any:
+    """The packed PP hop (vllm/v1/worker/gpu/pp_hop.py) when
+    VLLM_PP_PACKED_HOP=1 and the configuration allows it, else None. Resolved
+    once per worker; tolerates workers without the hop state attributes."""
+    if getattr(worker, "_pp_hop_resolved", False):
+        return worker._pp_hop
+    worker._pp_hop_resolved = True
+    worker._pp_hop = None
+    if not envs.VLLM_PP_PACKED_HOP:
+        return None
+    pp = get_pp_group()
+    if pp.world_size <= 1:
+        return None
+    reason = None
+    if not worker.use_v2_model_runner:
+        reason = "needs the V2 model runner"
+    elif get_tp_group().world_size > 1:
+        reason = "TP > 1 (the default hop slices tensors across TP ranks)"
+    elif getattr(pp, "use_cpu_custom_send_recv", False):
+        reason = "custom CPU send/recv communicator"
+    if reason is not None:
+        logger.warning("VLLM_PP_PACKED_HOP ignored: %s", reason)
+        return None
+    from vllm.v1.worker.gpu.pp_hop import PackedHop
+
+    no_metadata = envs.VLLM_PP_HOP_NO_METADATA
+    worker._pp_hop = PackedHop(pp, no_metadata=no_metadata)
+    logger.info(
+        "PP packed hop on: one device transfer per hop%s",
+        ", no per-step metadata" if no_metadata else "",
+    )
+    return worker._pp_hop
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -228,6 +262,10 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        # Packed hop (VLLM_PP_PACKED_HOP); resolved on the first PP step.
+        self._pp_hop: Any = None
+        self._pp_hop_resolved = False
+        self._pp_hop_layout: Any = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -1260,13 +1298,28 @@ class Worker(WorkerBase):
                 )
             }
 
+        pp_hop = _resolve_pp_hop(self) if forward_pass else None
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            if pp_hop is not None:
+                if getattr(self, "_pp_hop_layout", None) is None:
+                    from vllm.v1.worker.gpu.pp_hop import HopLayout
+
+                    self._pp_hop_layout = HopLayout.from_tensors(
+                        self.model_runner.intermediate_tensors.tensors
+                    )
+                tensor_dict, comm_handles = pp_hop.recv(
+                    self._pp_hop_layout,
+                    self.model_runner.pp_hop_rows(scheduler_output),
+                    device=self.device,
                 )
-            )
+                comm_postprocess = []
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+                )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -1296,6 +1349,15 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        if pp_hop is not None:
+            # One flat device send; the hop retains its buffer and metadata.
+            self._pp_send_work = pp_hop.send(
+                output.tensors, self.model_runner.pp_hop_rows(scheduler_output)
+            )
+            if self.use_v2_model_runner and self.model_runner.is_pooling_model:
+                return self.model_runner.pool()  # type: ignore
+            return None
+
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
@@ -1309,6 +1371,9 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
             return self.model_runner.pool()  # type: ignore
         return None
+
+    def _get_pp_hop(self) -> Any:
+        return _resolve_pp_hop(self)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
