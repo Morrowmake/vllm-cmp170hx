@@ -48,6 +48,7 @@ def warmup_ampere_decode(worker, capture_sizes) -> None:
     from vllm.ampere_decode import (
         use_ampere_kda_decode,
         use_ampere_mhc_decode,
+        use_ampere_mhc_decode_v2,
         use_ampere_moe_routing,
     )
 
@@ -57,6 +58,8 @@ def warmup_ampere_decode(worker, capture_sizes) -> None:
     model = worker.get_model()
     device = worker.device
 
+    if envs.VLLM_GLM5_DECODE_MHC_V2:
+        _warmup_mhc_v2(model, device, capture_sizes, use_ampere_mhc_decode_v2)
     if envs.VLLM_GLM5_DECODE_MHC:
         _warmup_mhc(model, device, capture_sizes, use_ampere_mhc_decode)
     if envs.VLLM_GLM5_DECODE_MOE_ROUTING:
@@ -84,6 +87,32 @@ def _warmup_mhc(model, device, capture_sizes, gate) -> None:
         return
     mhc_decode.warmup(ms, hidden=hidden, hc=hc, sinkhorn=sinkhorn, device=device)
     logger.info("Warmed up sm_80 mHC decode kernels for M in %s.", ms)
+
+
+def _warmup_mhc_v2(model, device, capture_sizes, gate) -> None:
+    """Compile the v2 mHC kernels for every capture size its gate accepts.
+
+    The v2 kernels keep no module-level buffers (outputs and split partials are
+    allocated per call, from the graph pool during capture), so compiling
+    before capture is all that is needed.
+    """
+    from vllm import envs
+    from vllm.ampere_decode import mhc_decode_v2
+
+    layer = _find_module(model, "mhc_fused_post_pre_op")
+    if layer is None:
+        return
+    hidden = int(layer.hidden_size)
+    hc = int(layer.n)
+    sinkhorn = int(layer.mhc_sinkhorn_iterations)
+    bound = envs.VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS
+    ms = [m for m in _token_sizes(capture_sizes, bound) if gate(m, hc, hidden)]
+    if not ms:
+        logger.info("sm_80 mHC decode v2 requested but its gate is closed "
+                    "(hc=%d, hidden=%d); using the previous paths.", hc, hidden)
+        return
+    mhc_decode_v2.warmup(ms, hidden=hidden, hc=hc, sinkhorn=sinkhorn, device=device)
+    logger.info("sm_80 mHC decode v2 on for M <= %d; warmed up M in %s.", bound, ms)
 
 
 def _moe_shape(worker, model) -> tuple[int, int] | None:
