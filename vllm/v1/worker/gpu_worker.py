@@ -658,6 +658,16 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        from vllm.v1.worker.gpu import mem_attribution
+
+        mem_attribution.log_kv_accounting(
+            self.requested_memory,
+            profile_result,
+            cudagraph_memory_estimate,
+            cudagraph_memory_estimate_applied,
+            self.available_kv_cache_memory_bytes,
+        )
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
