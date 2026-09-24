@@ -25,7 +25,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
     native_next_n_supported,
 )
-from vllm.utils.math_utils import round_down
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -801,6 +801,32 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * 40
 
 
+def get_indexer_gather_workspace_size(
+    vllm_config: VllmConfig, compress_ratio: int = 1
+) -> int:
+    """Rows of index-K a single prefill chunk can ever gather.
+
+    ``get_max_prefill_buffer_size`` is a hardware heuristic (40 *
+    ``max_model_len``), not a bound on what a step can produce. A prefill chunk
+    never spans more requests than the model runner has slots for
+    (``max_num_seqs``: the scheduler asserts ``len(running) <= max_num_seqs``
+    and validates ``max_num_active_seqs`` to be no larger), and each request
+    contributes at most ``cdiv(max_model_len, compress_ratio)`` compressed
+    entries. Clamping the heuristic to that product leaves chunk formation
+    unchanged whenever the clamp still exceeds what a step can gather, and it
+    stops the O(N) gather workspace being sized for requests that cannot exist.
+
+    The clamp is never below ``cdiv(max_model_len, compress_ratio)``, so the
+    single-request escape hatch in ``_split_indexer_prefill_chunks`` (which
+    admits one request whatever the limit) still fits the workspace.
+    """
+    return min(
+        get_max_prefill_buffer_size(vllm_config),
+        vllm_config.scheduler_config.max_num_seqs
+        * cdiv(vllm_config.model_config.max_model_len, compress_ratio),
+    )
+
+
 def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
@@ -882,8 +908,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.use_pcp = self.pcp_world_size > 1
         self.pcp_rank = get_pcp_group().rank_in_group if self.use_pcp else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
-        self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config
@@ -978,6 +1002,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 "DCP is not supported with sparse indexer KV compression "
                 f"(compress_ratio={self.compress_ratio})."
             )
+
+        # NOTE(Chen):an estimated max size of flattened_kv. Need to double
+        # check. Clamped to what one step can actually gather; this must
+        # stay in step with the indexer op's gather workspace, which is
+        # sized by the same helper.
+        self.max_prefill_buffer_size = get_indexer_gather_workspace_size(
+            self.vllm_config, self.compress_ratio
+        )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
