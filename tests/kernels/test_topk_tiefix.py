@@ -285,3 +285,50 @@ def test_tie_group_spanning_many_tiles(tiefix, block):
             num_warps=1,
         )
         assert row_sets(fixed) == row_sets(ref)
+
+
+# --- pre-capture compile ----------------------------------------------------
+
+
+@pytest.fixture
+def tiefix_mod():
+    return importlib.import_module("vllm.model_executor.layers.indexer_topk_tiefix")
+
+
+def test_flag_on_warms_the_kernel_once(monkeypatch, tiefix_mod):
+    calls = []
+    monkeypatch.setattr(tiefix_mod, "warm_tiefix", lambda: calls.append(1))
+    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    use_tiefix_topk.cache_clear()
+    use_canonical_topk.cache_clear()
+    try:
+        assert use_tiefix_topk() is True
+        assert use_tiefix_topk() is True
+        assert calls == [1]
+    finally:
+        use_tiefix_topk.cache_clear()
+
+
+def test_flag_off_does_not_warm(monkeypatch, tiefix_mod):
+    calls = []
+    monkeypatch.setattr(tiefix_mod, "warm_tiefix", lambda: calls.append(1))
+    use_tiefix_topk.cache_clear()
+    try:
+        assert use_tiefix_topk() is False
+        assert calls == []
+    finally:
+        use_tiefix_topk.cache_clear()
+
+
+def test_warm_is_a_noop_without_cuda(monkeypatch, tiefix_mod):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    tiefix_mod.warm_tiefix()  # must not launch or raise
+
+
+def test_row_geometry_is_not_specialised(tiefix_mod):
+    k = tiefix_mod._topk_tiefix_kernel
+    params = [p.name for p in getattr(k, "params", [])]
+    if not params:
+        pytest.skip("kernel object exposes no parameter list here")
+    dns = {params[i] if isinstance(i, int) else i for i in k.do_not_specialize}
+    assert {"stride_l", "stride_i", "n_cols"} <= dns

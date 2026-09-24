@@ -201,6 +201,11 @@ def use_tiefix_topk() -> bool:
             "set breaks ties at the k-th score by lowest index "
             "(VLLM_GLM5_TOPK_TIEFIX=1; set 0 to disable)"
         )
+        # First call is the first indexer forward (the profiling run, eager):
+        # compile the kernel variants there, before any graph capture.
+        from vllm.model_executor.layers.indexer_topk_tiefix import warm_tiefix
+
+        warm_tiefix()
     return on
 
 

@@ -48,7 +48,10 @@ def _ordered_key(x):
     return tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
 
 
-@triton.jit
+# The row geometry (strides, width) is not specialised: one compiled variant per
+# (K, HAS_STARTS, RELATIVE) whatever the batch, so nothing new compiles after
+# warm_tiefix() has run, in particular not during CUDA graph capture.
+@triton.jit(do_not_specialize=["stride_l", "stride_i", "n_cols"])
 def _topk_tiefix_kernel(
     logits_ptr,
     idx_ptr,
@@ -116,6 +119,32 @@ def _topk_tiefix_kernel(
             tl.store(irow + n_gt + rank, out, mask=is_eq & (rank < need))
             taken += tl.sum(is_eq.to(tl.int32), axis=0)
             c0 += BLOCK
+
+
+_WARM_KS = (512, 2048)
+
+
+def warm_tiefix() -> None:
+    """Compile the kernel variants the indexer uses (K 512 for kpool 4 and 2048
+    for kpool 1; decode = absolute, prefill = relative with starts) before any
+    CUDA graph capture; Triton otherwise compiles on first launch. A no-op
+    without CUDA or inside a capture."""
+    if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
+        return
+    dev = torch.device("cuda", torch.cuda.current_device())
+    for k in _WARM_KS:
+        logits = torch.zeros((1, k + 1), dtype=torch.float32, device=dev)
+        ends = torch.full((1,), k + 1, dtype=torch.int32, device=dev)
+        starts = torch.zeros((1,), dtype=torch.int32, device=dev)
+        for relative in (False, True):
+            ids = torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k)
+            topk_tiefix_(
+                logits,
+                ids,
+                row_ends=ends,
+                row_starts=starts if relative else None,
+                relative=relative,
+            )
 
 
 def topk_tiefix_(
