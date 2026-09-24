@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
+    VLLM_GLM5_TOPK_SORTED: bool = False
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
@@ -1694,6 +1695,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1 = deterministic Triton kernel, 2 = deterministic torch path for A/B.
     "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": lambda: int(
         os.getenv("VLLM_GLM5_DETERMINISTIC_MOE_ALIGN", "0")
+    ),
+    # Put each row of the sparse indexer's selected top-k (token or pool ids)
+    # in ascending order before attention reads it. The stock top-k kernels
+    # return the right set in an arrival-dependent order, and the sparse MLA
+    # kernel accumulates its online softmax in index order, so the same
+    # prompt otherwise gets a different attention output from run to run
+    # (last-bit differences that the rest of the model amplifies). Only the
+    # order changes, never the set. Default OFF: unset, the indexer is
+    # byte-identical to upstream.
+    "VLLM_GLM5_TOPK_SORTED": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TOPK_SORTED", "0"))
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
     # Size the DFlash drafter's RoPE cos/sin cache to the reachable positions
