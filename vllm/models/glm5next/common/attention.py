@@ -314,6 +314,47 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
+    def _use_idx_glue_weights(self, hidden_states: torch.Tensor) -> bool:
+        """Host gate for the fp32-weights fold (VLLM_GLM5_DECODE_IDX_GLUE).
+
+        Only where the merged wk+weights GEMM itself runs on the thin GEMM, so
+        the k columns stay bitwise what that GEMM stores today.
+        """
+        from vllm.ampere_decode import use_idx_glue
+
+        if not use_idx_glue("weights"):
+            return False
+        from vllm.ampere_decode.idx_glue import thin_gemm_dual_supported
+        from vllm.ampere_thin_gemm import use_ampere_thin_gemm
+
+        w = self.wk_weights_proj.weight
+        return (
+            use_ampere_thin_gemm()
+            and getattr(self.wk_weights_proj, "bias", None) is None
+            and thin_gemm_dual_supported(hidden_states, w, self.head_dim)
+        )
+
+    def _use_idx_glue_fwht(
+        self, q: torch.Tensor, weights: torch.Tensor, wscale: float
+    ) -> bool:
+        """Host gate for the weight-scale fold into the Hadamard+quant kernel."""
+        from vllm.ampere_decode import use_idx_glue
+
+        if not use_idx_glue("fwht"):
+            return False
+        from vllm.ampere_decode.idx_glue import is_pow2_float
+
+        # A power-of-two constant makes (w * q_scale) * wscale exact whatever
+        # the constant's representation; the unfused leaf gets the same value.
+        return (
+            is_pow2_float(wscale)
+            and q.is_contiguous()
+            and weights.dtype == torch.float32
+            and weights.ndim == 2
+            and weights.shape[1] == self.n_head
+            and q.shape[0] == weights.shape[0] * self.n_head
+        )
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -322,16 +363,26 @@ class Indexer(nn.Module):
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
+        if self._use_idx_glue_weights(hidden_states):
+            # One thin-GEMM launch stores the k columns bf16 (bitwise the
+            # merged GEMM's) and the weight columns as its fp32 accumulator,
+            # instead of recomputing them with a separate fp32 sgemm.
+            from vllm.ampere_decode.idx_glue import thin_gemm_dual
+
+            k, weights = thin_gemm_dual(
+                hidden_states, self.wk_weights_proj.weight, self.head_dim
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
+            if self._wp_fp32 is None:
+                self._wp_fp32 = (
+                    self.wk_weights_proj.weight.data[self.head_dim :, :]
+                    .t()
+                    .contiguous()
+                    .float()
+                )
+            weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -367,13 +418,20 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        wscale = self.softmax_scale * self.n_head**-0.5
+        if self._use_idx_glue_fwht(q, weights, wscale):
+            # Same rotation/quant and the same fp32 (w * q_scale) * wscale,
+            # in one launch with more CTAs; q_scale has no other consumer.
+            from vllm.ampere_decode.idx_glue import fwht128_quant_fp8_wscale
 
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
-        )
+            q_fp8, weights = fwht128_quant_fp8_wscale(q, weights, wscale)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+        else:
+            q_fp8, q_scale = fwht128_quant_fp8(q)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+
+            weights = _fused_indexer_weight_scale(weights, q_scale, wscale)
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.

@@ -189,6 +189,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_GLM5_DECODE_KDA_V2: bool = False
+    VLLM_GLM5_DECODE_IDX_GLUE: bool = False
+    VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_THIN_GEMM: bool = False
@@ -1583,6 +1585,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_GLM5_DECODE_MOE_ROUTING", "1"))
     ),
     "VLLM_GLM5_DECODE_KDA": lambda: bool(int(os.getenv("VLLM_GLM5_DECODE_KDA", "1"))),
+    # Opt in to the sm_80 MLA-indexer decode glue folds in
+    # vllm/ampere_decode/idx_glue.py (GA100-class parts only). Default OFF:
+    # with this unset every call site keeps its existing code path exactly.
+    # VLLM_GLM5_DECODE_IDX_GLUE_PARTS selects the folds (comma list, only read
+    # when the switch is on): weights (fp32 head weights from the wk+weights
+    # thin GEMM), glue (indexer casts/fill/copy folded into kernels), fwht
+    # (weight scale folded into the query Hadamard+quant, more CTAs), cache
+    # (MLA latent cache write merged with the top-k index remap), moesum
+    # (routed moe_sum fused with the shared-expert add).
+    "VLLM_GLM5_DECODE_IDX_GLUE": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_IDX_GLUE", "0"))
+    ),
+    "VLLM_GLM5_DECODE_IDX_GLUE_PARTS": lambda: os.getenv(
+        "VLLM_GLM5_DECODE_IDX_GLUE_PARTS", "weights,glue,fwht,cache,moesum"
+    ),
     # Per-family token bounds: never dispatch above these. Each is the top of
     # the family's measured win region, not a shared cap -- mHC is 0.90x at
     # M=16, which is the concurrency-4 decode shape (4 seqs x (1 + 3) spec

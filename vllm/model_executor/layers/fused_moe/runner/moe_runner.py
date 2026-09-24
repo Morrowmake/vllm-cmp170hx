@@ -738,16 +738,26 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
-            self.moe_config.hidden_dim_unpadded
-            if self._quant_method.has_unpadded_output
-            else 0,
+        glue_moe_sum = envs.VLLM_GLM5_DECODE_IDX_GLUE and self._idx_glue_arm_moe_sum(
+            hidden_states, og_hidden_dim_pre_xform
         )
+        if glue_moe_sum:
+            from vllm.ampere_decode.idx_glue import MOE_SUM_DEFERRAL
+
+            MOE_SUM_DEFERRAL.arm()
+        try:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+                self.moe_config.hidden_dim_unpadded
+                if self._quant_method.has_unpadded_output
+                else 0,
+            )
+        finally:
+            pending_moe_sum = MOE_SUM_DEFERRAL.take() if glue_moe_sum else None
 
         #
         # Note: there are two all-reduce points below. They are mutually
@@ -761,6 +771,18 @@ class MoERunner(MoERunnerInterface):
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
         fused_output = cast(torch.Tensor, fused_output)
+        if pending_moe_sum is not None and not self._idx_glue_can_fuse_moe_sum(
+            pending_moe_sum[0], shared_output
+        ):
+            # Not fusable after all: do the deferred sum where it would have
+            # gone (and into fused_output, should the experts' finalize have
+            # copied the unsummed buffer), then carry on unchanged.
+            from vllm.ampere_decode.moe_routing import moe_sum as ampere_moe_sum
+
+            ampere_moe_sum(pending_moe_sum[0], out=pending_moe_sum[1])
+            if fused_output.data_ptr() != pending_moe_sum[1].data_ptr():
+                ampere_moe_sum(pending_moe_sum[0], out=fused_output)
+            pending_moe_sum = None
 
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
@@ -789,7 +811,14 @@ class MoERunner(MoERunnerInterface):
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
 
-        if shared_output is not None:
+        if pending_moe_sum is not None:
+            # VLLM_GLM5_DECODE_IDX_GLUE "moesum": the routed sum (bf16-rounded
+            # as before) and this add in one kernel; bitwise the same result.
+            from vllm.ampere_decode.idx_glue import moe_sum_add
+
+            assert shared_output is not None
+            result = moe_sum_add(pending_moe_sum[0], shared_output)
+        elif shared_output is not None:
             result = shared_output + fused_output
         else:
             result = fused_output
@@ -799,6 +828,44 @@ class MoERunner(MoERunnerInterface):
         )
 
         return self._maybe_add_zero_expert_output(result)
+
+    def _idx_glue_arm_moe_sum(
+        self, hidden_states: torch.Tensor, og_hidden_dim_pre_xform
+    ) -> bool:
+        """Host gate: may the routed moe_sum be deferred into the shared add?
+
+        Everything between the experts' sum and ``shared + routed`` must be the
+        identity: no routed scale, no output transform, no reduction of the
+        routed output before the add, no hidden-dim padding. Decode sizes only
+        (M <= 32, the captured thin-GEMM region).
+        """
+        if (
+            self._shared_experts is None
+            or self.routed_scaling_factor != 1.0
+            or self.routed_output_transform is not None
+            or og_hidden_dim_pre_xform is not None
+            or self._fused_output_is_reduced
+            or hidden_states.dim() != 2
+            or hidden_states.shape[0] > 32
+            or hidden_states.dtype != torch.bfloat16
+        ):
+            return False
+        from vllm.ampere_decode import use_idx_glue
+
+        return use_idx_glue("moesum")
+
+    @staticmethod
+    def _idx_glue_can_fuse_moe_sum(
+        moe_inp: torch.Tensor, shared_output: torch.Tensor | None
+    ) -> bool:
+        return (
+            shared_output is not None
+            and shared_output.dim() == 2
+            and moe_inp.dim() == 3
+            and shared_output.dtype == moe_inp.dtype
+            and shared_output.shape[0] == moe_inp.shape[0]
+            and shared_output.shape[1] == moe_inp.shape[2]
+        )
 
     @property
     def do_naive_dispatch_combine(self) -> bool:
