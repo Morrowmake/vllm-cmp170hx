@@ -140,6 +140,7 @@ _CONFIG_OVERRIDES: dict = {
     (4096, 2048, 4): (16, 128, 1, 2, 4),  # 13.70 us vs cuBLAS 15.01 (1.096x), separate timing 13.70 us
     (4096, 2048, 8): (64, 256, 1, 4, 4),  # 13.86 us vs cuBLAS 15.17 (1.095x), separate timing 13.89 us
     (4096, 2048, 16): (64, 128, 1, 8, 4),  # 13.66 us vs cuBLAS 15.20 (1.112x), separate timing 13.76 us
+    (4096, 2048, 24): (64, 128, 1, 8, 4),  # 14.66 us vs cuBLAS 15.39 (1.050x), separate timing 14.53 us, fallback was 19.55
     (4096, 2048, 32): (64, 128, 1, 4, 4),  # 14.50 us vs cuBLAS 15.52 (1.071x), separate timing 14.50 us
     (4096, 2048, None): (16, 128, 1, 2, 4),
     # mla_q_b_proj+idx_wq_b  N=4096 K=1536
@@ -198,6 +199,17 @@ _CONFIG_OVERRIDES: dict = {
     (128, 4096, 16): (16, 128, 8, 4, 4),  # 5.03 us vs cuBLAS 6.62 (1.315x), separate timing 5.20 us
     (128, 4096, 32): (16, 128, 8, 4, 4),  # 5.76 us vs cuBLAS 7.11 (1.233x), separate timing 6.14 us
     (128, 4096, None): (16, 128, 8, 4, 4),
+    # dflash_fc  N=4096 K=20480 (DFlash drafter input projection, replicated).
+    # One schedule wins or ties at every M; M=16 is within noise of the old
+    # fallback but kept equal to the any-M row below.
+    (4096, 20480, 1): (128, 128, 2, 4, 4),  # 105.73 us vs cuBLAS 111.23 (1.052x), separate timing 105.86 us, fallback was 109.31
+    (4096, 20480, 2): (128, 128, 2, 4, 4),  # 106.50 us vs cuBLAS 112.64 (1.058x), separate timing 106.50 us, fallback was 110.98
+    (4096, 20480, 4): (128, 128, 2, 4, 4),  # 107.01 us vs cuBLAS 112.77 (1.054x), separate timing 107.01 us, fallback was 110.21
+    (4096, 20480, 8): (128, 128, 2, 4, 4),  # 107.52 us vs cuBLAS 113.02 (1.051x), separate timing 107.65 us, fallback was 111.23
+    (4096, 20480, 16): (128, 128, 2, 4, 4),  # 108.54 us vs cuBLAS 113.66 (1.047x), separate timing 108.54 us, fallback was 109.95
+    (4096, 20480, 24): (128, 128, 2, 4, 4),  # 112.51 us vs cuBLAS 150.78 (1.340x), separate timing 112.64 us, fallback was 130.05
+    (4096, 20480, 32): (128, 128, 2, 4, 4),  # 112.77 us vs cuBLAS 151.94 (1.347x), separate timing 112.64 us, fallback was 142.59
+    (4096, 20480, None): (128, 128, 2, 4, 4),
     # kda_f_b_proj+kda_g_b_proj  N=2048 K=128
     (2048, 128, 1): (32, 64, 1, 2, 5),  # 2.50 us vs cuBLAS 3.39 (1.353x), separate timing 2.50 us
     (2048, 128, 2): (32, 128, 1, 4, 2),  # 2.55 us vs cuBLAS 3.49 (1.370x), separate timing 2.57 us
