@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_THIN_GEMM: bool = False
+    VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1676,6 +1677,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_GLM5_DETERMINISTIC_MOE_ALIGN", "0")
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
+    # Size the DFlash drafter's RoPE cos/sin cache to the reachable positions
+    # (max_model_len plus a small query margin) instead of the drafter config's
+    # max_position_embeddings. Rows are position-indexed, so every reachable
+    # row is unchanged; the unreachable tail is simply not allocated.
+    "VLLM_GLM5_DRAFTER_ROPE_FIT": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DRAFTER_ROPE_FIT", "0"))
+    ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
     # and the routed dispatch, then joins after the routed kernels. Because the
