@@ -168,3 +168,15 @@ def test_chunker_unchanged_by_the_clamp_at_deployment_config():
         max_logits_bytes,
     )
     assert clamped == legacy
+
+
+def test_kill_switch_restores_legacy_heuristic(monkeypatch):
+    """``VLLM_GLM5_INDEXER_GATHER_CLAMP=0`` gives back the unclamped size for
+    both the op workspace and the builder chunk limit (same helper)."""
+    cfg = _config(DEPLOY_MAX_MODEL_LEN, DEPLOY_MAX_NUM_SEQS)
+    monkeypatch.setenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "0")
+    assert get_indexer_gather_workspace_size(
+        cfg, DEPLOY_KPOOL
+    ) == get_max_prefill_buffer_size(cfg)
+    monkeypatch.setenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "1")
+    assert get_indexer_gather_workspace_size(cfg, DEPLOY_KPOOL) == 524288

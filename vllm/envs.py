@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TOPK_CANONICAL: bool = False
     VLLM_GLM5_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_GLM5_THIN_GEMM: bool = False
+    VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1621,6 +1622,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_GLM5_DETERMINISTIC_MOE_ALIGN", "0")
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
+    # Size the sparse indexer's K-gather workspace (and the metadata builder's
+    # chunk limit) by what one step can gather, max_num_seqs *
+    # cdiv(max_model_len, compress_ratio), instead of the 40 * max_model_len
+    # heuristic alone. 0 restores the heuristic.
+    "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
+        int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "1"))
+    ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
     # and the routed dispatch, then joins after the routed kernels. Because the
