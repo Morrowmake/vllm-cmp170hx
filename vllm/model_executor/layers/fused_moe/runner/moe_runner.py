@@ -69,7 +69,9 @@ def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     hold. In place keeps the tensor's identity, which the sm_80 fused decode
     routing uses to hand over its own alignment; batches it covers
     (<= VLLM_GLM5_DECODE_MOE_MAX_TOKENS rows, captured at exact sizes) are
-    skipped. Returns topk_ids."""
+    skipped. A larger batch that the fused router v2 covered (up to 32 rows)
+    had its alignment computed before the mask; that handoff is dropped here
+    so the alignment is recomputed from the masked ids. Returns topk_ids."""
     global _MASK_PADDING, _MASK_MIN_ROWS
     if _MASK_PADDING is None:
         import vllm.envs as envs
@@ -96,6 +98,18 @@ def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     if is_padding is None or is_padding.shape[0] != topk_ids.shape[0]:
         return topk_ids
     topk_ids.masked_fill_(is_padding.unsqueeze(1), -1)
+    # The sm_80 fused decode router (VLLM_GLM5_DECODE_MOE_ROUTE_V2, up to 32
+    # rows) stashed a block alignment of these ids before the mask; drop it
+    # so the alignment is recomputed from the masked ids. Which rows are
+    # padding is only known on the device, so this is decided by the call
+    # shape alone and is the same in eager mode and in a captured graph.
+    from vllm.ampere_decode import drop_fused_align
+
+    if drop_fused_align(topk_ids):
+        logger.info_once(
+            "GLM-5 MoE padding mask: the fused router's block alignment is "
+            "recomputed from the masked ids (VLLM_GLM5_MOE_MASK_PADDING=1)"
+        )
     return topk_ids
 
 
