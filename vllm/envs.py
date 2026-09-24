@@ -182,6 +182,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_KDA: bool = True
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
+    VLLM_GLM5_DECODE_MHC_V2: bool = False
+    VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_GLM5_DECODE_KDA_V2: bool = False
@@ -1586,6 +1588,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The per-M table is in vllm/ampere_decode/__init__.py.
     "VLLM_GLM5_DECODE_MHC_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MHC_MAX_TOKENS", "8")
+    ),
+    # mHC v2 (vllm/ampere_decode/mhc_decode_v2.py): one implementation for
+    # 1 <= M <= VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS that replaces both the v1
+    # kernel and TileLang in that range. Off by default; needs
+    # VLLM_GLM5_DECODE_KERNELS=1 as well, and takes precedence over
+    # VLLM_GLM5_DECODE_MHC when on.
+    "VLLM_GLM5_DECODE_MHC_V2": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_MHC_V2", "0"))
+    ),
+    "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", "32")
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")

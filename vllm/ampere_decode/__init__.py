@@ -38,6 +38,7 @@ import torch
 
 __all__ = [
     "use_ampere_mhc_decode",
+    "use_ampere_mhc_decode_v2",
     "use_ampere_moe_routing",
     "use_ampere_kda_decode",
     "use_ampere_kda_decode_v2",
@@ -106,6 +107,43 @@ def use_ampere_mhc_decode(
     if hidden_size <= 0 or hidden_size % 128:
         return False
     if hc_mult < 2 or (hc_mult * (hc_mult + 2)) % 8:
+        return False
+    return _is_sm80()
+
+
+def use_ampere_mhc_decode_v2(
+    num_tokens: int,
+    hc_mult: int,
+    hidden_size: int,
+    *,
+    norm_weight: object | None = _PRESENT,
+) -> bool:
+    """Gate for vllm/ampere_decode/mhc_decode_v2.py::mhc_fused_post_pre.
+
+    Checked before ``use_ampere_mhc_decode``: when open it replaces both the v1
+    kernel (M <= 8) and TileLang (M > 8) for 1 <= M <=
+    ``VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS`` (32). Does not require
+    ``VLLM_GLM5_DECODE_MHC``. Measured us/call, graph replay, one CMP 170HX,
+    against the faster of v1 and TileLang in the same run (best of 3):
+
+        M     v1      TileLang   v2     vs faster   vs production today
+        4    12.71    12.94     7.76     1.64x       1.64x (v1)
+        8    15.22    16.22     8.27     1.84x       1.84x (v1)
+       16    20.28    18.15     8.91     2.04x       2.04x (TileLang)
+       32    22.66    25.66    10.66     2.13x       2.41x (TileLang)
+
+    Only the hc == 4, hidden % 1024 == 0 path (two Gluon kernels) was measured
+    and validated, so the gate admits nothing else.
+    """
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_MHC_V2:
+        return False
+    if num_tokens < 1 or num_tokens > envs.VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS:
+        return False
+    if norm_weight is None:
+        return False
+    if hc_mult != 4 or hidden_size <= 0 or hidden_size % 1024:
         return False
     return _is_sm80()
 
