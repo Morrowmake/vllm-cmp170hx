@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_pcp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.communication_op import get_tp_all_reduce_interceptor
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
     ForwardContext,
@@ -423,6 +424,61 @@ class MoERunner(MoERunnerInterface):
             and self._quant_method.moe_kernel.output_is_reduced()
         )
 
+    def inline_all_reduce_reason(self) -> str | None:
+        """Why ``forward`` reads a TP all-reduce result before returning, or None.
+
+        Two paths reduce *inside* the runner and consume the result on the
+        spot: the shared-expert all-reduce taken when the MoE kernel reports
+        ``output_is_reduced`` (the sum ``shared + fused`` follows at once), and
+        the early routed all-reduce ahead of a non-commutative routed output
+        transform. A caller that defers TP all-reduces through
+        ``set_tp_all_reduce_interceptor`` (the GLM-5 prefill overlap) hands
+        back a buffer that is not valid until it joins, so either path would
+        read unfinished data there. Ask before opening such a region. When the
+        MoE kernel reduces its own output it also runs collectives of its own
+        inside the fused op, which the interceptor does not see either.
+
+        Returns None on the ordinary TP path (the only reduction is the final
+        one, whose result is returned to the caller unread).
+        """
+        mc = self.moe_config
+        if mc.is_sequence_parallel:
+            return None
+        fused_reduced = self._fused_output_is_reduced
+        if fused_reduced:
+            return (
+                "the MoE kernel reduces its own output (output_is_reduced), so "
+                "the shared-expert output is all-reduced and consumed inside "
+                "the runner"
+            )
+        if (
+            self.routed_output_transform is not None
+            and not getattr(self.routed_output_transform, "reduce_commutative", False)
+            and (mc.tp_size > 1 or mc.ep_size > 1)
+        ):
+            return (
+                "the routed output transform needs the routed output all-reduced "
+                "inside the runner before it is applied"
+            )
+        return None
+
+    @staticmethod
+    def _refuse_deferred_all_reduce(what: str) -> None:
+        """Raise if a deferring all-reduce interceptor is installed.
+
+        Called only on the two inline-consumed reductions (see
+        ``inline_all_reduce_reason``), never on the ordinary TP path.
+        """
+        if get_tp_all_reduce_interceptor() is not None:
+            raise RuntimeError(
+                f"MoE runner: the {what} is all-reduced and read inside the "
+                "runner, but a TP all-reduce interceptor is installed, which "
+                "returns the result before it is valid. This would compute on "
+                "unfinished data. Open the deferring region only when "
+                "MoERunner.inline_all_reduce_reason() is None (the GLM-5 "
+                "prefill overlap checks this and stays off)."
+            )
+
     def _maybe_reduce_shared_expert_output(
         self,
         shared_output: torch.Tensor | None,
@@ -444,6 +500,7 @@ class MoERunner(MoERunnerInterface):
             and not self.moe_config.is_sequence_parallel
             and fused_output_is_reduced
         ):
+            self._refuse_deferred_all_reduce("shared-expert output")
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
@@ -473,6 +530,7 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not fused_output_is_reduced
         ):
+            self._refuse_deferred_all_reduce("routed output (before its transform)")
             fused_output = tensor_model_parallel_all_reduce(fused_output)
             fused_output_is_reduced = True
         return fused_output, fused_output_is_reduced

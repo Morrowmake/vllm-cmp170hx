@@ -1069,6 +1069,23 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         streams = layer.hc_post(hidden_states, residual, post, comb)
         return hc_contract(streams, self.mhc_num_residual_streams)
 
+    def _overlap_unsafe_reason(self) -> str | None:
+        """Why the prefill overlap must not run on this model, or None.
+
+        The overlap defers every TP all-reduce inside a layer's MLP and joins
+        it afterwards. An MoE that reads one of its own all-reduce results
+        before returning (see ``MoERunner.inline_all_reduce_reason``) would
+        read a buffer still in flight. Asked once, when the first region would
+        be built, so it costs nothing per step.
+        """
+        for layer in self._active_layers:
+            if not getattr(layer, "_mlp_is_moe", False):
+                continue
+            reason = layer.mlp.experts.inline_all_reduce_reason()
+            if reason is not None:
+                return f"layer {layer.layer_idx}: {reason}"
+        return None
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1119,6 +1136,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             mhc=self.mhc,
             sequence_parallel=self.is_sequence_parallel,
             allow_cross_layer=not self.aux_hidden_state_layers,
+            unsafe_reason=self._overlap_unsafe_reason,
         )
         try:
             if self.aux_hidden_state_layers:
