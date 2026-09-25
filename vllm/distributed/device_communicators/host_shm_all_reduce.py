@@ -60,6 +60,11 @@ sets an error word in the shared header and returns without writing its output,
 so a peer that dies turns into a loud error rather than a wedged GPU. The host
 side checks those words periodically and raises.
 
+Setup is collective: every step ends in an agreement over the CPU group, so
+either every rank enables the host path or every rank falls back to NCCL. A
+rank whose setup fails can never go on alone and leave its peers waiting in a
+collective it will not join.
+
 Enabling
 --------
 Off by default. `VLLM_GLM5_HOST_ALLREDUCE=1` turns it on. It then stands
@@ -80,6 +85,7 @@ import ctypes
 import hashlib
 import mmap
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -127,6 +133,10 @@ TWO_SHOT_MIN_BYTES = 64 * 1024
 DMA_MIN_BYTES = 256 * 1024
 
 _SUPPORTED = (torch.bfloat16, torch.float32)
+
+# Pauses before re-trying a refused `cudaHostRegister` (see `_register`). Setup
+# runs once per process, so the worst case costs well under a second.
+REGISTER_RETRY_DELAYS_S = (0.05, 0.2, 0.5)
 
 # --------------------------------------------------------------------------
 CUDA_SRC = r"""
@@ -511,12 +521,27 @@ twoshot_dma(const Vec<T, N>* __restrict__ inp,
 }  // namespace hostshm
 
 // ---------------------------------------------------------------------------
+// A failed registration is not fatal to the process (the caller falls back to
+// NCCL), so the error must not stay behind as the runtime's last error: the
+// next unrelated kernel-launch check would report it as its own.
 int64_t host_register(int64_t ptr, int64_t nbytes) {
-  CUDA_CHECK(cudaHostRegister(reinterpret_cast<void*>(ptr),
-                              static_cast<size_t>(nbytes),
-                              cudaHostRegisterMapped | cudaHostRegisterPortable));
+  void* p = reinterpret_cast<void*>(ptr);
+  cudaError_t e = cudaHostRegister(p, static_cast<size_t>(nbytes),
+                                   cudaHostRegisterMapped | cudaHostRegisterPortable);
+  if (e != cudaSuccess) {
+    (void)cudaGetLastError();
+    TORCH_CHECK(false, "cudaHostRegister: ", cudaGetErrorString(e),
+                " (", static_cast<int>(e), ")");
+  }
   void* dev = nullptr;
-  CUDA_CHECK(cudaHostGetDevicePointer(&dev, reinterpret_cast<void*>(ptr), 0));
+  e = cudaHostGetDevicePointer(&dev, p, 0);
+  if (e != cudaSuccess) {
+    (void)cudaGetLastError();
+    cudaHostUnregister(p);
+    (void)cudaGetLastError();
+    TORCH_CHECK(false, "cudaHostGetDevicePointer: ", cudaGetErrorString(e),
+                " (", static_cast<int>(e), ")");
+  }
   return reinterpret_cast<int64_t>(dev);
 }
 
@@ -689,6 +714,13 @@ def _p2p_unavailable(world_size: int) -> bool:
         return False
 
 
+def _p2p_handover_requested() -> bool:
+    """Whether the operator set VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE (see below)."""
+    from vllm.platforms.cuda import pcie_p2p_custom_allreduce_allowed
+
+    return pcie_p2p_custom_allreduce_allowed()
+
+
 def _stand_aside_for_custom_allreduce(world_size: int) -> bool:
     """True when the operator has handed the fast path to `CustomAllreduce`.
 
@@ -738,6 +770,11 @@ class HostShmAllreduce:
         self._mm = None
         self._cbuf = None
         self.mod = None
+        self.name: str | None = None
+        self._created = False
+        self._failed_ranks: list[int] = []
+        self._local_error: str | None = None
+        self._register_attempts = 0
         self.calls = 0
         self.check_every = max(1, int(check_every))
 
@@ -771,14 +808,22 @@ class HostShmAllreduce:
             )
             return
 
-        if _stand_aside_for_custom_allreduce(self.world_size):
-            logger.info_once(
-                "Host-shm all-reduce stands aside: "
-                "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1 and this platform has "
-                "working GPU peer-to-peer, so the device-memory custom "
-                "all-reduce owns the fast path."
-            )
-            return
+        # Stand-aside is decided per rank from a peer-access probe, so a probe
+        # that answers differently on one rank would split the group: that rank
+        # returns here while the others go on into the setup collectives below
+        # and wait for it forever. The probe only runs when the operator has
+        # set the hand-over env, so only then is the answer agreed: any rank
+        # standing aside makes every rank stand aside.
+        if _p2p_handover_requested():
+            stand_aside = _stand_aside_for_custom_allreduce(self.world_size)
+            if not self._agree(not stand_aside):
+                logger.info_once(
+                    "Host-shm all-reduce stands aside: "
+                    "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE=1 and this platform has "
+                    "working GPU peer-to-peer, so the device-memory custom "
+                    "all-reduce owns the fast path."
+                )
+                return
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -802,33 +847,32 @@ class HostShmAllreduce:
         self.seg_bytes = HEADER_BYTES + (3 * self.world_size + 2) * self.slot_bytes
         self.spin_cycles = int(spin_timeout_s * SM_CLOCK_HZ)
 
-        try:
-            # Rank 0 compiles first; the others reuse the cache rather than
-            # racing the same ninja build directory.
-            if self.rank == 0:
-                self.mod = _load_module()
-            dist.barrier(group=self.group)
-            if self.rank != 0:
-                self.mod = _load_module()
-            self._open_segment()
-            self.seq = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=self.device)
-            self._scratch: dict[tuple, torch.Tensor] = {}
-            dist.barrier(group=self.group)
-        except Exception as exc:
+        if not self._setup():
+            where = (
+                "rank(s) " + ", ".join(str(r) for r in self._failed_ranks)
+                if self._failed_ranks
+                else "a rank (the agreement collective itself failed)"
+            )
             logger.warning(
-                "Host-shm all-reduce is disabled: setup failed (%s: %s). "
-                "Falling back to NCCL for every message.",
-                type(exc).__name__,
-                exc,
+                "Host-shm all-reduce is disabled: setup failed on %s%s. Every "
+                "rank of the group falls back to NCCL for every message.",
+                where,
+                f" -- here: {self._local_error}" if self._local_error else "",
             )
             self.close()
             return
 
         self.disabled = False
+        retried = (
+            f", registration retried {self._register_attempts - 1}x on this rank"
+            if self._register_attempts > 1
+            else ""
+        )
         logger.info_once(
             "Host-shm all-reduce enabled for messages <= %d B "
             "(world=%d, threads=%d, blocks=%d, two-shot >= %d B, DMA publish "
-            ">= %d B, segment %.1f MiB).",
+            ">= %d B, segment %.1f MiB; setup agreed by all %d ranks, "
+            "registration one rank at a time%s).",
             self.host_cap,
             self.world_size,
             self.threads,
@@ -836,9 +880,91 @@ class HostShmAllreduce:
             self.two_shot_min_bytes,
             self.dma_min_bytes,
             self.seg_bytes / (1 << 20),
+            self.world_size,
+            retried,
         )
 
     # -- setup ------------------------------------------------------------
+    #
+    # Setup is a fixed sequence of steps, and every rank runs every step's
+    # collective whatever happened locally. Each step does its local work with
+    # errors caught, then all ranks agree on the outcome (an all-gather of a
+    # per-rank ok flag over the CPU group). A failure anywhere is therefore
+    # seen by every rank at the same step, all of them stop there, and all of
+    # them fall back to NCCL together. The earlier version let a rank whose
+    # setup raised disable itself alone: it went on to the next collective
+    # while its peers still waited in the setup barrier, and the boot hung.
+
+    def _agree(self, ok: bool) -> bool:
+        """All-gather `ok` over the group; True only if every rank is ok.
+
+        Records which ranks failed. A failure of the collective itself (a peer
+        died, a bogus group) counts as not ok -- it can never raise out of
+        setup and can never wait forever, because gloo collectives fail when a
+        peer's connection closes.
+        """
+        try:
+            mine = torch.tensor([1 if ok else 0], dtype=torch.int32)
+            flags = [torch.zeros(1, dtype=torch.int32) for _ in range(self.world_size)]
+            dist.all_gather(flags, mine, group=self.group)
+        except Exception as exc:
+            self._failed_ranks = []
+            if self._local_error is None:
+                self._local_error = f"agreement failed: {type(exc).__name__}: {exc}"
+            return False
+        bad = [r for r, f in enumerate(flags) if int(f.item()) == 0]
+        if bad:
+            self._failed_ranks = bad
+            return False
+        return True
+
+    def _step(self, fn) -> bool:
+        """Run `fn` on this rank (None: nothing to do here), then agree."""
+        ok = True
+        if fn is not None:
+            try:
+                fn()
+            except Exception as exc:
+                ok = False
+                self._local_error = f"{type(exc).__name__}: {exc}"
+        return self._agree(ok)
+
+    def _setup(self) -> bool:
+        first = self.rank == 0
+        try:
+            # Rank 0 compiles first; the others reuse the cache rather than
+            # racing the same ninja build directory.
+            if not self._step(self._load if first else None):
+                return False
+            if not self._step(None if first else self._load):
+                return False
+            # A collective on every rank; it cannot fail on one rank alone
+            # without the group's connections failing on all of them.
+            try:
+                self.name = self._segment_name()
+            except Exception as exc:
+                self._local_error = f"{type(exc).__name__}: {exc}"
+                self.name = None
+            if not self._agree(self.name is not None):
+                return False
+            if not self._step(self._create_segment if first else None):
+                return False
+            if not self._step(self._map_segment):
+                return False
+            # Register one rank at a time, rank 0 first. See _register.
+            for r in range(self.world_size):
+                if not self._step(self._register if self.rank == r else None):
+                    return False
+            return self._step(self._alloc_seq)
+        finally:
+            # Every rank has mapped the segment or given up, so the name can
+            # go: mappings stay valid and nothing is left in /dev/shm, on
+            # success, on failure, or if we are killed later.
+            self._unlink_segment()
+
+    def _load(self) -> None:
+        self.mod = _load_module()
+
     def _segment_name(self) -> str:
         """A name every rank of this group agrees on, unique per group.
 
@@ -854,22 +980,23 @@ class HostShmAllreduce:
                                    group=self.group)
         return f"vllm_hostshm_ar_{box[0]}"
 
-    def _open_segment(self) -> None:
-        self.name = self._segment_name()
-        path = f"/dev/shm/{self.name}"
-        if self.rank == 0:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            try:
-                os.ftruncate(fd, self.seg_bytes)
-                # The flag words must start at zero, or the first generation
-                # never matches.
-                with mmap.mmap(fd, HEADER_BYTES) as hdr:
-                    hdr.write(b"\0" * HEADER_BYTES)
-            finally:
-                os.close(fd)
-        dist.barrier(group=self.group)
+    def _path(self) -> str:
+        return f"/dev/shm/{self.name}"
 
-        fd = os.open(path, os.O_RDWR)
+    def _create_segment(self) -> None:
+        fd = os.open(self._path(), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        self._created = True
+        try:
+            os.ftruncate(fd, self.seg_bytes)
+            # The flag words must start at zero, or the first generation
+            # never matches.
+            with mmap.mmap(fd, HEADER_BYTES) as hdr:
+                hdr.write(b"\0" * HEADER_BYTES)
+        finally:
+            os.close(fd)
+
+    def _map_segment(self) -> None:
+        fd = os.open(self._path(), os.O_RDWR)
         try:
             self._mm = mmap.mmap(fd, self.seg_bytes)
         finally:
@@ -877,17 +1004,61 @@ class HostShmAllreduce:
         self._cbuf = ctypes.c_char.from_buffer(self._mm)
         self.host_ptr = ctypes.addressof(self._cbuf)
         assert self.host_ptr % PAGE == 0, "mmap base must be page aligned"
-        self.dev_base = self.mod.host_register(self.host_ptr, self.seg_bytes)
-        self._registered = True
 
-        # Every rank has mapped and registered it, so the name can go: the
-        # mappings stay valid and nothing is left in /dev/shm if we are killed.
-        dist.barrier(group=self.group)
-        if self.rank == 0:
+    def _register(self) -> None:
+        """`cudaHostRegister` this rank's mapping of the shared segment.
+
+        Called by one rank at a time, rank 0 first, never concurrently. The
+        driver pins the pages with `pin_user_pages(FOLL_LONGTERM)`, and the
+        kernel will not long-term pin a page that sits in a CMA pageblock (on
+        Linux 6.16+ with Kexec HandOver on, its scratch areas are CMA
+        pageblocks, tens of GiB of ordinary movable memory): it first migrates
+        the page elsewhere. When several processes pin the same shared pages at
+        once, each one's reference makes the others' migration fail, and the
+        losers' `cudaHostRegister` returns `invalid argument` (the kernel log
+        shows "Cannot map memory with base addr ... and size of ... pages").
+        Registered alone, rank 0 migrates any such page once, and later ranks
+        find every page already pinnable. A short retry covers any other
+        transient refusal.
+        """
+        delays = REGISTER_RETRY_DELAYS_S
+        for attempt, delay in enumerate((0.0,) + tuple(delays)):
+            if delay:
+                time.sleep(delay)
+            self._register_attempts = attempt + 1
             try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+                if self.rank == envs.VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK:
+                    raise RuntimeError(
+                        "cudaHostRegister: refused on purpose "
+                        "(VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK)"
+                    )
+                self.dev_base = self.mod.host_register(self.host_ptr, self.seg_bytes)
+            except Exception as exc:
+                if attempt == len(delays):
+                    raise
+                logger.warning(
+                    "Host-shm all-reduce: registering the segment failed on rank "
+                    "%d (attempt %d, %s); retrying.",
+                    self.rank,
+                    attempt + 1,
+                    exc,
+                )
+                continue
+            self._registered = True
+            return
+
+    def _alloc_seq(self) -> None:
+        self.seq = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=self.device)
+        self._scratch: dict[tuple, torch.Tensor] = {}
+
+    def _unlink_segment(self) -> None:
+        if not self._created:
+            return
+        self._created = False
+        try:
+            os.unlink(self._path())
+        except FileNotFoundError:
+            pass
 
     # -- dispatch ---------------------------------------------------------
     def _blocks(self, nbytes: int) -> int:

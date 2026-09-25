@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
+    VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK: int = -1
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1832,6 +1833,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR": lambda: os.getenv(
         "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR", None
     ),
+    # Testing only: the host-staged all-reduce's segment registration fails
+    # on purpose on this TP rank (-1, the default: never). Exercises the
+    # collective fallback on real hardware: every rank must then fall back to
+    # NCCL together. Never set it in production.
+    "VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK": lambda: int(
+        os.getenv("VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK", "-1")
+    ),
     # Never dispatch above this M (= num_seqs * (1 + num_spec)). 32 is measured,
     # and it is a cudagraph capture size, so the bound lands exactly on one.
     # Count-weighted over the whole shape table: M=32 is 1.157x with 0 of 16
@@ -2892,6 +2900,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_XLA_CACHE_PATH",
         "VLLM_CONFIG_ROOT",
         "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR",
+        # Testing only (a forced setup failure); decided before any compile.
+        "VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",
