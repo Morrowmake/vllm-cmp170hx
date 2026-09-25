@@ -138,7 +138,7 @@ def test_every_autotune_is_pinnable_and_in_table():
     got = _run(
         "print(json.dumps({'registry': sorted(pa.REGISTRY),"
         " 'defaults': sorted(autotune_pins.DEFAULTS),"
-        " 'pins': sorted({n for n, _ in autotune_pins.PINS})}))",
+        " 'pins': sorted({n for n, _, _ in autotune_pins.PINS})}))",
         None,
     )
     assert len(got["registry"]) == counts["pinned"] == 23
@@ -148,15 +148,24 @@ def test_every_autotune_is_pinnable_and_in_table():
 
 _VALIDATE = """
 bad = []
+b = autotune_pins.T_BUCKETS
+if not (isinstance(b, tuple) and all(isinstance(x, int) and x > 0 for x in b)
+        and list(b) == sorted(set(b))):
+    bad.append(("T_BUCKETS", repr(b)))
 for name, spec in autotune_pins.DEFAULTS.items():
     if pa.find_config(pa.REGISTRY[name].configs, spec) is None:
         bad.append(("default", name, spec))
-for (name, key), spec in autotune_pins.PINS.items():
+for (name, key, H), per in autotune_pins.PINS.items():
     t = pa.REGISTRY.get(name)
-    if t is None or pa.find_config(t.configs, spec) is None:
-        bad.append(("pin", name, repr(key), spec))
-    if not isinstance(key, tuple):
-        bad.append(("key", name, repr(key)))
+    if not isinstance(key, tuple) or not (H is None or isinstance(H, int)):
+        bad.append(("key", name, repr(key), repr(H)))
+    if not per:
+        bad.append(("empty", name, repr(key)))
+    for bucket, spec in per.items():
+        if bucket is not None and bucket not in b:
+            bad.append(("bucket", name, repr(key), bucket))
+        if t is None or pa.find_config(t.configs, spec) is None:
+            bad.append(("pin", name, repr(key), bucket, spec))
 print(json.dumps(bad))
 """
 
@@ -191,34 +200,56 @@ t.fn = Launch()
 x = torch.empty(1, dtype=torch.bfloat16)
 f = torch.empty(1, dtype=torch.float32)
 common = dict(q=x, v=x, g=f, h=x, o=x, A=f, cu_seqlens=None, chunk_indices=None,
-              scale=1.0, T=100, H=16, K=128, V=128)
-listed_key = pa.tuning_key(t, (), dict(common, BT=64))
+              scale=1.0, K=128, V=128, BT=64)
+key = pa.tuning_key(t, (), dict(common, T=40, H=16))
+autotune_pins.T_BUCKETS = (64, 1152)
 spec = {"kwargs": {"BK": 32, "BV": 128}, "num_warps": 8, "num_stages": 2}
-autotune_pins.PINS[(name, listed_key)] = spec
-t.run(**common, BT=64)
-t.run(**common, BT=64)
-t.run(**common, BT=32)
+spec_open = {"kwargs": {"BK": 64, "BV": 128}, "num_warps": 2, "num_stages": 4}
+autotune_pins.PINS.clear()
+autotune_pins.PINS[(name, key, 16)] = {64: spec, None: spec_open}
+t.run(**common, T=40, H=16)    # bucket 64: table
+t.run(**common, T=64, H=16)    # bucket 64: table (cached)
+t.run(**common, T=1000, H=16)  # bucket 1152: not in the table -> default
+t.run(**common, T=5000, H=16)  # open bucket: table
+t.run(**common, T=40, H=64)    # other H: default
+try:
+    t.run(**common, H=16)      # no T: must not guess
+    missing_t = "ran"
+except AssertionError:
+    missing_t = "asserted"
 print(json.dumps({
     "calls": t.fn.calls,
-    "cache": {repr(k): pa.config_spec(c) for k, c in t.cache.items()},
-    "listed_key": repr(listed_key),
+    "n_cache": len(t.cache),
     "default": autotune_pins.DEFAULTS[name],
-    "spec": spec,
+    "spec": spec, "spec_open": spec_open, "missing_t": missing_t,
+    "buckets": [pa.t_bucket(v, (64, 1152)) for v in (1, 64, 65, 1152, 1153)],
 }))
 """
 
 
-def test_pinned_run_uses_one_config_without_benchmark():
+def test_pinned_run_uses_one_config_per_bucket_without_benchmark():
     got = _run(_PRUNE, "1")
-    spec, default = got["spec"], got["default"]
 
     def flat(s):
         return {**s["kwargs"], "num_warps": s["num_warps"], "num_stages": s["num_stages"]}
 
-    assert got["calls"] == [flat(spec), flat(spec), flat(default)]
-    assert got["cache"][got["listed_key"]] == spec
-    assert len(got["cache"]) == 2
-    assert [v for k, v in got["cache"].items() if k != got["listed_key"]] == [default]
+    spec, spec_open, default = got["spec"], got["spec_open"], got["default"]
+    assert got["calls"] == [flat(spec), flat(spec), flat(default), flat(spec_open),
+                            flat(default)]
+    assert got["n_cache"] == 4
+    assert got["missing_t"] == "asserted"
+    assert got["buckets"] == [64, 64, 1152, 1152, None]
+
+
+_T_ARGS = """
+print(json.dumps(sorted(n for n, t in pa.REGISTRY.items() if "T" not in t.arg_names)))
+"""
+
+
+def test_only_l2norm_kernel1_has_no_T_argument():
+    # Every other kernel's pin depends on its T argument; this one has none
+    # and always uses the open bucket.
+    assert _run(_T_ARGS, None) == ["fla.l2norm.l2norm_fwd_kernel1"]
 
 
 _GATE_CLOSED = """
@@ -311,3 +342,29 @@ def test_pinned_kernel_runs_in_interpreter():
     key, spec = got["cache"][0]
     assert key.startswith("(2, 128, 64, True, ")
     assert spec == got["default"]
+
+
+_BANNER = """
+import types
+from vllm.platforms import current_platform
+cls = type(current_platform)
+cls.get_device_capability = classmethod(lambda c, device_id=0: types.SimpleNamespace(major=8, minor=0))
+cls.is_cuda = classmethod(lambda c: True)
+pa._gate = None
+opened = pa._gate_open()
+# a table entry that is not a config of its kernel falls back to the default
+name = "glm5_kda.chunk_gla_fwd_kernel_o"
+t = pa.REGISTRY[name]
+key = (64, "torch.bfloat16")
+autotune_pins.PINS[(name, key, 16)] = {None: {"kwargs": {"BK": 7}, "num_warps": 3, "num_stages": 9}}
+cfg, src = pa.resolve(name, key, 16, None, t.configs)
+cls.get_device_capability = classmethod(lambda c, device_id=0: types.SimpleNamespace(major=9, minor=0))
+pa._gate = None
+closed = pa._gate_open()
+print(json.dumps([opened, src, pa.config_spec(cfg) == autotune_pins.DEFAULTS[name], closed]))
+"""
+
+
+def test_banners_and_bad_pin_fallback_log_cleanly():
+    # The log calls dedupe on their arguments, which must be hashable.
+    assert _run(_BANNER, "1") == [True, "default", True, False]

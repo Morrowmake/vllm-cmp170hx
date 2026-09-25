@@ -9,15 +9,22 @@
   by name in ``REGISTRY``.
 * ``VLLM_GLM5_FLA_PIN_AUTOTUNE=1``: the ``Autotuner`` becomes a
   ``PinnedAutotuner``. On its first launch it checks the device; on sm_80 every
-  launch uses the config from ``autotune_pins.PINS[(name, key)]`` or, for a key
-  not in the table, the kernel's ``autotune_pins.DEFAULTS[name]``. Nothing is
-  benchmarked, so the config (and with it the reduction order: BK tiles over a
-  contracted dimension, chunk lengths, warp and stage counts) depends only on
-  the shape. On any other device it autotunes as usual.
+  launch uses the config the pin table gives for (kernel, autotune key, H,
+  T bucket), or the kernel's ``autotune_pins.DEFAULTS[name]`` when the table
+  has no entry. Nothing is benchmarked, so the config (and with it the
+  reduction order: BK tiles over a contracted dimension, warp and stage
+  counts) is a pure function of the launch shape. On any other device it
+  autotunes as usual.
 
-The key is built exactly as ``triton.runtime.autotuner.Autotuner.run`` builds
-it: the values of ``key`` in argument order, then ``str(dtype)`` of every
-tensor argument in call order. The pin table uses the same tuples.
+The autotune key is built exactly as ``triton.runtime.autotuner.Autotuner.run``
+builds it: the values of ``key`` in argument order, then ``str(dtype)`` of
+every tensor argument in call order. None of these keys holds the token
+count, and several do not hold the head count, yet the fastest config depends
+on both. The pin lookup therefore adds ``H`` (the kernel's ``H`` argument, or
+None) and the T bucket: the first upper bound in ``autotune_pins.T_BUCKETS``
+that is >= the kernel's ``T`` argument (the total token count of the launch),
+or None past the last bound. The one kernel without a ``T`` argument
+(``fla.l2norm.l2norm_fwd_kernel1``) always uses the None bucket.
 
 Kernel names are ``fla.<module>.<function>`` for the vendored
 flash-linear-attention ops and ``glm5_kda.<function>`` for the GLM-5 KDA
@@ -57,13 +64,38 @@ def kernel_name(fn: Any) -> str:
 
 def tuning_key(tuner: Any, args: tuple, kwargs: dict) -> tuple:
     """The key ``Autotuner.run`` caches the winner under (Triton 3.7)."""
-    all_args = {**dict(zip(tuner.arg_names, args)), **kwargs}
+    return _key_of(tuner, {**dict(zip(tuner.arg_names, args)), **kwargs})
+
+
+def _key_of(tuner: Any, all_args: dict) -> tuple:
     _args = {k: v for (k, v) in all_args.items() if k in tuner.arg_names}
     key = [_args[k] for k in tuner.keys if k in _args]
     for _, arg in _args.items():
         if hasattr(arg, "dtype"):
             key.append(str(arg.dtype))
     return tuple(key)
+
+
+def t_bucket(T: int | None, bounds: tuple) -> int | None:
+    """The T bucket: the first bound >= T, None past the last (or no T)."""
+    if T is None:
+        return None
+    for b in bounds:
+        if T <= b:
+            return b
+    return None
+
+
+def pin_lookup_key(tuner: Any, args: tuple, kwargs: dict, bounds: tuple) -> tuple:
+    """(autotune key, H, T bucket) for one launch."""
+    all_args = {**dict(zip(tuner.arg_names, args)), **kwargs}
+    if "T" in tuner.arg_names:
+        T = all_args.get("T")
+        assert isinstance(T, int), f"{tuner.base_fn.__name__}: T must be an int"
+    else:
+        T = None
+    H = all_args.get("H")
+    return _key_of(tuner, all_args), H, t_bucket(T, bounds)
 
 
 def config_spec(config: Any) -> dict:
@@ -87,21 +119,25 @@ def find_config(configs: list, spec: dict) -> Any | None:
     return None
 
 
-def resolve(name: str, key: tuple, configs: list) -> tuple[Any, str]:
-    """The pinned config for (name, key) and where it came from."""
+def resolve(
+    name: str, key: tuple, H: int | None, bucket: int | None, configs: list
+) -> tuple[Any, str]:
+    """The pinned config for (name, key, H, bucket) and where it came from."""
     from vllm.third_party.flash_linear_attention.ops import autotune_pins
 
-    spec = autotune_pins.PINS.get((name, key))
+    spec = autotune_pins.PINS.get((name, key, H), {}).get(bucket)
     if spec is not None:
         config = find_config(configs, spec)
         if config is not None:
             return config, "table"
         logger.warning_once(
-            "fla autotune pin for %s key=%s is not one of its configs (%s); "
-            "using the kernel default",
+            "fla autotune pin for %s key=%s H=%s T<=%s is not one of its "
+            "configs (%s); using the kernel default",
             name,
             key,
-            spec,
+            H,
+            bucket,
+            str(spec),
         )
     spec = autotune_pins.DEFAULTS.get(name)
     if spec is None:
@@ -127,10 +163,11 @@ def _gate_open() -> bool:
             from vllm.third_party.flash_linear_attention.ops import autotune_pins
 
             logger.info_once(
-                "fla autotune pinned: %d kernels, %d table entries%s; unlisted "
-                "keys use the per-kernel default",
+                "fla autotune pinned: %d kernels, %d table entries, T buckets "
+                "%s%s; unlisted shapes use the per-kernel default",
                 len(REGISTRY),
-                len(autotune_pins.PINS),
+                sum(len(v) for v in autotune_pins.PINS.values()),
+                str(list(autotune_pins.T_BUCKETS)),
                 " (provisional table)" if autotune_pins.PROVISIONAL else "",
             )
         else:
@@ -153,18 +190,26 @@ if HAS_TRITON:
         def run(self, *args, **kwargs):
             if len(self.configs) <= 1 or not _gate_open():
                 return super().run(*args, **kwargs)
-            key = tuning_key(self, args, kwargs)
-            config = self.cache.get(key)
+            from vllm.third_party.flash_linear_attention.ops import autotune_pins
+
+            key, H, bucket = pin_lookup_key(
+                self, args, kwargs, autotune_pins.T_BUCKETS
+            )
+            # Own cache key: the Triton key plus H and the T bucket.
+            cache_key = (*key, "H", H, "T<=", bucket)
+            config = self.cache.get(cache_key)
             if config is None:
-                config, source = resolve(self._pin_name, key, self.configs)
-                self.cache[key] = config
+                config, source = resolve(self._pin_name, key, H, bucket, self.configs)
+                self.cache[cache_key] = config
                 if source == "default":
                     logger.info_once(
-                        "fla autotune pin: %s key=%s not in the table, using "
-                        "the default %s",
+                        "fla autotune pin: %s key=%s H=%s T<=%s not in the "
+                        "table, using the default %s",
                         self._pin_name,
                         key,
-                        config,
+                        H,
+                        bucket,
+                        str(config),
                     )
             self.nargs = dict(zip(self.arg_names, args))
             self.best_config = config
