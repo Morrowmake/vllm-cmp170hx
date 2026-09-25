@@ -15,6 +15,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+from .pinned_autotune import pinned_autotune
 from .utils import FLA_CHUNK_SIZE
 
 # On RDNA (gfx11xx/gfx12xx) WMMA only
@@ -34,7 +35,7 @@ if current_platform.is_rocm():
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]

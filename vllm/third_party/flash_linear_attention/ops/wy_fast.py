@@ -14,10 +14,11 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+from .pinned_autotune import pinned_autotune
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
