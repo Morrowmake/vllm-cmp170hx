@@ -232,6 +232,8 @@ if TYPE_CHECKING:
     VLLM_PP_HOP_NO_METADATA: bool = False
     VLLM_PP_SPLIT_DRAFT_EVENT: bool = False
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
+    VLLM_GLM5_PP_MARLIN_PREFILL: bool = False
+    VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1911,6 +1913,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # summation order. Default OFF.
     "VLLM_GLM5_PP_FOLD_DRAFT_FC": lambda: bool(
         int(os.getenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"))
+    ),
+    # Whole-expert Marlin W4A16 MoE at prefill (pipeline parallel, TP=1: all
+    # 288 experts, N=2048, on one sm_80 card): align the routed rows into one
+    # block list per size 64/48/32/16 (cheapest cover per expert) instead of
+    # padding every expert to one block size, and run each Marlin GEMM once
+    # per list (vllm/ampere_prefill/pp_marlin_prefill.py). Same compiled
+    # Marlin kernels; bitwise equal output on the measured shapes. Taken only
+    # for M >= VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS on exactly that
+    # configuration; everything else, and TP4 (N=512), keeps fused_marlin_moe.
+    # Off by default.
+    "VLLM_GLM5_PP_MARLIN_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL", "0"))
+    ),
+    "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "384")
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if

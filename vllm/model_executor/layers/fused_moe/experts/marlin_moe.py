@@ -739,6 +739,25 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         ctx = self._lora_context
         if ctx is None:
+            if envs.VLLM_GLM5_PP_MARLIN_PREFILL:
+                from vllm.ampere_prefill.pp_marlin_prefill import maybe_apply
+
+                if maybe_apply(
+                    self,
+                    output,
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation,
+                    global_num_experts,
+                    expert_map,
+                    apply_router_weight_on_input,
+                    workspace13,
+                    workspace2,
+                ):
+                    return
             fused_marlin_moe(
                 hidden_states=hidden_states,
                 w1=w1,

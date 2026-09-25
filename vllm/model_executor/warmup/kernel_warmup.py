@@ -246,6 +246,18 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             warmed_experts,
         )
 
+    # The split-block Marlin MoE prefill (vllm/ampere_prefill/
+    # pp_marlin_prefill.py). Same reason: its block-list buffers are
+    # allocate-once per (device, E) and its Triton kernels compile on first
+    # launch. Only with VLLM_GLM5_PP_MARLIN_PREFILL.
+    if envs.VLLM_GLM5_PP_MARLIN_PREFILL:
+        from vllm.ampere_prefill.pp_marlin_prefill import (
+            warmup_from_worker as warmup_pp_marlin_prefill,
+        )
+
+        if warmup_pp_marlin_prefill(worker):
+            logger.info("Warmed up the split-block Marlin MoE prefill lists.")
+
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
