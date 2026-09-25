@@ -486,18 +486,40 @@ def _check_dual_gemm(dev, ms=(1, 4, 16, 32)):
         ref_lo = full[:, :HEAD_DIM]
         assert torch.equal(lo.cpu(), ref_lo.cpu()), m
         assert lo.stride() == ref_lo.stride(), (lo.stride(), ref_lo.stride())
-        # the fp32 block is the accumulator the bf16 store rounds
-        assert torch.equal(_to_bf16(hi).cpu(), full[:, HEAD_DIM:].cpu()), m
         assert (full.cpu().double() - x.double() @ w.double().t()).abs().max() < 0.05
         truth = x.double() @ w[HEAD_DIM:].double().t()
         old = (x_d.float() @ w_d[HEAD_DIM:].t().contiguous().float()).cpu()
-        err_new = (hi.cpu().double() - truth).abs().max().item()
-        err_old = (old.double() - truth).abs().max().item()
+        e_new = (hi.cpu().double() - truth).abs()
+        e_old = (old.double() - truth).abs()
+        err_new, err_old = e_new.max().item(), e_old.max().item()
         diff = (hi.cpu() - old).abs().max().item()
         stats.append((m, err_new, err_old, diff))
-        scale = truth.abs().max().item()
-        assert err_new <= 1e-5 * scale + 2 * err_old, (m, err_new, err_old)
+        # fp32 block vs the fp32 sgemm it replaces, both against the exact
+        # product; relative gate, no absolute floor
+        assert e_new.mean().item() <= 1.10 * e_old.mean().item(), (m, e_new.mean(), e_old.mean())
+        assert err_new <= 1.25 * err_old, (m, err_new, err_old)
     return stats
+
+
+def _dual_gemm_accuracy(cases):
+    """(sum of per-call mean errors, worst max) of the fp32 block and of the
+    fp32 sgemm it replaces, both against the float64 product."""
+    from vllm.ampere_decode.idx_glue import thin_gemm_dual
+
+    s_new = s_old = w_new = w_old = 0.0
+    over = 0
+    for x, w, hd in cases:
+        truth = x.double() @ w[hd:].double().t()
+        _, hi = thin_gemm_dual(x, w, hd)
+        old = torch.mm(x.float(), w[hd:].t().contiguous().float())
+        e_new = (hi.double() - truth).abs()
+        e_old = (old.double() - truth).abs()
+        s_new += e_new.mean().item()
+        s_old += e_old.mean().item()
+        w_new = max(w_new, e_new.max().item())
+        w_old = max(w_old, e_old.max().item())
+        over += e_new.mean().item() > 1.5 * e_old.mean().item()
+    return s_new / s_old, w_new / w_old, over
 
 
 CHECKS = {
@@ -543,6 +565,75 @@ def test_dual_gemm_all_decode_sizes_gpu():
     for m, err_new, err_old, diff in stats:
         print(f"M={m}: max|new-fp64|={err_new:.3e} max|sgemm-fp64|={err_old:.3e} "
               f"max|new-sgemm|={diff:.3e}")
+
+
+@cuda_only
+@pytest.mark.parametrize("spread", ["normal", "outlier_channels"])
+def test_dual_gemm_fp32_block_no_floor_gpu(spread):
+    """The fp32 head-weight block is at least as accurate as the fp32 sgemm
+    it replaces (mean <= 1.10x, max <= 1.25x its error against the float64
+    product), with no absolute tolerance, at every decode size. The running
+    mma accumulator it replaced was 5-6x on real inputs."""
+    g = _gen(11)
+    w = (torch.randn(HEAD_DIM + N_HEAD, HIDDEN, generator=g) * 0.02).to(torch.bfloat16).cuda()
+    cases = []
+    for m in (1, 4, 8, 16, 24, 25, 32):
+        for _ in range(3):
+            x = torch.randn(m, HIDDEN, generator=g)
+            if spread == "outlier_channels":
+                x[:, torch.randint(0, HIDDEN, (8,), generator=g)] *= 50
+            cases.append((x.to(torch.bfloat16).cuda(), w, HEAD_DIM))
+    r_mean, r_max, over = _dual_gemm_accuracy(cases)
+    assert r_mean <= 1.10 and r_max <= 1.25, (r_mean, r_max, over)
+
+
+@cuda_only
+@pytest.mark.skipif(not os.environ.get("VLLM_GLM5_IDX_GLUE_CAPTURE"),
+                    reason="set VLLM_GLM5_IDX_GLUE_CAPTURE to a directory of "
+                    "captured (x, w, head_dim) .pt files")
+def test_dual_gemm_fp32_block_real_inputs_gpu():
+    """The same gate on real captured decode inputs: each ``*.pt`` file holds
+    ``x`` (bf16 [M, hidden]), ``w`` (the wk+weights_proj weight, bf16) and
+    ``head_dim``, taken at the ``thin_gemm_dual`` call site."""
+    import glob
+
+    files = sorted(glob.glob(os.path.join(os.environ["VLLM_GLM5_IDX_GLUE_CAPTURE"], "*.pt")))
+    assert files
+    cases = []
+    for f in files:
+        c = torch.load(f, weights_only=True)
+        cases.append((c["x"].cuda(), c["w"].cuda(), int(c["head_dim"])))
+    r_mean, r_max, over = _dual_gemm_accuracy(cases)
+    print(f"{len(cases)} calls: mean {r_mean:.3f}x, max {r_max:.3f}x, calls > 1.5x: {over}")
+    assert r_mean <= 1.10 and r_max <= 1.25 and over == 0, (r_mean, r_max, over)
+
+
+@cuda_only
+def test_dual_gemm_graph_replay_gpu():
+    """CUDA-graph replay on new inputs equals eager bitwise, with no
+    allocation per replay."""
+    from vllm.ampere_decode.idx_glue import thin_gemm_dual
+
+    g = _gen(12)
+    w = (torch.randn(HEAD_DIM + N_HEAD, HIDDEN, generator=g) * 0.02).to(torch.bfloat16).cuda()
+    for m in (4, 16, 32):
+        x = torch.randn(m, HIDDEN, generator=g).to(torch.bfloat16).cuda()
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            thin_gemm_dual(x, w, HEAD_DIM)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                lo, hi = thin_gemm_dual(x, w, HEAD_DIM)
+        torch.cuda.synchronize()
+        for _ in range(3):
+            x.copy_(torch.randn(m, HIDDEN, generator=g).to(torch.bfloat16))
+            before = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == before
+            e_lo, e_hi = thin_gemm_dual(x, w, HEAD_DIM)
+            assert torch.equal(lo, e_lo) and torch.equal(hi, e_hi), m
 
 
 @cuda_only

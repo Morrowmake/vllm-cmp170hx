@@ -103,6 +103,30 @@ def idx_glue_part(part: str) -> bool:
 # weights: wk+weights thin GEMM with a bf16 low block and an fp32 high block
 # ---------------------------------------------------------------------------
 @triton.jit
+def _add_rn(a, b):
+    # Plain fp32 add the compiler cannot fold into an mma accumulator or
+    # reassociate (a tensor-core mma adding into a non-zero accumulator
+    # truncates on sm_80).
+    return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b],
+                                     dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _sub_rn(a, b):
+    return tl.inline_asm_elementwise("sub.rn.f32 $0, $1, $2;", "=r,r,r", [a, b],
+                                     dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _kahan_add(s, c, v):
+    """(s, c) += v with Kahan compensation; returns the new (s, c)."""
+    y = _sub_rn(v, c)
+    t = _add_rn(s, y)
+    c = _sub_rn(_sub_rn(t, s), y)
+    return t, c
+
+
+@triton.jit
 def _thin_gemm_dual_kernel(
     X, W, Y, Y2, P, LOCK,
     M, N, K, N_LO,
@@ -117,15 +141,22 @@ def _thin_gemm_dual_kernel(
     SPLIT_K: tl.constexpr,
     EVEN_K: tl.constexpr,
     TILED_M: tl.constexpr,
+    HI_SUB_K: tl.constexpr = 0,
+    HI_KAHAN_LOOP: tl.constexpr = False,
+    HI_KAHAN_REDUCE: tl.constexpr = False,
 ):
     """``ampere_thin_gemm.thin_gemm._thin_gemm_kernel`` with a split store.
 
-    The main loop and the fixed-order split-K reduction are the incumbent's,
-    line for line, so every output column carries the same fp32 value the
-    incumbent rounds to bf16. Columns ``< N_LO`` are stored bf16 into ``Y``
-    (exactly the incumbent's store); columns ``>= N_LO`` are stored as the
-    unrounded fp32 accumulator into ``Y2``. ``N_LO % BLOCK_N == 0`` (checked
-    by the wrapper), so every N tile is entirely one or the other.
+    Columns ``< N_LO`` run the incumbent's main loop and fixed-order split-K
+    reduction line for line and are stored bf16 into ``Y`` (bitwise the
+    incumbent's store). Columns ``>= N_LO`` replace a fp32 sgemm, so they are
+    accumulated for fp32 accuracy and stored unrounded into ``Y2``: a fresh
+    mma accumulator per ``HI_SUB_K``-wide k slice, summed in fp32 registers
+    (an sm_80 mma that adds products into a non-zero accumulator truncates
+    them to the running sum's exponent), and a Kahan-compensated split-K
+    reduce. ``HI_SUB_K == 0`` keeps the incumbent loop for them too.
+    ``N_LO % BLOCK_N == 0`` (checked by the wrapper), so every N tile is
+    entirely one or the other.
     """
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -151,20 +182,45 @@ def _thin_gemm_dual_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     step = BLOCK_K * SPLIT_K
     n_iter = tl.cdiv(K, step)
-    for i in range(n_iter):
-        if EVEN_K:
-            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
-            w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
-        else:
-            k_now = i * step + pid_k * BLOCK_K + offs_k
-            k_mask = k_now < K
-            x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-            w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
-        x_ptrs += step * stride_xk
-        w_ptrs += step * stride_wk
-
     is_lo = pid_n * BLOCK_N < N_LO
+    if is_lo or HI_SUB_K == 0:
+        # bf16 columns: the incumbent's loop, line for line (bitwise the
+        # merged GEMM's k columns).
+        for i in range(n_iter):
+            if EVEN_K:
+                x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+                w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+            else:
+                k_now = i * step + pid_k * BLOCK_K + offs_k
+                k_mask = k_now < K
+                x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+                w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+            x_ptrs += step * stride_xk
+            w_ptrs += step * stride_wk
+    else:
+        # fp32 columns: a fresh mma accumulator per HI_SUB_K-wide slice,
+        # summed in fp32 registers (optionally Kahan-compensated), so no
+        # product is truncated to the running sum's exponent inside the mma.
+        comp = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        offs_s = tl.arange(0, HI_SUB_K)
+        for i in range(n_iter):
+            for j in tl.static_range(BLOCK_K // HI_SUB_K):
+                kk = i * step + pid_k * BLOCK_K + j * HI_SUB_K + offs_s
+                xs = X + x_m[:, None] * stride_xm + kk[None, :] * stride_xk
+                ws = W + w_n[:, None] * stride_wn + kk[None, :] * stride_wk
+                if EVEN_K:
+                    x = tl.load(xs, mask=m_mask[:, None], other=0.0)
+                    w = tl.load(ws, mask=n_mask[:, None], other=0.0)
+                else:
+                    k_mask = kk < K
+                    x = tl.load(xs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+                    w = tl.load(ws, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+                blk = tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+                if HI_KAHAN_LOOP:
+                    acc, comp = _kahan_add(acc, comp, blk)
+                else:
+                    acc = _add_rn(acc, blk)
     y_ptrs = Y + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
     y2_ptrs = Y2 + offs_m[:, None] * stride_y2m + \
         (offs_n - N_LO)[None, :] * stride_y2n
@@ -185,9 +241,16 @@ def _thin_gemm_dual_kernel(
         arrived = tl.atomic_add(lock, 1, sem="acq_rel", scope="gpu")
         if arrived == SPLIT_K - 1:
             tot = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            for k in tl.static_range(SPLIT_K):
-                tot += tl.load(P + k * stride_pk + p_off, mask=p_mask,
-                               other=0.0, cache_modifier=".cv")
+            if HI_KAHAN_REDUCE and not is_lo:
+                tc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k in tl.static_range(SPLIT_K):
+                    v = tl.load(P + k * stride_pk + p_off, mask=p_mask,
+                                other=0.0, cache_modifier=".cv")
+                    tot, tc = _kahan_add(tot, tc, v)
+            else:
+                for k in tl.static_range(SPLIT_K):
+                    tot += tl.load(P + k * stride_pk + p_off, mask=p_mask,
+                                   other=0.0, cache_modifier=".cv")
             if is_lo:
                 tl.store(y_ptrs, tot.to(Y.dtype.element_ty), mask=p_mask)
             else:
@@ -210,14 +273,24 @@ def thin_gemm_dual_supported(x: torch.Tensor, w: torch.Tensor, n_lo: int) -> boo
     return n_lo % BLOCK_N == 0
 
 
+# fp32 (high) block accumulation: (k width of each fresh mma accumulator, Kahan
+# in the k loop, Kahan in the split-K reduce); a width of 0 keeps the
+# incumbent's running accumulator. On real decode inputs (M 4-32, K 4096) the
+# running accumulator was 5.6x the fp32 sgemm's mean error against an exact
+# product; (64, False, True) is 0.62x mean, 0.51x max, for <= 0.7 us per call.
+_HI_ACC = (64, False, True)
+
+
 def thin_gemm_dual(
-    x: torch.Tensor, w: torch.Tensor, n_lo: int
+    x: torch.Tensor, w: torch.Tensor, n_lo: int, _hi_acc=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``F.linear(x, w)`` split at column ``n_lo``: (bf16 [M, n_lo], fp32 [M, N-n_lo]).
 
     The bf16 block is bitwise what ``thin_gemm(x, w)[:, :n_lo]`` returns and is
     returned as a view of an ``[M, N]`` buffer so its strides match that slice.
-    The fp32 block is the same accumulator before the bf16 rounding.
+    The fp32 block is accumulated as described in ``_thin_gemm_dual_kernel``;
+    its error against an exact product is no worse than the fp32 sgemm it
+    replaces (``tests/kernels/test_ampere_idx_glue.py``).
     """
     from vllm.ampere_thin_gemm.thin_gemm import (
         _dummy_fp32,
@@ -230,6 +303,7 @@ def thin_gemm_dual(
     N = w.shape[0]
     BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = _select_config(M, N, K)
     assert n_lo % BLOCK_N == 0, (n_lo, BLOCK_N)
+    hi = _HI_ACC if _hi_acc is None else _hi_acc
     lo_buf = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     y_lo = lo_buf[:, :n_lo]
     y_hi = torch.empty((M, N - n_lo), dtype=torch.float32, device=x.device)
@@ -256,6 +330,7 @@ def thin_gemm_dual(
         sp[0], sp[1], sp[2],
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=SPLIT_K,
         EVEN_K=even_k, TILED_M=(tiles_m > 1),
+        HI_SUB_K=min(hi[0], BLOCK_K), HI_KAHAN_LOOP=hi[1], HI_KAHAN_REDUCE=hi[2],
         num_warps=num_warps, num_stages=num_stages,
     )
     return y_lo, y_hi
