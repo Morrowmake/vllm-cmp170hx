@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
+    VLLM_GLM5_PP_KDA_PREFILL: bool = False
     VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_GLM5_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MHC: bool = True
@@ -1614,6 +1615,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Needs VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
     "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD": lambda: bool(
         int(os.getenv("VLLM_GLM5_SMLA_PREFILL_PRED_LOAD", "0"))
+    ),
+    # sm_80 KDA chunked prefill (vllm/ampere_prefill/kda_prefill.py) in place
+    # of the upstream chunk_kda_with_fused_gate, when all 64 heads live on one
+    # card (pipeline parallel, TP=1): six launches instead of nine, fixed
+    # launch configurations, fp32-exact intermediates where the recurrence
+    # needs them. Taken only on sm_80 with the Triton prefill backend, head
+    # dim 128, bf16 activations, fp32 state, the safe gate at -5, and chunks
+    # of up to 2312 tokens and 16 sequences; everything else keeps the
+    # upstream path. Off by default.
+    "VLLM_GLM5_PP_KDA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PP_KDA_PREFILL", "0"))
     ),
     "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY": lambda: bool(
         int(os.getenv("VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY", "0"))

@@ -348,6 +348,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
+        # VLLM_GLM5_PP_KDA_PREFILL: the layer part of the gate, resolved once.
+        self._pp_kda_prefill = False
+        if _envs.VLLM_GLM5_PP_KDA_PREFILL:
+            from vllm.ampere_prefill.kda_prefill import use_for_layer
+
+            self._pp_kda_prefill = use_for_layer(
+                self.kda_prefill_backend,
+                self.local_num_heads,
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                self.kda_safe_gate,
+                self.kda_lower_bound,
+            )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
         ) = None
@@ -846,10 +859,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     out=ns_out,
                 )
             else:
+                chunk_fn = chunk_kda_with_fused_gate
+                if self._pp_kda_prefill:
+                    from vllm.ampere_prefill.kda_prefill import select_chunk_fn
+
+                    chunk_fn = select_chunk_fn(
+                        chunk_kda_with_fused_gate,
+                        q_ns.shape[0],
+                        non_spec_query_start_loc.shape[0] - 1,
+                        q_ns.dtype,
+                        g1_ns.dtype,
+                        recurrent_state.dtype,
+                        self.A_log.dtype,
+                        self.dt_bias.dtype,
+                    )
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
+                ) = chunk_fn(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
                     v=_rearr(v_ns),
