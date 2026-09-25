@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_GLM5_REPLICATED_EMBED: bool = False
     VLLM_GLM5_PREFILL_KERNELS: bool = False
+    VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
@@ -1573,6 +1574,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # code path exactly.
     "VLLM_GLM5_PREFILL_KERNELS": lambda: bool(
         int(os.getenv("VLLM_GLM5_PREFILL_KERNELS", "0"))
+    ),
+    # Sparse-MLA prefill with all 64 heads on one card (pipeline parallel,
+    # TP=1): a Gluon kernel that gathers each cache row once for all heads and
+    # compacts the valid index slots before the loop
+    # (vllm/ampere_prefill/sparse_prefill_mla_pp.py). Taken only on sm_80 with
+    # 64 heads, bf16, the 512-wide NoPE layout, 2176 index slots and 1..2312
+    # query rows; everything else keeps the Triton kernel. Needs
+    # VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
+    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PP_SPARSE_MLA_PREFILL", "0"))
     ),
     # Token threshold. Below it the upstream kernels win (they are tuned for
     # decode shapes) and every captured CUDA graph keeps the upstream kernel.

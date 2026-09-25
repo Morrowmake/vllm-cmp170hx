@@ -212,6 +212,15 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.ampere_thin_gemm.warmup import warmup_ampere_thin_gemm
 
     warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
+    # The 64-head sparse-MLA prefill kernel (sparse_prefill_mla_pp.py). Prefill
+    # runs eagerly, but compiling here keeps the Gluon JIT off the first
+    # request. No-op unless VLLM_GLM5_PP_SPARSE_MLA_PREFILL and
+    # VLLM_GLM5_PREFILL_KERNELS are set and this rank runs 64 heads on sm_80.
+    if envs.VLLM_GLM5_PP_SPARSE_MLA_PREFILL:
+        from vllm.ampere_prefill.sparse_prefill_mla_pp import warmup_from_worker
+
+        if warmup_from_worker(worker):
+            logger.info("Compiled the PP sparse-MLA prefill kernel.")
 
     # The deterministic MoE block alignment (moe_align_kernel.py). Same reason:
     # its per-(device, E) scratch is allocate-once and Triton compiles on first

@@ -404,6 +404,17 @@ def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
     assert num_heads_kv == 1, "only kv head = 1 is supported"
     index_topk = indices.shape[2]
 
+    from vllm import envs
+
+    if envs.VLLM_GLM5_PP_SPARSE_MLA_PREFILL:
+        # 64 heads on one card: the Gluon kernel of sparse_prefill_mla_pp,
+        # on exactly the configuration it was validated on.
+        from vllm.ampere_prefill import sparse_prefill_mla_pp
+
+        if sparse_prefill_mla_pp.use(q, kv, indices, d_v, block_dpe, out):
+            return sparse_prefill_mla_pp.sparse_mla_prefill(
+                q, kv, indices, sm_scale, d_v=d_v, out=out)
+
     if block_dpe is None:
         block_dpe = dim_qk - d_v
     BLOCK_DPE = block_dpe
