@@ -83,10 +83,17 @@ def maybe_configure_aux_fc_fold(
     pp_handler: Any,
     load_dummy_weights: bool = False,
     files: list[str] | None = None,
+    dtype: torch.dtype | None = None,
 ) -> bool:
     """Enable the fold on this stage if VLLM_GLM5_PP_FOLD_DRAFT_FC=1 and the
     model supports it. Must run after the aux layers and the relay are
-    configured and before the persistent receive buffer is allocated."""
+    configured and before the persistent receive buffer is allocated.
+
+    `dtype` is the activation dtype the aux states are captured in (the
+    model config's dtype); the weight blocks are cast to it. Without it the
+    first floating-point parameter of the stage that is not fp32 is used: a
+    stage's first parameter can be an fp32 tensor (mHC mixing weights, router
+    bias), which would make the blocks fp32 while the aux states are bf16."""
     if not envs.VLLM_GLM5_PP_FOLD_DRAFT_FC:
         return False
     from vllm.distributed.parallel_state import get_pp_group
@@ -116,7 +123,15 @@ def maybe_configure_aux_fc_fold(
     )
     local = list(range(base, base + num_local))
     device = next(inner.parameters()).device
-    dtype = next(inner.parameters()).dtype
+    if dtype is None:
+        dtype = next(
+            (
+                p.dtype
+                for p in inner.parameters()
+                if p.is_floating_point() and p.dtype != torch.float32
+            ),
+            torch.bfloat16,
+        )
     if load_dummy_weights:
         blocks = {i: torch.zeros(hidden, hidden, dtype=dtype) for i in local}
     else:

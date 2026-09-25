@@ -422,6 +422,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.speculative_config,
                         self.pp_handler,
                         load_dummy_weights=load_dummy_weights,
+                        dtype=self.dtype,
                     )
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):

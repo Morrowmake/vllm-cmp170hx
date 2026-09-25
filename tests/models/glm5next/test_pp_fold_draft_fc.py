@@ -125,6 +125,30 @@ def test_folded_fc_equals_single_stage_fc(
     )
 
 
+@pytest.mark.parametrize("explicit", [True, False])
+def test_fold_blocks_take_the_activation_dtype(monkeypatch, tmp_path, explicit):
+    """A stage whose first parameter is fp32 (mHC mixing weights, router bias)
+    must still fold in the activation dtype: the aux states are bf16."""
+    monkeypatch.setenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "1")
+    _, files = _fc_file(tmp_path, 2)
+    _set_pp(monkeypatch, 1, 2)
+    m = _build_stage(_embed(), 4, 2, 4, (1, 3))
+    m.device = "cpu"
+    fp32_first = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+    params = [fp32_first] + list(m.parameters())
+    monkeypatch.setattr(m, "parameters", lambda recurse=True: iter(params))
+    wrapper = SimpleNamespace(
+        model=m, make_empty_intermediate_tensors=m.make_empty_intermediate_tensors
+    )
+    handler = SimpleNamespace(aux_hidden_state_relay_keys=("stale",))
+    eagle3_utils.reserve_aux_intermediate_tensor_slots(wrapper)
+    kw = {"dtype": torch.bfloat16} if explicit else {}
+    assert maybe_configure_aux_fc_fold(wrapper, SimpleNamespace(method="dflash"),
+                                       handler, files=files, **kw)
+    assert m.aux_fc_blocks
+    assert all(w.dtype == torch.bfloat16 for w in m.aux_fc_blocks.values())
+
+
 def test_column_blocks_are_the_fc_slices(tmp_path):
     w, files = _fc_file(tmp_path, 5)
     blocks = load_fc_column_blocks(files, [0, 3, 4], HIDDEN, 5)
