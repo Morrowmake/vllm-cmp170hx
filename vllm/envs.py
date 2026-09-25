@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
     VLLM_GLM5_PP_KDA_PREFILL: bool = False
+    VLLM_GLM5_TP4_KDA_PREFILL: bool = False
     VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_GLM5_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MHC: bool = True
@@ -1630,6 +1631,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upstream path. Off by default.
     "VLLM_GLM5_PP_KDA_PREFILL": lambda: bool(
         int(os.getenv("VLLM_GLM5_PP_KDA_PREFILL", "0"))
+    ),
+    # The same sm_80 KDA chunked prefill with tensor parallel 4 (16 heads per
+    # card), for prefill chunks of up to 3460 tokens (the TP token budget) and
+    # 16 sequences; the other conditions as VLLM_GLM5_PP_KDA_PREFILL. Its own
+    # switch so the two layouts are judged separately. Off by default.
+    "VLLM_GLM5_TP4_KDA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TP4_KDA_PREFILL", "0"))
     ),
     "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY": lambda: bool(
         int(os.getenv("VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY", "0"))

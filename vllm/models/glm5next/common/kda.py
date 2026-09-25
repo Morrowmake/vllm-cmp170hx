@@ -348,10 +348,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
-        # VLLM_GLM5_PP_KDA_PREFILL: the layer part of the gate, resolved once.
+        # VLLM_GLM5_PP_KDA_PREFILL (64 heads) / VLLM_GLM5_TP4_KDA_PREFILL (16
+        # heads): the layer part of the gate, resolved once.
         self._pp_kda_prefill = False
-        if _envs.VLLM_GLM5_PP_KDA_PREFILL:
-            from vllm.ampere_prefill.kda_prefill import use_for_layer
+        if _envs.VLLM_GLM5_PP_KDA_PREFILL or _envs.VLLM_GLM5_TP4_KDA_PREFILL:
+            from vllm.ampere_prefill.kda_prefill import enabled_heads, use_for_layer
 
             self._pp_kda_prefill = use_for_layer(
                 self.kda_prefill_backend,
@@ -360,6 +361,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 vllm_config.model_config.dtype,
                 self.kda_safe_gate,
                 self.kda_lower_bound,
+                allowed_heads=enabled_heads(),
             )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
@@ -872,6 +874,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                         recurrent_state.dtype,
                         self.A_log.dtype,
                         self.dt_bias.dtype,
+                        num_heads=self.local_num_heads,
                     )
                 (
                     core_attn_out_non_spec,

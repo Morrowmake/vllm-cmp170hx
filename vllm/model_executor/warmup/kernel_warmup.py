@@ -203,12 +203,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.ampere_decode.warmup import warmup_ampere_decode
 
     warmup_ampere_decode(worker, cudagraph_capture_sizes)
-    # The sm_80 KDA chunked prefill at 64 heads (vllm/ampere_prefill/
+    # The sm_80 KDA chunked prefill at 64 or 16 heads (vllm/ampere_prefill/
     # kda_prefill.py): compile its kernels before the first prefill. Prefill
     # runs eagerly, so this is about first-request latency, not capture.
-    # Only with VLLM_GLM5_PP_KDA_PREFILL=1, and a no-op unless a KDA layer
-    # took the path.
-    if envs.VLLM_GLM5_PP_KDA_PREFILL:
+    # Only with VLLM_GLM5_PP_KDA_PREFILL=1 or VLLM_GLM5_TP4_KDA_PREFILL=1, and
+    # a no-op unless a KDA layer took the path.
+    if envs.VLLM_GLM5_PP_KDA_PREFILL or envs.VLLM_GLM5_TP4_KDA_PREFILL:
         from vllm.ampere_prefill.kda_prefill import warmup_from_worker
 
         warmup_from_worker(worker)

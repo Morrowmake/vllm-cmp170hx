@@ -9,12 +9,15 @@
 # notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
-"""KDA chunked prefill for GLM-5.3-Flash with 64 heads per card, sm_80.
+"""KDA chunked prefill for GLM-5.3-Flash with 64 or 16 heads per card, sm_80.
 
 ``VLLM_GLM5_PP_KDA_PREFILL=1`` replaces ``chunk_kda_with_fused_gate`` of
 ``vllm/models/glm5next/nvidia/ops/third_party/kda`` at the prefill call site
 of ``vllm/models/glm5next/common/kda.py`` when all 64 heads live on one card
-(pipeline parallel, TP=1). Same signature, same outputs: ``o [1, T, H, V]``
+(pipeline parallel, TP=1); ``VLLM_GLM5_TP4_KDA_PREFILL=1`` does the same under
+tensor parallel 4 (16 heads per card, chunks of up to 3460 tokens). The
+kernels take the head count from the inputs; the two flags differ only in
+the gate. Same signature, same outputs: ``o [1, T, H, V]``
 in the dtype of ``v`` and ``final_state [N, H, V, K]`` fp32 (K contiguous,
 the layout the decode kernels read from the state pool).
 
@@ -46,7 +49,10 @@ Measured on one CMP 170HX (70 SMs), CUDA-graph replay of a rotation of real
 inputs: 1.65x the incumbent over the production prefill chunks (weighted
 geomean of 2304-token continuing and first chunks and a 1282-token tail).
 Error against an exact fp64 token-sequential recomputation is at most the
-incumbent's on every output (final_state well below it).
+incumbent's on every output (final_state well below it). At 16 heads (TP4
+shapes: 3456-token first and continuing chunks and a 1282-token tail, real TP4
+inputs): 1.43x, 77.9 -> 54.3 ms per 8.2K-token prompt per card over the 34
+KDA layers, error again at most the incumbent's.
 
 Every launch configuration is fixed (no runtime autotune), so the result is a
 pure function of the inputs and bitwise reproducible run to run and boot to
@@ -1158,21 +1164,56 @@ def chunk_kda_with_fused_gate(
 # Gate, dispatch and warm-up
 # ============================================================================
 
-# The configuration this path was validated on: all 64 heads on one card, head
-# dim 128, bf16 activations, fp32 recurrent state, A_log and dt_bias, the
-# bounded (safe) gate at lower_bound -5, l2-normalised q and k, varlen
-# cu_seqlens, and prefill chunks of 1..2312 tokens holding at most 16
-# sequences. Anything else keeps the upstream path.
+# The configurations this path was validated on: all 64 heads on one card
+# (pipeline parallel, TP=1; VLLM_GLM5_PP_KDA_PREFILL) with prefill chunks of
+# 1..2312 tokens, or 16 heads per card (tensor parallel 4;
+# VLLM_GLM5_TP4_KDA_PREFILL) with chunks of 1..3460 tokens (the TP token
+# budget); both at head dim 128, bf16 activations, fp32 recurrent state, A_log
+# and dt_bias, the bounded (safe) gate at lower_bound -5, l2-normalised q and
+# k, varlen cu_seqlens, and at most 16 sequences per chunk. Anything else
+# keeps the upstream path.
 HEADS = 64
 HEAD_DIM = 128
 LOWER_BOUND = -5.0
 MAX_TOKENS = 2312
 MAX_SEQS = 16
+TP4_HEADS = 16
+TP4_MAX_TOKENS = 3460
+
+FLAG = "VLLM_GLM5_PP_KDA_PREFILL"
+TP4_FLAG = "VLLM_GLM5_TP4_KDA_PREFILL"
 
 BANNER = (
     "GLM5 PP KDA prefill: sm_80 fused chunk path live (64 heads); "
     "VLLM_GLM5_PP_KDA_PREFILL=1"
 )
+TP4_BANNER = (
+    "GLM5 TP4 KDA prefill: sm_80 fused chunk path live (16 heads); "
+    "VLLM_GLM5_TP4_KDA_PREFILL=1"
+)
+
+# per local head count: (flag, largest chunk, banner, layout named in the gate)
+_BY_HEADS = {
+    HEADS: (FLAG, MAX_TOKENS, BANNER, "pipeline parallel, TP=1"),
+    TP4_HEADS: (TP4_FLAG, TP4_MAX_TOKENS, TP4_BANNER, "tensor parallel 4"),
+}
+
+
+def enabled_heads() -> tuple[int, ...]:
+    """The local head counts whose flag is set."""
+    from vllm import envs
+
+    out: tuple[int, ...] = ()
+    if envs.VLLM_GLM5_PP_KDA_PREFILL:
+        out += (HEADS,)
+    if envs.VLLM_GLM5_TP4_KDA_PREFILL:
+        out += (TP4_HEADS,)
+    return out
+
+
+def _flags(allowed_heads) -> str:
+    names = [_BY_HEADS[h][0] for h in allowed_heads if h in _BY_HEADS]
+    return " / ".join(names) or FLAG
 
 
 def layer_closed_reason(
@@ -1183,14 +1224,18 @@ def layer_closed_reason(
     safe_gate: bool,
     lower_bound: float | None,
     capability: tuple[int, int] | None,
+    allowed_heads: tuple[int, ...] = (HEADS,),
 ) -> str:
     """Why a KDA layer cannot take this path, or '' when it can."""
     if capability != (8, 0):
         return f"device capability {capability} (needs sm_80)"
     if backend != "triton":
         return f"prefill backend {backend} (needs triton)"
-    if num_heads != HEADS:
-        return f"{num_heads} heads on this rank (needs {HEADS}: pipeline parallel, TP=1)"
+    if num_heads not in allowed_heads or num_heads not in _BY_HEADS:
+        needs = " or ".join(
+            f"{h}: {_BY_HEADS[h][3]}" for h in allowed_heads if h in _BY_HEADS
+        )
+        return f"{num_heads} heads on this rank (needs {needs or 'a flag'})"
     if head_dim != HEAD_DIM:
         return f"head_dim {head_dim} (needs {HEAD_DIM})"
     if dtype != torch.bfloat16:
@@ -1207,23 +1252,27 @@ def use_for_layer(
     dtype: torch.dtype,
     safe_gate: bool,
     lower_bound: float | None,
+    allowed_heads: tuple[int, ...] = (HEADS,),
 ) -> bool:
-    """Resolve the layer part of the gate once (called with the flag set)."""
+    """Resolve the layer part of the gate once (called with a flag set;
+    ``allowed_heads`` from ``enabled_heads()``)."""
     from vllm.platforms import current_platform
 
     cap = current_platform.get_device_capability()
     cap = None if cap is None else (int(cap.major), int(cap.minor))
     why = layer_closed_reason(
-        backend, num_heads, head_dim, dtype, safe_gate, lower_bound, cap
+        backend, num_heads, head_dim, dtype, safe_gate, lower_bound, cap,
+        allowed_heads,
     )
     if why:
         logger.info_once(
-            "VLLM_GLM5_PP_KDA_PREFILL=1 but the sm_80 KDA prefill path is off: "
-            "%s; using the upstream chunk path",
+            "%s=1 but the sm_80 KDA prefill path is off: %s; using the "
+            "upstream chunk path",
+            _flags(allowed_heads),
             why,
         )
         return False
-    logger.info_once(BANNER)
+    logger.info_once(_BY_HEADS[num_heads][2])
     return True
 
 
@@ -1235,11 +1284,12 @@ def call_closed_reason(
     state_dtype: torch.dtype,
     a_log_dtype: torch.dtype,
     bias_dtype: torch.dtype | None,
+    max_tokens: int = MAX_TOKENS,
 ) -> str:
     """Why this prefill call cannot take the path, or '' when it can. Host
     values only (shapes, dtypes): no device sync."""
-    if not 1 <= num_tokens <= MAX_TOKENS:
-        return f"prefill chunk outside 1..{MAX_TOKENS} tokens"
+    if not 1 <= num_tokens <= max_tokens:
+        return f"prefill chunk outside 1..{max_tokens} tokens"
     if not 1 <= num_seqs <= MAX_SEQS:
         return f"more than {MAX_SEQS} sequences in the chunk"
     if qkv_dtype != torch.bfloat16 or g_dtype != torch.bfloat16:
@@ -1260,16 +1310,20 @@ def select_chunk_fn(
     state_dtype: torch.dtype,
     a_log_dtype: torch.dtype,
     bias_dtype: torch.dtype | None,
+    num_heads: int = HEADS,
 ):
     """This module's chunk_kda_with_fused_gate when the call is in the
-    validated range, else ``upstream`` (called with identical arguments)."""
+    validated range for ``num_heads`` local heads (a layer that passed
+    ``use_for_layer``), else ``upstream`` (called with identical arguments)."""
+    flag, max_tokens = _BY_HEADS[num_heads][:2]
     why = call_closed_reason(
-        num_tokens, num_seqs, qkv_dtype, g_dtype, state_dtype, a_log_dtype, bias_dtype
+        num_tokens, num_seqs, qkv_dtype, g_dtype, state_dtype, a_log_dtype,
+        bias_dtype, max_tokens,
     )
     if why:
         logger.info_once(
-            "VLLM_GLM5_PP_KDA_PREFILL=1 but this prefill call keeps the upstream "
-            "chunk path: %s",
+            "%s=1 but this prefill call keeps the upstream chunk path: %s",
+            flag,
             why,
         )
         return upstream
@@ -1281,7 +1335,8 @@ def warmup(plans, device="cuda", heads: int = HEADS, head_dim: int = HEAD_DIM):
     lengths) in the production input layout (q, k, v column views of one
     [T, 3 * H * D] buffer, fp32 beta, fp32 initial state). All launch
     configurations are fixed, so one small plan already compiles everything;
-    Triton specialises on none of the shape values that differ between plans."""
+    Triton specialises on none of the shape values that differ between plans
+    (the head count is a compile-time constant: warm up with the layer's)."""
     P = heads * head_dim
     for seqlens in plans:
         T = int(sum(seqlens))
@@ -1310,12 +1365,13 @@ WARMUP_PLANS = ([64], [65, 63])
 
 def warmup_from_worker(worker) -> None:
     """Compile the path before serving when any KDA layer of this worker took
-    it (the first prefill then pays no Triton compilation). Prefill runs
-    eagerly, outside CUDA graphs; nothing here is kept after the call. No-op
-    unless VLLM_GLM5_PP_KDA_PREFILL=1 and the layer gate is open."""
+    it (the first prefill then pays no Triton compilation), at that layer's
+    head count. Prefill runs eagerly, outside CUDA graphs; nothing here is
+    kept after the call. No-op unless VLLM_GLM5_PP_KDA_PREFILL=1 or
+    VLLM_GLM5_TP4_KDA_PREFILL=1 and the layer gate is open."""
     from vllm import envs
 
-    if not envs.VLLM_GLM5_PP_KDA_PREFILL:
+    if not (envs.VLLM_GLM5_PP_KDA_PREFILL or envs.VLLM_GLM5_TP4_KDA_PREFILL):
         return
     layer = None
     for module in worker.get_model().modules():
@@ -1324,8 +1380,10 @@ def warmup_from_worker(worker) -> None:
             break
     if layer is None:
         return
-    warmup(WARMUP_PLANS, device=worker.device)
+    heads = int(getattr(layer, "local_num_heads", HEADS))
+    warmup(WARMUP_PLANS, device=worker.device, heads=heads)
     logger.info(
-        "Warmed up the sm_80 KDA prefill kernels (64 heads) for plans %s.",
+        "Warmed up the sm_80 KDA prefill kernels (%d heads) for plans %s.",
+        heads,
         WARMUP_PLANS,
     )
