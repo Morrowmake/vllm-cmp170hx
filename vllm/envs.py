@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
+    VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
     VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_GLM5_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MHC: bool = True
@@ -1592,6 +1593,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The current schedule measured 1.06x at 4 query rows and 1.19x at 16 on
     # sm_80 with 16 heads per rank; this is the way back if a part outside
     # that measurement regresses.
+    # Predicate the row gather of the sm_80 sparse-MLA prefill kernel
+    # (vllm/ampere_prefill/sparse_prefill_mla.py) on the index mask, so that
+    # invalid (-1) top-k slots fetch nothing instead of all reading cache row
+    # 0. The output is bitwise unchanged. Taken only with all 64 heads on one
+    # card (pipeline parallel, TP=1) at the 512-wide NoPE layout, 2176 index
+    # slots and the 64-head schedule; every other shape keeps the plain gather.
+    # Needs VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
+    "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD": lambda: bool(
+        int(os.getenv("VLLM_GLM5_SMLA_PREFILL_PRED_LOAD", "0"))
+    ),
     "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY": lambda: bool(
         int(os.getenv("VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY", "0"))
     ),

@@ -91,7 +91,10 @@ never atomics into the accumulator, so the result is bitwise reproducible.
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton  # noqa: F401  (Triton 3.7.1)
+
+logger = init_logger(__name__)
 
 
 def num_sms(device=0):
@@ -141,6 +144,7 @@ def _sparse_mla_kernel(
     V_IS_K: tl.constexpr,
     ROTATE: tl.constexpr,
     LOGE2: tl.constexpr,
+    PRED_LOAD: tl.constexpr = False,
 ):
     cur_q = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -210,7 +214,21 @@ def _sparse_mla_kernel(
         if V_IS_K:
             # V is the leading dim_v dims of the same rows: gather each row once
             # in its natural [BLOCK_N, D] layout and use it for both dots.
-            kn = tl.load(k_buffer + rows[:, None] + offs_d[None, :])
+            if PRED_LOAD:
+                # Predicated gather: invalid slots fetch nothing. A first
+                # prefill chunk carries ~1,100 invalid slots per row, and with
+                # the clamp above every one of them reads cache row 0, so all
+                # CTAs of the chunk queue on one 1 KB line of L2 (measured at
+                # 64 heads, 2304 rows: 16.3 ms against 9.5 ms predicated, and
+                # 9.8 ms for a continuing chunk). The zero rows never reach
+                # the output: their scores are forced to -1e30 and their pv
+                # weight to 0 below, exactly as for the clamped row, so the
+                # result is bitwise the clamped gather's whenever cache row 0
+                # is finite.
+                kn = tl.load(k_buffer + rows[:, None] + offs_d[None, :],
+                             mask=mask_kv[:, None], other=0.0)
+            else:
+                kn = tl.load(k_buffer + rows[:, None] + offs_d[None, :])
             qk = tl.dot(q, tl.trans(kn))
         else:
             k = tl.load(k_buffer + rows[None, :] + offs_d[:, None])
@@ -319,6 +337,54 @@ def _select_config(num_tokens, index_topk, h_q, dim_qk, sms):
     return BLOCK_H, BLOCK_N, num_splits, num_warps, num_stages
 
 
+# The predicated gather (PRED_LOAD) is taken only on the configuration it was
+# timed and checked on: all 64 heads on one card, the 512-wide NoPE latent with
+# V read from it (no RoPE tail), 2176 index slots (2048 top-k + a 128-slot
+# local section), bf16, one split with the rotated start, and the 64-head
+# schedule of _select_config.  Anything else keeps the plain gather.
+_PRED_LOAD_HEADS = 64
+_PRED_LOAD_DIM = 512
+_PRED_LOAD_TOPK = 2176
+_PRED_LOAD_CONFIG = (32, 32, 1, 4, 2)   # BLOCK_H, BLOCK_N, splits, warps, stages
+
+
+def _pred_load_closed(q, kv, index_topk, block_dpe, d_v, config, rotate):
+    """Why the predicated gather does not apply here, or '' when it does."""
+    if torch.cuda.get_device_capability(q.device) != (8, 0):
+        return "not sm_80"
+    if q.shape[1] != _PRED_LOAD_HEADS:
+        return f"{q.shape[1]} query heads on this rank (needs {_PRED_LOAD_HEADS})"
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        return f"dtype {q.dtype}/{kv.dtype} (needs bfloat16)"
+    if (q.shape[2] != _PRED_LOAD_DIM or block_dpe != 0 or d_v != _PRED_LOAD_DIM):
+        return (f"layout dim_qk {q.shape[2]} block_dpe {block_dpe} d_v {d_v} "
+                f"(needs {_PRED_LOAD_DIM}/0/{_PRED_LOAD_DIM})")
+    if index_topk != _PRED_LOAD_TOPK:
+        return f"{index_topk} index slots (needs {_PRED_LOAD_TOPK})"
+    if tuple(config) != _PRED_LOAD_CONFIG or not rotate:
+        return f"schedule {tuple(config)} rotate {rotate} (needs {_PRED_LOAD_CONFIG}, rotated)"
+    return ""
+
+
+def _use_pred_load(q, kv, index_topk, block_dpe, d_v, config, rotate):
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_SMLA_PREFILL_PRED_LOAD:
+        return False
+    why = _pred_load_closed(q, kv, index_topk, block_dpe, d_v, config, rotate)
+    if why:
+        logger.info_once(
+            "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD=1 but the sparse-MLA prefill "
+            "predicated gather is off for this call: %s; using the plain gather",
+            why)
+        return False
+    logger.info_once(
+        "sparse-MLA prefill predicated gather active "
+        "(VLLM_GLM5_SMLA_PREFILL_PRED_LOAD=1, %d heads, %d index slots, sm_80)",
+        _PRED_LOAD_HEADS, _PRED_LOAD_TOPK)
+    return True
+
+
 def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
     from vllm.triton_utils import LOG2E, LOGE2
     from vllm.v1.attention.ops.triton_mla_sparse import _workspace
@@ -335,9 +401,10 @@ def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
     BLOCK_DMODEL = dim_qk - BLOCK_DPE
     BLOCK_DV = d_v
 
-    BLOCK_H, BLOCK_N, num_splits, num_warps, num_stages = _select_config(
+    config = _select_config(
         num_tokens, index_topk, num_heads_q, dim_qk,
         num_sms(q.device.index or 0))
+    BLOCK_H, BLOCK_N, num_splits, num_warps, num_stages = config
 
     scale = sm_scale * LOG2E
     kv_group_num = num_heads_q // num_heads_kv
@@ -359,6 +426,11 @@ def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
         part_acc, part_sum, part_max, counter = _workspace(
             q.device, num_tokens, num_heads_q, num_splits, BLOCK_DV, grid[1])
 
+    rotate = num_splits == 1 and index_topk % BLOCK_N == 0
+    extra = {}
+    if _use_pred_load(q, kv, index_topk, BLOCK_DPE, d_v, config, rotate):
+        extra["PRED_LOAD"] = True
+
     sq, skv, so, si = q.stride(), kv.stride(), out.stride(), indices.stride()
     _sparse_mla_kernel[grid](
         q_buffer=q, k_buffer=kv, indices_ptr=indices,
@@ -376,9 +448,10 @@ def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
         NUM_SPLITS=num_splits, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N,
         BLOCK_DV=BLOCK_DV, BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DPE=BLOCK_DPE,
         V_IS_K=(d_v == BLOCK_DMODEL),
-        ROTATE=(num_splits == 1 and index_topk % BLOCK_N == 0),
+        ROTATE=rotate,
         LOGE2=LOGE2,
         num_warps=num_warps, num_stages=num_stages,
+        **extra,
     )
     return out, max_logits, softmax_lse
 
