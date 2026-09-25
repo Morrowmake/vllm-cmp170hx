@@ -10,8 +10,9 @@ score is forced to -1e30 and its pv weight to 0 either way.
 CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the flag, the gate and its
 fallbacks, and that the launch is unchanged whenever the gate is closed.
 GPU tests (skip without a device): on vs off bitwise on production-layout
-inputs, on real captured prefill records when ``SMLA_PRE_CAPTURE_DIR`` points
-at them, the 16-head fallback, and CUDA-graph replay.
+inputs at 64 heads (pipeline parallel) and 16 heads (tensor parallel 4), on
+real captured prefill records when ``SMLA_PRE_CAPTURE_DIR`` points at them,
+and CUDA-graph replay.
 
     CUDA_VISIBLE_DEVICES="" pytest -q tests/kernels/test_ampere_smla_prefill_pred_load.py
     pytest -q tests/kernels/test_ampere_smla_prefill_pred_load.py
@@ -27,6 +28,8 @@ from vllm.ampere_prefill import sparse_prefill_mla as spm
 
 FLAG = "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD"
 HEADS, DIM, WIDTH, TOPK, TAIL, GROUP = 64, 512, 2176, 2048, 128, 4
+TP4_HEADS = 16
+LIVE_HEADS = (HEADS, TP4_HEADS)
 SM_SCALE = 0.0625
 HAS_GPU = torch.cuda.is_available()
 IS_SM80 = HAS_GPU and torch.cuda.get_device_capability(0) == (8, 0)
@@ -109,11 +112,12 @@ def sm80(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (8, 0))
 
 
+@pytest.mark.parametrize("heads", LIVE_HEADS)
 @pytest.mark.parametrize("T", [512, 1152, 1282, 2304, 3456])
-def test_gate_open_on_the_validated_configuration(monkeypatch, sm80, T):
+def test_gate_open_on_the_validated_configuration(monkeypatch, sm80, T, heads):
     monkeypatch.setenv(FLAG, "1")
-    q, kv, w = _meta(T)
-    cfg, rot = _cfg(T, HEADS)
+    q, kv, w = _meta(T, heads=heads)
+    cfg, rot = _cfg(T, heads)
     assert spm._pred_load_closed(q, kv, w, 0, DIM, cfg, rot) == ""
     assert spm._use_pred_load(q, kv, w, 0, DIM, cfg, rot) is True
 
@@ -131,8 +135,10 @@ def test_gate_closed_when_flag_off(monkeypatch):
 
 
 @pytest.mark.parametrize("case,expect", [
-    ("heads16", "16 query heads"),
+    ("heads8", "8 query heads"),
     ("heads32", "32 query heads"),
+    ("heads16_64schedule", "schedule"),
+    ("heads64_16schedule", "schedule"),
     ("fp16", "dtype"),
     ("dpe", "layout"),
     ("dim576", "layout"),
@@ -145,8 +151,12 @@ def test_gate_closed_fallbacks(monkeypatch, sm80, case, expect):
     q, kv, w = _meta()
     cfg, rot = _cfg(2304, HEADS)
     dpe, dv = 0, DIM
-    if case == "heads16":
+    if case == "heads8":
+        q, kv, w = _meta(heads=8)
+        cfg, rot = _cfg(2304, 8)
+    elif case == "heads16_64schedule":
         q, kv, w = _meta(heads=16)
+    elif case == "heads64_16schedule":
         cfg, rot = _cfg(2304, 16)
     elif case == "heads32":
         q, kv, w = _meta(heads=32)
@@ -203,7 +213,8 @@ def _launch_kwargs(monkeypatch, T, heads, width=WIDTH):
 
 @pytest.mark.parametrize("T,heads,width", [
     (2304, 64, WIDTH), (1282, 64, WIDTH), (2304, 16, WIDTH), (3456, 16, WIDTH),
-    (2304, 64, 2048)])
+    (1282, 16, WIDTH), (2304, 64, 2048), (3456, 16, 2048), (2304, 8, WIDTH),
+    (2304, 32, WIDTH)])
 def test_launch_unchanged_when_gate_closed(monkeypatch, sm80, T, heads, width):
     """Flag off: the launch never carries PRED_LOAD.  Flag on: only the
     validated configuration adds it, and nothing else in the launch moves."""
@@ -212,7 +223,7 @@ def test_launch_unchanged_when_gate_closed(monkeypatch, sm80, T, heads, width):
     assert "PRED_LOAD" not in off
     monkeypatch.setenv(FLAG, "1")
     g1, on = _launch_kwargs(monkeypatch, T, heads, width)
-    live = heads == 64 and width == WIDTH
+    live = heads in LIVE_HEADS and width == WIDTH
     assert on.pop("PRED_LOAD", False) is live
     assert g0 == g1 and on == off
 
@@ -268,8 +279,22 @@ def test_on_equals_off_with_fully_masked_rows(monkeypatch):
 
 
 @needs_sm80
-def test_16_heads_fall_through(monkeypatch):
-    q, kv, idx = make_case(2304, 0, seed=3, heads=16)
+@pytest.mark.parametrize("T,prior", [(3456, 0), (3456, 3456), (3456, 6912), (1282, 6912),
+                                     (1282, 0), (600, 0)])
+def test_16_heads_on_equals_off_bitwise(monkeypatch, T, prior):
+    """The tensor-parallel-4 layout (16 heads per rank, 3456-row chunks)."""
+    q, kv, idx = make_case(T, prior, seed=3 + T + prior, heads=TP4_HEADS)
+    cfg, rot = _cfg(T, TP4_HEADS)
+    assert spm._pred_load_closed(q, kv, WIDTH, 0, DIM, cfg, rot) == ""
+    off = tuple(t.clone() for t in _run(q, kv, idx, False, monkeypatch))
+    on = _run(q, kv, idx, True, monkeypatch)
+    _assert_same(on, off)
+    assert torch.isfinite(on[0]).all() and torch.isfinite(on[2]).all()
+
+
+@needs_sm80
+def test_8_heads_fall_through(monkeypatch):
+    q, kv, idx = make_case(2304, 0, seed=3, heads=8)
     off = tuple(t.clone() for t in _run(q, kv, idx, False, monkeypatch))
     on = _run(q, kv, idx, True, monkeypatch)
     _assert_same(on, off)
@@ -290,11 +315,12 @@ def test_real_records_on_equals_off_equals_live(monkeypatch):
     n = 0
     for f in _capture_dir():
         c = torch.load(f, map_location="cpu", weights_only=False)
-        if int(c["in_num_heads"]) != HEADS or c["in_indices"].shape[2] != WIDTH:
+        heads = int(c["in_num_heads"])
+        if heads not in LIVE_HEADS or c["in_indices"].shape[2] != WIDTH:
             continue
         NT = int(c["in_num_tokens"])
         rows = c["in_rows"].cuda()
-        q = torch.zeros(NT, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+        q = torch.zeros(NT, heads, DIM, dtype=torch.bfloat16, device="cuda")
         q[rows] = c["in_q"].cuda()
         idx = torch.full((NT, 1, WIDTH), -1, dtype=torch.int32, device="cuda")
         idx[rows] = c["in_indices"].cuda()
@@ -305,7 +331,7 @@ def test_real_records_on_equals_off_equals_live(monkeypatch):
         assert torch.equal(off[0][rows], c["out_out"].cuda()), f
         n += 1
     if n == 0:
-        pytest.skip("no 64-head records in SMLA_PRE_CAPTURE_DIR")
+        pytest.skip("no 64- or 16-head records in SMLA_PRE_CAPTURE_DIR")
 
 
 def _graph_growth(fn):
@@ -379,12 +405,13 @@ def test_graph_replay_equals_eager_no_growth(monkeypatch):
 
 
 @needs_sm80
-def test_graph_capture_through_the_launcher(monkeypatch):
+@pytest.mark.parametrize("heads,T", [(HEADS, 2304), (TP4_HEADS, 3456)])
+def test_graph_capture_through_the_launcher(monkeypatch, heads, T):
     """Through sparse_mla_fwd (which allocates its stats per call) the capture
     allocates exactly what the flag-off capture allocates, and replay equals
     eager."""
-    q, kv, idx = make_case(2304, 0, seed=13)
-    out = torch.empty(2304, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+    q, kv, idx = make_case(T, 0, seed=13, heads=heads)
+    out = torch.empty(T, heads, DIM, dtype=torch.bfloat16, device="cuda")
     growth, res = {}, {}
     for flag in (False, True):
         eager = _run(q, kv, idx, flag, monkeypatch, out=out)[0].clone()

@@ -337,23 +337,30 @@ def _select_config(num_tokens, index_topk, h_q, dim_qk, sms):
     return BLOCK_H, BLOCK_N, num_splits, num_warps, num_stages
 
 
-# The predicated gather (PRED_LOAD) is taken only on the configuration it was
-# timed and checked on: all 64 heads on one card, the 512-wide NoPE latent with
-# V read from it (no RoPE tail), 2176 index slots (2048 top-k + a 128-slot
-# local section), bf16, one split with the rotated start, and the 64-head
-# schedule of _select_config.  Anything else keeps the plain gather.
-_PRED_LOAD_HEADS = 64
+# The predicated gather (PRED_LOAD) is taken only on the configurations it was
+# timed and checked on: the 512-wide NoPE latent with V read from it (no RoPE
+# tail), 2176 index slots (2048 top-k + a 128-slot local section), bf16, one
+# split with the rotated start, and one of two head layouts with the schedule
+# _select_config gives it: all 64 heads on one card (pipeline parallel, TP=1;
+# BLOCK_H 32, 4 warps) or 16 heads per rank (tensor parallel 4; BLOCK_H 16,
+# 2 warps).  Anything else keeps the plain gather.
 _PRED_LOAD_DIM = 512
 _PRED_LOAD_TOPK = 2176
-_PRED_LOAD_CONFIG = (32, 32, 1, 4, 2)   # BLOCK_H, BLOCK_N, splits, warps, stages
+# heads per rank -> (BLOCK_H, BLOCK_N, splits, warps, stages)
+_PRED_LOAD_SCHEDULES = {
+    64: (32, 32, 1, 4, 2),
+    16: (16, 32, 1, 2, 2),
+}
 
 
 def _pred_load_closed(q, kv, index_topk, block_dpe, d_v, config, rotate):
     """Why the predicated gather does not apply here, or '' when it does."""
     if torch.cuda.get_device_capability(q.device) != (8, 0):
         return "not sm_80"
-    if q.shape[1] != _PRED_LOAD_HEADS:
-        return f"{q.shape[1]} query heads on this rank (needs {_PRED_LOAD_HEADS})"
+    heads = q.shape[1]
+    if heads not in _PRED_LOAD_SCHEDULES:
+        return (f"{heads} query heads on this rank (needs one of "
+                f"{sorted(_PRED_LOAD_SCHEDULES, reverse=True)})")
     if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
         return f"dtype {q.dtype}/{kv.dtype} (needs bfloat16)"
     if (q.shape[2] != _PRED_LOAD_DIM or block_dpe != 0 or d_v != _PRED_LOAD_DIM):
@@ -361,8 +368,10 @@ def _pred_load_closed(q, kv, index_topk, block_dpe, d_v, config, rotate):
                 f"(needs {_PRED_LOAD_DIM}/0/{_PRED_LOAD_DIM})")
     if index_topk != _PRED_LOAD_TOPK:
         return f"{index_topk} index slots (needs {_PRED_LOAD_TOPK})"
-    if tuple(config) != _PRED_LOAD_CONFIG or not rotate:
-        return f"schedule {tuple(config)} rotate {rotate} (needs {_PRED_LOAD_CONFIG}, rotated)"
+    want = _PRED_LOAD_SCHEDULES[heads]
+    if tuple(config) != want or not rotate:
+        return (f"schedule {tuple(config)} rotate {rotate} "
+                f"(needs {want}, rotated, at {heads} heads)")
     return ""
 
 
@@ -381,7 +390,7 @@ def _use_pred_load(q, kv, index_topk, block_dpe, d_v, config, rotate):
     logger.info_once(
         "sparse-MLA prefill predicated gather active "
         "(VLLM_GLM5_SMLA_PREFILL_PRED_LOAD=1, %d heads, %d index slots, sm_80)",
-        _PRED_LOAD_HEADS, _PRED_LOAD_TOPK)
+        q.shape[1], _PRED_LOAD_TOPK)
     return True
 
 

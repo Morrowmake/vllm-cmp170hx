@@ -1597,8 +1597,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (vllm/ampere_prefill/sparse_prefill_mla.py) on the index mask, so that
     # invalid (-1) top-k slots fetch nothing instead of all reading cache row
     # 0. The output is bitwise unchanged. Taken only with all 64 heads on one
-    # card (pipeline parallel, TP=1) at the 512-wide NoPE layout, 2176 index
-    # slots and the 64-head schedule; every other shape keeps the plain gather.
+    # card (pipeline parallel, TP=1) or 16 heads per rank (tensor parallel 4)
+    # at the 512-wide NoPE layout, 2176 index slots and the schedule that head
+    # count gets; every other shape keeps the plain gather.
     # Needs VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
     "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD": lambda: bool(
         int(os.getenv("VLLM_GLM5_SMLA_PREFILL_PRED_LOAD", "0"))
