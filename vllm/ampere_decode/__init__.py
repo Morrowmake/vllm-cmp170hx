@@ -229,6 +229,15 @@ def use_ampere_kda_decode(
 # kda_decode_v2.py): the TP=4 GLM-5.3-Flash rank shape, up to 5 tokens per
 # sequence (its gate workspace holds 8 token rows) and up to 8 sequences.
 _KDA_V2_HEADS = 16
+# Pipeline parallel keeps all 64 KDA heads on one card. There the fused step
+# only wins for one sequence (graph replay, distinct state slots, one CMP
+# 170HX, us/call vs the unfused path the layer takes otherwise):
+#     sequences x 4 tokens    1       2       3       4
+#     unfused               36.2    54.2    75.2    98.4
+#     fused v2              29.7    62.3   100.2   120.6
+# so at 64 heads the gate also caps the sequence count
+# (VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS, default 1; 0 turns it off there).
+_KDA_V2_WIDE_HEADS = 64
 _KDA_V2_HEAD_DIM = 128
 _KDA_V2_MAX_TOKENS_PER_SEQ = 5
 _KDA_V2_MAX_SEQS = 8
@@ -263,7 +272,12 @@ def use_ampere_kda_decode_v2(
         return False
     if num_tokens > envs.VLLM_GLM5_DECODE_KDA_MAX_TOKENS:
         return False
-    if num_heads != _KDA_V2_HEADS or head_dim != _KDA_V2_HEAD_DIM:
+    if head_dim != _KDA_V2_HEAD_DIM:
+        return False
+    if num_heads == _KDA_V2_WIDE_HEADS:
+        if num_seqs > envs.VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS:
+            return False
+    elif num_heads != _KDA_V2_HEADS:
         return False
     for w in (w_f, w_g):
         if w is None:

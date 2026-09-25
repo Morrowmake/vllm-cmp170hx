@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_KDA_MAX_TOKENS: int = 64
     VLLM_GLM5_DECODE_KDA_V2: bool = False
+    VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS: int = 1
     VLLM_GLM5_DECODE_IDX_GLUE: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_GLM5_TOPK_CANONICAL: bool = False
@@ -1681,6 +1682,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # falls back to the existing path elsewhere. Off by default.
     "VLLM_GLM5_DECODE_KDA_V2": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_KDA_V2", "0"))
+    ),
+    # With 64 KDA heads per card (pipeline parallel, one card per stage) the
+    # fused v2 step is taken only up to this many sequences in a step: it
+    # wins for one sequence and loses from two (see use_ampere_kda_decode_v2).
+    # 0 keeps the 64-head layout on the unfused path. No effect at 16 heads.
+    "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS": lambda: int(
+        os.getenv("VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS", "1")
     ),
     # Opt in to the sm_80 thin-M BF16 GEMM in vllm/ampere_thin_gemm/ for the
     # layers GLM-5.3-Flash's W4A16 recipe leaves unquantized (GA100-class parts

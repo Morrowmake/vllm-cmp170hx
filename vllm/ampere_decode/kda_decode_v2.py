@@ -15,7 +15,8 @@ replaces, in meaning,
 and advances `conv_state` and `rec_state` in place exactly as they do.
 Called from the spec-decode branch of vllm/models/glm5next/common/kda.py when
 VLLM_GLM5_DECODE_KDA_V2=1 (see use_ampere_kda_decode_v2 for the covered
-shapes: 16 heads of 128, T <= 5 tokens per sequence, <= 8 sequences).
+shapes: 16 heads of 128, T <= 5 tokens per sequence, <= 8 sequences; 64
+heads of 128 for one sequence under pipeline parallel).
 
 SCHEDULE.  nseq * H * NV CTAs of 1 or 2 warps (see _select), NV V-slices of
 BV value rows per (sequence, head), ~512 warps.  Per CTA:
@@ -554,7 +555,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
 _WARMED = set()
 
 
-def warmup(plans=((1, 4), (4, 4)), device=None):
+def warmup(plans=((1, 4), (4, 4)), device=None, heads=16):
     """Compile every (nseq, T) plan and allocate the counters and the gate
     workspace before capture.
 
@@ -563,13 +564,13 @@ def warmup(plans=((1, 4), (4, 4)), device=None):
     will replay.
     """
     dev = torch.device("cuda") if device is None else device
-    H, D, KA, CONV_K = 16, 128, 128, 4
+    H, D, KA, CONV_K = int(heads), 128, 128, 4
     _counter(dev, max([int(n) for n, _ in plans] + [1]) * H)
     PROJ = H * D
     CONV_DIM = 3 * PROJ
     PW = CONV_DIM + H + 2 * KA
     for nseq, T in plans:
-        key = (int(nseq), int(T), TARGET_CTAS, BV_MIN, BV_MAX, NUM_WARPS, DC)
+        key = (int(nseq), int(T), H, TARGET_CTAS, BV_MIN, BV_MAX, NUM_WARPS, DC)
         if key in _WARMED:
             continue
         M = nseq * T

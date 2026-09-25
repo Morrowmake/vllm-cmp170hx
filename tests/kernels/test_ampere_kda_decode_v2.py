@@ -36,6 +36,7 @@ CONV_DIM = 3 * PROJ
 PW = CONV_DIM + H + 2 * KA
 ENV = ("VLLM_GLM5_DECODE_KERNELS", "VLLM_GLM5_DECODE_KDA",
        "VLLM_GLM5_DECODE_KDA_V2", "VLLM_GLM5_DECODE_KDA_MAX_TOKENS",
+       "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS",
        "VLLM_GLM5_DECODE_MHC", "VLLM_GLM5_DECODE_MOE_ROUTING")
 
 
@@ -105,13 +106,44 @@ def test_gate_covers_exactly_the_validated_shapes():
         assert not use_ampere_kda_decode_v2(1, 6, H, D, w, w)       # T > 5
         assert not use_ampere_kda_decode_v2(2, 7, H, D, w, w)       # ragged
         assert not use_ampere_kda_decode_v2(0, 4, H, D, w, w)
-        assert not use_ampere_kda_decode_v2(1, 4, 64, D, w, w)      # 64 heads
+        assert not use_ampere_kda_decode_v2(1, 4, 32, D, w, w)      # 32 heads
         assert not use_ampere_kda_decode_v2(1, 4, H, 64, w, w)
         e.set(VLLM_GLM5_DECODE_KDA_MAX_TOKENS=8)
         assert not use_ampere_kda_decode_v2(4, 16, H, D, w, w)      # bound
         assert use_ampere_kda_decode_v2(2, 8, H, D, w, w)
     finally:
         e.undo()
+
+
+def test_gate_at_64_heads_takes_one_sequence():
+    """Pipeline parallel (64 heads per card): one sequence only by default."""
+    e = _Env()
+    try:
+        e.set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_V2=1)
+        w64 = _w(shape=(64 * D, D))
+        for t in range(1, 6):
+            assert use_ampere_kda_decode_v2(1, t, 64, D, w64, w64), t
+        assert not use_ampere_kda_decode_v2(2, 8, 64, D, w64, w64)
+        assert not use_ampere_kda_decode_v2(1, 6, 64, D, w64, w64)   # T > 5
+        # the 16-head weights do not fit a 64-head layer
+        assert not use_ampere_kda_decode_v2(1, 4, 64, D, _w(), _w())
+        e.set(VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS=0)
+        assert not use_ampere_kda_decode_v2(1, 4, 64, D, w64, w64)
+        e.set(VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS=2)
+        assert use_ampere_kda_decode_v2(2, 8, 64, D, w64, w64)
+        assert not use_ampere_kda_decode_v2(3, 12, 64, D, w64, w64)
+        # the 16-head gate ignores the 64-head bound
+        e.set(VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS=0)
+        assert use_ampere_kda_decode_v2(8, 32, H, D, _w(), _w())
+    finally:
+        e.undo()
+
+
+def test_env_wide_max_seqs_default_is_one():
+    os.environ.pop("VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS", None)
+    from vllm import envs
+
+    assert envs.VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS == 1
 
 
 def test_gate_checks_the_weights():
@@ -408,13 +440,84 @@ def gpu_test_warmup_covers_the_capture_plans():
         e.undo()
 
 
+def gpu_test_64_heads_one_sequence():
+    """Pipeline-parallel shape (64 heads on one card), one sequence: ON matches
+    the unfused path (as gpu_test_on_matches_off), is run-to-run bitwise and
+    replays a captured graph bitwise; two sequences take the unfused path
+    bitwise."""
+    import vllm.models.glm5next.common.kda as kmod
+    from vllm.ampere_decode import kda_decode_v2
+
+    g = globals()
+    saved = {k: g[k] for k in ("H", "PROJ", "CONV_DIM", "PW")}
+    g["H"] = 64
+    g["PROJ"] = g["H"] * D
+    g["CONV_DIM"] = 3 * g["PROJ"]
+    g["PW"] = g["CONV_DIM"] + g["H"] + 2 * KA
+    e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA=1,
+                   VLLM_GLM5_DECODE_KDA_V2=1)
+    try:
+        kda_decode_v2.warmup(plans=((1, 4),), heads=64)
+        on, off, p0, meta, x = _pair(1, seed=71)
+        y1, c1, r1 = _run(on, x, meta, p0)
+        y0, c0, r0 = _run(off, x, meta, p0)
+        assert on._ampere_kda_normed and not off._ampere_kda_normed
+        tol = 2.0 * 2 ** -8 * float(y0.float().abs().max())
+        dy = float((y1.float() - y0.float()).abs().max())
+        assert dy <= tol, (dy, tol)
+        assert torch.equal(c1, c0)
+        d = (r1 - r0).abs()
+        assert float(d.max()) < 3e-2 and float((d > 1e-4).float().mean()) < 1e-3
+        y2, c2, r2 = _run(on, x, meta, p0)
+        assert torch.equal(y2, y1) and torch.equal(c2, c1) and torch.equal(r2, r1)
+
+        conv, rec = on.kv_cache
+        saved_fc = kmod.get_forward_context
+        kmod.get_forward_context = lambda: types.SimpleNamespace(
+            attn_metadata={on.prefix: meta})
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                on.forward(x.clone(), None)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            xg = x.clone()
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                yg = on.forward(xg, None)
+        finally:
+            kmod.get_forward_context = saved_fc
+        conv.copy_(p0[0])
+        rec.copy_(p0[1])
+        gr.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(yg, y1) and torch.equal(conv, c1) and torch.equal(rec, r1)
+        del gr
+
+        # two sequences at 64 heads: the gate closes, ON is the unfused path
+        on2, off2, q0, meta2, x2 = _pair(2, seed=72)
+        ya, ca, ra = _run(on2, x2, meta2, q0)
+        yb, cb, rb = _run(off2, x2, meta2, q0)
+        assert not on2._ampere_kda_normed
+        assert torch.equal(ya, yb) and torch.equal(ca, cb) and torch.equal(ra, rb)
+        print(f"  64 heads, 1 seq: out diff {dy:.2e} (tol {tol:.2e}), "
+              f"state max {float(d.max()):.2e}; graph replay bitwise; 2 seqs bitwise off")
+    finally:
+        e.undo()
+        g.update(saved)
+
+
 CPU_TESTS = (test_env_default_is_off, test_gate_needs_master_and_family_flag,
              test_gate_covers_exactly_the_validated_shapes,
+             test_gate_at_64_heads_takes_one_sequence,
+             test_env_wide_max_seqs_default_is_one,
              test_gate_checks_the_weights, test_import_does_not_initialise_cuda)
 GPU_TESTS = (gpu_test_on_matches_off, gpu_test_fallback_is_bitwise_off,
              gpu_test_off_is_the_unfused_composition,
              gpu_test_on_deterministic_and_capturable,
-             gpu_test_warmup_covers_the_capture_plans)
+             gpu_test_warmup_covers_the_capture_plans,
+             gpu_test_64_heads_one_sequence)
 
 if pytest is not None:
     _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(),
@@ -427,6 +530,7 @@ if pytest is not None:
         gpu_test_on_deterministic_and_capturable)
     test_gpu_warmup_covers_the_capture_plans = _needs_gpu(
         gpu_test_warmup_covers_the_capture_plans)
+    test_gpu_64_heads_one_sequence = _needs_gpu(gpu_test_64_heads_one_sequence)
 
 
 def _main():

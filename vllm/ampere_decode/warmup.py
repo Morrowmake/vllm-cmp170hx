@@ -226,10 +226,20 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
         )
     ]
     if not plans:
+        logger.info(
+            "sm_80 KDA decode v2 requested but its gate is closed at %d heads "
+            "(VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS=0 or an unsupported shape); "
+            "using the previous path.",
+            heads,
+        )
         return
-    kda_decode_v2.warmup(plans=tuple(plans), device=torch.device(device))
+    kda_decode_v2.warmup(
+        plans=tuple(plans), device=torch.device(device), heads=heads
+    )
     logger.info(
-        "Warmed up sm_80 KDA decode v2 kernel for (nseq, T) in %s.", plans
+        "Warmed up sm_80 KDA decode v2 kernel for (nseq, T) in %s at %d heads.",
+        plans,
+        heads,
     )
 
 
