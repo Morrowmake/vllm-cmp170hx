@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PROLOGUE_FUSE_GDN: bool = True
     VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT: bool = True
     VLLM_GLM5_AUX_HIDDEN_TENSOR: Literal["stream_mean", "branch"] = "stream_mean"
+    VLLM_KV_SWA_INFLIGHT_SCRATCH: bool = False
     VLLM_GLM5_SHARED_EXPERT_REORDER: bool = False
     VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_PP_PACKED_HOP: bool = False
@@ -1882,6 +1883,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the admission cap are unchanged. Default OFF.
     "VLLM_KV_MAMBA_INFLIGHT_STATES": lambda: bool(
         int(os.getenv("VLLM_KV_MAMBA_INFLIGHT_STATES", "0"))
+    ),
+    # KV capacity report: charge the in-flight part of a sliding-window
+    # group's per-request reservation (the blocks a request holds only while
+    # it has steps in flight) once per running request (max_num_seqs) instead
+    # of once per concurrency slot, like the Mamba speculative scratch.
+    # Accounting only: the block pool, the admission cap and the
+    # single-request fit check are unchanged. Not applied with a KV
+    # connector. Default OFF.
+    "VLLM_KV_SWA_INFLIGHT_SCRATCH": lambda: bool(
+        int(os.getenv("VLLM_KV_SWA_INFLIGHT_SCRATCH", "0"))
     ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate

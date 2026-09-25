@@ -31,6 +31,20 @@ logger = init_logger(__name__)
 _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
 
 
+def sliding_window_inflight_scratch_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether sliding-window in-flight blocks count as running-only scratch.
+
+    Set by VLLM_KV_SWA_INFLIGHT_SCRATCH. Closed with a KV connector: an async
+    KV load or a delayed free holds blocks for a request that is not running,
+    so the running-requests bound does not cover it.
+    """
+    from vllm import envs
+
+    if not envs.VLLM_KV_SWA_INFLIGHT_SCRATCH:
+        return False
+    return vllm_config.kv_transfer_config is None
+
+
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
 # ---------------------------------------------------------------------------
@@ -873,6 +887,27 @@ class SlidingWindowSpec(AttentionSpec):
             max_model_len=vllm_config.model_config.max_model_len,
         )
         return max_blocks * self.page_size_bytes
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        # With VLLM_KV_SWA_INFLIGHT_SCRATCH, the part of the per-request cap
+        # that covers in-flight tokens is held only by a running request:
+        # frees follow the processed-token basis, so a request holds more
+        # than its settled window only while it has steps in flight, and
+        # waiting or preempted requests hold no blocks. At most `max_num_seqs`
+        # requests run, so capacity planning can charge it once per running
+        # request. Every running request is still charged the full cap, and
+        # neither the admission cap nor the pool size changes.
+        if not sliding_window_inflight_scratch_enabled(vllm_config):
+            return 0
+        max_model_len = vllm_config.model_config.max_model_len
+        full = self.max_admission_blocks_per_request(
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_model_len=max_model_len,
+        )
+        settled = self.max_admission_blocks_per_request(
+            max_in_flight_tokens=0, max_model_len=max_model_len
+        )
+        return max(0, full - settled) * self.page_size_bytes
 
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]

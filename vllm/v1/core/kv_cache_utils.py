@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
     iter_layer_specs,
     replace_as,
+    sliding_window_inflight_scratch_enabled,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -1122,6 +1123,8 @@ def get_max_concurrency_for_kv_cache_config(
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
     if envs.VLLM_KV_MAMBA_INFLIGHT_STATES:
         _log_mamba_inflight_states(vllm_config, kv_cache_config)
+    if envs.VLLM_KV_SWA_INFLIGHT_SCRATCH:
+        _log_sliding_window_inflight_scratch(vllm_config, kv_cache_config)
     limits = [
         _pool_concurrency_limit(
             kv_cache_config.num_blocks,
@@ -1176,6 +1179,43 @@ def _log_mamba_inflight_states(
         "per concurrency slot (KV connector)"
         if vllm_config.kv_transfer_config is not None
         else "once per running request",
+    )
+
+
+def _log_sliding_window_inflight_scratch(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """One line saying whether VLLM_KV_SWA_INFLIGHT_SCRATCH is live."""
+    if not sliding_window_inflight_scratch_enabled(vllm_config):
+        logger.info_once(
+            "VLLM_KV_SWA_INFLIGHT_SCRATCH is set but a KV connector is "
+            "configured; sliding-window in-flight blocks stay charged per "
+            "concurrency slot."
+        )
+        return
+    swa_blocks = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        layer_spec = (
+            spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+        )
+        if isinstance(layer_spec, SlidingWindowSpec):
+            swa_blocks += cdiv(
+                spec.speculative_scratch_bytes(vllm_config), spec.page_size_bytes
+            )
+    if swa_blocks == 0:
+        logger.info_once(
+            "VLLM_KV_SWA_INFLIGHT_SCRATCH is set but no sliding-window group "
+            "has an in-flight part; the KV capacity report is unchanged."
+        )
+        return
+    logger.info_once(
+        "SWA in-flight scratch: %d sliding-window blocks per request charged "
+        "once per running request (max_num_seqs=%d, max_in_flight_tokens=%d) "
+        "in the KV capacity report (VLLM_KV_SWA_INFLIGHT_SCRATCH=1).",
+        swa_blocks,
+        vllm_config.scheduler_config.max_num_seqs,
+        vllm_config.max_in_flight_tokens,
     )
 
 
