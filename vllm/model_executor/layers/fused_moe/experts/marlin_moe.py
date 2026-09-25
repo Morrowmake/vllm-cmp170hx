@@ -739,7 +739,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         ctx = self._lora_context
         if ctx is None:
-            if envs.VLLM_GLM5_PP_MARLIN_PREFILL:
+            if envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
                 from vllm.ampere_prefill.pp_marlin_prefill import maybe_apply
 
                 if maybe_apply(

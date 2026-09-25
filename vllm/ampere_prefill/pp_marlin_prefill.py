@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-block Marlin W4A16 MoE for whole-expert prefill on sm_80.
+"""Split-block Marlin W4A16 MoE prefill on sm_80 (PP whole experts, TP4 shards).
 
 WHAT.  Under pipeline parallelism with TP=1 every stage holds all 288 experts
-whole (N=2048, K=4096).  ``fused_marlin_moe`` aligns the ~64 rows per expert
+whole (N=2048, K=4096; ``VLLM_GLM5_PP_MARLIN_PREFILL``); under tensor
+parallel 4 every card holds all 288 sharded to N=512
+(``VLLM_GLM5_TP4_MARLIN_PREFILL``).  ``fused_marlin_moe`` aligns the ~64 rows per expert
 to one block size, so the last block of each expert is mostly padding (~1.55x
 the useful rows at 2304 tokens).  This path replaces the alignment with
 ``moe_split_align`` (one block list per size 64/48/32/16, cheapest cover per
@@ -13,7 +15,15 @@ the incumbent's: the same compiled Marlin kernels with fp32 reduce, the same
 activation (``layer.activation``), the same slot-order sum
 (``layer.moe_sum``), the same workspaces.  Marlin's per-row result does not
 depend on the block a row lands in, so the output is bitwise equal to
-``fused_marlin_moe`` on the measured shapes.
+``fused_marlin_moe`` on the measured PP shapes.  At N=512 it is not bitwise
+equal (measured); its error against an fp64 reference equals the
+incumbent's (1.00x mean and max on captured TP4 calls).  Under
+TP4 the prefill overlap (two micro-batches) halves each chunk, so the calls
+see M = 1728 (x2 per 3456-token chunk) and 640/642 for a 1282-token tail,
+where the incumbent pads to 1.76x / 2.04x the routed rows and the split
+cover to 1.16x / 1.45x (captured TP4 routing).  The cover's cost table was
+fitted at N=2048; on the captured TP4 routing any per-block cost affine in
+the block size gives the same covers, so it is kept.
 
 EMPTY LISTS.  A list with no block (e.g. no 64-row block at a few hundred
 tokens) is still launched: sizes stay on the device, so skipping it would
@@ -26,9 +36,10 @@ GATE.  Taken only for exactly the validated configuration: sm_80, bf16
 activations, uint4b8 group-128 weights without zero points, bias, global
 scales or activation quantisation, E = 288 local = global (no expert map),
 top-8, K = 4096, N = 2048, SiLU with clamp limit 10.0, router weight applied
-on the output, and M >= VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS.  Everything
-else falls through to ``fused_marlin_moe`` unchanged.  Under TP4 N is 512, so
-the gate stays closed there.
+on the output, and M >= VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS; or the same
+with N = 512 and M >= VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS under
+VLLM_GLM5_TP4_MARLIN_PREFILL.  Everything else falls through to
+``fused_marlin_moe`` unchanged.
 
 CUDA GRAPHS.  No host sync and no per-call allocation: the list buffers are
 allocated once per (device, E) for max_num_batched_tokens rows by ``warmup``
@@ -51,6 +62,7 @@ E_GATE = 288
 TOPK_GATE = 8
 K_GATE = 4096
 N_GATE = 2048
+N_GATE_TP4 = 512
 GROUP_SIZE = 128
 CLAMP_LIMIT = 10.0
 
@@ -80,6 +92,19 @@ def _is_sm80(device: torch.device) -> bool:
     return ok
 
 
+def enabled_shapes() -> dict:
+    """{N: (flag, min_tokens)} for the flags that are set: N=2048 under
+    VLLM_GLM5_PP_MARLIN_PREFILL, N=512 under VLLM_GLM5_TP4_MARLIN_PREFILL."""
+    out = {}
+    if envs.VLLM_GLM5_PP_MARLIN_PREFILL:
+        out[N_GATE] = ("VLLM_GLM5_PP_MARLIN_PREFILL",
+                       envs.VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS)
+    if envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
+        out[N_GATE_TP4] = ("VLLM_GLM5_TP4_MARLIN_PREFILL",
+                           envs.VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS)
+    return out
+
+
 def _buffers(device: torch.device, E: int, rows: int, create: bool):
     from vllm.ampere_prefill import moe_split_align
 
@@ -100,8 +125,10 @@ def _buffers(device: torch.device, E: int, rows: int, create: bool):
 def gate_reason(layer, hidden_states: torch.Tensor, w1: torch.Tensor,
                 w2: torch.Tensor, topk_weights: torch.Tensor,
                 topk_ids: torch.Tensor, activation, global_num_experts: int,
-                expert_map, apply_router_weight_on_input: bool) -> str | None:
+                expert_map, apply_router_weight_on_input: bool,
+                allowed_n: tuple = (N_GATE,)) -> str | None:
     """None when the split path may run, else why not (for the banner).
+    ``allowed_n``: the intermediate sizes whose flag is set.
 
     Structural conditions first, the device last, so the gate is testable
     without a GPU."""
@@ -121,8 +148,10 @@ def gate_reason(layer, hidden_states: torch.Tensor, w1: torch.Tensor,
     if hidden_states.dim() != 2 or hidden_states.size(1) != K_GATE:
         return f"hidden size {tuple(hidden_states.shape)[1:]} != {K_GATE}"
     N = marlin_moe_intermediate_size(w1, w2)
-    if N != N_GATE:
-        return f"intermediate size N={N} != {N_GATE} (TP-sharded experts)"
+    if N not in allowed_n:
+        if tuple(allowed_n) == (N_GATE,):
+            return f"intermediate size N={N} != {N_GATE} (TP-sharded experts)"
+        return f"intermediate size N={N} not in {tuple(allowed_n)}"
     if getattr(layer, "input_dtype", None) is not None:
         return f"activation quantisation to {layer.input_dtype}"
     if hidden_states.dtype != torch.bfloat16:
@@ -159,13 +188,18 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
     """Run the split path into ``output`` and return True, or return False
     (nothing touched) so the caller runs ``fused_marlin_moe``."""
     M = hidden_states.size(0)
-    min_tokens = envs.VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS
-    if M < min_tokens:
+    shapes = enabled_shapes()
+    if not shapes or M < min(m for _, m in shapes.values()):
         return False
     why = gate_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
                       activation, global_num_experts, expert_map,
-                      apply_router_weight_on_input)
+                      apply_router_weight_on_input, tuple(shapes))
+    flag = " / ".join(f for f, _ in shapes.values())
+    min_tokens = 0
     if why is None:
+        flag, min_tokens = shapes[w2.size(1) * 16]
+        if M < min_tokens:
+            return False
         rows = M * topk_ids.size(1)
         buf = _buffers(hidden_states.device, w1.size(0), rows,
                        create=not torch.cuda.is_current_stream_capturing())
@@ -173,12 +207,13 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
             why = f"no list buffers for {rows} rows during a graph capture"
     if why is not None:
         logger.info_once(
-            "VLLM_GLM5_PP_MARLIN_PREFILL is set but the gate is closed (%s); "
-            "using fused_marlin_moe.", why)
+            "%s is set but the gate is closed (%s); using fused_marlin_moe.",
+            flag, why)
         return False
     logger.info_once(
-        "PP Marlin MoE prefill active (VLLM_GLM5_PP_MARLIN_PREFILL): split "
-        "64/48/32/16-row block lists for M >= %d.", min_tokens)
+        "%s Marlin MoE prefill active (%s): split 64/48/32/16-row block lists "
+        "for M >= %d.", "PP" if flag == "VLLM_GLM5_PP_MARLIN_PREFILL" else "TP4",
+        flag, min_tokens)
     run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
         activation, workspace13, workspace2, buf)
     return True
@@ -248,9 +283,10 @@ def warmup(device, num_experts: int, max_tokens: int, topk: int) -> None:
 
 def warmup_from_worker(worker) -> int:
     """Pre-capture hook from ``model_executor/warmup/kernel_warmup.py``.
-    No-op unless VLLM_GLM5_PP_MARLIN_PREFILL is set on an sm_80 device and the
-    model has 288 routed experts; returns the expert count warmed (0 if not)."""
-    if not envs.VLLM_GLM5_PP_MARLIN_PREFILL:
+    No-op unless VLLM_GLM5_PP_MARLIN_PREFILL or VLLM_GLM5_TP4_MARLIN_PREFILL
+    is set on an sm_80 device and the model has 288 routed experts; returns
+    the expert count warmed (0 if not)."""
+    if not (envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL):
         return 0
     device = torch.device(worker.device)
     if device.type != "cuda" or not _is_sm80(device):

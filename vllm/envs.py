@@ -237,6 +237,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
     VLLM_GLM5_PP_MARLIN_PREFILL: bool = False
     VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
+    VLLM_GLM5_TP4_MARLIN_PREFILL: bool = False
+    VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1952,6 +1954,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "384")
+    ),
+    # The same split-block Marlin MoE prefill under tensor parallel 4 (each
+    # card holds all 288 experts sharded to N=512): taken only for M >=
+    # VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS with N=512 and otherwise the
+    # conditions of VLLM_GLM5_PP_MARLIN_PREFILL. Its own switch so the two
+    # layouts are judged separately. Off by default.
+    "VLLM_GLM5_TP4_MARLIN_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL", "0"))
+    ),
+    "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
