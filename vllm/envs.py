@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_GLM5_MEM_ATTRIBUTION: bool = False
+    VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_GLM5_PREFILL_OVERLAP: bool = False
     VLLM_GLM5_PREFILL_OVERLAP_SPLITS: int = 2
@@ -1871,6 +1872,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cache is sized. Logging only; the KV cache size is unchanged.
     "VLLM_GLM5_MEM_ATTRIBUTION": lambda: bool(
         int(os.getenv("VLLM_GLM5_MEM_ATTRIBUTION", "0"))
+    ),
+    # Align-mode Mamba KV reservation under async scheduling or pipeline
+    # parallelism: also reserve the state blocks a request holds for the
+    # prefill chunks it has in flight (min(max_concurrent_batches,
+    # cdiv(max_in_flight_tokens, block)) - 1 per group beyond the two of
+    # synchronous scheduling), charged once per running request. Changes the
+    # reported KV capacity and the single-request fit check; the block pool
+    # and the admission cap are unchanged. Default OFF.
+    "VLLM_KV_MAMBA_INFLIGHT_STATES": lambda: bool(
+        int(os.getenv("VLLM_KV_MAMBA_INFLIGHT_STATES", "0"))
     ),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate

@@ -1120,6 +1120,8 @@ def get_max_concurrency_for_kv_cache_config(
             num_blocks_per_request += required
             scratch_blocks_per_request += scratch
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    if envs.VLLM_KV_MAMBA_INFLIGHT_STATES:
+        _log_mamba_inflight_states(vllm_config, kv_cache_config)
     limits = [
         _pool_concurrency_limit(
             kv_cache_config.num_blocks,
@@ -1139,6 +1141,42 @@ def get_max_concurrency_for_kv_cache_config(
             )
         )
     return min(limits)
+
+
+def _log_mamba_inflight_states(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """One line saying whether VLLM_KV_MAMBA_INFLIGHT_STATES is live."""
+    per_group: list[int] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.first_spec
+        if isinstance(spec, MambaSpec):
+            per_group.append(spec.inflight_state_blocks(vllm_config))
+    if not any(per_group):
+        logger.info_once(
+            "VLLM_KV_MAMBA_INFLIGHT_STATES is set but no align-mode Mamba "
+            "group holds in-flight states (max_concurrent_batches=%d, "
+            "mamba_cache_mode=%s); the KV reservation is unchanged.",
+            vllm_config.max_concurrent_batches,
+            vllm_config.cache_config.mamba_cache_mode,
+        )
+        return
+    logger.info_once(
+        "Mamba in-flight states: %d extra state blocks per request (%d per "
+        "group x %d align-mode groups) reserved for prefill chunks in flight "
+        "(max_concurrent_batches=%d, max_in_flight_tokens=%d), charged %s "
+        "(VLLM_KV_MAMBA_INFLIGHT_STATES=1).",
+        sum(per_group),
+        max(per_group),
+        len(per_group),
+        vllm_config.max_concurrent_batches,
+        vllm_config.max_in_flight_tokens,
+        "per concurrency slot (KV connector)"
+        if vllm_config.kv_transfer_config is not None
+        else "once per running request",
+    )
 
 
 def _pool_concurrency_limit(
