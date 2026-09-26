@@ -657,7 +657,7 @@ def _real_logger():
     return dt.logger
 
 
-def _run_finalize(monkeypatch, rank, verdict_ok):
+def _run_finalize(monkeypatch, rank, verdict_ok, controller=None):
     """finalize() on one rank with an in-process PP group: the last stage's
     info, the tail stage's info and the verdict arrive in finalize's order."""
     _real_logger()
@@ -679,8 +679,8 @@ def _run_finalize(monkeypatch, rank, verdict_ok):
 
     monkeypatch.setattr(ps, "get_pp_group", lambda: _Group())
     gate = dt.DraftTailGate(requested=TAIL, stage=TAIL, reason="")
-    c = dt.DraftTailController(SimpleNamespace(), torch.device("cpu"), gate,
-                               rank, PP)
+    c = controller or dt.DraftTailController(
+        SimpleNamespace(), torch.device("cpu"), gate, rank, PP)
     mine = last if rank == PP - 1 else dict(info)
     monkeypatch.setattr(c, "_local_info", lambda: mine)
     monkeypatch.setattr(c, "_copy_weights", lambda pp, idx: (verdict_ok, ""))
@@ -940,6 +940,84 @@ def _batch(idx, computed, prefill, scheduled, structured=False):
         num_scheduled_tokens=np.array(scheduled),
         has_structured_output_reqs=structured,
     )
+
+
+def test_finalized_pipeline_decodes_on_every_stage(monkeypatch):
+    """Receiver-only stages need no tail state across repeated decode steps."""
+    from vllm.v1.worker.gpu.spec_decode.dflash2 import speculator as sm
+
+    monkeypatch.setenv(FLAG, str(TAIL))
+    monkeypatch.setenv("VLLM_PP_DRAFT_TAIL_VERIFY", "1")
+    comm = _FakeComm()
+    monkeypatch.setattr(torch.distributed, "broadcast", comm.broadcast)
+    monkeypatch.setattr(torch.distributed, "send", comm.send)
+    monkeypatch.setattr(torch.distributed, "recv", comm.recv)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, s: None)
+    monkeypatch.setattr(pp_utils, "async_tensor_h2d",
+                        lambda data, device: torch.as_tensor(data))
+    monkeypatch.setattr(dt, "tail_side_stream_workspaces",
+                        lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(sm, "_selector_walk_kernel", _WalkStub())
+
+    spec, rows = _speculator(3, 1, split=False)
+    cfg = _config()
+    cfg.model_config = SimpleNamespace(use_fp64_gumbel=False)
+    cfg.scheduler_config = SimpleNamespace(max_num_seqs=MAX_REQS)
+    cfg.speculative_config.num_speculative_tokens = K
+    cfg.speculative_config.draft_model_config.get_hidden_size = lambda: 16
+    monkeypatch.setattr(dt, "DraftTailModule", lambda *a: SimpleNamespace(
+        top_k=spec.top_k, compute_candidates=spec.model.compute_candidates,
+        select=spec.model.model.candidate_selector))
+    controllers = []
+    handlers = [_make_handler(r, True) for r in range(PP)]
+    states = [torch.zeros(MAX_REQS, K, dtype=torch.int64) for _ in range(PP)]
+    for rank in range(PP):
+        c = dt.DraftTailController.create(cfg, torch.device("cpu"), rank, PP)
+        c.attach_handler(handlers[rank])
+        c.attach_speculator(spec if c.is_last else None)
+        c.load(None, spec.dtype)
+        _run_finalize(monkeypatch, rank, True, controller=c)
+        controllers.append(c)
+
+    batch = _batch([0, 1, 2], [10] * 3, [5] * 3, [K + 1] * 3)
+    last = controllers[-1]
+    for step in range(2):
+        for rank, h in enumerate(handlers):
+            if h.is_last_rank:
+                h.apply_remote_drafts(batch.idx_mapping_np, states[rank])
+            else:
+                h.get_prev_sampled_outputs(states[rank])
+        with _as_rank(comm, PP - 1):
+            handlers[-1].broadcast(
+                torch.full((3, K + 1), step, dtype=torch.int64),
+                torch.ones(3, dtype=torch.int32),
+                torch.zeros(3, dtype=torch.int32), batch)
+            assert last.remote_step(batch)
+            spec.input_buffers.input_ids.add_(1)
+            spec._generate_draft(rows, rows * spec.num_query_per_req,
+                                 None, None, None)
+            spec.tail_rows = rows
+            check = last.check_drafts(batch.num_reqs)
+            assert check is not None
+            handlers[-1].send_draft_tail(last.payload(batch.num_reqs), batch,
+                                         check)
+        for rank in [0, 1, TAIL]:
+            with _as_rank(comm, rank):
+                assert handlers[rank].receive(batch, controllers[rank].step(batch))
+        for h in handlers[:-1]:
+            assert torch.equal(h.queue[-1].draft_tokens, check)
+
+    for rank, h in enumerate(handlers):
+        if h.is_last_rank:
+            h.apply_remote_drafts(batch.idx_mapping_np, states[rank])
+            assert h.remote_drafts.verify_report() == (6, 0)
+        else:
+            for _ in range(PP):
+                h.get_prev_sampled_outputs(states[rank])
+        assert torch.equal(states[rank][batch.idx_mapping], check)
+    bcasts = [[e for e in log if e[0] == "bcast"] for log in comm.log]
+    assert all(ops == bcasts[0] for ops in bcasts)
 
 
 def _schedule(seed, steps=40):

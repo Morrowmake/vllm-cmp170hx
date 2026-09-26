@@ -776,13 +776,16 @@ class DraftTailController:
 
         if not self.remote_step(input_batch):
             return None
+        if not self.is_tail:
+            # Receiver-only stages need the broadcast root, not the payload.
+            return DraftTailStep(payload_nbytes=0)
         assert self.layout is not None
         num_reqs = input_batch.num_reqs
         rows = tail_rows(num_reqs, self.rows_table)
-        compute = None
-        if self.is_tail:
-            def compute(payload: torch.Tensor, draft_tokens: torch.Tensor) -> None:
-                self._run(payload, rows, num_reqs, draft_tokens)
+
+        def compute(payload: torch.Tensor, draft_tokens: torch.Tensor) -> None:
+            self._run(payload, rows, num_reqs, draft_tokens)
+
         return DraftTailStep(self.layout.nbytes(rows), compute)
 
     def check_drafts(self, num_reqs: int) -> torch.Tensor | None:
