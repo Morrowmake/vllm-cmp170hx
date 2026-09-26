@@ -231,6 +231,8 @@ if TYPE_CHECKING:
     VLLM_PP_PACKED_HOP: bool = False
     VLLM_PP_HOP_NO_METADATA: bool = False
     VLLM_PP_SPLIT_DRAFT_EVENT: bool = False
+    VLLM_PP_DRAFT_TAIL_STAGE: int = -1
+    VLLM_PP_DRAFT_TAIL_VERIFY: bool = False
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
     VLLM_GLM5_PP_MARLIN_PREFILL: bool = False
     VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
@@ -1905,6 +1907,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the forward. Default OFF.
     "VLLM_PP_SPLIT_DRAFT_EVENT": lambda: bool(
         int(os.getenv("VLLM_PP_SPLIT_DRAFT_EVENT", "0"))
+    ),
+    # Pipeline parallelism with a DFlash2 drafter: run the drafter's tail
+    # (candidate lm_head pass, top-k, selector, walk) on this earlier stage
+    # instead of the last one, which then only runs the drafter's layers.
+    # Needs no KV cache on that stage, one lm_head + selector copy. Draft
+    # tokens are bit-identical. -1 (default) = off.
+    "VLLM_PP_DRAFT_TAIL_STAGE": lambda: int(
+        os.getenv("VLLM_PP_DRAFT_TAIL_STAGE", "-1")
+    ),
+    # Validation aid for VLLM_PP_DRAFT_TAIL_STAGE: the last stage also runs
+    # the tail itself and counts rows whose received drafts differ (logged
+    # every 500 steps). Costs the tail's time on the last stage. Default OFF.
+    "VLLM_PP_DRAFT_TAIL_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_PP_DRAFT_TAIL_VERIFY", "0"))
     ),
     # GLM-5.3-Flash + DFlash under PP: each stage multiplies its own aux
     # hidden states by their slice of the drafter's input projection (fc) and

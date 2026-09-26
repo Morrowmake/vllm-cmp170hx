@@ -13,8 +13,8 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
 
 
-def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
-    from vllm.compilation.backends import set_model_tag
+def dflash_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    """The config the drafter is built under (its modules, compile tags)."""
     from vllm.model_executor.models.qwen3_dflash import (
         dflash_has_any_non_causal,
     )
@@ -24,7 +24,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_model_config = speculative_config.draft_model_config
     # Select an attention backend that supports the drafter's attention: mixing
     # a non-causal layer onto a causal-only backend would fail.
-    draft_vllm_config = replace(
+    return replace(
         vllm_config,
         attention_config=replace(
             vllm_config.attention_config,
@@ -41,6 +41,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         ),
         load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
     )
+
+
+def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+    from vllm.compilation.backends import set_model_tag
+
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    draft_model_config = speculative_config.draft_model_config
+    draft_vllm_config = dflash_draft_vllm_config(vllm_config)
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config

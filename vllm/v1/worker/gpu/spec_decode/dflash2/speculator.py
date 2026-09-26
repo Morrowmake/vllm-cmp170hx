@@ -9,6 +9,13 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.pp_draft_tail import (
+    TailPayloadLayout,
+    TailPayloadViews,
+    pack_tail_payload,
+    run_draft_tail,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 
@@ -196,6 +203,172 @@ class DFlash2Speculator(DFlashSpeculator):
         self.candidate_sampler = CandidateSampler(
             self.max_num_reqs, self.num_speculative_steps, self.top_k, device
         )
+        # VLLM_PP_DRAFT_TAIL_STAGE (last pipeline stage only): the drafter
+        # forward (and its CUDA graphs) stop after gathering the tail's inputs
+        # into ``_tail_staging``; the tail then runs here eagerly from those
+        # inputs, or on the tail stage. Set before any forward or capture.
+        self.split_tail = False
+        self._tail_layout: TailPayloadLayout | None = None
+        self._tail_staging: torch.Tensor | None = None
+        self._tail_row_ids: torch.Tensor | None = None
+        self._tail_packed_rows: int | None = None
+        self.tail_rows: int | None = None
+
+    def enable_split_tail(self) -> None:
+        """Split the drafter's tail off its forward (see VLLM_PP_DRAFT_TAIL_STAGE).
+
+        Draft tokens are unchanged: the tail runs the same kernels on the same
+        rows, only from a gathered copy of its inputs.
+        """
+        k = self.num_speculative_steps
+        self._tail_layout = TailPayloadLayout(
+            max_rows=self.max_num_reqs,
+            num_steps=k,
+            hidden_size=self.hidden_size,
+            hidden_dtype=self.dtype,
+            anchor_dtype=self.input_buffers.input_ids.dtype,
+        )
+        self._tail_staging = torch.zeros(
+            self._tail_layout.nbytes(self.max_num_reqs),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        self._tail_row_ids = (
+            torch.arange(self.max_num_reqs * k, dtype=torch.int32, device=self.device)
+            // k
+        )
+        # Row r's anchor token sits at input_ids[r * num_query_per_req], the
+        # rows _score_candidates reads.
+        self._anchor_indices = (
+            torch.arange(self.max_num_reqs, dtype=torch.int64, device=self.device)
+            * self.num_query_per_req
+        )
+        self.split_tail = True
+
+    @property
+    def tail_layout(self) -> TailPayloadLayout:
+        assert self._tail_layout is not None
+        return self._tail_layout
+
+    def tail_staging_views(self, rows: int) -> TailPayloadViews:
+        assert self._tail_staging is not None
+        return self.tail_layout.views(self._tail_staging, rows)
+
+    def tail_payload(self, rows: int) -> torch.Tensor:
+        """The staged tail inputs for ``rows`` rows, as the bytes to send."""
+        assert self._tail_staging is not None
+        return self._tail_staging[: self.tail_layout.nbytes(rows)]
+
+    def _walk_from_payload(
+        self,
+        out_tokens: torch.Tensor,
+        realized_scores: torch.Tensor,
+    ):
+        block_k = triton.next_power_of_2(self.top_k)
+
+        def walk(candidate_ids, scores, views: TailPayloadViews, rows: int) -> None:
+            _selector_walk_kernel[(rows,)](
+                scores.contiguous(),
+                candidate_ids.contiguous(),
+                views.sample_pos,
+                views.row_state,
+                views.temperature,
+                views.seeds,
+                out_tokens,
+                realized_scores,
+                num_steps=self.num_speculative_steps,
+                top_k=self.top_k,
+                BLOCK_K=block_k,
+                SAMPLE_PROBABILISTIC=self.draft_logits is not None,
+                USE_FP64=self.use_fp64_gumbel,
+                num_warps=1,
+            )
+
+        return walk
+
+    def run_tail_local(self, rows: int) -> None:
+        """The tail on this stage, from the staged inputs (split mode)."""
+        assert self.split_tail
+        candidate_ids, _ = run_draft_tail(
+            self.model.compute_candidates,
+            self.model.model.candidate_selector,
+            self._walk_from_payload(self.draft_tokens, self.candidate_sampler.scores),
+            self.tail_staging_views(rows),
+            rows,
+            self.num_speculative_steps,
+            self.top_k,
+        )
+        # Same follow-ups as the fused path (the moved tail is gated to
+        # configurations that need neither).
+        num_sample = rows * self.num_speculative_steps
+        if self.enable_adaptive_verification:
+            self._maybe_predict_acceptance(
+                self.candidate_sampler.scores[:rows].flatten(0, 1),
+                self.sample_idx_mapping[:num_sample],
+                self.sample_col[:num_sample],
+            )
+        if self.draft_logits is not None:
+            self.candidate_sampler._cache_draft_logits(
+                candidate_ids, num_sample, self.sample_idx_mapping, self.draft_logits
+            )
+
+    def _split_tail_rows(self, num_reqs: int, dummy_run: bool, is_profile: bool) -> int:
+        """Rows the drafter forward just ran over (its CUDA-graph padding)."""
+        if self._tail_packed_rows is not None:
+            # An eager forward (or a capture) recorded its row count.
+            return self._tail_packed_rows
+        # A replayed graph: the dispatch is a pure function of the batch.
+        batch_desc, _ = dispatch_cg_and_sync_dp(
+            self.query_cudagraph_manager,
+            num_reqs,
+            num_reqs * self.num_query_per_req,
+            uniform_token_count=self.num_query_per_req,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=is_profile,
+        )
+        if batch_desc.num_reqs:
+            return batch_desc.num_reqs
+        return min(batch_desc.num_tokens, self.max_num_reqs)
+
+    def graph_rows_table(self) -> dict[int, int]:
+        """Request count -> rows the drafter forward runs over, for every
+        batch size (sent to the tail stage once, after capture)."""
+        table: dict[int, int] = {}
+        for num_reqs in range(1, self.max_num_reqs + 1):
+            batch_desc, _ = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_reqs * self.num_query_per_req,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+            )
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                table[num_reqs] = batch_desc.num_reqs or min(
+                    batch_desc.num_tokens, self.max_num_reqs
+                )
+            else:
+                table[num_reqs] = num_reqs
+        return table
+
+    def propose(self, input_batch, *args, remote_tail: bool = False, **kwargs):
+        if not self.split_tail:
+            return super().propose(input_batch, *args, **kwargs)
+        self._tail_packed_rows = None
+        super().propose(input_batch, *args, **kwargs)
+        num_reqs = input_batch.num_reqs
+        rows = self._split_tail_rows(
+            num_reqs,
+            kwargs.get("dummy_run", False),
+            kwargs.get("is_profile", False),
+        )
+        self.tail_rows = rows
+        if remote_tail:
+            # The tail stage computes this step's drafts from the staged inputs.
+            return None
+        self.run_tail_local(rows)
+        return self.draft_tokens[:num_reqs]
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # fp32 so the walk and the rejection that checks it read the same
@@ -219,6 +392,25 @@ class DFlash2Speculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        if self.split_tail:
+            # Stop after the drafter's layers: gather the tail's inputs. Runs
+            # inside the captured graph (static shapes for a given num_reqs).
+            pack_tail_payload(
+                self.tail_staging_views(num_reqs),
+                num_reqs,
+                self.num_speculative_steps,
+                last_hidden_states,
+                self.sample_indices,
+                self.input_buffers.input_ids,
+                self._anchor_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                self._tail_row_ids,
+            )
+            self._tail_packed_rows = num_reqs
+            return
         num_sample = num_reqs * self.num_speculative_steps
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
             num_reqs, self.num_speculative_steps, -1

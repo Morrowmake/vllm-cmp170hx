@@ -3,6 +3,7 @@
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,10 +11,14 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pp_draft_tail import RemoteDrafts, RemoteDraftQueue
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -49,6 +54,19 @@ class PendingDrafts:
     gen_at_consume_np: np.ndarray  # [num_reqs]
 
 
+@dataclass
+class DraftTailStep:
+    """This step's moved draft tail (VLLM_PP_DRAFT_TAIL_STAGE).
+
+    On the tail stage ``compute`` turns the received payload into the step's
+    draft tokens (written into its second argument); elsewhere it is None and
+    the stage only needs to know that the drafts are rooted at the tail stage.
+    """
+
+    payload_nbytes: int
+    compute: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+
+
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
     that produce a sampled token this step, and therefore must have that token
@@ -72,7 +90,12 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        draft_tail_stage: int = -1,
+        max_concurrent_batches: int = 1,
     ):
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
@@ -114,6 +137,26 @@ class PPHandler:
             and num_speculative_steps > 0
         )
         self.pending_drafts: PendingDrafts | None = None
+
+        # VLLM_PP_DRAFT_TAIL_STAGE: the stage (rank within the PP group) that
+        # runs the drafter's tail, with its own communicator for the payload
+        # hop from the last stage. Created on every rank (a new NCCL group).
+        self.draft_tail_stage = draft_tail_stage
+        self.draft_tail_src = -1
+        self.tail_group = None
+        self.remote_drafts: RemoteDraftQueue | None = None
+        if draft_tail_stage >= 0 and num_speculative_steps > 0:
+            pp_group = get_pp_group()
+            self.draft_tail_src = pp_group.ranks[draft_tail_stage]
+            self.tail_group = pp_group.make_sibling_device_group(
+                group_desc="pp_draft_tail"
+            )
+            if self.is_last_rank:
+                # An entry older than every step that can be in flight has
+                # long landed; waiting on it costs nothing.
+                self.remote_drafts = RemoteDraftQueue(
+                    max_age=max(2, max_concurrent_batches + 1)
+                )
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -255,9 +298,87 @@ class PPHandler:
                 send, src=self.last_rank, group=self.broadcast_group
             )
 
-    def receive(self, input_batch: InputBatch) -> bool:
+    def send_draft_tail(
+        self,
+        payload: torch.Tensor,
+        input_batch: InputBatch,
+        check: torch.Tensor | None = None,
+    ) -> None:
+        """Last stage, a step whose tail runs on the tail stage: send the
+        payload there, then receive the drafts it roots like any other stage.
+        The drafts reach the request state through ``apply_remote_drafts``."""
+        assert self.is_last_rank and self.remote_drafts is not None
+        need_sampled_mask = compute_need_sampled_mask(input_batch)
+        assert need_sampled_mask is not None
+        num_reqs = input_batch.num_reqs
+        gen_np = self.req_idx_gen_np[input_batch.idx_mapping_np].copy()
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            # Allocated on the main stream (the drafter wrote it there).
+            payload.record_stream(self.broadcast_stream)
+            torch.distributed.send(
+                payload, dst=self.draft_tail_src, group=self.tail_group
+            )
+            draft_tokens = torch.empty(
+                num_reqs,
+                self.num_speculative_steps,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            torch.distributed.broadcast(
+                draft_tokens, src=self.draft_tail_src, group=self.broadcast_group
+            )
+            event = self.broadcast_stream.record_event()
+            draft_tokens.record_stream(self.main_stream)
+        self.remote_drafts.push(
+            RemoteDrafts(
+                step=self.remote_drafts.step,
+                event=event,
+                draft_tokens=draft_tokens,
+                idx_mapping_np=input_batch.idx_mapping_np.copy(),
+                keep_np=need_sampled_mask.copy(),
+                gen_np=gen_np,
+                check=check,
+            )
+        )
+
+    def apply_remote_drafts(
+        self, batch_idx_np: np.ndarray, draft_tokens_to_update: torch.Tensor
+    ) -> None:
+        """Last stage, before a step reads draft tokens: scatter the drafts of
+        every earlier step that holds one of this batch's requests (waiting on
+        the main stream only for those)."""
+        queue = self.remote_drafts
+        if queue is None:
+            return
+        queue.next_step()
+        if not len(queue):
+            return
+        queue.apply(
+            batch_idx_np,
+            self.req_idx_gen_np,
+            draft_tokens_to_update,
+            self.main_stream.wait_event,
+            lambda idx_np: async_tensor_h2d(idx_np, device=self.device),
+        )
+        if queue.checked_rows is not None and queue.step % queue.REPORT_EVERY == 0:
+            checked, differing = queue.verify_report()
+            logger.info(
+                "PP draft tail check: %d of %d rows differ from the last "
+                "stage's own tail (VLLM_PP_DRAFT_TAIL_VERIFY).",
+                differing,
+                checked,
+            )
+
+    def receive(
+        self, input_batch: InputBatch, draft_tail: DraftTailStep | None = None
+    ) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
-        requests in the batch."""
+        requests in the batch.
+
+        ``draft_tail`` is set when this step's drafts are rooted at the tail
+        stage (VLLM_PP_DRAFT_TAIL_STAGE); on the tail stage it also carries
+        the computation that produces them."""
         assert not self.is_last_rank
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
@@ -294,9 +415,31 @@ class PPHandler:
                     dtype=torch.int64,
                     device=self.device,
                 )
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
+                if draft_tail is None:
+                    torch.distributed.broadcast(
+                        draft_tokens, src=self.last_rank, group=self.broadcast_group
+                    )
+                elif draft_tail.compute is not None:
+                    # Tail stage: take the payload from the last stage, run the
+                    # tail here and root the draft broadcast.
+                    payload = torch.empty(
+                        draft_tail.payload_nbytes, dtype=torch.uint8, device=self.device
+                    )
+                    torch.distributed.recv(
+                        payload, src=self.last_rank, group=self.tail_group
+                    )
+                    draft_tail.compute(payload, draft_tokens)
+                    torch.distributed.broadcast(
+                        draft_tokens,
+                        src=self.draft_tail_src,
+                        group=self.broadcast_group,
+                    )
+                else:
+                    torch.distributed.broadcast(
+                        draft_tokens,
+                        src=self.draft_tail_src,
+                        group=self.broadcast_group,
+                    )
             if self.split_draft_event:
                 draft_event = self.broadcast_stream.record_event()
             else:

@@ -37,7 +37,9 @@ Constraints (see ../README.md): sm_80 only, Triton 3.7.1, no TMA/wgmma, no fp8,
 must be CUDA-graph capturable (see `warmup()`).
 """
 
+import contextlib
 import os
+
 import torch
 import triton
 import triton.language as tl
@@ -492,9 +494,36 @@ def _thin_gemm_kernel(
 
 _WORKSPACE: dict = {}
 
+# Workspace lanes.  The shared partials and arrival counters are safe because
+# launches on one stream are serialized.  A caller that runs thin GEMMs on a
+# second stream while the first one is busy selects another lane and gets
+# buffers of its own.  Lane 0, the default, keeps the keys every other caller
+# has always used.  A plain module-level slot (not a ContextVar) so that the
+# lookup stays traceable inside torch.compile'd regions; a compiled region
+# keeps the buffers of the lane it was traced in.
+_LANE = [0]
+
+
+@contextlib.contextmanager
+def workspace_lane(lane: int):
+    """Run the enclosed thin GEMMs on workspace lane ``lane`` (>= 0)."""
+    if lane < 0:
+        raise ValueError(f"workspace lane must be non-negative, got {lane}")
+    prev = _LANE[0]
+    _LANE[0] = lane
+    try:
+        yield
+    finally:
+        _LANE[0] = prev
+
+
+def _lane_key(*key):
+    lane = _LANE[0]
+    return key if lane == 0 else ("lane", lane, *key)
+
 
 def _partials(split_k, M, N, device):
-    key = (device.index, split_k * M * N)
+    key = _lane_key(device.index, split_k * M * N)
     buf = _WORKSPACE.get(key)
     if buf is None:
         buf = torch.empty(split_k * M * N, dtype=torch.float32, device=device)
@@ -509,7 +538,7 @@ def _locks(tiles_n, device):
     recorded stays valid.  The kernel always leaves the counters at zero, so a
     buffer can be reused by any shape and across replays.
     """
-    key = (device.index, "lock", tiles_n)
+    key = _lane_key(device.index, "lock", tiles_n)
     buf = _WORKSPACE.get(key)
     if buf is None:
         buf = torch.zeros(tiles_n, dtype=torch.int32, device=device)

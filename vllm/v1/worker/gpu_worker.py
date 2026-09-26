@@ -915,6 +915,10 @@ class Worker(WorkerBase):
         if not self.model_config.enforce_eager:
             with self._get_cudagraph_capture_context():
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+        if self.use_v2_model_runner and hasattr(
+            self.model_runner, "finalize_pp_draft_tail"
+        ):
+            self.model_runner.finalize_pp_draft_tail()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

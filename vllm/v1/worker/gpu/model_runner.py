@@ -136,6 +136,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.gpu.pp_draft_tail import DraftTailController
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
@@ -297,6 +298,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
 
+        # VLLM_PP_DRAFT_TAIL_STAGE: the drafter's tail on an earlier stage.
+        self.draft_tail = (
+            DraftTailController.create(
+                vllm_config,
+                device,
+                get_pp_group().rank_in_group,
+                get_pp_group().world_size,
+            )
+            if self.use_pp and self.speculative_config is not None
+            else None
+        )
+        if self.draft_tail is not None:
+            self.draft_tail.attach_speculator(self.speculator)
+
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
@@ -336,7 +351,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                draft_tail_stage=(
+                    self.draft_tail.gate.stage if self.draft_tail is not None else -1
+                ),
+                max_concurrent_batches=vllm_config.max_concurrent_batches,
             )
+            if self.draft_tail is not None:
+                self.draft_tail.attach_handler(self.pp_handler)
 
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
@@ -432,6 +453,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 if self.aux_fc_folded:
                     mark_drafter_aux_fc_folded(self.speculator)
+            if self.draft_tail is not None:
+                self.draft_tail.load(self.model, self.dtype)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -1125,6 +1148,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+    def finalize_pp_draft_tail(self) -> None:
+        """VLLM_PP_DRAFT_TAIL_STAGE: every stage, once, after graph capture."""
+        if self.draft_tail is not None:
+            self.draft_tail.finalize()
+
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
@@ -1494,6 +1522,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        if getattr(self.pp_handler, "remote_drafts", None) is not None:
+            # Last stage with a moved draft tail: land the drafts this batch reads.
+            self.pp_handler.apply_remote_drafts(
+                idx_mapping_np, self.req_states.draft_tokens
+            )
         logits_indices = combine_sampled_and_draft_tokens(*combine_args)
         if self.pp_handler is not None and self.pp_handler.has_pending_drafts():
             # The previous step's draft values are still in flight from the
@@ -2160,7 +2193,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
+            all_decode_next = self.pp_handler.receive(
+                input_batch,
+                self.draft_tail.step(input_batch) if self.draft_tail else None,
+            )
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -2262,6 +2298,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        remote_tail = False
         if self.speculator is not None:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
@@ -2286,6 +2323,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.supports_variable_num_steps
             ):
                 propose_kwargs["num_steps"] = num_draft_tokens_to_propose
+            if self.draft_tail is not None and self.draft_tail.remote_step(input_batch):
+                remote_tail = propose_kwargs["remote_tail"] = True
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2303,7 +2342,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                     **propose_kwargs,
                 )
-            if draft_tokens.shape[1] == self.req_states.draft_tokens.shape[1]:
+            if remote_tail:
+                # The tail stage roots this step's drafts; they reach the
+                # request state through apply_remote_drafts.
+                assert self.draft_tail is not None
+                tail_payload = self.draft_tail.payload(input_batch.num_reqs)
+                tail_check = self.draft_tail.check_drafts(input_batch.num_reqs)
+            elif draft_tokens.shape[1] == self.req_states.draft_tokens.shape[1]:
                 self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             else:
                 # Adaptive SD asked for a narrow block; leave the tail columns
@@ -2329,7 +2374,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_draft_tokens_to_propose < proposed_drafts.shape[1]:
                 proposed_drafts = proposed_drafts[:, :num_draft_tokens_to_propose]
             self.draft_tokens_handler.set_draft_tokens(input_batch, proposed_drafts)
-            if self.pp_handler is not None:
+            if self.pp_handler is not None and remote_tail:
+                self.pp_handler.send_draft_tail(tail_payload, input_batch, tail_check)
+            elif self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
