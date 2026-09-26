@@ -27,6 +27,9 @@ def _pp_scheduler(spread: bool):
     )
     scheduler.parallel_config.pipeline_parallel_size = PP
     scheduler.pp_size = PP
+    # The async scheduler's decode re-eligibility stride, set from the PP size
+    # at construction.
+    scheduler.decode_stagger = PP
     scheduler.use_pp = True
     scheduler.pp_spread_decodes = spread
     return scheduler
