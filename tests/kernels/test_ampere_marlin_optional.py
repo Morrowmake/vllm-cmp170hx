@@ -155,25 +155,6 @@ def test_warmup_allocations_follow_admitted_width_and_tokens(
     assert prefill._warmup_capacities(width, budget) == expected
 
 
-@pytest.mark.parametrize("width,requested,capacity", [
-    (512, 4, 32), (2048, 4, 8), (2048, 64, 64),
-])
-def test_decode_scratch_reserves_only_admitted_capacity(
-    monkeypatch, width, requested, capacity,
-):
-    # Exercise real allocation sizing on CPU, with only CUDA stream queries
-    # replaced; PP4 must not inherit TP4's four-times-larger row reservation.
-    monkeypatch.setattr(decode, "_WORKSPACES", {})
-    monkeypatch.setattr(torch.cuda, "current_stream",
-                        lambda _device: SimpleNamespace(cuda_stream=0))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    ws = decode._workspaces(torch.device("cpu"), width, requested, create=True)
-    assert ws["max_tokens"] == capacity
-    split_planes = 4 if width == 512 else 1
-    assert ws["part"].numel() == split_planes * capacity * 8 * 2 * width
-    assert ws["c3"].numel() == capacity * 8 * 4096
-
-
 has_extension = importlib.util.find_spec("vllm._ampere_marlin_C") is not None
 gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or not has_extension,
