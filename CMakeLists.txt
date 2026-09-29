@@ -34,6 +34,17 @@ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
+set(_AMPERE_MARLIN_DEFAULT OFF)
+if("$ENV{VLLM_BUILD_AMPERE_MARLIN}" STREQUAL "1")
+  set(_AMPERE_MARLIN_DEFAULT ON)
+endif()
+option(VLLM_BUILD_AMPERE_MARLIN
+  "Build the optional sm_80 Marlin decode and prefill library"
+  ${_AMPERE_MARLIN_DEFAULT})
+if(VLLM_BUILD_AMPERE_MARLIN AND NOT VLLM_TARGET_DEVICE STREQUAL "cuda")
+  message(FATAL_ERROR "VLLM_BUILD_AMPERE_MARLIN requires a CUDA build")
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 # Suppress potential warnings about unused manually-specified variables
@@ -1421,6 +1432,39 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     message(STATUS "Not building Marlin MOE kernels as no compatible archs found"
                    " in CUDA target architectures")
   endif()
+endif()
+
+# This target is independent of layout and never changes the baseline MoE library.
+if(VLLM_BUILD_AMPERE_MARLIN)
+  set(AMPERE_MARLIN_SRC
+    "csrc/libtorch_stable/moe/ampere_marlin/decode.cu"
+    "csrc/libtorch_stable/moe/ampere_marlin/ops.cu"
+    "csrc/libtorch_stable/moe/ampere_marlin/kernels_sm80.cu"
+    "csrc/libtorch_stable/moe/ampere_marlin/module.cpp")
+  set_gencode_flags_for_srcs(SRCS "${AMPERE_MARLIN_SRC}" CUDA_ARCHS "8.0")
+  set(AMPERE_MARLIN_FLAGS ${VLLM_GPU_FLAGS})
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+    list(APPEND AMPERE_MARLIN_FLAGS "-static-global-template-stub=false")
+  endif()
+  define_extension_target(
+    _ampere_marlin_C
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${AMPERE_MARLIN_SRC}
+    COMPILE_FLAGS ${AMPERE_MARLIN_FLAGS}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(_ampere_marlin_C PRIVATE USE_CUDA)
+  foreach(_map
+      "${CMAKE_CURRENT_SOURCE_DIR}=vllm"
+      "${CMAKE_CURRENT_BINARY_DIR}=build"
+      "$ENV{HOME}=source")
+    target_compile_options(_ampere_marlin_C PRIVATE
+      "$<$<COMPILE_LANGUAGE:CXX>:-ffile-prefix-map=${_map}>"
+      "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${_map}>")
+  endforeach()
+  set_target_properties(_ampere_marlin_C PROPERTIES
+    BUILD_RPATH_USE_ORIGIN TRUE INSTALL_RPATH "")
 endif()
 
 message(STATUS "Enabling MoE C_stable extension.")

@@ -23,6 +23,60 @@ The following are the supported quantization formats for vLLM:
 - [TorchAO](torchao.md)
 - [FP8 ViT Encoder Attention](fp8_vit_attn.md)
 
+## Optional compiled Marlin MoE on SM 8.0
+
+The optional `vllm._ampere_marlin_C` extension provides GLM-5.3-Flash W4A16
+MoE kernels for both TP4 and PP4 in one binary. Switching layouts needs a
+restart and warmup, not a rebuild. It does not requantize weights.
+
+Builds are opt-in with `VLLM_BUILD_AMPERE_MARLIN=1`. A CUDA toolkit and the
+matching PyTorch installation are required; a GPU is not required to build
+the SM 8.0 kernels. For an existing source installation:
+
+```bash
+python csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out vllm
+```
+
+The standalone command also accepts `--build-dir DIR` and `--verbose`.
+It writes `_ampere_marlin_C.abi3.so`. Runtime never compiles CUDA source.
+
+Both runtime flags default to `0` and are independent:
+
+| Flag | Guarded regime |
+| --- | --- |
+| `VLLM_GLM5_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, exactly 4 or 8 tokens |
+| `VLLM_GLM5_MARLIN_PREFILL_CUDA=1` | PP4 intermediate width 2048, 384–2304 tokens inclusive |
+
+All paths require SM 8.0, bf16 activations, 288 local/global experts, top-8
+routing, hidden width 4096, uint4b8 group-128 weights, and SiLU with clamp
+10.0. Expert maps, LoRA, activation quantization, zero points, biases,
+global scales and router weighting on input are excluded. Decode also
+retains the released path when torch-based deterministic alignment is
+selected. Unsupported shapes retain the released kernels, including the
+TP4 Python split-align/cost-cover prefill improvements when enabled.
+The compiled prefill flag can enable its supported PP4 split path without
+requiring the older Python prefill flag; an explicitly configured Python
+prefill minimum remains respected.
+PP4 decode batches other than 4/8 tokens and prefills above 2304 tokens keep
+the released path. TP4 prefill never selects the optional compiled kernel.
+
+The decode schedule retains routing and padding semantics, slot-order
+summation, shared-expert handling and final reduction. The prefill schedule
+retains split alignment, its cost-optimal cover and activation/sum behavior,
+using wide tiles only for 32/48/64-row lists. Optional scratch is reserved
+per device and stream before CUDA-graph capture, including PP workers.
+Decode scratch covers 32 tokens for TP4 and only 8 for PP4. Excluded widths
+do not reserve optional scratch: TP4 prefill uses only its released buffers.
+Fully masked graph padding rows remain don't-care, as with released kernels.
+
+With both flags off, the optional extension is not imported or loaded.
+Explicitly enabling either flag validates the binary at worker startup,
+before model loading/serving. A missing binary, mismatched PyTorch/C++ ABI
+or CUDA major version, or missing/incompatible operators raises an actionable
+`RuntimeError`; it never silently disables the requested extension. CUDA
+toolkit minor versions within the same major are accepted. Rebuild against
+the current environment or set both flags to `0` and restart to recover.
+
 ## Selecting Linear Backends per Quantization
 
 `--linear-backend` selects one backend for all quantized linear layers. For

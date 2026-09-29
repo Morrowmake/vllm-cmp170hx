@@ -276,6 +276,10 @@ __global__ void Marlin(
   #endif
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  #ifdef MARLIN_MOE_EMPTY_LIST_RETURN
+  // Split block lists can be empty.
+  if (num_tokens_past_padded == 0) return;
+  #endif
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750

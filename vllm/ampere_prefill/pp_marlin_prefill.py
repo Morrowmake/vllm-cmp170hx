@@ -70,10 +70,36 @@ CLAMP_LIMIT = 10.0
 # own exec-config choice.  Only configurations the compiled Marlin MoE library
 # already instantiates: (64, 256) at 256 threads exists for m-blocks 2..4.
 THREAD_CFG = {64: (64, 256, 1)}
+WIDE_THREAD_CFG = {64: (128, 256, 1), 48: (128, 256, 1), 32: (128, 256, 1)}
+
+
+def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
+    """Whole-expert prefill; TP4 retains its released split-cover schedule."""
+    return intermediate_size == N_GATE and 384 <= num_tokens <= 2304
+
+
+def _compiled_gate_closed(reason: str) -> None:
+    logger.info_once(
+        "VLLM_GLM5_MARLIN_PREFILL_CUDA is set but the compiled gate is closed "
+        "(%s); retaining the released prefill path.", reason)
+
 
 _BUFFERS: dict = {}
 _RETIRED: list = []
 _CAP_OK: dict = {}
+_REDUCE_BUFFERS: dict = {}
+
+
+def _reduce_scratch(device, create: bool):
+    key = (str(device), torch.cuda.current_stream(device).cuda_stream)
+    scratch = _REDUCE_BUFFERS.get(key)
+    if scratch is None and create:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Marlin prefill scratch must be warmed before capture")
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        scratch = torch.empty(sms * 4 * 64 * 256, device=device, dtype=torch.float32)
+        _REDUCE_BUFFERS[key] = scratch
+    return scratch
 
 
 def _thread_cfg(bs: int, size_n: int, size_k: int, table: dict) -> tuple:
@@ -102,13 +128,18 @@ def enabled_shapes() -> dict:
     if envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
         out[N_GATE_TP4] = ("VLLM_GLM5_TP4_MARLIN_PREFILL",
                            envs.VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS)
+    if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA:
+        out.setdefault(N_GATE, ("VLLM_GLM5_MARLIN_PREFILL_CUDA", 384))
     return out
 
 
-def _buffers(device: torch.device, E: int, rows: int, create: bool):
+def _buffers(device: torch.device, E: int, rows: int, create: bool,
+             compiled: bool = False):
     from vllm.ampere_prefill import moe_split_align
 
     key = (str(device), E)
+    if compiled:
+        key += (torch.cuda.current_stream(device).cuda_stream,)
     buf = _BUFFERS.get(key)
     if buf is not None and buf["t_max"] >= rows:
         return buf
@@ -188,8 +219,14 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
     """Run the split path into ``output`` and return True, or return False
     (nothing touched) so the caller runs ``fused_marlin_moe``."""
     M = hidden_states.size(0)
+    if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA and not compiled_regime(
+        M, w2.size(1) * 16
+    ):
+        _compiled_gate_closed("requires N=2048 and 384 <= M <= 2304")
     shapes = enabled_shapes()
     if not shapes or M < min(m for _, m in shapes.values()):
+        if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA:
+            _compiled_gate_closed("below the configured prefill minimum")
         return False
     why = gate_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
                       activation, global_num_experts, expert_map,
@@ -199,12 +236,31 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
     if why is None:
         flag, min_tokens = shapes[w2.size(1) * 16]
         if M < min_tokens:
+            if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA:
+                _compiled_gate_closed("below the configured prefill minimum")
             return False
         rows = M * topk_ids.size(1)
+        wide = (
+            envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
+            and compiled_regime(M, w2.size(1) * 16)
+            and topk_ids.dtype == torch.int32
+            and w1.dtype == torch.int32 and w2.dtype == torch.int32
+            and all(t.is_contiguous() for t in (
+                w1, w2, layer.w1_scale, layer.w2_scale, topk_weights, topk_ids))
+        )
+        if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA and not wide:
+            _compiled_gate_closed("unsupported token, weight, or routing layout")
+        if flag == "VLLM_GLM5_MARLIN_PREFILL_CUDA" and not wide:
+            return False
         buf = _buffers(hidden_states.device, w1.size(0), rows,
-                       create=not torch.cuda.is_current_stream_capturing())
+                       create=not torch.cuda.is_current_stream_capturing(),
+                       compiled=wide)
         if buf is None:
             why = f"no list buffers for {rows} rows during a graph capture"
+        if wide and _reduce_scratch(
+            hidden_states.device, create=not torch.cuda.is_current_stream_capturing()
+        ) is None:
+            why = "reduction scratch not warmed on the capture stream"
     if why is not None:
         logger.info_once(
             "%s is set but the gate is closed (%s); using fused_marlin_moe.",
@@ -212,15 +268,20 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
         return False
     logger.info_once(
         "%s Marlin MoE prefill active (%s): split 64/48/32/16-row block lists "
-        "for M >= %d.", "PP" if flag == "VLLM_GLM5_PP_MARLIN_PREFILL" else "TP4",
+        "for M >= %d.", "PP" if w2.size(1) * 16 == N_GATE else "TP4",
         flag, min_tokens)
+    if wide:
+        logger.info_once(
+            "Compiled Marlin MoE prefill active "
+            "(VLLM_GLM5_MARLIN_PREFILL_CUDA): sm_80, N=2048, 384 <= M <= 2304."
+        )
     run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
-        activation, workspace13, workspace2, buf)
+        activation, workspace13, workspace2, buf, wide=wide)
     return True
 
 
 def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
-        activation, workspace13, workspace2, buf, thread_cfg=None):
+        activation, workspace13, workspace2, buf, thread_cfg=None, wide=False):
     """The split path. Workspaces as ``MarlinExperts.apply`` passes them to
     ``fused_marlin_moe`` (workspace2 holds w13's and w2's outputs, workspace13
     the activation)."""
@@ -232,6 +293,16 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     from vllm.scalar_type import scalar_types
 
     table = THREAD_CFG if thread_cfg is None else thread_cfg
+    wide_op = None
+    if wide:
+        from vllm.ampere_marlin import require_extension
+
+        wide_op = require_extension().prefill_gemm
+        scratch = _reduce_scratch(
+            hidden_states.device, create=not torch.cuda.is_current_stream_capturing()
+        )
+        if scratch is None:
+            raise RuntimeError("Call Marlin prefill warmup before run/capture")
     M, K = hidden_states.shape
     E = w1.size(0)
     topk = topk_ids.size(1)
@@ -245,28 +316,45 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
 
     lists = split_align(topk_ids, E, buf)
     for bs, sorted_ids, expert_ids, ntpp in lists:
-        tk, tn, bps = _thread_cfg(bs, 2 * N, K, table)
-        ops.moe_wna16_marlin_gemm(
-            hidden_states, c1, w1, None, layer.w1_scale, None, None, None,
-            workspace, sorted_ids, expert_ids, ntpp, topk_weights,
-            moe_block_size=bs, top_k=topk, mul_topk_weights=False,
-            b_q_type=qt, size_m=M, size_n=2 * N, size_k=K,
-            use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
-            thread_k=tk, thread_n=tn, blocks_per_sm=bps)
+        if wide_op is not None and bs in WIDE_THREAD_CFG:
+            tk, tn, bps = WIDE_THREAD_CFG[bs]
+            wide_op(
+                hidden_states, c1, w1, None, layer.w1_scale, None, None, None,
+                workspace, sorted_ids, expert_ids, ntpp, topk_weights,
+                bs, topk, False, qt.id, M, 2 * N, K, False, True, False,
+                tk, tn, bps, scratch)
+        else:
+            tk, tn, bps = _thread_cfg(bs, 2 * N, K, table)
+            ops.moe_wna16_marlin_gemm(
+                hidden_states, c1, w1, None, layer.w1_scale, None, None, None,
+                workspace, sorted_ids, expert_ids, ntpp, topk_weights,
+                moe_block_size=bs, top_k=topk, mul_topk_weights=False,
+                b_q_type=qt, size_m=M, size_n=2 * N, size_k=K,
+                use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
+                thread_k=tk, thread_n=tn, blocks_per_sm=bps)
     layer.activation(activation, c2, c1, topk_ids=topk_ids, expert_map=None)
     for bs, sorted_ids, expert_ids, ntpp in lists:
-        tk, tn, bps = _thread_cfg(bs, K, N, table)
-        ops.moe_wna16_marlin_gemm(
-            c2, c3, w2, None, layer.w2_scale, None, None, None,
-            workspace, sorted_ids, expert_ids, ntpp, topk_weights,
-            moe_block_size=bs, top_k=1, mul_topk_weights=True,
-            b_q_type=qt, size_m=rows, size_n=K, size_k=N,
-            use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
-            thread_k=tk, thread_n=tn, blocks_per_sm=bps)
+        if wide_op is not None and bs in WIDE_THREAD_CFG:
+            tk, tn, bps = WIDE_THREAD_CFG[bs]
+            wide_op(
+                c2, c3, w2, None, layer.w2_scale, None, None, None,
+                workspace, sorted_ids, expert_ids, ntpp, topk_weights,
+                bs, 1, True, qt.id, rows, K, N, False, True, False,
+                tk, tn, bps, scratch)
+        else:
+            tk, tn, bps = _thread_cfg(bs, K, N, table)
+            ops.moe_wna16_marlin_gemm(
+                c2, c3, w2, None, layer.w2_scale, None, None, None,
+                workspace, sorted_ids, expert_ids, ntpp, topk_weights,
+                moe_block_size=bs, top_k=1, mul_topk_weights=True,
+                b_q_type=qt, size_m=rows, size_n=K, size_k=N,
+                use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
+                thread_k=tk, thread_n=tn, blocks_per_sm=bps)
     layer.moe_sum(c3.view(M, topk, K), output, topk_ids, None)
 
 
-def warmup(device, num_experts: int, max_tokens: int, topk: int) -> None:
+def warmup(device, num_experts: int, max_tokens: int, topk: int,
+           *, compiled: bool = False) -> None:
     """Allocate the list buffers for the current stream and compile the
     split-alignment kernels.  Must run before any CUDA-graph capture."""
     from vllm.ampere_prefill.moe_split_align import split_align
@@ -275,10 +363,34 @@ def warmup(device, num_experts: int, max_tokens: int, topk: int) -> None:
     if device.type != "cuda" or torch.cuda.is_current_stream_capturing():
         return
     with torch.cuda.device(device):
-        buf = _buffers(device, num_experts, max_tokens * topk, create=True)
+        buf = _buffers(
+            device, num_experts, max_tokens * topk, create=True,
+            compiled=compiled,
+        )
+        if compiled:
+            _reduce_scratch(device, create=True)
         ids = torch.zeros(1, topk, device=device, dtype=torch.int32)
         split_align(ids, num_experts, buf)
         torch.cuda.synchronize(device)
+
+
+def _warmup_capacities(N: int, max_tokens: int) -> tuple[int, int]:
+    """Released and compiled list capacities; zero means no allocation."""
+    selected = enabled_shapes().get(N)
+    if selected is None:
+        return 0, 0
+    flag, minimum = selected
+    released = (
+        max_tokens if flag != "VLLM_GLM5_MARLIN_PREFILL_CUDA" else 0
+    )
+    compiled = 0
+    if (
+        envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
+        and max_tokens >= max(384, minimum)
+        and compiled_regime(max(384, minimum), N)
+    ):
+        compiled = min(max_tokens, 2304)
+    return released, compiled
 
 
 def warmup_from_worker(worker) -> int:
@@ -286,7 +398,11 @@ def warmup_from_worker(worker) -> int:
     No-op unless VLLM_GLM5_PP_MARLIN_PREFILL or VLLM_GLM5_TP4_MARLIN_PREFILL
     is set on an sm_80 device and the model has 288 routed experts; returns
     the expert count warmed (0 if not)."""
-    if not (envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL):
+    if not (
+        envs.VLLM_GLM5_PP_MARLIN_PREFILL
+        or envs.VLLM_GLM5_TP4_MARLIN_PREFILL
+        or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
+    ):
         return 0
     device = torch.device(worker.device)
     if device.type != "cuda" or not _is_sm80(device):
@@ -297,6 +413,12 @@ def warmup_from_worker(worker) -> int:
     topk = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
     if E != E_GATE or topk != TOPK_GATE:
         return 0
+    tp = worker.vllm_config.parallel_config.tensor_parallel_size
+    N = int(getattr(cfg, "moe_intermediate_size", 0)) // tp
     max_tokens = int(worker.scheduler_config.max_num_batched_tokens)
-    warmup(device, E, max_tokens, topk)
-    return E
+    released, compiled = _warmup_capacities(N, max_tokens)
+    if released:
+        warmup(device, E, released, topk)
+    if compiled:
+        warmup(device, E, compiled, topk, compiled=True)
+    return E if released or compiled else 0

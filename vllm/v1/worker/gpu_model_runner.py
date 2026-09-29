@@ -6864,6 +6864,16 @@ class GPUModelRunner(
         num_warmups: int | None = None,
         profiler: AbstractContextManager[Any] | None = None,
     ):
+        # Run on the actual capture stream, even when dummy warmups are zero.
+        # Optional scratch must not come from a different stream or graph pool.
+        if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
+            from vllm.ampere_decode.marlin_moe import warmup_from_worker
+
+            warmup_from_worker(self)
+        if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA:
+            from vllm.ampere_prefill.pp_marlin_prefill import warmup_from_worker
+
+            warmup_from_worker(self)
         if profiler is None:
             profiler = nullcontext()
         if num_warmups is None:

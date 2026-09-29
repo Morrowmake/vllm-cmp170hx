@@ -173,7 +173,11 @@ MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType a_type,
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
-#include "kernel_selector.h"
+#ifdef MARLIN_MOE_KERNEL_SELECTOR
+  #include MARLIN_MOE_KERNEL_SELECTOR
+#else
+  #include "kernel_selector.h"
+#endif
 
   return kernel;
 }
@@ -319,7 +323,13 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
+#ifdef MARLIN_MOE_MAX_THREADS
+    thread_tfg = thread_config_t{
+        thread_k, thread_n,
+        std::min(MARLIN_MOE_MAX_THREADS, thread_k * thread_n / 64)};
+#else
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
+#endif
     if (blocks_per_sm == -1) blocks_per_sm = 1;
     exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
     STD_TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
@@ -404,7 +414,15 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     bool mul_topk_weights, vllm::ScalarTypeId const& b_type_id, int64_t size_m,
     int64_t size_n, int64_t size_k, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    , torch::stable::Tensor& c_tmp
+#endif
+    ) {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+  STD_TORCH_CHECK(c_or_none.has_value(),
+                  "prefill_gemm requires a preallocated output tensor");
+#endif
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.scalar_type();
@@ -524,7 +542,12 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(a_type.size_bits() == 8,
                     "a_scales can only be used for 8bit activation.");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    // The kernel ignores this pointer for 16-bit activations.
+    a_scales = c_tmp;
+#else
     a_scales = torch::stable::new_empty(a, {0}, kFloat);
+#endif
     STD_TORCH_CHECK(
         a_type.size_bits() != 8,
         "the a_scales parameter must be passed for 8bit activation.");
@@ -551,18 +574,33 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     c = torch::stable::new_empty(a, {size_m * top_k, size_n}, c_dtype);
   }
 
-  // Alloc C tmp buffer that is going to be used for the global reduce
+  // Scratch for the fixed-order global reduction.
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+  STD_TORCH_CHECK(c_tmp.device().is_cuda() &&
+                      c_tmp.get_device() == a.get_device() &&
+                      c_tmp.is_contiguous() && c_tmp.scalar_type() == kFloat,
+                  "c_tmp must be contiguous float32 scratch on A's device");
+#else
   torch::stable::Tensor c_tmp;
+#endif
   if (use_fp32_reduce && !use_atomic_add) {
     // max num of threadblocks is sms * 4
     long max_c_tmp_size = min(
         (long)size_n * sorted_token_ids.size(0),
         (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    STD_TORCH_CHECK(c_tmp.numel() >= max_c_tmp_size,
+                    "c_tmp needs at least ", max_c_tmp_size, " float32 elements");
+#else
     c_tmp = torch::stable::new_empty(a, {max_c_tmp_size}, kFloat);
-  } else {
+#endif
+  }
+#ifndef MARLIN_MOE_PREALLOCATED_SCRATCH
+  else {
     c_tmp = torch::stable::new_empty(a, {0}, kFloat);
   }
+#endif
 
   // Detect group size.
   int num_groups = -1;
@@ -590,7 +628,11 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
                     "global_scale can only be used for nvfp4 format.");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    global_scale = c_tmp;  // Unused for uint4b8 weights.
+#else
     global_scale = torch::stable::new_empty(a, {0}, kFloat);
+#endif
     STD_TORCH_CHECK(
         !(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
         "the global_scale parameter must be passed for nvfp4 format.");
@@ -605,7 +647,11 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(b_bias.size(1) == size_n, "b_bias.size(1) != size_n");
     STD_TORCH_CHECK(b_bias.stride(1) == 1, "b_bias.stride(1) != 1");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    b_bias = c_tmp;  // Unused when has_bias is false.
+#else
     b_bias = torch::stable::new_empty(a, {0}, c_dtype);
+#endif
   }
 
   torch::stable::Tensor b_zeros;
@@ -614,9 +660,17 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(b_zeros.device().is_cuda(), "b_zeros is not on GPU");
     STD_TORCH_CHECK(b_zeros.is_contiguous(), "b_zeros is not contiguous");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    b_zeros = c_tmp;  // Unused when has_zp is false.
+#else
     b_zeros = torch::stable::new_empty(a, {0}, c_dtype);
+#endif
   }
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+  bool has_zp = b_zeros_or_none.has_value() && b_zeros.size(-1) > 0;
+#else
   bool has_zp = b_zeros.size(-1) > 0;
+#endif
   if (has_zp) {
     STD_TORCH_CHECK(
         b_type == vllm::kU4 || b_type == vllm::kU8,
@@ -701,6 +755,8 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
   return c;
 }
 
+#ifndef MARLIN_MOE_NO_MOE_C_IMPL
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_wna16_marlin_gemm", TORCH_BOX(&moe_wna16_marlin_gemm));
 }
+#endif

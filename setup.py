@@ -60,6 +60,13 @@ rust_build = load_module_from_path(
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
+BUILD_AMPERE_MARLIN = os.getenv("VLLM_BUILD_AMPERE_MARLIN", "0") == "1"
+if BUILD_AMPERE_MARLIN and USE_PRECOMPILED_EXTENSIONS:
+    raise RuntimeError(
+        "To retain precompiled vLLM extensions, build Ampere Marlin separately: "
+        "VLLM_BUILD_AMPERE_MARLIN=1 python "
+        "csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out DIR"
+    )
 # VLLM_USE_PRECOMPILED implies precompiled rust frontend too.
 USE_PRECOMPILED_RUST_FRONTEND = (
     envs.VLLM_USE_PRECOMPILED or envs.VLLM_USE_PRECOMPILED_RUST
@@ -268,6 +275,7 @@ class cmake_build_ext(build_ext):
         cmake_args = [
             "-DCMAKE_BUILD_TYPE={}".format(cfg),
             "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
+            f"-DVLLM_BUILD_AMPERE_MARLIN={'ON' if BUILD_AMPERE_MARLIN else 'OFF'}",
         ]
 
         verbose = envs.VERBOSE
@@ -1365,6 +1373,11 @@ def get_requirements() -> list[str]:
 
 
 ext_modules = []
+
+if BUILD_AMPERE_MARLIN:
+    if not _is_cuda():
+        raise RuntimeError("VLLM_BUILD_AMPERE_MARLIN=1 requires a CUDA build")
+    ext_modules.append(CMakeExtension(name="vllm._ampere_marlin_C"))
 
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))

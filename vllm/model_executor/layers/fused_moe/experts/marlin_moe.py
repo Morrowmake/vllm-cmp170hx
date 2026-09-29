@@ -739,7 +739,20 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         ctx = self._lora_context
         if ctx is None:
-            if envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
+            if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
+                from vllm.ampere_decode.marlin_moe import maybe_apply as decode_apply
+
+                if decode_apply(
+                    self, output, hidden_states, w1, w2, topk_weights,
+                    topk_ids, activation, global_num_experts, expert_map,
+                    apply_router_weight_on_input,
+                ):
+                    return
+            if (
+                envs.VLLM_GLM5_PP_MARLIN_PREFILL
+                or envs.VLLM_GLM5_TP4_MARLIN_PREFILL
+                or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
+            ):
                 from vllm.ampere_prefill.pp_marlin_prefill import maybe_apply
 
                 if maybe_apply(

@@ -194,6 +194,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
 
+    # Independent of the older TP-only decode warmup: PP workers also need
+    # persistent scratch before profiling/capture can use the optional ops.
+    if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
+        from vllm.ampere_decode.marlin_moe import warmup_from_worker
+
+        warmup_from_worker(worker)
+
     # The sm_80 decode kernels (vllm/ampere_decode/). This MUST run before
     # capture_model(): moe_routing._scratch() and kda_decode._counter() are
     # allocate-once module-level buffers, and an allocation made during a
@@ -251,7 +258,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # allocate-once per (device, E) and its Triton kernels compile on first
     # launch. Only with VLLM_GLM5_PP_MARLIN_PREFILL or
     # VLLM_GLM5_TP4_MARLIN_PREFILL.
-    if envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
+    if (
+        envs.VLLM_GLM5_PP_MARLIN_PREFILL
+        or envs.VLLM_GLM5_TP4_MARLIN_PREFILL
+        or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
+    ):
         from vllm.ampere_prefill.pp_marlin_prefill import (
             warmup_from_worker as warmup_pp_marlin_prefill,
         )

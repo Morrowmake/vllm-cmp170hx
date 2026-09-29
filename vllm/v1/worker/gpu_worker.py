@@ -433,6 +433,13 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        if (
+            envs.VLLM_GLM5_MARLIN_DECODE_CUDA
+            or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
+        ):
+            from vllm.ampere_marlin import require_extension
+
+            require_extension()
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
