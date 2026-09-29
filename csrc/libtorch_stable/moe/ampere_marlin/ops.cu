@@ -3,8 +3,8 @@
 // _ampere_marlin_C: vLLM's Marlin MoE GEMM host code (../marlin_moe_wna16/
 // ops.cu) compiled with the settings of common.h and registered as
 // torch.ops._ampere_marlin_C.prefill_gemm. Its final argument is caller-owned
-// float32 reduction scratch. Only explicit (thread_k 128, thread_n 256)
-// configurations at 32/48/64-row blocks are built; any other request fails
+// float32 reduction scratch. Explicit K128/N128 tiles are built for 32/48
+// rows and K128/N256 for 64 rows; any other request fails
 // with "Unsupported shapes".
 #include "libtorch_stable/moe/ampere_marlin/common.h"
 

@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Settings shared by the prefill translation units of _ampere_marlin_C:
 // MoE GEMM of ../marlin_moe_wna16/ compiled under its own namespace, with
-// (thread_k 128, thread_n 256) tiles at 256 threads for whole-expert prefill
-// on sm_80, and an early return for a launch whose block list is empty.
+// K128 fetch tiles with K64 accumulator ownership for whole-expert prefill
+// on sm_80: N128 at 128 threads for 32/48 rows, N256 at 256 threads for 64
+// rows. The 48-row tile uses three pipeline stages to fit two CTAs per SM.
+// Empty block lists return before accessing their inputs.
 // Nothing here changes _moe_C_stable_libtorch: it is built without these
 // macros.
 #pragma once
@@ -15,6 +17,6 @@
 
 #define MARLIN_NAMESPACE_NAME ampere_marlin
 #define MARLIN_MOE_EMPTY_LIST_RETURN
-#define MARLIN_MOE_MAX_THREADS 256
+#define MARLIN_MOE_K64_CHAINS
 #define MARLIN_MOE_KERNEL_SELECTOR \
   "libtorch_stable/moe/ampere_marlin/kernel_selector_wide.h"

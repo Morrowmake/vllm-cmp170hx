@@ -666,6 +666,20 @@ __global__ void Marlin(
       b_sh_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
+#ifdef MARLIN_MOE_K64_CHAINS
+  static_assert(a_type == vllm::kBFloat16 && b_type == vllm::kU4B8 &&
+                group_blocks == 8 && thread_k_blocks == 8 &&
+                !m_block_size_8 && b_sh_wr_iters == 4 &&
+                threads == 2 * b_sh_stride_threads);
+  // Each K warp row keeps its K64 pair in both halves of the K128 fetch:
+  // row 0 consumes k16 chunks 0,1,4,5; row 1 consumes 2,3,6,7.
+  constexpr int b_sh_rd_row_iters = 2;
+  auto k_fragment_offset = [](int k) { return 4 * (k / 2) + k % 2; };
+#else
+  constexpr int b_sh_rd_row_iters = b_sh_wr_iters;
+  auto k_fragment_offset = [](int k) { return k; };
+#endif
+
   // Scale sizes/strides
   int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
   constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
@@ -697,7 +711,7 @@ __global__ void Marlin(
   int a_sh_rd =
       a_sh_stride * ((threadIdx.x % 32) % (16 / (m_block_size_8 ? 2 : 1))) +
       (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
-  a_sh_rd += 2 * ((threadIdx.x / 32) / tb_n_warps) * b_sh_wr_iters;
+  a_sh_rd += 2 * ((threadIdx.x / 32) / tb_n_warps) * b_sh_rd_row_iters;
 
   int b_gl_rd;
   if (threads <= b_sh_stride) {
@@ -710,7 +724,7 @@ __global__ void Marlin(
   b_gl_rd += B_expert_off + b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
-  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
+  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_rd_row_iters - 1));
 
   int s_gl_rd;
   if constexpr (group_blocks == -1) {
@@ -813,7 +827,8 @@ __global__ void Marlin(
   for (int i = 0; i < b_sh_wr_iters; i++) {
   #pragma unroll
     for (int j = 0; j < thread_m_blocks; j++)
-      a_sh_rd_trans[i][j] = transform_a(2 * i + a_sh_rd_delta_i * j + a_sh_rd);
+      a_sh_rd_trans[i][j] =
+          transform_a(2 * k_fragment_offset(i) + a_sh_rd_delta_i * j + a_sh_rd);
   }
 
   // Since B-accesses have non-constant stride they have to be computed at
@@ -973,7 +988,8 @@ __global__ void Marlin(
   #pragma unroll
     for (int i = 0; i < b_thread_vecs; i++) {
       frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(
-          &sh_b_stage[b_sh_stride * (k % b_sh_wr_iters) + b_sh_rd + i]);
+          &sh_b_stage[b_sh_stride * k_fragment_offset(k % b_sh_wr_iters) +
+                      b_sh_rd + i]);
     }
   };
 
@@ -1732,9 +1748,9 @@ __global__ void Marlin(
   // Main loop.
   while (slice_iters) {
     // We unroll over both the global fetch and the register load pipeline to
-    // ensure all shared memory accesses are static. Note that both pipelines
-    // have even length meaning that the next iteration will always start at
-    // index 0.
+    // ensure all shared memory accesses are static. Each shared-memory tile
+    // consumes an even number of register fragments, so the two register
+    // buffers restart at index 0 independently of the number of stages.
 
   #pragma unroll
     for (int pipe = 0; pipe < stages;) {

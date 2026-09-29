@@ -304,6 +304,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   STD_TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
                   "marlin kernel only support Turing or newer GPUs.");
   int stages = 4;
+#ifdef MARLIN_MOE_K64_CHAINS
+  // K128/N128 with 48 rows needs three stages for two resident CTAs.
+  stages = thread_m_blocks == 3 ? 3 : 4;
+#endif
   if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
     STD_TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
@@ -323,10 +327,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
-#ifdef MARLIN_MOE_MAX_THREADS
-    thread_tfg = thread_config_t{
-        thread_k, thread_n,
-        std::min(MARLIN_MOE_MAX_THREADS, thread_k * thread_n / 64)};
+#ifdef MARLIN_MOE_K64_CHAINS
+    // Two K warp rows, independent of the K128 global fetch width.
+    thread_tfg = thread_config_t{thread_k, thread_n, thread_n};
 #else
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
 #endif

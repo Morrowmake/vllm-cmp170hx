@@ -8,8 +8,8 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4B8.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 8, false, 4, 8, false>( MARLIN_KERNEL_PARAMS );
-template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4B8.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 8, false, 4, 8, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4B8.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 128, 2, 8, 8, false, 4, 8, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4B8.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 128, 3, 8, 8, false, 3, 8, false>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4B8.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 8, false, 4, 8, false>( MARLIN_KERNEL_PARAMS );
 
 }

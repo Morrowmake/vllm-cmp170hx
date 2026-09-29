@@ -13,11 +13,12 @@ expert) and runs each Marlin GEMM as one launch per list, with the 64-row
 list on a (thread_k 64, thread_n 256, 1 block/SM) tile.  Everything else is
 the incumbent's: the same compiled Marlin kernels with fp32 reduce, the same
 activation (``layer.activation``), the same slot-order sum
-(``layer.moe_sum``), the same workspaces.  Marlin's per-row result does not
-depend on the block a row lands in, so the output is bitwise equal to
-``fused_marlin_moe`` on the measured PP shapes.  At N=512 it is not bitwise
-equal (measured); its error against an fp64 reference equals the
-incumbent's (1.00x mean and max on captured TP4 calls).  Under
+(``layer.moe_sum``), the same workspaces.  Split-cover scheduling can change
+stream-K boundaries and reduction order: measured PP outputs differ bitwise
+from unsplit ``fused_marlin_moe``.  The optional compiled prefill targets the
+released Python split-cover schedule, not unsplit equivalence.  At N=512
+split-cover outputs also differ bitwise (measured); error against an fp64
+reference equals the incumbent's (1.00x mean and max on captured TP4 calls).  Under
 TP4 the prefill overlap (two micro-batches) halves each chunk, so the calls
 see M = 1728 (x2 per 3456-token chunk) and 640/642 for a 1282-token tail,
 where the incumbent pads to 1.76x / 2.04x the routed rows and the split
@@ -70,7 +71,9 @@ CLAMP_LIMIT = 10.0
 # own exec-config choice.  Only configurations the compiled Marlin MoE library
 # already instantiates: (64, 256) at 256 threads exists for m-blocks 2..4.
 THREAD_CFG = {64: (64, 256, 1)}
-WIDE_THREAD_CFG = {64: (128, 256, 1), 48: (128, 256, 1), 32: (128, 256, 1)}
+# Retain the split-cover N tiles and stream-K grid while fetching K128.
+# The optional kernels use two K warp rows: 256/128 threads for N256/N128.
+WIDE_THREAD_CFG = {64: (128, 256, 1), 48: (128, 128, 2), 32: (128, 128, 2)}
 
 
 def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
