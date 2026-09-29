@@ -40,6 +40,7 @@ def build(out: Path, build_dir: Path, verbose: bool) -> None:
         f"-ffile-prefix-map={ROOT}=vllm",
         f"-ffile-prefix-map={build_dir}=build",
         f"-ffile-prefix-map={Path.home()}=source",
+        f"-ffile-prefix-map={Path(torch.__file__).resolve().parent}=torch",
     ]
     flags = ["-O3", "-std=c++20", "-DUSE_CUDA"]
     cuda_flags = [

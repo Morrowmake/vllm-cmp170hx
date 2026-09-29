@@ -1458,7 +1458,8 @@ if(VLLM_BUILD_AMPERE_MARLIN)
   foreach(_map
       "${CMAKE_CURRENT_SOURCE_DIR}=vllm"
       "${CMAKE_CURRENT_BINARY_DIR}=build"
-      "$ENV{HOME}=source")
+      "$ENV{HOME}=source"
+      "${TORCH_INSTALL_PREFIX}=torch")
     target_compile_options(_ampere_marlin_C PRIVATE
       "$<$<COMPILE_LANGUAGE:CXX>:-ffile-prefix-map=${_map}>"
       "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${_map}>")
