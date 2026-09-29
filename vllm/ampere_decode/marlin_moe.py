@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prebuilt sm_80 W4A16 MoE decode with the released routing/sum contract.
 
-The two GEMMs use fixed-order split-K reduction and the same bf16 rounding
-points as the released activation. ``layer.moe_sum`` retains slot-order sum,
+Sharded W13 uses fixed-order split-K reduction; whole-expert W13 uses Marlin's
+two-chain reduction grouping. Both retain the released bf16 rounding points. ``layer.moe_sum`` retains slot-order sum,
 shared-expert deferral, and the subsequent shared add/all-reduce. Fully masked
 CUDA-graph padding rows remain don't-care; no routing or padding flag changes.
 Persistent buffers are shared by serialized calls on each device, as are the
@@ -58,7 +58,10 @@ def _workspaces(device, N: int, max_tokens: int, *, create: bool):
         _RETIRED.append(ws)  # Existing graphs may still reference these tensors.
     ws = {
         "max_tokens": capacity,
-        "part": torch.zeros(4 * rows * 2 * N, device=device, dtype=torch.float32),
+        "part": torch.zeros(
+            (4 if N == 512 else 1) * rows * 2 * N,
+            device=device, dtype=torch.float32,
+        ),
         "h": torch.zeros(rows * N, device=device, dtype=torch.bfloat16),
         "c3": torch.zeros(rows * K_GATE, device=device, dtype=torch.bfloat16),
         "ctr": torch.zeros(2, device=device, dtype=torch.int32),

@@ -169,7 +169,8 @@ def test_decode_scratch_reserves_only_admitted_capacity(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     ws = decode._workspaces(torch.device("cpu"), width, requested, create=True)
     assert ws["max_tokens"] == capacity
-    assert ws["part"].numel() == 4 * capacity * 8 * 2 * width
+    split_planes = 4 if width == 512 else 1
+    assert ws["part"].numel() == split_planes * capacity * 8 * 2 * width
     assert ws["c3"].numel() == capacity * 8 * 4096
 
 
