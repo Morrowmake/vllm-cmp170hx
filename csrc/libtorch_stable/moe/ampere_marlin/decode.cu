@@ -13,7 +13,7 @@
  *   scales bf16 [E][K/128][N]: inside each 64-col chunk, col c sits at
  *   8*(c%8) + c/8, so lane (g) needs the 8 contiguous scales 8g..8g+7.
  *
- * Sharded W13 and W2 share one GEMM kernel; whole-expert W13 preserves Marlin's
+ * Sharded W13 and W2 share one GEMM kernel; whole-expert GEMMs preserve Marlin's
  * reduction grouping in a separate streaming kernel. Tokens (<= 8 per aligned block) are the
  * mma N dimension.  Every warp is independent: it takes warp-items (aligned block b,
  * TW adjacent 64-col tiles, k-slice ks of R k16 rows) from an integer work queue and
@@ -30,7 +30,8 @@
  *   w13: fp32 part[ks][slot][2N]; TP shards use four fixed splits, whole experts
  *        use the two-chain Marlin grouping and one full-sum plane (no atomics)
  *   act: fixed-order split-K sum -> bf16 (R1) -> clamp-silu-mul (R2, R3) -> h
- *   w2 : one k-slice; bf16(acc) (R4) * bf16(router w) -> bf16 (R5) -> c3[slot][K]
+ *   w2 : TP shards use one K chain; whole experts use the Marlin grouping above
+ *        bf16(acc) (R4) * bf16(router w) -> bf16 (R5) -> c3[slot][K]
  */
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -266,18 +267,19 @@ __global__ void __launch_bounds__(WARPS * 32)
   cp_async_wait<0>();
 }
 
-// Whole-expert W13 uses the block-8 Marlin arithmetic partition: 128 output
+// Whole-expert GEMMs use the block-8 Marlin arithmetic partition: 128 output
 // columns, 64 K values per tile, two K chains, and three reference CTAs per SM.
 // The streaming launch geometry is independent of this reduction geometry.
-template <int TW>
+template <int TW, bool W13>
 __global__ void __launch_bounds__(WARPS * 32)
-    moe_dec_w13(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
+    moe_dec_whole(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
                 const int4* __restrict__ W, const int4* __restrict__ S,
                 const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
-                const int32_t* __restrict__ ntpp, int n_slots, int topk_log2,
-                int reference_grid, int* __restrict__ ctr,
-                int* __restrict__ ctr_other, float* __restrict__ out) {
-  constexpr int K = 4096, N = 4096, CR = 8;
+                const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
+                int n_slots, int topk_log2, int reference_grid, int* __restrict__ ctr,
+                int* __restrict__ ctr_other, float* __restrict__ part,
+                __nv_bfloat16* __restrict__ out) {
+  constexpr int K = W13 ? 4096 : 2048, N = 4096, CR = 8;
   constexpr int K_TILES = K / 64, N_TILES = N / 128;
   constexpr int GROUPS = N / 64 / TW;
   constexpr int SLOT = CR * TW * 32;
@@ -309,7 +311,7 @@ __global__ void __launch_bounds__(WARPS * 32)
     const int tile = b * N_TILES + t0 / 2;
     const int e0 = eids[b], e = e0 < 0 ? 0 : e0;
     const int sid = sorted[b * 8 + g];
-    const int arow = e0 >= 0 && sid < n_slots ? sid >> topk_log2 : 0;
+    const int arow = e0 >= 0 && sid < n_slots ? (W13 ? sid >> topk_log2 : sid) : 0;
     const int4* const weights = W + (int64_t)e * (K / 16) * (N / 2) + t0 * 32 + lane;
     const int4* const scales = S + (int64_t)e * (K / 128) * (N / 8) + t0 * 8 + g;
     const uint32_t* const input =
@@ -393,6 +395,11 @@ __global__ void __launch_bounds__(WARPS * 32)
 
     const int s0 = sorted[b * 8 + 2 * c], s1 = sorted[b * 8 + 2 * c + 1];
     const bool v0 = e0 >= 0 && s0 < n_slots, v1 = e0 >= 0 && s1 < n_slots;
+    float w0 = 0.f, w1 = 0.f;
+    if constexpr (!W13) {
+      w0 = v0 ? __bfloat162float(__float2bfloat16(topk_w[s0])) : 0.f;
+      w1 = v1 ? __bfloat162float(__float2bfloat16(topk_w[s1])) : 0.f;
+    }
 #pragma unroll
     for (int u = 0; u < TW; u++)
 #pragma unroll
@@ -400,8 +407,15 @@ __global__ void __launch_bounds__(WARPS * 32)
 #pragma unroll
         for (int h = 0; h < 2; h++) {
           const int col = t0 * 64 + g + 64 * u + 16 * j + 8 * h;
-          if (v0) out[(int64_t)s0 * N + col] = total[u][j][2 * h];
-          if (v1) out[(int64_t)s1 * N + col] = total[u][j][2 * h + 1];
+          if constexpr (W13) {
+            if (v0) part[(int64_t)s0 * N + col] = total[u][j][2 * h];
+            if (v1) part[(int64_t)s1 * N + col] = total[u][j][2 * h + 1];
+          } else {
+            if (v0) out[(int64_t)s0 * N + col] = __float2bfloat16(
+                __bfloat162float(__float2bfloat16(total[u][j][2 * h])) * w0);
+            if (v1) out[(int64_t)s1 * N + col] = __float2bfloat16(
+                __bfloat162float(__float2bfloat16(total[u][j][2 * h + 1])) * w1);
+          }
         }
   }
 }
@@ -493,17 +507,18 @@ static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const
   return ksplit;
 }
 
-template <int TW>
-static int64_t launch_whole_w13(at::Tensor const& a, at::Tensor const& w,
+template <int TW, bool W13>
+static int64_t launch_whole(at::Tensor const& a, at::Tensor const& w,
                                 at::Tensor const& s, at::Tensor const& sorted,
                                 at::Tensor const& eids, at::Tensor const& ntpp,
-                                int64_t topk, int64_t n_slots, int cap,
+                                at::Tensor const& topk_w, int64_t topk, int64_t n_slots, int cap,
                                 at::Tensor& ctr, at::Tensor& out) {
   constexpr int N = 4096, CR = 8, T = WARPS * 32;
   constexpr int SMEM = WARPS * 2 * CR * TW * 32 * (int)sizeof(int4);
-  TORCH_CHECK(out.scalar_type() == at::kFloat && out.numel() >= n_slots * N,
-              "w13 full-sum buffer");
-  auto kern = moe_dec_w13<TW>;
+  TORCH_CHECK(out.scalar_type() == (W13 ? at::kFloat : at::kBFloat16) &&
+                  out.numel() >= n_slots * N,
+              "whole-expert output buffer");
+  auto kern = moe_dec_whole<TW, W13>;
   static const int occ = [&] {
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     int n = 0;
@@ -519,8 +534,10 @@ static int64_t launch_whole_w13(at::Tensor const& a, at::Tensor const& w,
     kern<<<grid, T, SMEM, at::cuda::getCurrentCUDAStream()>>>(
         (const __nv_bfloat16*)a.data_ptr(), a.stride(0), (const int4*)w.data_ptr(),
         (const int4*)s.data_ptr(), sorted.data_ptr<int32_t>(), eids.data_ptr<int32_t>(),
-        ntpp.data_ptr<int32_t>(), (int)n_slots, log2_exact(topk), 3 * sms,
-        ctr.data_ptr<int32_t>(), ctr.data_ptr<int32_t>() + 1, out.data_ptr<float>());
+        ntpp.data_ptr<int32_t>(), topk_w.data_ptr<float>(), (int)n_slots, log2_exact(topk),
+        3 * sms, ctr.data_ptr<int32_t>() + (W13 ? 0 : 1),
+        ctr.data_ptr<int32_t>() + (W13 ? 1 : 0), W13 ? out.data_ptr<float>() : nullptr,
+        W13 ? nullptr : (__nv_bfloat16*)out.data_ptr());
   return 1;
 }
 
@@ -548,10 +565,10 @@ int64_t ampere_marlin_decode_gemm(at::Tensor const& a, at::Tensor const& w, at::
   const at::cuda::OptionalCUDAGuard guard(a.device());
   if (w13 && K == 4096 && N == 4096 && rows == 64) {
     if ((cfg & 15) == 0)
-      return launch_whole_w13<1>(a, w, s, sorted, eids, ntpp, topk, n_slots,
+      return launch_whole<1, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots,
                                  (int)(cfg >> 4), ctr, out);
     if ((cfg & 15) == 1)
-      return launch_whole_w13<2>(a, w, s, sorted, eids, ntpp, topk, n_slots,
+      return launch_whole<2, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots,
                                  (int)(cfg >> 4), ctr, out);
   }
 #define AMPERE_MARLIN_CASE(RR, WW, CFG, CR, TW, KK, NN)                                                      \
@@ -563,7 +580,14 @@ int64_t ampere_marlin_decode_gemm(at::Tensor const& a, at::Tensor const& w, at::
   AMPERE_MARLIN_CASE(RR, WW, 1, 8, 2, KK, NN)
   AMPERE_MARLIN_CFGS(64, true, 4096, 1024)
   AMPERE_MARLIN_CFGS(32, false, 512, 4096)
-  AMPERE_MARLIN_CFGS(128, false, 2048, 4096)
+  if (!w13 && K == 2048 && N == 4096 && rows == 128) {
+    if ((cfg & 15) == 0)
+      return launch_whole<1, false>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots,
+                                    (int)(cfg >> 4), ctr, out);
+    if ((cfg & 15) == 1)
+      return launch_whole<2, false>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots,
+                                    (int)(cfg >> 4), ctr, out);
+  }
 #undef AMPERE_MARLIN_CFGS
 #undef AMPERE_MARLIN_CASE
   TORCH_CHECK(false, "unsupported rows=", rows, " w13=", w13, " cfg=", cfg);
