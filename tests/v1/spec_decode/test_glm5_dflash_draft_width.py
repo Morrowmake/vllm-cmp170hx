@@ -489,3 +489,75 @@ def test_dynamic_conv_kernel_matches_the_static_kernel(width):
         x, delta, base, torch.tensor([1 + width], dtype=torch.int32, device="cuda"),
         hidden // 64)
     assert torch.equal(dyn, static)
+
+
+@pytest.fixture()
+def gloo_tp1():
+    """A one-process gloo tensor-parallel group (CPU), for modules whose
+    layers ask for the TP group at construction."""
+    import contextlib
+    import os
+    import tempfile
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        with set_current_vllm_config(VllmConfig()):
+            init_distributed_environment(world_size=1, rank=0,
+                                         distributed_init_method=f"file://{path}",
+                                         local_rank=0, backend="gloo")
+            initialize_model_parallel(1, 1, backend="gloo")
+            yield
+        cleanup_dist_env_and_memory()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_conv_module_constructs_both_ways(gloo_tp1, dynamic):
+    """The real DFlashGroupedConv.__init__ (not a stub), both modes: with the
+    draft width on it owns a non-persistent block-length buffer, otherwise
+    none. Forward (prepare + finish) at every width: the dynamic module with
+    its block set to 1 + w equals a static module built for block 1 + w."""
+    from vllm.model_executor.models import qwen3_dflash2 as m
+
+    def build(block, dyn):
+        conv = m.DFlashGroupedConv(hidden_size=64, taps=3, group_size=8,
+                                   block_size=block, params_dtype=torch.float32,
+                                   prefix="t", dynamic_block=dyn)
+        g = torch.Generator().manual_seed(7)
+        with torch.no_grad():
+            conv.base_kernel.copy_(torch.randn(conv.base_kernel.shape, generator=g))
+            w = conv.kernel_projection.weight
+            w.copy_(torch.randn(w.shape, generator=g) * 0.1)
+        return conv
+
+    conv = build(6, dynamic)
+    if dynamic:
+        assert int(conv.block_size_tensor) == 6
+        assert "block_size_tensor" not in conv.state_dict()
+        assert "block_size_tensor" in dict(conv.named_buffers())
+    else:
+        assert conv.block_size_tensor is None
+        assert "block_size_tensor" not in dict(conv.named_buffers())
+    for width in (3, 4, 5):
+        x = torch.randn(3 * (1 + width), 64, generator=torch.Generator().manual_seed(width))
+        if dynamic:
+            conv.block_size_tensor.fill_(1 + width)
+            ref = build(1 + width, False)
+        else:
+            ref = build(6, False)
+        with torch.no_grad():
+            h, c = conv.prepare(x)
+            out = conv.finish(h, c)
+            h_ref, c_ref = ref.prepare(x)
+            out_ref = ref.finish(h_ref, c_ref)
+        assert torch.equal(out, out_ref), width

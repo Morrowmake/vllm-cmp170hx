@@ -321,13 +321,14 @@ class DFlashGroupedConv(nn.Module):
         # tokens per request) changes per step, so the conv reads it from
         # this device scalar (set by the drafter before each forward and
         # before each width's graph capture) rather than a compiled constant.
-        self.block_size_tensor: torch.Tensor | None = None
         if dynamic_block:
             self.register_buffer(
                 "block_size_tensor",
                 torch.tensor([block_size], dtype=torch.int32),
                 persistent=False,
             )
+        else:
+            self.block_size_tensor: torch.Tensor | None = None
         if hidden_size % group_size:
             raise ValueError(
                 f"conv_group_size={group_size} must divide hidden_size={hidden_size}."
