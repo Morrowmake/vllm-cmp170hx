@@ -313,7 +313,18 @@ class Scheduler(SchedulerInterface):
                         for n, k in enumerate(by_load, start=1)
                     ),
                 )
-            elif self.adaptive_k is not None:
+            if self.adaptive_k is not None and self.adaptive_k.config.accept:
+                cfg = self.adaptive_k.config
+                logger.info_once(
+                    "GLM-5 acceptance-aware DFlash depth active "
+                    "(VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT): each step's depth "
+                    "within the load width maximises expected tokens per unit "
+                    "step cost; costs %s for depths %s, hysteresis %.2f",
+                    str(cfg.accept_costs),
+                    str(cfg.allowed),
+                    cfg.accept_hysteresis,
+                )
+            if self.adaptive_k is not None and not self.adaptive_k.config.load_mode:
                 logger.info(
                     "Acceptance-adaptive speculative decoding enabled: "
                     "draft counts %s, ema=%.2f, margin=%.2f, quantile=%.2f",
@@ -700,6 +711,12 @@ class Scheduler(SchedulerInterface):
                 len(running) + len(self.waiting) + len(self.skipped_waiting)
             )
             k_want = config.k_for_load(num_reqs)
+            if config.accept:
+                # Acceptance-aware: within the load width, the depth that
+                # maximises the batch's expected tokens per unit step cost.
+                decoding = [r.request_id for r in running if not r.is_prefill_chunk]
+                if decoding:
+                    k_want = self.adaptive_k.select_by_acceptance(decoding, k_want)
             k_draft = k_want if config.draft_by_load else self.num_spec_tokens
         else:
             k_draft = k_want = self.adaptive_k.select_k(

@@ -214,6 +214,9 @@ if TYPE_CHECKING:
     VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
     VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
     VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS: str = ""
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
@@ -1869,6 +1872,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deepest block every step. Off: the deepest block, prefix verified.
     "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH": lambda: bool(
         int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH", "0"))
+    ),
+    # With VLLM_GLM5_DFLASH_ADAPTIVE_K: choose each step's depth from load
+    # and from recent draft acceptance (expected tokens per unit step cost);
+    # predictable text keeps the deep drafts, prose falls back. Costs: the
+    # relative step cost per draft count (ascending), empty = the layout
+    # default; HYST: the margin a new depth must win by.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT", "0"))
+    ),
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", ""
+    ),
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST": lambda: float(
+        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST", "0.03")
     ),
     # Chosen-depth histogram every N scheduler steps (0 = off).
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG": lambda: int(

@@ -1928,6 +1928,11 @@ class SpeculativeConfig:
         import vllm.envs as envs
 
         if not envs.VLLM_GLM5_DFLASH_ADAPTIVE_K:
+            if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
+                logger.warning_once(
+                    "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: it "
+                    "needs VLLM_GLM5_DFLASH_ADAPTIVE_K=1."
+                )
             if envs.VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH:
                 logger.warning_once(
                     "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH=1 set but off: it "
@@ -1977,6 +1982,43 @@ class SpeculativeConfig:
             # The drafter checks it can draft per width (greedy DFlash2) and
             # otherwise keeps its full block; the verified depth is the same.
             self.adaptive_k["draft_by_load"] = True
+        if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
+            accept = self._glm5_accept_depth_config(sorted(set(by_load)))
+            if accept is not None:
+                self.adaptive_k["accept"] = accept
+
+    def _glm5_accept_depth_config(self, allowed: list[int]) -> dict | None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: step costs per draft count
+        (VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS, else the layout default measured
+        on 4x CMP 170HX: depth 4 / 5 cost 1.08 / 1.16 of depth 3 with tensor
+        parallelism, 1.10 / 1.21 with pipeline parallelism) and hysteresis."""
+        import vllm.envs as envs
+
+        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS.replace(" ", "")
+        try:
+            costs = [float(x) for x in raw.split(",") if x]
+        except ValueError:
+            costs = None
+        if not raw:
+            pp = getattr(self.target_parallel_config, "pipeline_parallel_size", 1)
+            per_depth = 0.105 if (pp or 1) > 1 else 0.08
+            base = allowed[0]
+            costs = [1.0 + per_depth * (k - base) for k in allowed]
+            if allowed == [3, 4, 5]:
+                costs = [1.0, 1.10, 1.21] if (pp or 1) > 1 else [1.0, 1.08, 1.16]
+        if not costs or len(costs) != len(allowed) or min(costs) <= 0:
+            logger.warning_once(
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: "
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS=%r needs one positive cost "
+                "per draft count %s.",
+                raw,
+                str(allowed),
+            )
+            return None
+        return {
+            "costs": costs,
+            "hysteresis": max(0.0, min(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST, 0.5)),
+        }
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
