@@ -16,6 +16,7 @@ from tests.kernels import test_ampere_pp_marlin_prefill as pp_helpers
 from tests.kernels import test_ampere_tp4_marlin_prefill as tp_helpers
 
 DECODE = "VLLM_GLM5_MARLIN_DECODE_CUDA"
+VARIANT = "VLLM_GLM5_MARLIN_DECODE_VARIANT"
 PREFILL = "VLLM_GLM5_MARLIN_PREFILL_CUDA"
 
 
@@ -24,6 +25,7 @@ def isolated_optional_flags(monkeypatch):
     for name in (DECODE, PREFILL, "VLLM_GLM5_PP_MARLIN_PREFILL",
                  "VLLM_GLM5_TP4_MARLIN_PREFILL", "VLLM_GLM5_DECODE_IDX_GLUE"):
         monkeypatch.setenv(name, "0")
+    monkeypatch.delenv(VARIANT, raising=False)
     monkeypatch.setattr(ampere_marlin, "_OPS", None)
 
 
@@ -51,6 +53,41 @@ def test_independent_flags(monkeypatch, decode_flag, prefill_flag):
     assert envs.VLLM_GLM5_MARLIN_DECODE_CUDA is decode_flag
     assert envs.VLLM_GLM5_MARLIN_PREFILL_CUDA is prefill_flag
     assert (2048 in prefill.enabled_shapes()) is prefill_flag
+
+
+def test_decode_variant_defaults_to_orig_and_validates(monkeypatch):
+    assert envs.VLLM_GLM5_MARLIN_DECODE_VARIANT == "orig"
+    assert decode.variant() == "orig"
+    monkeypatch.setenv(VARIANT, "exact")
+    assert decode.variant() == "exact"
+    monkeypatch.setenv(VARIANT, "fast")
+    with pytest.raises(ValueError):
+        decode.variant()
+
+
+@pytest.mark.parametrize("name,suffix", [("orig", "_orig"), ("exact", "")])
+def test_decode_variant_selects_operators(name, suffix):
+    ops = SimpleNamespace(**{
+        f"decode_{op}{s}": f"{op}{s}" for op in ("gemm", "act") for s in ("", "_orig")
+    })
+    assert decode._ops_for(ops, name) == (f"gemm{suffix}", f"act{suffix}")
+
+
+@pytest.mark.parametrize("name,planes", [("orig", 4), ("exact", 1)])
+def test_decode_scratch_holds_variant_partials(monkeypatch, name, planes):
+    # Real allocation sizing on CPU with only CUDA stream queries replaced.
+    monkeypatch.setenv(VARIANT, name)
+    monkeypatch.setattr(decode, "_WORKSPACES", {})
+    monkeypatch.setattr(torch.cuda, "current_stream",
+                        lambda _device: SimpleNamespace(cuda_stream=0))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    ws = decode._workspaces(torch.device("cpu"), 512, 4, create=True)
+    assert ws["part"].numel() == planes * 32 * 8 * 2 * 512
+
+
+def test_older_library_without_orig_operators_is_rejected(monkeypatch):
+    assert "decode_gemm_orig" in ampere_marlin._SCHEMA_ARGUMENTS
+    assert "decode_act_orig" in ampere_marlin._SCHEMA_ARGUMENTS
 
 
 def test_missing_extension_is_actionable(monkeypatch):
@@ -165,8 +202,10 @@ prefill_weights = pp_helpers.weights
 
 
 @gpu
+@pytest.mark.parametrize("name", ["orig", "exact"])
 @pytest.mark.parametrize("M,active", [(4, 4), (16, 12), (24, 20), (32, 28)])
-def test_decode_accuracy_padding_and_graph(decode_weights, monkeypatch, M, active):
+def test_decode_accuracy_padding_and_graph(decode_weights, monkeypatch, M, active,
+                                           name):
     if torch.cuda.get_device_capability() != (8, 0):
         pytest.skip("SM 8.0 kernels")
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -175,6 +214,7 @@ def test_decode_accuracy_padding_and_graph(decode_weights, monkeypatch, M, activ
     )
 
     monkeypatch.setenv("VLLM_GLM5_DETERMINISTIC_MOE_ALIGN", "1")
+    monkeypatch.setenv(VARIANT, name)
     deterministic_moe_align_mode.cache_clear()
     hp = tp_helpers.hp
     layer = hp._gpu_layer(decode_weights)

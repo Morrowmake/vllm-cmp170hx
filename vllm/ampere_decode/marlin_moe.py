@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prebuilt sm_80 W4A16 MoE decode with the released routing/sum contract.
 
-Sharded and whole-expert GEMMs use the admitted block-8 Marlin two-chain/stripe
-reduction and a single full-sum W13 plane, retaining the released bf16 rounding
-points. This descriptor is not a universal Marlin auto-selector; equivalence
+Two reduction orders are built into the library and chosen by
+``VLLM_GLM5_MARLIN_DECODE_VARIANT``. ``orig`` (the default) splits the W13
+projection four ways along K into fixed-order fp32 partials; it is faster and
+changes the fp32 summation order, so decoded text may differ from the released
+kernels while staying within their fp64 accuracy bounds. ``exact`` makes
+sharded and whole-expert GEMMs use the admitted block-8 Marlin two-chain/stripe
+reduction and a single full-sum W13 plane. Both retain the released bf16
+rounding points. This descriptor is not a universal Marlin auto-selector; equivalence
 admission must bind the ordinary binary and device. ``layer.moe_sum`` retains slot-order sum,
 shared-expert deferral, and the subsequent shared add/all-reduce. Fully masked
 CUDA-graph padding rows remain don't-care; no routing or padding flag changes.
@@ -29,6 +34,8 @@ MAX_TOKENS = 32
 _SCRATCH_TOKENS = {512: MAX_TOKENS, 2048: 8}
 W13_ROWS = 64
 _WORKSPACES: dict = {}
+# W13 fp32 partial planes per variant (the original kernel splits K four ways).
+_W13_PLANES = {"orig": 4, "exact": 1}
 _RETIRED: list = []
 
 
@@ -40,12 +47,24 @@ def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
     )
 
 
+def variant() -> str:
+    return envs.VLLM_GLM5_MARLIN_DECODE_VARIANT
+
+
+def _ops_for(ops, name: str):
+    """(gemm, act) operators of the selected reduction order."""
+    if name == "orig":
+        return ops.decode_gemm_orig, ops.decode_act_orig
+    return ops.decode_gemm, ops.decode_act
+
+
 def _config(num_tokens: int) -> tuple[int, int]:
     return (49 if num_tokens >= 16 else 0, 49 if num_tokens > 16 else 0)
 
 
 def _workspaces(device, N: int, max_tokens: int, *, create: bool):
-    key = (str(device), torch.cuda.current_stream(device).cuda_stream, N)
+    planes = _W13_PLANES[variant()]
+    key = (str(device), torch.cuda.current_stream(device).cuda_stream, N, planes)
     ws = _WORKSPACES.get(key)
     if ws is not None and ws["max_tokens"] >= max_tokens:
         return ws
@@ -61,7 +80,7 @@ def _workspaces(device, N: int, max_tokens: int, *, create: bool):
     ws = {
         "max_tokens": capacity,
         "part": torch.zeros(
-            rows * 2 * N,
+            planes * rows * 2 * N,
             device=device, dtype=torch.float32,
         ),
         "h": torch.zeros(rows * N, device=device, dtype=torch.bfloat16),
@@ -160,7 +179,8 @@ def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
         return False
     logger.info_once(
         "Compiled Marlin MoE decode active (VLLM_GLM5_MARLIN_DECODE_CUDA): "
-        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in {4, 8}."
+        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in {4, 8}; "
+        "variant=%s (VLLM_GLM5_MARLIN_DECODE_VARIANT).", variant(),
     )
     run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids, activation)
     return True
@@ -175,7 +195,7 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     """
     from vllm.ampere_marlin import require_extension
 
-    ops = require_extension()
+    decode_gemm, decode_act = _ops_for(require_extension(), variant())
     M, K = hidden_states.shape
     N = w2.size(1) * 16
     ws = _workspaces(hidden_states.device, N, M, create=False)
@@ -192,13 +212,13 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     c3 = ws["c3"][:slots * K].view(slots, K)
     tw = topk_weights.view(-1)
     c13, c2 = _config(M)
-    ksplit = ops.decode_gemm(
+    ksplit = decode_gemm(
         hidden_states, w1, layer.w1_scale, sorted_ids, expert_ids, ntpp, tw,
         TOPK_GATE, slots, K, 2 * N, True, W13_ROWS, c13, ws["ctr"], ws["part"],
     )
-    ops.decode_act(ws["part"], topk_ids.view(-1), ksplit, slots, N,
+    decode_act(ws["part"], topk_ids.view(-1), ksplit, slots, N,
                    layer.activation_config.clamp_limit, h)
-    ops.decode_gemm(
+    decode_gemm(
         h, w2, layer.w2_scale, sorted_ids, expert_ids, ntpp, tw,
         TOPK_GATE, slots, N, K, False, N // 16, c2, ws["ctr"], c3,
     )
@@ -230,6 +250,10 @@ def warmup_from_worker(worker):
     device = torch.device(worker.device)
     if device.type != "cuda" or not _is_sm80(device):
         return
+    logger.info_once(
+        "[ampere-marlin] compiled decode variant=%s "
+        "(VLLM_GLM5_MARLIN_DECODE_VARIANT=orig|exact).", variant(),
+    )
     model_config = worker.vllm_config.model_config
     cfg = getattr(model_config, "hf_text_config", None) or model_config.hf_config
     if (getattr(cfg, "n_routed_experts", 0) != E_GATE

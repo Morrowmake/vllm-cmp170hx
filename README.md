@@ -129,7 +129,10 @@ acceptance-adaptive draft count, off unless set — `adaptive_k` in
 **Optional compiled Marlin.** One sm_80 library, `vllm._ampere_marlin_C`, for
 both layouts: `VLLM_GLM5_MARLIN_DECODE_CUDA` (eligible small batches) and
 `VLLM_GLM5_MARLIN_PREFILL_CUDA` (PP4). Requesting either without a compatible
-library fails at startup rather than falling back silently.
+library fails at startup rather than falling back silently. The decode kernels
+come in two reduction orders, chosen by `VLLM_GLM5_MARLIN_DECODE_VARIANT`:
+`orig` (default; splits the first projection along K, faster, changes the fp32
+summation order) and `exact` (the released Marlin summation order).
 
 **Correctness fixes (always on).** 64-bit KV row offsets in the
 sparse-attention kernels and a vocabulary clamp in the sampler kernels.

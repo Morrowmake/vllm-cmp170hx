@@ -243,6 +243,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
     VLLM_GLM5_MARLIN_PREFILL_CUDA: bool = False
+    VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1997,6 +1998,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_MARLIN_PREFILL_CUDA": lambda: bool(
         int(os.getenv("VLLM_GLM5_MARLIN_PREFILL_CUDA", "0"))
+    ),
+    # Reduction order of the compiled decode kernels when
+    # VLLM_GLM5_MARLIN_DECODE_CUDA is on: "orig" (default) splits the w13
+    # projection four ways along K (faster, different fp32 summation order);
+    # "exact" keeps the released Marlin summation order.
+    "VLLM_GLM5_MARLIN_DECODE_VARIANT": env_with_choices(
+        "VLLM_GLM5_MARLIN_DECODE_VARIANT", "orig", ["orig", "exact"]
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if

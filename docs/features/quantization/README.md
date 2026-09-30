@@ -47,6 +47,13 @@ Both runtime flags default to `0` and are independent:
 | `VLLM_GLM5_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, exactly 4 or 8 tokens |
 | `VLLM_GLM5_MARLIN_PREFILL_CUDA=1` | PP4 intermediate width 2048, 384–2304 tokens inclusive |
 
+`VLLM_GLM5_MARLIN_DECODE_VARIANT` selects the decode reduction order: `orig`
+(default) splits the first projection four ways along K into fixed-order fp32
+partials, which is faster but sums in a different order from the released
+kernels, so decoded text can differ while staying within their accuracy
+bounds; `exact` keeps the released Marlin summation order. Both are in the same
+library; the startup log names the active variant.
+
 All paths require SM 8.0, bf16 activations, 288 local/global experts, top-8
 routing, hidden width 4096, uint4b8 group-128 weights, and SiLU with clamp
 10.0. Expert maps, LoRA, activation quantization, zero points, biases,

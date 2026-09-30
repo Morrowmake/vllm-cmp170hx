@@ -24,6 +24,16 @@ _SCHEMA_ARGUMENTS = {
         "Tensor Tensor int int int float Tensor",
         "",
     ),
+    "decode_gemm_orig": (
+        "a w s sorted eids ntpp topk_w topk n_slots K N w13 rows cfg ctr out",
+        "Tensor Tensor Tensor Tensor Tensor Tensor Tensor int int int int bool int int Tensor Tensor",
+        "int",
+    ),
+    "decode_act_orig": (
+        "part ids ksplit n_slots Nh limit h",
+        "Tensor Tensor int int int float Tensor",
+        "",
+    ),
     "prefill_gemm": (
         "a c_or_none b_q_weight b_bias_or_none b_scales a_scales global_scale "
         "b_zeros_or_none workspace sorted_token_ids expert_ids "
