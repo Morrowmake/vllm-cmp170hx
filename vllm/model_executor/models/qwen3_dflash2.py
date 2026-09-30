@@ -150,6 +150,117 @@ def dflash2_grouped_conv(
     return torch.ops.vllm.dflash2_grouped_conv(x, delta, base, block_size, group_size)
 
 
+@triton.jit
+def _dflash2_grouped_conv_dyn_kernel(
+    x_ptr,
+    delta_ptr,
+    base_ptr,
+    output_ptr,
+    block_size_ptr,
+    x_stride_row,
+    delta_stride_row,
+    delta_stride_tap,
+    base_stride_tap,
+    output_stride_row,
+    NUM_CHANNELS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    TAPS: tl.constexpr,
+    ELEMENT_BLOCK: tl.constexpr,
+) -> None:
+    """_dflash2_grouped_conv_kernel with the per-request block length read
+    from device memory (load-following draft width): the same arithmetic,
+    only the block length is a runtime value instead of a constant."""
+    row = tl.program_id(0) // triton.cdiv(NUM_CHANNELS, ELEMENT_BLOCK)
+    col_block = tl.program_id(0) % triton.cdiv(NUM_CHANNELS, ELEMENT_BLOCK)
+    channels = col_block * ELEMENT_BLOCK + tl.arange(0, ELEMENT_BLOCK)
+    mask = channels < NUM_CHANNELS
+    groups = channels // GROUP_SIZE
+    position = row % tl.load(block_size_ptr)
+
+    delta_row = delta_ptr + row * delta_stride_row
+    x_row = x_ptr + row * x_stride_row
+    accumulator = (
+        tl.load(base_ptr + channels, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(delta_row + groups, mask=mask, other=0.0).to(tl.float32)
+    ) * tl.load(x_row + channels, mask=mask, other=0.0).to(tl.float32)
+
+    for tap in tl.static_range(1, TAPS):
+        tap_mask = mask & (position >= tap)
+        coefficient = tl.load(
+            base_ptr + tap * base_stride_tap + channels,
+            mask=tap_mask,
+            other=0.0,
+        ).to(tl.float32) + tl.load(
+            delta_row + tap * delta_stride_tap + groups,
+            mask=tap_mask,
+            other=0.0,
+        ).to(tl.float32)
+        x = tl.load(
+            x_ptr + (row - tap) * x_stride_row + channels,
+            mask=tap_mask,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += coefficient * x
+
+    tl.store(
+        output_ptr + row * output_stride_row + channels,
+        accumulator,
+        mask=mask,
+    )
+
+
+def dflash2_grouped_conv_dyn_impl(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    num_rows, num_channels = x.shape
+    output = torch.empty_like(x)
+    if num_rows == 0:
+        return output
+
+    element_block = 1024 if num_rows >= 128 and num_channels % 1024 == 0 else 512
+    grid = (num_rows * triton.cdiv(num_channels, element_block),)
+    _dflash2_grouped_conv_dyn_kernel[grid](
+        x,
+        delta,
+        base,
+        output,
+        block_size,
+        x.stride(0),
+        delta.stride(0),
+        delta.stride(1),
+        base.stride(0),
+        output.stride(0),
+        NUM_CHANNELS=num_channels,
+        GROUP_SIZE=group_size,
+        TAPS=base.shape[0],
+        ELEMENT_BLOCK=element_block,
+        num_warps=4,
+    )
+    return output
+
+
+def dflash2_grouped_conv_dyn_fake(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="dflash2_grouped_conv_dyn",
+    op_func=dflash2_grouped_conv_dyn_impl,
+    fake_impl=dflash2_grouped_conv_dyn_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _grouped_conv(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
@@ -158,9 +269,16 @@ def _grouped_conv(
     num_groups: int,
     group_size: int,
     taps: int,
+    block_size_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if hidden_states.is_cuda:
+        if block_size_tensor is not None:
+            return torch.ops.vllm.dflash2_grouped_conv_dyn(
+                hidden_states, delta, base, block_size_tensor, group_size
+            )
         return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
+    if block_size_tensor is not None:
+        block_size = int(block_size_tensor.item())
 
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
@@ -176,6 +294,16 @@ def _grouped_conv(
     return output.flatten(-2)
 
 
+def _load_following_width(vllm_config: VllmConfig) -> bool:
+    """Whether the drafter drafts per-step widths
+    (VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH), so the conv's block length varies."""
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+        load_following_draft_widths,
+    )
+
+    return bool(load_following_draft_widths(vllm_config))
+
+
 class DFlashGroupedConv(nn.Module):
     def __init__(
         self,
@@ -186,8 +314,20 @@ class DFlashGroupedConv(nn.Module):
         params_dtype: torch.dtype,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
+        dynamic_block: bool = False,
     ) -> None:
         super().__init__()
+        # Load-following draft width: the block length (bonus + drafted
+        # tokens per request) changes per step, so the conv reads it from
+        # this device scalar (set by the drafter before each forward and
+        # before each width's graph capture) rather than a compiled constant.
+        self.block_size_tensor: torch.Tensor | None = None
+        if dynamic_block:
+            self.register_buffer(
+                "block_size_tensor",
+                torch.tensor([block_size], dtype=torch.int32),
+                persistent=False,
+            )
         if hidden_size % group_size:
             raise ValueError(
                 f"conv_group_size={group_size} must divide hidden_size={hidden_size}."
@@ -221,6 +361,7 @@ class DFlashGroupedConv(nn.Module):
             self.num_groups,
             self.group_size,
             self.taps,
+            self.block_size_tensor,
         )
 
     def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -263,6 +404,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             group_size=int(draft_config["conv_group_size"]),
             # Query tokens per request: the bonus token plus the mask tokens.
             block_size=1 + speculative_config.num_speculative_tokens,
+            dynamic_block=_load_following_width(vllm_config),
             params_dtype=vllm_config.model_config.dtype,
             quant_config=quant_config,
         )

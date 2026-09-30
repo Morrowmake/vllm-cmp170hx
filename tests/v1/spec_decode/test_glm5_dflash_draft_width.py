@@ -401,3 +401,91 @@ def test_drafter_gate_warning_logs_on_a_non_first_rank(monkeypatch, caplog_vllm)
     assert sm.load_following_draft_widths(cfg, log=True) == ()
     assert any("keeps its full block: needs greedy draft sampling" in r.getMessage()
                for r in caplog_vllm.records)
+
+
+# ------------------------------------------- the drafter's block-length conv
+
+
+def _conv_inputs(rows, hidden=64, groups=8, taps=3, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(rows, hidden, generator=g)
+    delta = torch.randn(rows, taps, groups, generator=g)
+    base = torch.randn(taps, hidden, generator=g)
+    return x, delta, base
+
+
+@pytest.mark.parametrize("width", [3, 4, 5])
+@pytest.mark.parametrize("num_reqs", [1, 2, 8])
+def test_dynamic_conv_equals_a_drafter_of_that_width(width, num_reqs):
+    """A width-w step in a K=5 drafter convolves each request's 1+w block as a
+    K=w drafter does -- the block length follows the step, not the config."""
+    from vllm.model_executor.models import qwen3_dflash2 as m
+
+    x, delta, base = _conv_inputs(num_reqs * (1 + width))
+    k_w = m._grouped_conv(x, delta, base, 1 + width, 8, 8, 3)
+    dyn = m._grouped_conv(x, delta, base, 6, 8, 8, 3,
+                          block_size_tensor=torch.tensor([1 + width], dtype=torch.int32))
+    assert torch.equal(dyn, k_w)
+
+
+def test_fixed_block_length_mixes_requests_at_a_narrow_width():
+    """The bug the dynamic block fixes: with the configured block (6) a width-3
+    step's blocks of 4 are misaligned, so the conv reads across requests."""
+    from vllm.model_executor.models import qwen3_dflash2 as m
+
+    x, delta, base = _conv_inputs(2 * 4)
+    assert not torch.equal(m._grouped_conv(x, delta, base, 6, 8, 8, 3),
+                           m._grouped_conv(x, delta, base, 4, 8, 8, 3))
+
+
+def test_conv_module_gets_a_block_tensor_only_with_width_mode():
+    from vllm.model_executor.models import qwen3_dflash2 as m
+
+    static = object.__new__(m.DFlashGroupedConv)
+    torch.nn.Module.__init__(static)
+    static.block_size_tensor = None
+    assert static.block_size_tensor is None
+    cfg = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            adaptive_k_config=AdaptiveKConfig.from_dict(BY_LOAD_WIDTH, 5),
+            draft_sample_method="greedy", enable_adaptive_verification=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1))
+    assert m._load_following_width(cfg) is True
+    cfg.speculative_config.adaptive_k_config = AdaptiveKConfig.from_dict(
+        {"by_load": [5, 4, 3]}, 5)
+    assert m._load_following_width(cfg) is False
+
+
+def test_set_width_writes_the_block_length_into_the_drafter():
+    s, _ = _drafter(5, (3, 4, 5), 5, 2, 0, False)
+    tensors = [torch.tensor([6], dtype=torch.int32) for _ in range(3)]
+    s.model = torch.nn.Module()
+    for i, t in enumerate(tensors):
+        sub = torch.nn.Module()
+        sub.block_size_tensor = t
+        s.model.add_module(f"conv{i}", sub)
+    s._block_size_tensors = None
+    s._model_block_size = None
+    s.set_width(3)
+    assert all(int(t) == 4 for t in tensors)
+    s.set_width(4)
+    assert all(int(t) == 5 for t in tensors)
+    s.set_width(5)
+    assert all(int(t) == 6 for t in tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("width", [3, 4, 5])
+def test_dynamic_conv_kernel_matches_the_static_kernel(width):
+    """GPU: the runtime-block Triton kernel gives the static kernel's output
+    bit for bit at every width (both fp32-accumulate the same terms)."""
+    from vllm.model_executor.models import qwen3_dflash2 as m
+
+    num_reqs, hidden = 8, 1024
+    x, delta, base = (t.cuda().to(torch.bfloat16)
+                      for t in _conv_inputs(num_reqs * (1 + width), hidden, 64, 3))
+    static = m.dflash2_grouped_conv_impl(x, delta, base, 1 + width, hidden // 64)
+    dyn = m.dflash2_grouped_conv_dyn_impl(
+        x, delta, base, torch.tensor([1 + width], dtype=torch.int32, device="cuda"),
+        hidden // 64)
+    assert torch.equal(dyn, static)

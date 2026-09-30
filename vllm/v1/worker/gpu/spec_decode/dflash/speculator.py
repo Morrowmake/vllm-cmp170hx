@@ -146,7 +146,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_col = self._sample_cols[width]
         if width in self._cg_managers:
             self.query_cudagraph_manager = self._cg_managers[width]
+        self._set_model_block_size(1 + width)
         self._on_width(width)
+
+    def _set_model_block_size(self, block_size: int) -> None:
+        """Tell a drafter whose layers depend on the per-request block length
+        (DFlash2's grouped conv) the length this width drafts. A device
+        scalar written on the stream, so eager, compiled and captured
+        forwards all read the current value; written only on a change."""
+        model = getattr(self, "model", None)
+        if not isinstance(model, nn.Module) or len(getattr(self, "widths", ())) < 2:
+            return
+        tensors = getattr(self, "_block_size_tensors", None)
+        if tensors is None:
+            tensors = self._block_size_tensors = [
+                m.block_size_tensor
+                for m in model.modules()
+                if getattr(m, "block_size_tensor", None) is not None
+            ]
+        if tensors and getattr(self, "_model_block_size", None) != block_size:
+            for t in tensors:
+                t.fill_(block_size)
+            self._model_block_size = block_size
 
     def _on_width(self, width: int) -> None:
         """Subclass hook for per-width state."""
