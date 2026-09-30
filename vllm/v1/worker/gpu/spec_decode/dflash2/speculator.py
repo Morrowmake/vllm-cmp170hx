@@ -118,10 +118,13 @@ def _cache_draft_logits_kernel(
     tl.store(cached_candidate_ptr + cache_base + offsets, token_ids, mask=mask)
 
 
-def load_following_draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
+def load_following_draft_widths(
+    vllm_config: VllmConfig, log: bool = False
+) -> tuple[int, ...]:
     """Draft widths for VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH, or () when the
     drafter keeps its configured width. Taken from the config alone, so every
-    pipeline stage reaches the same answer."""
+    pipeline stage reaches the same answer. ``log``: say why the gate is
+    closed (the drafter's process only)."""
     spec = getattr(vllm_config, "speculative_config", None)
     config = getattr(spec, "adaptive_k_config", None) if spec is not None else None
     if config is None or not getattr(config, "draft_by_load", False):
@@ -134,13 +137,28 @@ def load_following_draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
     elif vllm_config.parallel_config.data_parallel_size != 1:
         reason = "not with data parallelism"
     if reason:
-        logger.warning_once(
-            "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH=1 set but the drafter keeps "
-            "its full block: %s.",
-            reason,
-        )
+        if log:
+            # Plain warning, not *_once: the drafter lives on the last pipeline
+            # stage, and *_once logs only on the local first rank.
+            logger.warning(
+                "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH=1 set but the drafter "
+                "keeps its full block: %s.",
+                reason,
+            )
         return ()
     return tuple(config.allowed)
+
+
+def log_draft_width_banner(widths) -> None:
+    """The drafter's banner. A plain info line, once per drafter (one per
+    process): the drafter lives on the last pipeline stage, where *_once
+    (local first rank only) would never print it."""
+    logger.info(
+        "GLM-5 load-following DFlash draft width active "
+        "(VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH): the drafter drafts the width "
+        "the next step verifies; drafter graphs for widths %s",
+        tuple(widths),
+    )
 
 
 class CandidateSampler:
@@ -246,18 +264,13 @@ class DFlash2Speculator(DFlashSpeculator):
         self._anchor_indices_by_width: dict[int, torch.Tensor] = {}
         # Plain DFlash2 only: LiLiCorr scores its candidates its own way.
         widths = (
-            load_following_draft_widths(vllm_config)
+            load_following_draft_widths(vllm_config, log=True)
             if type(self) is DFlash2Speculator
             else ()
         )
         if widths:
             self.enable_draft_widths(widths)
-            logger.info_once(
-                "GLM-5 load-following DFlash draft width active "
-                "(VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH): the drafter drafts "
-                "the width the next step verifies; drafter graphs for widths %s",
-                str(self.widths),  # *_once args must hash
-            )
+            log_draft_width_banner(self.widths)
 
     def _on_width(self, width: int) -> None:
         self.candidate_sampler.num_steps = width

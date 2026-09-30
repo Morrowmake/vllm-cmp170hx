@@ -360,3 +360,44 @@ def test_tail_rows_table_per_width_and_single_width():
     assert c._rows(3, 3) == 4 and c._rows(3, 4) == 3
     c.rows_table = {1: 1, 2: 2, 3: 4}  # one width: request count -> rows
     assert c._rows(3, 5) == 4
+
+
+# ------------------------------------------------- logs on a non-first rank
+
+
+def _not_local_first_rank(monkeypatch):
+    """A pipeline stage other than the first: *_once would print nothing."""
+    import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(ps, "is_local_first_rank", lambda: False)
+    monkeypatch.setattr(ps, "is_global_first_rank", lambda: False)
+
+
+def test_drafter_banner_logs_on_a_non_first_rank(monkeypatch, caplog_vllm):
+    _not_local_first_rank(monkeypatch)
+    from vllm.logger import init_logger
+
+    # The premise: a *_once line is dropped on this rank ...
+    init_logger("vllm.test_draft_width").info_once("once-only line %s", "x")
+    # ... while the drafter's banner still prints.
+    sm.log_draft_width_banner((3, 4, 5))
+    messages = [r.getMessage() for r in caplog_vllm.records]
+    assert not any("once-only line" in m for m in messages)
+    assert any(
+        "GLM-5 load-following DFlash draft width active" in m and "(3, 4, 5)" in m
+        for m in messages
+    ), messages
+
+
+def test_drafter_gate_warning_logs_on_a_non_first_rank(monkeypatch, caplog_vllm):
+    _not_local_first_rank(monkeypatch)
+    cfg = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            adaptive_k_config=AdaptiveKConfig.from_dict(BY_LOAD_WIDTH, 5),
+            draft_sample_method="probabilistic", enable_adaptive_verification=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1))
+    assert sm.load_following_draft_widths(cfg) == ()
+    assert not any("keeps its full block" in r.getMessage() for r in caplog_vllm.records)
+    assert sm.load_following_draft_widths(cfg, log=True) == ()
+    assert any("keeps its full block: needs greedy draft sampling" in r.getMessage()
+               for r in caplog_vllm.records)
