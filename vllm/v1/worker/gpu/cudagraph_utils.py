@@ -276,6 +276,10 @@ class CudaGraphManager:
         # double that answers every predicate truthily) still lands on the
         # ordinary single-query-length path.
         adaptive_k_counts = self._adaptive_k_draft_counts()
+        # Query length -> most requests a uniform decode batch of that length
+        # can hold (load-adaptive depth verifies deep drafts only when few
+        # requests run); absent means max_num_reqs.
+        decode_max_reqs: dict[int, int] = {}
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
@@ -308,6 +312,14 @@ class CudaGraphManager:
                 num_spec + num_new_sampled_tokens_per_step
                 for num_spec in adaptive_k_counts
             )
+            adaptive_k_config = speculative_config.adaptive_k_config
+            if getattr(adaptive_k_config, "load_mode", False):
+                decode_max_reqs = {
+                    num_spec + num_new_sampled_tokens_per_step: (
+                        adaptive_k_config.max_reqs_for(num_spec, self.max_num_reqs)
+                    )
+                    for num_spec in adaptive_k_counts
+                }
         else:
             decode_query_lens = [self.decode_query_len]
 
@@ -339,6 +351,8 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                        or rounded_num_reqs
+                        > decode_max_reqs.get(decode_query_len, self.max_num_reqs)
                     ):
                         continue
 

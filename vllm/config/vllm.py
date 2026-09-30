@@ -2503,6 +2503,32 @@ class VllmConfig:
                             ):
                                 widest_batch[num_spec + 1] = batch_size
                             decode_tiers = list(widest_batch.items())
+                    adaptive_k_config = (
+                        speculative_config.adaptive_k_config
+                        if speculative_config is not None
+                        else None
+                    )
+                    if adaptive_k_config is not None and adaptive_k_config.load_mode:
+                        # Load-adaptive depth: each draft count is verified
+                        # only up to its request count, and the widest batch
+                        # runs at the last (configured) depth, so size the
+                        # graph ceiling from that depth. This keeps the mixed
+                        # graph set of the configured depth unchanged.
+                        base_query_len = adaptive_k_config.by_load[-1] + 1
+                        max_cudagraph_capture_size = min(
+                            max_num_seqs * base_query_len * 2,
+                            default_max_graph_size,
+                        )
+                        decode_tiers = [
+                            (k + 1, tier_max_reqs)
+                            for k in adaptive_k_config.allowed
+                            if (
+                                tier_max_reqs := adaptive_k_config.max_reqs_for(
+                                    k, max_num_seqs
+                                )
+                            )
+                            > 0
+                        ]
 
                     uniform_decode_sizes = sorted(
                         {

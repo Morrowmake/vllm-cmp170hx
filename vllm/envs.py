@@ -210,6 +210,9 @@ if TYPE_CHECKING:
     VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
@@ -1847,6 +1850,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # row is unchanged; the unreachable tail is simply not allocated.
     "VLLM_GLM5_DRAFTER_ROPE_FIT": lambda: bool(
         int(os.getenv("VLLM_GLM5_DRAFTER_ROPE_FIT", "0"))
+    ),
+    # Load-adaptive DFlash draft depth. The drafter produces the widest block
+    # every step and each step verifies a prefix whose length follows the
+    # number of requests in the server: VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS
+    # lists the depth for 1, 2, ... requests; beyond the list the configured
+    # num_speculative_tokens applies. Off: the configured depth every step.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K", "0"))
+    ),
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "5,4"
+    ),
+    # Chosen-depth histogram every N scheduler steps (0 = off).
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG": lambda: int(
+        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG", "0")
     ),
     # Size the sparse indexer's K-gather workspace (and the metadata builder's
     # chunk limit) by what one step can gather, max_num_seqs *

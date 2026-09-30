@@ -301,6 +301,19 @@ class Scheduler(SchedulerInterface):
                 self.adaptive_k = AdaptiveKPolicy(
                     speculative_config.adaptive_k_config
                 )
+            if self.adaptive_k is not None and self.adaptive_k.config.load_mode:
+                by_load = self.adaptive_k.config.by_load
+                logger.info_once(
+                    "GLM-5 load-adaptive DFlash depth active "
+                    "(VLLM_GLM5_DFLASH_ADAPTIVE_K): drafts %d per step, "
+                    "verifies %s requests",
+                    self.num_spec_tokens,
+                    ", ".join(
+                        f"{k} at {n}" if n < len(by_load) else f"{k} at >= {n}"
+                        for n, k in enumerate(by_load, start=1)
+                    ),
+                )
+            elif self.adaptive_k is not None:
                 logger.info(
                     "Acceptance-adaptive speculative decoding enabled: "
                     "draft counts %s, ema=%.2f, margin=%.2f, quantile=%.2f",
@@ -675,13 +688,27 @@ class Scheduler(SchedulerInterface):
         running = self.running
         if not running:
             return self.num_spec_tokens, self.num_spec_tokens
-        k_draft = self.adaptive_k.select_k([r.request_id for r in running])
+        config = self.adaptive_k.config
+        if config.load_mode:
+            # Load mode: the drafter always produces its full block (a DFlash
+            # block is one fixed-shape pass), so drafts are never the limit
+            # after the first step; the width follows every request the
+            # server holds, waiting ones included.
+            k_draft = self.num_spec_tokens
+            num_reqs = (
+                len(running) + len(self.waiting) + len(self.skipped_waiting)
+            )
+            k_want = config.k_for_load(num_reqs)
+        else:
+            k_draft = k_want = self.adaptive_k.select_k(
+                [r.request_id for r in running]
+            )
 
         available = min(
             (len(r.spec_token_ids) for r in running if r.spec_token_ids),
             default=k_draft,
         )
-        k_verify = k_draft if available >= k_draft else self.adaptive_k.snap(available)
+        k_verify = k_want if available >= k_want else self.adaptive_k.snap(available)
 
         for request in running:
             if len(request.spec_token_ids) > k_verify:
