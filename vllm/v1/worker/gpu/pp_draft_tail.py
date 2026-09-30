@@ -86,7 +86,8 @@ def draft_tail_gate(vllm_config: VllmConfig, requested: int) -> DraftTailGate:
     Everything checked here is identical on every rank. Features the moved
     tail does not carry (probabilistic draft sampling, adaptive verification,
     acceptance-adaptive draft counts, tensor parallelism within a stage) keep
-    the tail on the last stage.
+    the tail on the last stage. Load-adaptive depth is carried: it drafts the
+    full block every step and narrows only the verification width.
     """
 
     def off(reason: str) -> DraftTailGate:
@@ -121,7 +122,14 @@ def draft_tail_gate(vllm_config: VllmConfig, requested: int) -> DraftTailGate:
         return off("probabilistic draft sampling keeps the tail on the last stage")
     if spec.enable_adaptive_verification:
         return off("adaptive verification keeps the tail on the last stage")
-    if spec.uses_adaptive_k() or spec.uses_dynamic_speculative_decoding():
+    if spec.uses_dynamic_speculative_decoding():
+        return off("variable draft counts keep the tail on the last stage")
+    if spec.uses_adaptive_k() and not getattr(
+        getattr(spec, "adaptive_k_config", None), "load_mode", False
+    ):
+        # Load-adaptive depth (VLLM_GLM5_DFLASH_ADAPTIVE_K) drafts the full
+        # block every step and narrows only the verification, so the tail's
+        # rows and width are those of a fixed num_speculative_tokens.
         return off("variable draft counts keep the tail on the last stage")
     return DraftTailGate(requested, requested, "")
 

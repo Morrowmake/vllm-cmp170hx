@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 
 # Keys accepted in the ``adaptive_k`` speculative-config mapping.
 _CONFIG_KEYS = frozenset(
-    {"min", "max", "ema", "margin", "quantile", "allowed", "log_interval"}
+    {"min", "max", "ema", "margin", "quantile", "allowed", "log_interval", "by_load"}
 )
 
 
@@ -41,6 +41,32 @@ class AdaptiveKConfig:
     # CUDA graphs must be captured for. Always sorted, always ends at max_k.
     allowed: tuple[int, ...] = ()
     log_interval: int = 0
+    # Load mode: the verification width for 1, 2, ... requests in the server;
+    # the last entry covers every larger count. Empty: acceptance mode.
+    by_load: tuple[int, ...] = ()
+
+    @property
+    def load_mode(self) -> bool:
+        return bool(self.by_load)
+
+    def k_for_load(self, num_reqs: int) -> int:
+        """Verification width for ``num_reqs`` requests (load mode)."""
+        assert self.by_load
+        return self.by_load[min(max(num_reqs, 1), len(self.by_load)) - 1]
+
+    def max_reqs_for(self, k: int, max_num_reqs: int) -> int:
+        """Largest request count at which ``k`` is verified, so decode CUDA
+        graphs for ``k`` are needed only up to it. Every count in acceptance
+        mode; 0 when load mode never picks ``k``."""
+        if not self.by_load:
+            return max_num_reqs
+        if self.by_load[-1] == k:
+            return max_num_reqs
+        widest = 0
+        for n, value in enumerate(self.by_load, start=1):
+            if value == k:
+                widest = n
+        return min(widest, max_num_reqs)
 
     @classmethod
     def from_dict(cls, raw: Any, num_speculative_tokens: int) -> "AdaptiveKConfig":
@@ -99,6 +125,39 @@ class AdaptiveKConfig:
             raise ValueError(f"adaptive_k.quantile ({quantile}) must be in [0, 1].")
         if log_interval < 0:
             raise ValueError("adaptive_k.log_interval must be >= 0.")
+
+        raw_by_load = raw.get("by_load")
+        by_load: tuple[int, ...] = ()
+        if raw_by_load is not None:
+            if not isinstance(raw_by_load, (list, tuple)) or not raw_by_load:
+                raise ValueError(
+                    "adaptive_k.by_load must be a non-empty list of draft "
+                    "counts (for 1, 2, ... requests; the last covers the rest)."
+                )
+            by_load = tuple(int(k) for k in raw_by_load)
+            illegal = sorted(
+                {k for k in by_load if not 1 <= k <= num_speculative_tokens}
+            )
+            if illegal:
+                raise ValueError(
+                    f"adaptive_k.by_load contains {illegal}, outside "
+                    f"[1, num_speculative_tokens={num_speculative_tokens}]."
+                )
+            if "allowed" in raw or "min" in raw or "max" in raw:
+                raise ValueError(
+                    "adaptive_k.by_load names the draft counts itself; drop "
+                    "allowed/min/max."
+                )
+            return cls(
+                min_k=min(by_load),
+                max_k=max(by_load),
+                ema=ema,
+                margin=margin,
+                quantile=quantile,
+                allowed=tuple(sorted(set(by_load))),
+                log_interval=log_interval,
+                by_load=by_load,
+            )
 
         raw_allowed = raw.get("allowed")
         if raw_allowed is None:

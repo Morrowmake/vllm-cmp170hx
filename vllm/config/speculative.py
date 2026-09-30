@@ -519,6 +519,10 @@ class SpeculativeConfig:
       Defaults to every count in ``1..num_speculative_tokens``. Decode CUDA
       graphs are captured for exactly this set.
     - ``log_interval``: emit a chosen-k histogram every N steps (0 = off).
+    - ``by_load``: pick the count from the number of requests in the server
+      instead of from acceptance: entry ``i`` is the count for ``i + 1``
+      requests, the last entry covers every larger number. Replaces
+      ``min``/``max``/``allowed``.
 
     All of this runs on the scheduler's CPU thread; unlike
     ``enable_adaptive_verification`` nothing is trimmed on the device, so it
@@ -1166,6 +1170,8 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        self._maybe_enable_glm5_load_adaptive_depth()
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -1907,6 +1913,61 @@ class SpeculativeConfig:
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def _maybe_enable_glm5_load_adaptive_depth(self) -> None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K: deeper DFlash drafts when few requests
+        run, the configured depth under load.
+
+        Rewrites the configuration before anything is derived from it: the
+        drafter width becomes the deepest listed depth, and ``adaptive_k``
+        picks each step's verification width from the request count
+        (VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS for 1, 2, ... requests, then the
+        configured ``num_speculative_tokens``). Idempotent: a configuration it
+        already rewrote is left alone.
+        """
+        import vllm.envs as envs
+
+        if not envs.VLLM_GLM5_DFLASH_ADAPTIVE_K:
+            return
+        if isinstance(self.adaptive_k, dict) and "by_load" in self.adaptive_k:
+            return
+
+        def closed(reason: str) -> None:
+            logger.warning_once(
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K=1 set but load-adaptive DFlash "
+                "depth is off: %s.",
+                reason,
+            )
+
+        if self.method != "dflash":
+            return closed(f"needs the DFlash drafter (method is {self.method!r})")
+        if self.num_speculative_tokens is None or self.num_speculative_tokens < 1:
+            return closed("num_speculative_tokens is not set")
+        if self.adaptive_k is not None:
+            return closed("adaptive_k is already configured")
+        if self.num_speculative_tokens_per_batch_size is not None:
+            return closed("num_speculative_tokens_per_batch_size is configured")
+        if self.enable_adaptive_verification:
+            return closed("enable_adaptive_verification is on")
+        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS
+        try:
+            depths = [int(x) for x in raw.replace(" ", "").split(",") if x]
+        except ValueError:
+            return closed(f"VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} is not a list")
+        if not depths or min(depths) < 1:
+            return closed(f"VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} is empty or < 1")
+        base = int(self.num_speculative_tokens)
+        if max(depths) <= base:
+            return closed(
+                f"no depth in VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} "
+                f"exceeds num_speculative_tokens={base}"
+            )
+        by_load = depths + [base]
+        self.num_speculative_tokens = max(by_load)
+        self.adaptive_k = {
+            "by_load": by_load,
+            "log_interval": max(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG, 0),
+        }
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
