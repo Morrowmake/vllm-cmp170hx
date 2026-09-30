@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Questions
+  - name: "Running a model: GLM-5.3-Flash recipe"
+    url: https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/issues
+    about: Each supported model has its own recipe repository. Installing, starting, settings, layouts and results belong in that recipe's issues.
+  - name: General vLLM questions
     url: https://discuss.vllm.ai
-    about: Ask questions and discuss with other vLLM community members
+    about: Questions about vLLM itself, not specific to this fork.

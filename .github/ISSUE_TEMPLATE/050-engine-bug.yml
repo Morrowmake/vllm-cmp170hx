@@ -1,0 +1,43 @@
+name: Engine bug (this fork)
+description: A crash, wrong output or regression in this fork's engine code.
+title: "[engine] "
+labels: ["bug"]
+body:
+  - type: input
+    id: commit
+    attributes:
+      label: Engine commit
+      description: The fork commit you run (`git rev-parse HEAD`, or the recipe release and its pin).
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The model and checkpoint, e.g. GLM-5.3-Flash W4A16.
+    validations:
+      required: true
+  - type: dropdown
+    id: layout
+    attributes:
+      label: Layout
+      options:
+        - TP4
+        - PP4
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: switches
+    attributes:
+      label: Environment switches
+      description: The `VLLM_*` variables set, or the `DRY=1 ./start.sh` output. Does it go away with the related switch set to 0?
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: Steps to reproduce, the request if it matters, and the relevant log lines.
+    validations:
+      required: true

@@ -1,110 +1,183 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
-
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+<h1 align="center">vLLM for the NVIDIA CMP 170HX</h1>
 
 <p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
+  <img alt="target" src="https://img.shields.io/badge/target-Ampere%20sm__80-76b900?style=flat">
+  &nbsp;
+  <img alt="base" src="https://img.shields.io/badge/upstream-vLLM%200.30.1%20dev-4b32c3?style=flat">
+  &nbsp;
+  <img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue?style=flat">
 </p>
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+This is a fork of [vLLM](https://github.com/vllm-project/vllm) for the
+**NVIDIA CMP 170HX** (Ampere, sm_80), built to serve models fast on one card
+or several: tensor-parallel and pipeline-parallel layouts across cards, a
+full-precision KV cache and repeatable single-request outputs.
+**GLM-5.3-Flash** is the first supported model; more will follow.
 
----
+The fork has two layers:
 
-## About
+- **General work** for sm_80 and PCIe-connected cards: kernels and attention
+  backends, all-reduce through host memory or PCIe, KV accounting,
+  determinism, pipeline-parallel scheduling, and an optional compiled Marlin
+  extension.
+- **Model-specific work**, gated by model family: it lives in that family's
+  model code or behind its own switches, and its kernels check the exact
+  shapes they were built for, handing anything else back to upstream's path.
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+Every performance feature sits behind an environment variable and is **off in
+the code by default**. Each supported model has a recipe repository whose
+launcher switches on the tested set. `0` turns a feature off again, with no rebuild.
+Variables carry the prefix of the model they were first built for
+(`VLLM_GLM5_*`), including some general ones.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+## Using it: take a recipe
 
-vLLM is fast with:
+Each model is served through its own recipe, which pins an exact fork commit,
+ships the engine as a container image, downloads the weights and starts an
+OpenAI-compatible server. Questions about running a model belong in its
+recipe's issues.
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+| Model | Recipe |
+|---|---|
+| GLM-5.3-Flash | [Morrowmake/glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe) |
 
-vLLM is flexible and easy to use with:
+## Supported models
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+### GLM-5.3-Flash
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+320B MoE, W4A16, 262,144-token context, DFlash2 speculative decoding.
+Upstream's sparse-attention path needs Hopper; this fork adds the sm_80 path
+that makes the model run at all, then makes it fast.
 
 ```bash
-uv pip install vllm
+git clone https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe.git
+cd glm53-flash-cmp170hx-recipe && ./start.sh     # LAYOUT=pp4 for pipeline-parallel 4
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+From the recipe's [release 1.5.0 results](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe#results)
+(DFlash2 at k=3, 180 W per card; methods and caveats are there):
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+| | TP4 (default) | PP4 (`LAYOUT=pp4`) |
+|---|---:|---:|
+| Streaming decode, 1 user, structured | **267.3 tok/s** | 141.8 tok/s |
+| Decode, 8 users, aggregate, structured | **758.9 tok/s** | 603.0 tok/s |
+| Cold prefill | 2,657 tok/s | **6,575 tok/s** |
+| KV pool at 262,144 context | 1,176,646 tokens | **2,334,498 tokens** |
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+Quality with DFlash2 (release 1.4.3, fixed batches): HumanEval 162/164 under
+TP4 and 163/164 under PP4; GSM8K 1,281/1,319 and 1,284/1,319.
 
-## Contributing
+GLM-specific switches (the recipe's
+[kill switch table](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe#kill-switches)
+says which layout each serves):
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+- Fused decode kernels for mHC mixing, MoE routing and alignment, and KDA
+  decode — `VLLM_GLM5_DECODE_KERNELS`; second generation `VLLM_GLM5_DECODE_MOE_ROUTE_V2`,
+  `VLLM_GLM5_DECODE_MHC_V2`, `VLLM_GLM5_DECODE_KDA_V2`, `VLLM_GLM5_DECODE_IDX_GLUE`;
+  fused decode prologue — `VLLM_GLM5_PROLOGUE_FUSE`.
+- Prefill kernels (mHC projection, sparse attention) — `VLLM_GLM5_PREFILL_KERNELS`,
+  `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`; at TP4 shapes `VLLM_GLM5_TP4_KDA_PREFILL`,
+  `VLLM_GLM5_TP4_MARLIN_PREFILL`; at PP4 shapes `VLLM_GLM5_PP_KDA_PREFILL`,
+  `VLLM_GLM5_PP_SPARSE_MLA_PREFILL`, `VLLM_GLM5_PP_MARLIN_PREFILL`.
+- Prefill all-reduces overlapped with the MoE (TP4) — `VLLM_GLM5_PREFILL_OVERLAP`;
+  batch-sharded logits and sampling (TP4) — `VLLM_GLM5_LOCAL_LOGITS`.
+- Drafter: selector tables split across cards — `VLLM_GLM5_DRAFTER_SELECTOR_SHARD`;
+  position table sized to the context — `VLLM_GLM5_DRAFTER_ROPE_FIT`; folded
+  input projection under PP4 — `VLLM_GLM5_PP_FOLD_DRAFT_FC`.
+- Always on: a rejected draft can no longer overwrite the tail of the
+  sparse-attention key pool.
 
-## Citation
+## General features
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+**sm_80 kernels and backends.** A sparse-MLA attention backend, an sm_80 path
+for the attention indexer and its FP8 stores, and sm_80 key-pool compression
+(always on). A retuned sparse-attention decode schedule, on in the engine
+(`VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY=1` restores the old one). Thin-batch BF16
+GEMMs tuned per shape, up to 32 rows — `VLLM_GLM5_THIN_GEMM`. MoE shared
+experts that overlap the routed experts — `VLLM_GLM5_SHARED_EXPERT_REORDER`.
 
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+**All-reduce over PCIe.** For cards without GPU peer access, small all-reduces
+take one round trip through shared host memory — `VLLM_GLM5_HOST_ALLREDUCE`.
+Where peer access is granted, a PCIe custom all-reduce runs in device memory
+instead — `VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE`, kernel chosen by
+`VLLM_CUSTOM_ALLREDUCE_ALGO`; it falls back to the host path on its own.
+
+**KV accounting.** The KV reserve covers what prefill chunks in flight really
+hold, so the reported pool is one the server can fill —
+`VLLM_KV_MAMBA_INFLIGHT_STATES`, `VLLM_KV_SWA_INFLIGHT_SCRATCH`. Indexer decode
+tables sized by the decode rows — `VLLM_GLM5_INDEXER_DECODE_ROWS`; indexer
+gather workspace clamp, on in the engine — `VLLM_GLM5_INDEXER_GATHER_CLAMP`.
+`VLLM_GLM5_MEM_ATTRIBUTION` logs where device memory goes at start-up.
+
+**Determinism.** A request on its own returns the same tokens and
+log-probabilities on every run and every install: fixed-order MoE block
+alignment (`VLLM_GLM5_DETERMINISTIC_MOE_ALIGN`), CUDA-graph padding kept out of
+the MoE (`VLLM_GLM5_MOE_MASK_PADDING`), indexer top-k consistent on ties and in
+a fixed order (`VLLM_GLM5_TOPK_TIEFIX`, `VLLM_GLM5_TOPK_SORTED`,
+`VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS`), pinned linear-attention prefill
+configurations (`VLLM_GLM5_FLA_PIN_AUTOTUNE`).
+
+**Pipeline-parallel and scheduling.** Decodes spread over every in-flight
+micro-batch — `VLLM_PP_SPREAD_DECODES`; one packed, metadata-free hand-off
+between stages — `VLLM_PP_PACKED_HOP`, `VLLM_PP_HOP_NO_METADATA`; drafter
+synchronisation — `VLLM_PP_SPLIT_DRAFT_EVENT`; the drafter's final step on a
+chosen stage — `VLLM_PP_DRAFT_TAIL_STAGE` (`-1` off). Fair prefill, where long
+prompts yield to running decodes — `--prefill-chunk-with-decodes N`. An
+acceptance-adaptive draft count, off unless set — `adaptive_k` in
+`--speculative-config` ([docs](docs/features/speculative_decoding/adaptive_k.md)).
+
+**Optional compiled Marlin.** One sm_80 library, `vllm._ampere_marlin_C`, for
+both layouts: `VLLM_GLM5_MARLIN_DECODE_CUDA` (eligible small batches) and
+`VLLM_GLM5_MARLIN_PREFILL_CUDA` (PP4). Requesting either without a compatible
+library fails at startup rather than falling back silently.
+
+**Correctness fixes (always on).** 64-bit KV row offsets in the
+sparse-attention kernels and a vocabulary clamp in the sampler kernels.
+
+Every custom kernel on a default path is checked on real captured inputs
+against a 64-bit reference, side by side with the code it replaces, and must
+be at least as accurate.
+
+## Upstream base
+
+The fork sits on upstream `main` at
+[`e55d076f89`](https://github.com/vllm-project/vllm/commit/e55d076f89fd01a0538a3e496d8ff20bf7980100)
+(2026-09-25), the vLLM **0.30.1** development line (`git describe`:
+`v0.30.1rc0-181-ge55d076f8`). `main` on this fork stays a clean mirror of
+upstream; general fixes are offered back upstream as pull requests.
+
+## Branches and releases
+
+The work is one branch, today `ampere-glm53`. When the second model lands it
+will be renamed to a model-neutral name; GitHub redirects the old name.
+
+A recipe pins an exact fork commit, never the branch. The branch moves to a
+newer upstream from time to time; every commit a recipe release pins is kept
+under a tag `<recipe>-<version>` (for GLM-5.3-Flash, `glm53-recipe-<version>`),
+so older releases keep installing. Release notes live in each recipe's
+changelog, e.g. [GLM-5.3-Flash](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/blob/main/CHANGELOG.md).
+
+## Building from source
+
+A recipe's native install (`RUNTIME=native ./install.sh`) is the reference.
+In short, on Python 3.12 with torch 2.13.0 (CUDA 13.0):
+
+```bash
+git clone -b ampere-glm53 https://github.com/Morrowmake/vllm-cmp170hx.git && cd vllm-cmp170hx
+VLLM_USE_PRECOMPILED=1 uv pip install -e .    # upstream's precompiled extensions carry sm_80
+uv pip install -r requirements/cuda.txt
+# optional compiled Marlin, built on its own without rebuilding the engine:
+VLLM_BUILD_AMPERE_MARLIN=1 python csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out vllm
 ```
 
-## Contact Us
+The optional library needs a CUDA toolkit (12.8 or newer), a C++20 compiler and
+Ninja; no GPU is needed to build it. `VLLM_BUILD_AMPERE_MARLIN=1` cannot be
+combined with `VLLM_USE_PRECOMPILED=1` in one install. Each recipe names the
+upstream wheel that supplies the precompiled extensions for its pin.
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+## Licence and credit
 
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+Apache-2.0, as upstream ([LICENSE](LICENSE)). This fork is a layer on the work
+of the [vLLM project](https://github.com/vllm-project/vllm) and its
+contributors; thank you. Upstream's own README is kept at
+[docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
