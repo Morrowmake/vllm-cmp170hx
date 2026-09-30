@@ -561,3 +561,42 @@ def test_conv_module_constructs_both_ways(gloo_tp1, dynamic):
             h_ref, c_ref = ref.prepare(x)
             out_ref = ref.finish(h_ref, c_ref)
         assert torch.equal(out, out_ref), width
+
+
+@pytest.mark.parametrize("width", [3, 5, 6, 7])
+@pytest.mark.parametrize("split", [False, True])
+def test_k7_narrow_draft_equals_a_drafter_of_that_width(monkeypatch, width, split):
+    """K_max 7: a width-w block in a K=7 drafter is a K=w drafter's step, fused and
+    through the PP draft-tail payload (split)."""
+    wide, rows = _drafter(7, (3, 4, 5, 6, 7), width, 3, 1, split)
+    plain, _ = _drafter(width, (), width, 3, 1, split)
+    out_wide = _draft(monkeypatch, wide, rows, 3, split)
+    out_plain = _draft(monkeypatch, plain, rows, 3, split)
+    assert torch.equal(out_wide[0], out_plain[0]) and out_wide[1] == out_plain[1]
+
+
+@pytest.mark.parametrize("width", [3, 6, 7])
+def test_k7_tail_stage_fills_only_the_drafted_columns(monkeypatch, width):
+    num_reqs = 3
+    last, rows = _drafter(7, (3, 4, 5, 6, 7), width, num_reqs, 1, True)
+    expect, _ = _draft(monkeypatch, last, rows, num_reqs, True)
+    payload = last.tail_payload(rows).clone()
+    tail = object.__new__(dt.DraftTailController)
+    tail.device = torch.device("cpu")
+    tail.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_fp64_gumbel=False))
+    tail.widths = (3, 4, 5, 6, 7)
+    tail.layouts = {w: last.tail_layout_for(w) for w in tail.widths}
+    tail.layout = tail.layouts[7]
+    tail.rows_table = {w: {n: n for n in range(1, 9)} for w in tail.widths}
+    tail.module = SimpleNamespace(top_k=TOP_K, compute_candidates=last.model.compute_candidates,
+                                  select=last.model.model.candidate_selector)
+    tail._out_tokens = torch.zeros(MAX_REQS, 7, dtype=torch.int64)
+    tail._scores = torch.zeros(MAX_REQS * 7 * TOP_K)
+    tail._workspaces = {}
+    monkeypatch.setattr(dt, "tail_side_stream_workspaces",
+                        lambda *a, **k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(sm, "_selector_walk_kernel", _WalkStub())
+    broadcast = torch.full((num_reqs, 7), -7, dtype=torch.int64)
+    tail._run(payload, rows, num_reqs, broadcast, width)
+    assert torch.equal(broadcast[:, :width], expect)
+    assert (broadcast[:, width:] == -7).all()

@@ -710,13 +710,16 @@ class Scheduler(SchedulerInterface):
             num_reqs = (
                 len(running) + len(self.waiting) + len(self.skipped_waiting)
             )
-            k_want = config.k_for_load(num_reqs)
+            k_want = load_width = config.k_for_load(num_reqs)
             if config.accept:
                 # Acceptance-aware: within the load width, the depth that
                 # maximises the batch's expected tokens per unit step cost.
                 decoding = [r.request_id for r in running if not r.is_prefill_chunk]
                 if decoding:
                     k_want = self.adaptive_k.select_by_acceptance(decoding, k_want)
+            forced = self._forced_depth()
+            if forced is not None and forced <= load_width:
+                k_want = forced
             k_draft = k_want if config.draft_by_load else self.num_spec_tokens
         else:
             k_draft = k_want = self.adaptive_k.select_k(
@@ -738,6 +741,33 @@ class Scheduler(SchedulerInterface):
         self.adaptive_k.record_choice(k_verify)
         self.adaptive_k.maybe_log()
         return k_verify, k_draft
+
+    def _forced_depth(self) -> int | None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE (diagnostics, step-cost
+        calibration): a depth written in that file, re-read every 64 steps,
+        replaces the chosen one while it is a captured depth."""
+        path = getattr(self, "_force_file", None)
+        if path is None:
+            from vllm import envs as _envs
+
+            path = self._force_file = _envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE
+            self._force_value = None
+            self._force_countdown = 0
+        if not path:
+            return None
+        self._force_countdown -= 1
+        if self._force_countdown <= 0:
+            self._force_countdown = 64
+            try:
+                with open(path) as f:
+                    value = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                value = 0
+            assert self.adaptive_k is not None
+            self._force_value = (
+                value if value in self.adaptive_k.config.allowed else None
+            )
+        return self._force_value
 
     def _pp_decode_cap(self) -> int | None:
         """Decode requests this micro-batch may take under PP decode spreading

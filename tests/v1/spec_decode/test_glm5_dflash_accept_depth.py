@@ -65,7 +65,7 @@ def _rewrite(spec):
     return spec
 
 
-@pytest.mark.parametrize("pp,costs", [(1, [1.0, 1.08, 1.16]), (4, [1.0, 1.10, 1.21])])
+@pytest.mark.parametrize("pp,costs", [(1, [1.0, 1.08, 1.16]), (4, [1.0, 1.105, 1.21])])
 def test_flag_adds_the_layout_costs(monkeypatch, pp, costs):
     monkeypatch.setenv(FLAG, "1")
     monkeypatch.setenv(ACCEPT, "1")
@@ -272,3 +272,106 @@ def test_banners_go_through_the_real_logger(caplog_vllm):
     assert any("GLM-5 acceptance-aware DFlash depth active" in m
                and "(1.0, 1.08, 1.16)" in m for m in messages), messages
     assert any("GLM-5 load-adaptive DFlash depth active" in m for m in messages)
+
+
+# ------------------------------------------------------------- K_max 7
+
+
+K7 = {"by_load": [7, 5, 3],
+      "accept": {"costs": [1.0, 1.08, 1.16, 1.24, 1.32], "hysteresis": 0.03}}
+
+
+def test_k7_allows_every_depth_from_3_to_7():
+    config = AdaptiveKConfig.from_dict(K7, 7)
+    assert config.allowed == (3, 4, 5, 6, 7)
+    # Without the acceptance-aware choice only the load widths are captured.
+    assert AdaptiveKConfig.from_dict({"by_load": [7, 5, 3]}, 7).allowed == (3, 5, 7)
+
+
+def test_k7_graph_ceiling_per_depth():
+    config = AdaptiveKConfig.from_dict(K7, 7)
+    assert [config.max_reqs_for(k, 8) for k in (3, 4, 5, 6, 7)] == [8, 2, 2, 1, 1]
+    assert config.max_reqs_for(2, 8) == 0 and config.max_reqs_for(8, 8) == 0
+
+
+def test_k7_choice_never_leaves_the_captured_graphs():
+    config = AdaptiveKConfig.from_dict(K7, 7)
+    policy = AdaptiveKPolicy(config)
+    rng = random.Random(9)
+    for p in (0.2, 0.5, 0.7, 0.9, 0.99):
+        for n in range(1, 9):
+            reqs = [f"{p}-{i}" for i in range(n)]
+            for r in reqs:
+                _feed(policy, r, p, 40, rng)
+            cap = config.k_for_load(n)
+            k = policy.select_by_acceptance(reqs, cap)
+            assert k in config.allowed and k <= cap
+            assert config.max_reqs_for(k, 8) >= n, (p, n, k)
+
+
+def test_k7_high_acceptance_reaches_7_and_prose_stays_at_most_5():
+    policy, rng = AdaptiveKPolicy(AdaptiveKConfig.from_dict(K7, 7)), random.Random(10)
+    _feed(policy, "code", 0.96, 80, rng, depth_of=lambda: 7)
+    assert policy.select_by_acceptance(["code"], cap=7) == 7
+    policy2 = AdaptiveKPolicy(AdaptiveKConfig.from_dict(K7, 7))
+    _feed(policy2, "prose", 0.7, 80, random.Random(11), depth_of=lambda: 5)
+    assert policy2.select_by_acceptance(["prose"], cap=7) <= 5
+    policy3 = AdaptiveKPolicy(AdaptiveKConfig.from_dict(K7, 7))
+    _feed(policy3, "chat", 0.45, 80, random.Random(12), depth_of=lambda: 3)
+    assert policy3.select_by_acceptance(["chat"], cap=7) == 3
+
+
+def test_multi_request_costs_are_used_for_batches():
+    raw = {"by_load": [7, 5, 3], "accept": {
+        "costs": [1.0, 1.08, 1.16, 1.24, 1.32],
+        "costs_multi": [1.0, 1.5, 2.0, 2.5, 3.0], "hysteresis": 0.0}}
+    policy = AdaptiveKPolicy(AdaptiveKConfig.from_dict(raw, 7))
+    for r in ("a", "b"):
+        policy._acc_s[r], policy._acc_f[r] = 95.0, 5.0
+    assert policy.select_by_acceptance(["a"], cap=5) == 5
+    assert policy.select_by_acceptance(["a", "b"], cap=5) == 3  # steep batch costs
+
+
+def test_k7_rewrite_default_costs(monkeypatch):
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(ACCEPT, "1")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "7,5")
+    for name in ("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI",
+                 "VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST", "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH"):
+        monkeypatch.delenv(name, raising=False)
+    spec = _rewrite(_spec())
+    assert spec.num_speculative_tokens == 7
+    assert spec.adaptive_k["by_load"] == [7, 5, 3]
+    assert spec.adaptive_k["accept"]["costs"] == [1.0, 1.08, 1.16, 1.24, 1.32]
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", "1,1.07,1.15,1.26,1.35")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI", "1,1.1,1.2,1.3,1.4")
+    spec = _rewrite(_spec())
+    assert spec.adaptive_k["accept"] == {"costs": [1, 1.07, 1.15, 1.26, 1.35],
+                                         "costs_multi": [1, 1.1, 1.2, 1.3, 1.4],
+                                         "hysteresis": 0.03}
+    AdaptiveKConfig.from_dict(spec.adaptive_k, 7)
+
+
+def test_force_file_pins_the_depth(tmp_path, monkeypatch):
+    force = tmp_path / "depth"
+    force.write_text("6")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE", str(force))
+    base = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192,
+                            num_speculative_tokens=7)
+    spec = base.vllm_config.speculative_config
+    spec.adaptive_k = K7
+    spec.adaptive_k_config = AdaptiveKConfig.from_dict(K7, 7)
+    scheduler = Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
+                          block_size=base.block_size, log_stats=True,
+                          structured_output_manager=StructuredOutputManager(base.vllm_config))
+    [req] = create_requests(num_requests=1)
+    scheduler.add_request(req)
+    scheduler.schedule()
+    req.spec_token_ids = list(range(11, 18))
+    scheduler.schedule()
+    assert scheduler.cur_num_spec_tokens == 6
+    force.write_text("9")  # not a captured depth: ignored
+    scheduler._force_countdown = 0
+    req.spec_token_ids = list(range(11, 18))
+    scheduler.schedule()
+    assert scheduler.cur_num_spec_tokens != 9

@@ -217,6 +217,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
@@ -1886,6 +1888,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST": lambda: float(
         os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST", "0.03")
+    ),
+    # Relative step costs for steps of two or more requests (empty: COSTS).
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI", ""
+    ),
+    # Diagnostics (step-cost calibration): a file holding a depth; while it
+    # holds one inside the load width, every step verifies that depth.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE", ""
     ),
     # Chosen-depth histogram every N scheduler steps (0 = off).
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG": lambda: int(

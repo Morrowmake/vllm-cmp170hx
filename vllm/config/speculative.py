@@ -1983,42 +1983,56 @@ class SpeculativeConfig:
             # otherwise keeps its full block; the verified depth is the same.
             self.adaptive_k["draft_by_load"] = True
         if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
-            accept = self._glm5_accept_depth_config(sorted(set(by_load)))
+            accept = self._glm5_accept_depth_config(by_load)
             if accept is not None:
                 self.adaptive_k["accept"] = accept
 
-    def _glm5_accept_depth_config(self, allowed: list[int]) -> dict | None:
-        """VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: step costs per draft count
-        (VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS, else the layout default measured
-        on 4x CMP 170HX: depth 4 / 5 cost 1.08 / 1.16 of depth 3 with tensor
-        parallelism, 1.10 / 1.21 with pipeline parallelism) and hysteresis."""
+    def _glm5_accept_depth_config(self, by_load: list[int]) -> dict | None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: relative step costs for every
+        depth from the shallowest to the deepest load width
+        (VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS, and _COSTS_MULTI for steps of two
+        or more requests; else the layout default measured on 4x CMP 170HX:
+        each extra depth costs 8 % of a depth-3 step with tensor parallelism,
+        10.5 % with pipeline parallelism) and the hysteresis."""
         import vllm.envs as envs
 
-        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS.replace(" ", "")
-        try:
-            costs = [float(x) for x in raw.split(",") if x]
-        except ValueError:
-            costs = None
+        allowed = list(range(min(by_load), max(by_load) + 1))
+
+        def parse(raw: str) -> list[float] | None:
+            try:
+                return [float(x) for x in raw.replace(" ", "").split(",") if x]
+            except ValueError:
+                return None
+
+        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS
+        costs = parse(raw)
         if not raw:
             pp = getattr(self.target_parallel_config, "pipeline_parallel_size", 1)
             per_depth = 0.105 if (pp or 1) > 1 else 0.08
-            base = allowed[0]
-            costs = [1.0 + per_depth * (k - base) for k in allowed]
-            if allowed == [3, 4, 5]:
-                costs = [1.0, 1.10, 1.21] if (pp or 1) > 1 else [1.0, 1.08, 1.16]
-        if not costs or len(costs) != len(allowed) or min(costs) <= 0:
+            costs = [round(1.0 + per_depth * (k - allowed[0]), 4) for k in allowed]
+        raw_multi = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI
+        costs_multi = parse(raw_multi) if raw_multi else []
+
+        def valid(c) -> bool:
+            return bool(c) and len(c) == len(allowed) and min(c) > 0
+
+        if not valid(costs) or (raw_multi and not valid(costs_multi)):
             logger.warning_once(
                 "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: "
-                "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS=%r needs one positive cost "
-                "per draft count %s.",
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS=%r / _COSTS_MULTI=%r need one "
+                "positive cost per depth %s.",
                 raw,
+                raw_multi,
                 str(allowed),
             )
             return None
-        return {
+        config = {
             "costs": costs,
             "hysteresis": max(0.0, min(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST, 0.5)),
         }
+        if costs_multi:
+            config["costs_multi"] = costs_multi
+        return config
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (

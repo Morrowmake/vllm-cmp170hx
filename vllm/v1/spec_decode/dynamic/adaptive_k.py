@@ -55,6 +55,8 @@ class AdaptiveKConfig:
     # maximises expected tokens per unit cost over the batch.
     accept: bool = False
     accept_costs: tuple[float, ...] = ()
+    # Costs for steps of two or more requests (empty: accept_costs).
+    accept_costs_multi: tuple[float, ...] = ()
     accept_hysteresis: float = 0.03
     accept_prior: float = 0.75
     accept_decay: float = 0.9
@@ -75,11 +77,16 @@ class AdaptiveKConfig:
         mode; 0 when load mode never picks ``k``."""
         if not self.by_load:
             return max_num_reqs
-        if self.by_load[-1] == k:
+        if k not in self.allowed:
+            return 0
+        if k <= self.by_load[-1]:
             return max_num_reqs
+        # A step verifies at most the load width, so depth k runs only while
+        # the load width is at least k (exactly the load width without the
+        # acceptance-aware choice, which then only lists load widths).
         widest = 0
         for n, value in enumerate(self.by_load, start=1):
-            if value == k:
+            if value >= k:
                 widest = n
         return min(widest, max_num_reqs)
 
@@ -169,11 +176,24 @@ class AdaptiveKConfig:
             if raw_accept is not None:
                 if not isinstance(raw_accept, dict):
                     raise ValueError("adaptive_k.accept must be a mapping.")
+                # The acceptance-aware choice may pick any depth from the
+                # shallowest load width up to the deepest one.
+                allowed = tuple(range(min(by_load), max(by_load) + 1))
                 costs = tuple(float(c) for c in raw_accept.get("costs", ()))
                 if len(costs) != len(allowed) or min(costs, default=0.0) <= 0:
                     raise ValueError(
                         f"adaptive_k.accept.costs needs one positive cost per "
                         f"draft count {list(allowed)}, got {list(costs)}."
+                    )
+                costs_multi = tuple(
+                    float(c) for c in raw_accept.get("costs_multi", ()) or ()
+                )
+                if costs_multi and (
+                    len(costs_multi) != len(allowed) or min(costs_multi) <= 0
+                ):
+                    raise ValueError(
+                        f"adaptive_k.accept.costs_multi needs one positive cost "
+                        f"per draft count {list(allowed)}, got {list(costs_multi)}."
                     )
                 hysteresis = float(raw_accept.get("hysteresis", 0.03))
                 prior = float(raw_accept.get("prior", 0.75))
@@ -187,6 +207,7 @@ class AdaptiveKConfig:
                 accept_kwargs = dict(
                     accept=True,
                     accept_costs=costs,
+                    accept_costs_multi=costs_multi,
                     accept_hysteresis=hysteresis,
                     accept_prior=prior,
                     accept_decay=decay,
@@ -378,9 +399,12 @@ class AdaptiveKPolicy:
         maximises the batch's expected tokens per unit step cost. Keeps the
         current depth unless another beats it by the hysteresis margin."""
         cfg = self.config
-        candidates = [
-            (k, cost) for k, cost in zip(cfg.allowed, cfg.accept_costs) if k <= cap
-        ]
+        table = (
+            cfg.accept_costs_multi
+            if len(req_ids) > 1 and cfg.accept_costs_multi
+            else cfg.accept_costs
+        )
+        candidates = [(k, cost) for k, cost in zip(cfg.allowed, table) if k <= cap]
         if not candidates or not req_ids:
             return cap
         rates = [self.accept_rate(r) for r in req_ids]
