@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
     VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
+    VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH: bool = False
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
@@ -1862,6 +1863,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": lambda: os.getenv(
         "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "5,4"
+    ),
+    # With VLLM_GLM5_DFLASH_ADAPTIVE_K: the drafter drafts only the depth the
+    # next step verifies (one drafter graph set per depth) instead of the
+    # deepest block every step. Off: the deepest block, prefix verified.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH", "0"))
     ),
     # Chosen-depth histogram every N scheduler steps (0 = off).
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG": lambda: int(

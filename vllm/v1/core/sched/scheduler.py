@@ -690,15 +690,17 @@ class Scheduler(SchedulerInterface):
             return self.num_spec_tokens, self.num_spec_tokens
         config = self.adaptive_k.config
         if config.load_mode:
-            # Load mode: the drafter always produces its full block (a DFlash
-            # block is one fixed-shape pass), so drafts are never the limit
-            # after the first step; the width follows every request the
-            # server holds, waiting ones included.
-            k_draft = self.num_spec_tokens
+            # Load mode: the width follows every request the server holds,
+            # waiting ones included. The drafter produces its full block (a
+            # DFlash block is one fixed-shape pass), so drafts are never the
+            # limit after the first step -- unless draft_by_load narrows the
+            # block to the width verified next, trading a one-step lag when
+            # load drops for a cheaper drafter under load.
             num_reqs = (
                 len(running) + len(self.waiting) + len(self.skipped_waiting)
             )
             k_want = config.k_for_load(num_reqs)
+            k_draft = k_want if config.draft_by_load else self.num_spec_tokens
         else:
             k_draft = k_want = self.adaptive_k.select_k(
                 [r.request_id for r in running]

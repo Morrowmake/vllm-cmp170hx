@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -17,6 +18,8 @@ from vllm.v1.worker.gpu.pp_draft_tail import (
     run_draft_tail,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -113,6 +116,31 @@ def _cache_draft_logits_kernel(
     scores = tl.load(scores_ptr + candidate_base + offsets, mask=mask)
     tl.store(logits_base + token_ids, scores, mask=mask)
     tl.store(cached_candidate_ptr + cache_base + offsets, token_ids, mask=mask)
+
+
+def load_following_draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
+    """Draft widths for VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH, or () when the
+    drafter keeps its configured width. Taken from the config alone, so every
+    pipeline stage reaches the same answer."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    config = getattr(spec, "adaptive_k_config", None) if spec is not None else None
+    if config is None or not getattr(config, "draft_by_load", False):
+        return ()
+    reason = ""
+    if spec.draft_sample_method != "greedy":
+        reason = "needs greedy draft sampling"
+    elif spec.enable_adaptive_verification:
+        reason = "not with adaptive verification"
+    elif vllm_config.parallel_config.data_parallel_size != 1:
+        reason = "not with data parallelism"
+    if reason:
+        logger.warning_once(
+            "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH=1 set but the drafter keeps "
+            "its full block: %s.",
+            reason,
+        )
+        return ()
+    return tuple(config.allowed)
 
 
 class CandidateSampler:
@@ -213,37 +241,75 @@ class DFlash2Speculator(DFlashSpeculator):
         self._tail_row_ids: torch.Tensor | None = None
         self._tail_packed_rows: int | None = None
         self.tail_rows: int | None = None
+        self._tail_layouts: dict[int, TailPayloadLayout] = {}
+        self._tail_row_ids_by_width: dict[int, torch.Tensor] = {}
+        self._anchor_indices_by_width: dict[int, torch.Tensor] = {}
+        # Plain DFlash2 only: LiLiCorr scores its candidates its own way.
+        widths = (
+            load_following_draft_widths(vllm_config)
+            if type(self) is DFlash2Speculator
+            else ()
+        )
+        if widths:
+            self.enable_draft_widths(widths)
+            logger.info_once(
+                "GLM-5 load-following DFlash draft width active "
+                "(VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH): the drafter drafts "
+                "the width the next step verifies; drafter graphs for widths %s",
+                str(self.widths),  # *_once args must hash
+            )
+
+    def _on_width(self, width: int) -> None:
+        self.candidate_sampler.num_steps = width
+        if self.split_tail:
+            self._tail_layout = self._tail_layouts[width]
+            self._tail_row_ids = self._tail_row_ids_by_width[width]
+            self._anchor_indices = self._anchor_indices_by_width[width]
 
     def enable_split_tail(self) -> None:
         """Split the drafter's tail off its forward (see VLLM_PP_DRAFT_TAIL_STAGE).
 
         Draft tokens are unchanged: the tail runs the same kernels on the same
-        rows, only from a gathered copy of its inputs.
+        rows, only from a gathered copy of its inputs. One payload layout per
+        draft width; the staging buffer is sized for the widest.
         """
-        k = self.num_speculative_steps
-        self._tail_layout = TailPayloadLayout(
-            max_rows=self.max_num_reqs,
-            num_steps=k,
-            hidden_size=self.hidden_size,
-            hidden_dtype=self.dtype,
-            anchor_dtype=self.input_buffers.input_ids.dtype,
-        )
+        # Stubs built without __init__ (tests) have one width.
+        if not hasattr(self, "widths"):
+            self.max_width = self.width = self.num_speculative_steps
+            self.widths = (self.max_width,)
+        for attr in ("_tail_layouts", "_tail_row_ids_by_width", "_anchor_indices_by_width"):
+            if not hasattr(self, attr):
+                setattr(self, attr, {})
+        for k in self.widths:
+            self._tail_layouts[k] = TailPayloadLayout(
+                max_rows=self.max_num_reqs,
+                num_steps=k,
+                hidden_size=self.hidden_size,
+                hidden_dtype=self.dtype,
+                anchor_dtype=self.input_buffers.input_ids.dtype,
+            )
+            self._tail_row_ids_by_width[k] = (
+                torch.arange(
+                    self.max_num_reqs * k, dtype=torch.int32, device=self.device
+                )
+                // k
+            )
+            # Row r's anchor token sits at input_ids[r * (1 + k)], the rows
+            # _score_candidates reads.
+            self._anchor_indices_by_width[k] = (
+                torch.arange(self.max_num_reqs, dtype=torch.int64, device=self.device)
+                * (1 + k)
+            )
         self._tail_staging = torch.zeros(
-            self._tail_layout.nbytes(self.max_num_reqs),
+            self._tail_layouts[self.max_width].nbytes(self.max_num_reqs),
             dtype=torch.uint8,
             device=self.device,
         )
-        self._tail_row_ids = (
-            torch.arange(self.max_num_reqs * k, dtype=torch.int32, device=self.device)
-            // k
-        )
-        # Row r's anchor token sits at input_ids[r * num_query_per_req], the
-        # rows _score_candidates reads.
-        self._anchor_indices = (
-            torch.arange(self.max_num_reqs, dtype=torch.int64, device=self.device)
-            * self.num_query_per_req
-        )
         self.split_tail = True
+        self._on_width(self.width)
+
+    def tail_layout_for(self, width: int) -> TailPayloadLayout:
+        return self._tail_layouts[width]
 
     @property
     def tail_layout(self) -> TailPayloadLayout:
@@ -331,26 +397,33 @@ class DFlash2Speculator(DFlashSpeculator):
             return batch_desc.num_reqs
         return min(batch_desc.num_tokens, self.max_num_reqs)
 
-    def graph_rows_table(self) -> dict[int, int]:
-        """Request count -> rows the drafter forward runs over, for every
-        batch size (sent to the tail stage once, after capture)."""
-        table: dict[int, int] = {}
-        for num_reqs in range(1, self.max_num_reqs + 1):
-            batch_desc, _ = dispatch_cg_and_sync_dp(
-                self.query_cudagraph_manager,
-                num_reqs,
-                num_reqs * self.num_query_per_req,
-                uniform_token_count=self.num_query_per_req,
-                dp_size=self.dp_size,
-                dp_rank=self.dp_rank,
-            )
-            if batch_desc.cg_mode == CUDAGraphMode.FULL:
-                table[num_reqs] = batch_desc.num_reqs or min(
-                    batch_desc.num_tokens, self.max_num_reqs
+    def graph_rows_table(self) -> dict[int, dict[int, int]]:
+        """Draft width -> (request count -> rows the drafter forward runs
+        over), for every batch size (sent to the tail stage once, after
+        capture)."""
+        tables: dict[int, dict[int, int]] = {}
+        current = self.width
+        for width in self.widths:
+            self.set_width(width)
+            table: dict[int, int] = {}
+            for num_reqs in range(1, self.max_num_reqs + 1):
+                batch_desc, _ = dispatch_cg_and_sync_dp(
+                    self.query_cudagraph_manager,
+                    num_reqs,
+                    num_reqs * self.num_query_per_req,
+                    uniform_token_count=self.num_query_per_req,
+                    dp_size=self.dp_size,
+                    dp_rank=self.dp_rank,
                 )
-            else:
-                table[num_reqs] = num_reqs
-        return table
+                if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                    table[num_reqs] = batch_desc.num_reqs or min(
+                        batch_desc.num_tokens, self.max_num_reqs
+                    )
+                else:
+                    table[num_reqs] = num_reqs
+            tables[width] = table
+        self.set_width(current)
+        return tables
 
     def propose(self, input_batch, *args, remote_tail: bool = False, **kwargs):
         if not self.split_tail:

@@ -24,7 +24,8 @@ logger = init_logger(__name__)
 
 # Keys accepted in the ``adaptive_k`` speculative-config mapping.
 _CONFIG_KEYS = frozenset(
-    {"min", "max", "ema", "margin", "quantile", "allowed", "log_interval", "by_load"}
+    {"min", "max", "ema", "margin", "quantile", "allowed", "log_interval", "by_load",
+     "draft_by_load"}
 )
 
 
@@ -44,6 +45,10 @@ class AdaptiveKConfig:
     # Load mode: the verification width for 1, 2, ... requests in the server;
     # the last entry covers every larger count. Empty: acceptance mode.
     by_load: tuple[int, ...] = ()
+    # Load mode: also draft only the width the next step verifies (the
+    # drafter must support per-width drafting; otherwise it drafts its full
+    # block and the scheduler still verifies the load width).
+    draft_by_load: bool = False
 
     @property
     def load_mode(self) -> bool:
@@ -157,8 +162,11 @@ class AdaptiveKConfig:
                 allowed=tuple(sorted(set(by_load))),
                 log_interval=log_interval,
                 by_load=by_load,
+                draft_by_load=bool(raw.get("draft_by_load", False)),
             )
 
+        if raw.get("draft_by_load"):
+            raise ValueError("adaptive_k.draft_by_load needs adaptive_k.by_load.")
         raw_allowed = raw.get("allowed")
         if raw_allowed is None:
             candidates = list(range(1, num_speculative_tokens + 1))

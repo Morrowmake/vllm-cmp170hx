@@ -1928,6 +1928,11 @@ class SpeculativeConfig:
         import vllm.envs as envs
 
         if not envs.VLLM_GLM5_DFLASH_ADAPTIVE_K:
+            if envs.VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH:
+                logger.warning_once(
+                    "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH=1 set but off: it "
+                    "needs VLLM_GLM5_DFLASH_ADAPTIVE_K=1."
+                )
             return
         if isinstance(self.adaptive_k, dict) and "by_load" in self.adaptive_k:
             return
@@ -1968,6 +1973,10 @@ class SpeculativeConfig:
             "by_load": by_load,
             "log_interval": max(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG, 0),
         }
+        if envs.VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH:
+            # The drafter checks it can draft per width (greedy DFlash2) and
+            # otherwise keeps its full block; the verified depth is the same.
+            self.adaptive_k["draft_by_load"] = True
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (

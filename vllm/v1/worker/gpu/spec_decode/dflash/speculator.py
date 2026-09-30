@@ -107,6 +107,50 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+        # Load-following draft width (VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH):
+        # the block is drafted at the width the scheduler asks for. Every
+        # per-width buffer below is a contiguous view of the widest one, and
+        # every width has its own drafter CUDA graphs. One width (the
+        # configured num_speculative_tokens) unless enable_draft_widths().
+        self.max_width = self.num_speculative_steps
+        self.widths: tuple[int, ...] = (self.max_width,)
+        self.width = self.max_width
+        self._full_draft_tokens = self.draft_tokens
+        self._draft_token_views = {self.max_width: self.draft_tokens}
+        self._sample_cols = {self.max_width: self.sample_col}
+        self._cg_managers: dict[int, DFlashCudaGraphManager] = {}
+
+    def enable_draft_widths(self, widths) -> None:
+        """Draft at any of ``widths`` (each <= num_speculative_tokens)."""
+        widths = tuple(sorted({int(w) for w in widths} | {self.max_width}))
+        assert 1 <= widths[0] and widths[-1] == self.max_width, widths
+        self.widths = widths
+        self.supports_variable_num_steps = len(widths) > 1
+        flat = self._full_draft_tokens.view(-1)
+        for w in widths:
+            self._draft_token_views[w] = flat[: self.max_num_reqs * w].view(
+                self.max_num_reqs, w
+            )
+            self._sample_cols[w] = torch.arange(
+                w, dtype=torch.int32, device=self.device
+            ).repeat(self.max_num_reqs)
+
+    def set_width(self, width: int) -> None:
+        """Make ``width`` the block the next forward drafts (host state only)."""
+        if width not in self._draft_token_views:
+            width = self.max_width
+        self.width = width
+        self.num_speculative_steps = width
+        self.num_query_per_req = 1 + width
+        self.draft_tokens = self._draft_token_views[width]
+        self.sample_col = self._sample_cols[width]
+        if width in self._cg_managers:
+            self.query_cudagraph_manager = self._cg_managers[width]
+        self._on_width(width)
+
+    def _on_width(self, width: int) -> None:
+        """Subclass hook for per-width state."""
+
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
@@ -136,12 +180,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
-        self.query_cudagraph_manager = DFlashCudaGraphManager(
-            self.vllm_config,
-            self.device,
-            cudagraph_mode,
-            decode_query_len=self.num_query_per_req,
-        )
+        for width in self.widths:
+            self._cg_managers[width] = DFlashCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                cudagraph_mode,
+                decode_query_len=1 + width,
+            )
+        self.set_width(self.max_width)
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
@@ -151,20 +197,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_idx_mapping.fill_(-1)
         # Capture must not write context K/V.
         self._context_slot_mappings.fill_(PAD_SLOT_ID)
-        assert self.query_cudagraph_manager is not None
-        self.query_cudagraph_manager.capture(
-            self._generate_draft,
-            self.input_buffers,
-            self.block_tables,
-            self.attn_groups,
-            self.kv_cache_config,
-            self.max_model_len,
-            causal=self._group_causal,
-            precompute_context_kv=lambda num_reqs: self._precompute_context_kv(
-                0, self._num_graph_context_tokens(num_reqs)
-            ),
-            progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
-        )
+        # One graph set per draft width; each is captured with that width's
+        # host state (block size, sample layout, draft-token view).
+        for width in self.widths:
+            self.set_width(width)
+            assert self.query_cudagraph_manager is not None
+            suffix = f" (width {width})" if len(self.widths) > 1 else ""
+            self.query_cudagraph_manager.capture(
+                self._generate_draft,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                causal=self._group_causal,
+                precompute_context_kv=lambda num_reqs: self._precompute_context_kv(
+                    0, self._num_graph_context_tokens(num_reqs)
+                ),
+                progress_bar_desc=(
+                    f"Capturing {self._speculator_name.lower()} CUDA graphs{suffix}"
+                ),
+            )
+        self.set_width(self.max_width)
 
     def load_draft_model(
         self,
@@ -354,7 +408,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
+        # The block width for this step: what the scheduler will verify next
+        # (load-following width), else the configured num_speculative_tokens.
+        self.set_width(num_steps if num_steps is not None else self.max_width)
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req

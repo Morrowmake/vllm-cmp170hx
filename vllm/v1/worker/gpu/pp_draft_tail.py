@@ -381,7 +381,10 @@ class RemoteDraftQueue:
     def _verify(self, e: RemoteDrafts, keep: np.ndarray) -> None:
         assert e.check is not None
         keep_t = torch.as_tensor(keep, device=e.draft_tokens.device)
-        diff = (e.draft_tokens != e.check).any(dim=1) & keep_t
+        # A narrow step (load-following draft width) fills only the first
+        # columns of the full-width broadcast; compare those.
+        width = e.check.shape[1]
+        diff = (e.draft_tokens[:, :width] != e.check).any(dim=1) & keep_t
         if self.checked_rows is None:
             self.checked_rows = torch.zeros((), dtype=torch.int64,
                                             device=e.draft_tokens.device)
@@ -703,8 +706,24 @@ class DraftTailController:
         self.is_last = pp_rank == pp_size - 1
         self.is_tail = gate.enabled and pp_rank == gate.stage
         self.live = False
-        self.rows_table: dict[int, int] | None = None
-        self.layout: TailPayloadLayout | None = None
+        # Draft width -> (request count -> drafter rows); one width unless
+        # VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH.
+        self.rows_table: dict[int, dict[int, int]] | None = None
+        self.layout: TailPayloadLayout | None = None  # the widest
+        self.layouts: dict[int, TailPayloadLayout] = {}
+        from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+            load_following_draft_widths,
+        )
+
+        spec = getattr(vllm_config, "speculative_config", None)
+        max_width = getattr(spec, "num_speculative_tokens", 0) or 0
+        archs = getattr(getattr(spec, "draft_model_config", None), "architectures", None)
+        plain_dflash2 = "LiLiCorrDraftModel" not in (archs or [])
+        self.widths = (
+            load_following_draft_widths(vllm_config)
+            if spec is not None and plain_dflash2
+            else ()
+        ) or (max_width,)
         self.module: DraftTailModule | None = None
         self.speculator = None
         self.handler = None  # the stage's PPHandler (communicator, stream)
@@ -742,7 +761,8 @@ class DraftTailController:
         if self.is_last and isinstance(speculator, DFlash2Speculator):
             speculator.enable_split_tail()
             self.speculator = speculator
-            self.layout = speculator.tail_layout
+            self.layouts = {w: speculator.tail_layout_for(w) for w in self.widths}
+            self.layout = self.layouts[max(self.widths)]
 
     def load(self, target_model: torch.nn.Module, dtype: torch.dtype) -> None:
         """Tail stage: allocate its copy of lm_head and the selector."""
@@ -755,13 +775,15 @@ class DraftTailController:
         spec = self.vllm_config.speculative_config
         k = spec.num_speculative_tokens
         max_rows = self.vllm_config.scheduler_config.max_num_seqs
-        self.layout = TailPayloadLayout(
-            max_rows=max_rows,
-            num_steps=k,
-            hidden_size=spec.draft_model_config.get_hidden_size(),
-            hidden_dtype=dtype,
-            anchor_dtype=torch.int32,
-        )
+        for w in self.widths:
+            self.layouts[w] = TailPayloadLayout(
+                max_rows=max_rows,
+                num_steps=w,
+                hidden_size=spec.draft_model_config.get_hidden_size(),
+                hidden_dtype=dtype,
+                anchor_dtype=torch.int32,
+            )
+        self.layout = self.layouts[max(self.widths)]
         self._out_tokens = torch.zeros(max_rows, k, dtype=torch.int64,
                                        device=self.device)
         self._scores = torch.zeros(max_rows * k * self.module.top_k,
@@ -778,8 +800,33 @@ class DraftTailController:
             input_batch.has_structured_output_reqs,
         )
 
-    def step(self, input_batch):
-        """Non-last stages: this step's DraftTailStep, or None (tail local)."""
+    def _layouts(self) -> dict[int, TailPayloadLayout]:
+        layouts = getattr(self, "layouts", None)
+        if not layouts and self.layout is not None:
+            layouts = self.layouts = {self.layout.num_steps: self.layout}
+        return layouts
+
+    def _width(self, width: int | None) -> int:
+        layouts = self._layouts()
+        return width if width in layouts else max(layouts)
+
+    def _table_for(self, width: int) -> dict[int, int] | None:
+        """Request count -> drafter rows at ``width``. The last stage sends
+        one table per width; a plain request-count table covers one width."""
+        rt = self.rows_table
+        if not rt:
+            return None
+        if isinstance(next(iter(rt.values())), dict):
+            return rt.get(width)
+        return rt
+
+    def _rows(self, num_reqs: int, width: int) -> int:
+        return tail_rows(num_reqs, self._table_for(width))
+
+    def step(self, input_batch, width: int | None = None):
+        """Non-last stages: this step's DraftTailStep, or None (tail local).
+        ``width`` is the block this step drafts (every stage has it from the
+        scheduler output)."""
         from vllm.v1.worker.gpu.pp_utils import DraftTailStep
 
         if not self.remote_step(input_batch):
@@ -788,13 +835,14 @@ class DraftTailController:
             # Receiver-only stages need the broadcast root, not the payload.
             return DraftTailStep(payload_nbytes=0)
         assert self.layout is not None
+        width = self._width(width)
         num_reqs = input_batch.num_reqs
-        rows = tail_rows(num_reqs, self.rows_table)
+        rows = self._rows(num_reqs, width)
 
         def compute(payload: torch.Tensor, draft_tokens: torch.Tensor) -> None:
-            self._run(payload, rows, num_reqs, draft_tokens)
+            self._run(payload, rows, num_reqs, draft_tokens, width)
 
-        return DraftTailStep(self.layout.nbytes(rows), compute)
+        return DraftTailStep(self._layouts()[width].nbytes(rows), compute)
 
     def check_drafts(self, num_reqs: int) -> torch.Tensor | None:
         """VLLM_PP_DRAFT_TAIL_VERIFY: the tail run here too, for comparison."""
@@ -809,8 +857,10 @@ class DraftTailController:
         """Last stage, after a split drafter forward: the bytes to send."""
         spec = self.speculator
         assert spec is not None and self.layout is not None
+        width = self._width(spec.width)
+        layout = self._layouts()[width]
         rows = spec.tail_rows
-        expected = tail_rows(num_reqs, self.rows_table)
+        expected = self._rows(num_reqs, width)
         if rows == expected:
             return spec.tail_payload(rows).clone()
         if not self._warned_rows:
@@ -821,15 +871,15 @@ class DraftTailController:
                 "but may differ from a last-stage tail).",
                 rows, num_reqs, expected, expected,
             )
-        out = torch.zeros(self.layout.nbytes(expected), dtype=torch.uint8,
+        out = torch.zeros(layout.nbytes(expected), dtype=torch.uint8,
                           device=self.device)
-        dst = self.layout.views(out, expected)
+        dst = layout.views(out, expected)
         dst.row_state.fill_(-1)
         copy_payload_rows(spec.tail_staging_views(rows), dst,
-                          min(rows, expected), self.layout.num_steps)
+                          min(rows, expected), layout.num_steps)
         return out
 
-    def _walk(self):
+    def _walk(self, width: int):
         from vllm.triton_utils import triton
         from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
             _selector_walk_kernel,
@@ -837,10 +887,12 @@ class DraftTailController:
 
         assert self.module is not None
         top_k = self.module.top_k
-        k = self.layout.num_steps
+        k = width
         block_k = triton.next_power_of_2(top_k)
         use_fp64 = self.vllm_config.model_config.use_fp64_gumbel
-        out_tokens, scores_out = self._out_tokens, self._scores
+        # The walk writes rows of k tokens contiguously: a width-k view.
+        out_tokens = self._out_tokens.view(-1)[: self._out_tokens.shape[0] * k]
+        scores_out = self._scores
 
         def walk(candidate_ids, scores, views: TailPayloadViews, rows: int) -> None:
             _selector_walk_kernel[(rows,)](
@@ -863,22 +915,26 @@ class DraftTailController:
         return walk
 
     def _run(self, payload: torch.Tensor, rows: int, num_reqs: int,
-             draft_tokens: torch.Tensor | None) -> None:
-        """Tail stage, on the broadcast stream (beside its own forward)."""
+             draft_tokens: torch.Tensor | None, width: int | None = None) -> None:
+        """Tail stage, on the broadcast stream (beside its own forward).
+        A narrow step fills the first ``width`` columns of the full-width
+        broadcast; the rest are never verified."""
         assert self.module is not None and self.layout is not None
-        views = self.layout.views(payload, rows)
+        width = self._width(width)
+        views = self._layouts()[width].views(payload, rows)
         with tail_side_stream_workspaces(self.device, self._workspaces):
             run_draft_tail(
                 self.module.compute_candidates,
                 self.module.select,
-                self._walk(),
+                self._walk(width),
                 views,
                 rows,
-                self.layout.num_steps,
+                width,
                 self.module.top_k,
             )
         if draft_tokens is not None:
-            draft_tokens.copy_(self._out_tokens[:num_reqs])
+            out = self._out_tokens.view(-1)[: self._out_tokens.shape[0] * width]
+            draft_tokens[:, :width].copy_(out.view(-1, width)[:num_reqs])
 
     # ---- after capture ----------------------------------------------------
 
@@ -898,10 +954,11 @@ class DraftTailController:
                     lm_head, spec.model.candidate_logits_processor, selector
                 ),
                 rows_table=spec.graph_rows_table(),
-                layout=(spec.tail_layout.max_rows, spec.tail_layout.num_steps,
-                        spec.tail_layout.hidden_size,
-                        str(spec.tail_layout.hidden_dtype),
-                        str(spec.tail_layout.anchor_dtype)),
+                layout=(self.layout.max_rows, self.layout.num_steps,
+                        self.layout.hidden_size,
+                        str(self.layout.hidden_dtype),
+                        str(self.layout.anchor_dtype)),
+                widths=list(self.widths),
                 probabilistic=spec.draft_logits is not None,
                 adaptive=bool(spec.enable_adaptive_verification),
                 fp64=bool(spec.use_fp64_gumbel),
@@ -922,6 +979,7 @@ class DraftTailController:
                                      m.candidate_selector),
                 layout=(lay.max_rows, lay.num_steps, lay.hidden_size,
                         str(lay.hidden_dtype), str(lay.anchor_dtype)),
+                widths=list(self.widths),
                 fp64=bool(self.vllm_config.model_config.use_fp64_gumbel),
             )
         return info
@@ -934,7 +992,7 @@ class DraftTailController:
             return False, tail.get("reason") or "tail stage not ready"
         if last.get("probabilistic") or last.get("adaptive"):
             return False, "the drafter samples probabilistically or adapts"
-        for key in ("sig", "mod", "layout", "fp64"):
+        for key in ("sig", "mod", "layout", "widths", "fp64"):
             if last.get(key) != tail.get(key):
                 return False, (
                     f"the two copies differ ({key}: {last.get(key)} vs "
@@ -1015,12 +1073,14 @@ class DraftTailController:
         row count, on the broadcast stream the tail runs on."""
         assert self.layout is not None and self.handler is not None
         stream = self.handler.broadcast_stream
-        rows_seen = sorted(set(self.rows_table.values()) |
-                           set(range(1, self.layout.max_rows + 1)))
         with torch.cuda.stream(stream):
-            for rows in rows_seen:
-                buf = torch.zeros(self.layout.nbytes(rows), dtype=torch.uint8,
-                                  device=self.device)
-                self.layout.views(buf, rows).row_state.fill_(-1)
-                self._run(buf, rows, 0, None)
+            for width, layout in sorted(self._layouts().items()):
+                table = self._table_for(width) or {}
+                rows_seen = sorted(set(table.values()) |
+                                   set(range(1, layout.max_rows + 1)))
+                for rows in rows_seen:
+                    buf = torch.zeros(layout.nbytes(rows), dtype=torch.uint8,
+                                      device=self.device)
+                    layout.views(buf, rows).row_state.fill_(-1)
+                    self._run(buf, rows, 0, None, width)
         torch.cuda.synchronize(self.device)
