@@ -248,8 +248,6 @@ _KDA_V2_MAX_TOKENS_PER_SEQ_EXT = 8
 # 35.9->24.5, 45.8->29.0, 81.7->54.7; at 8 sequences T=6 124.5->146.4 and
 # T=8 151.9->172.7), so the deep range is gated by sequences too.
 _KDA_V2_DEEP_MAX_SEQS = 4
-# 64 heads (pipeline parallel): the deep range is taken for one sequence only.
-_KDA_V2_DEEP_WIDE_MAX_SEQS = 1
 _KDA_V2_MAX_SEQS = 8
 
 
@@ -257,14 +255,12 @@ def kda_v2_max_tokens_per_seq(num_heads: int) -> int:
     """Tokens per sequence the v2 gate admits at `num_heads` heads.
 
     5, or 8 (the kernel's gate workspace rows) at the 16-head
-    (tensor-parallel) shape with VLLM_GLM5_DECODE_KDA_V2_DEEP=1 and at the
-    64-head (pipeline-parallel) shape with VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE=1.
+    (tensor-parallel) shape with VLLM_GLM5_DECODE_KDA_V2_DEEP=1. The 64-head
+    shape is validated only up to 5.
     """
     from vllm import envs
 
     if num_heads == _KDA_V2_HEADS and envs.VLLM_GLM5_DECODE_KDA_V2_DEEP:
-        return _KDA_V2_MAX_TOKENS_PER_SEQ_EXT
-    if num_heads == _KDA_V2_WIDE_HEADS and envs.VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE:
         return _KDA_V2_MAX_TOKENS_PER_SEQ_EXT
     return _KDA_V2_MAX_TOKENS_PER_SEQ
 
@@ -297,8 +293,9 @@ def use_ampere_kda_decode_v2(
     tokens_per_seq = num_tokens // num_seqs
     if tokens_per_seq > kda_v2_max_tokens_per_seq(num_heads):
         return False
-    if tokens_per_seq > _KDA_V2_MAX_TOKENS_PER_SEQ and num_seqs > (
-        _KDA_V2_DEEP_MAX_SEQS if num_heads == _KDA_V2_HEADS else _KDA_V2_DEEP_WIDE_MAX_SEQS
+    if (
+        tokens_per_seq > _KDA_V2_MAX_TOKENS_PER_SEQ
+        and num_seqs > _KDA_V2_DEEP_MAX_SEQS
     ):
         return False
     if num_tokens > envs.VLLM_GLM5_DECODE_KDA_MAX_TOKENS:
