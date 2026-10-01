@@ -197,8 +197,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # Independent of the older TP-only decode warmup: PP workers also need
     # persistent scratch before profiling/capture can use the optional ops.
     if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
-        from vllm.ampere_decode.marlin_moe import warmup_from_worker
+        from vllm.ampere_decode.marlin_moe import open_late_scratch, warmup_from_worker
 
+        # kernel_warmup runs after the KV cache is sized: the whole-expert
+        # decode scratch may be allocated from here on.
+        open_late_scratch()
         warmup_from_worker(worker)
 
     # The sm_80 decode kernels (vllm/ampere_decode/). This MUST run before

@@ -423,3 +423,44 @@ def test_multi_graph_replay(weights, monkeypatch, name, M):
     assert torch.equal(out, eager)
     assert torch.cuda.memory_allocated() == allocated
     deterministic_moe_align_mode.cache_clear()
+
+
+# ---------------------- whole-expert scratch only after KV sizing (CPU) ----
+
+@pytest.mark.parametrize("width,M", [(2048, 4), (2048, 6), (2048, 16), (512, 4)])
+def test_whole_expert_scratch_waits_for_kv_sizing(monkeypatch, width, M):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv(DECODE, "1")
+    monkeypatch.setenv(MID, "1")
+    monkeypatch.setenv(MULTI_ON, "1")
+    monkeypatch.setattr(decode, "_WORKSPACES", {})
+    monkeypatch.setattr(decode, "_late_scratch_open", False)
+    monkeypatch.setattr(decode, "gate_reason", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "current_stream",
+                        lambda _device: SimpleNamespace(cuda_stream=0))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    calls = []
+    monkeypatch.setattr(decode, "run", lambda *a, **k: calls.append(a))
+    args = pp_helpers._meta_args(M=M, n=width, device="cpu")
+    out = torch.zeros(M, 4096)
+
+    def apply():
+        return decode.maybe_apply(pp_helpers._layer(n=width), out, **args)
+
+    if width == 2048:
+        # profile run / graph-memory profiling: released kernels, nothing allocated
+        assert apply() is False and decode._WORKSPACES == {} and not calls
+        decode.open_late_scratch()
+    assert apply() is True and len(calls) == 1
+    (ws,) = decode._WORKSPACES.values()
+    assert ws["max_tokens"] == decode._scratch_tokens(width)
+
+
+def test_kernel_warmup_opens_scratch_before_warmup():
+    import inspect
+
+    from vllm.model_executor.warmup import kernel_warmup
+
+    src = inspect.getsource(kernel_warmup.kernel_warmup)
+    assert 0 < src.index("open_late_scratch()") < src.index("warmup_from_worker(worker)")
