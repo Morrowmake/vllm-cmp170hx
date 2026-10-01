@@ -365,7 +365,9 @@ class KDARecoverCommitMetadata:
 @dataclasses.dataclass
 class Glm5KDARecoverMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     recover_commit: KDARecoverCommitMetadata | None = None
-    recover_context: "KDARecoverCommitContext | None" = dataclasses.field(
+    # the builder's BuilderRecover: the commit context is created on the first
+    # commit (after the KV caches are bound), not when metadata is built
+    recover_context: "BuilderRecover | None" = dataclasses.field(
         default=None, repr=False, compare=False)
 
     def commit_recoverssm_state(
@@ -374,7 +376,7 @@ class Glm5KDARecoverMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         c = self.recover_commit
         if c is None or self.recover_context is None:
             return None
-        self.recover_context.commit(
+        self.recover_context.get_context().commit(
             num_accepted_tokens, c.state_indices, c.query_start_loc,
             request_indices=c.request_indices, block_table=c.block_table,
             num_computed_tokens=c.num_computed_tokens, mamba_block_size=c.block_size)
@@ -435,7 +437,7 @@ class BuilderRecover:
         fields = {f.name: getattr(meta, f.name) for f in dataclasses.fields(meta)}
         fields["num_accepted_tokens"] = self.ones[:rows]
         return Glm5KDARecoverMetadata(**fields, recover_commit=commit,
-                                      recover_context=self.get_context())
+                                      recover_context=self)
 
 
 # ---------------------------------------------------------------------------
