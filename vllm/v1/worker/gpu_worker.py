@@ -433,10 +433,10 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if (
-            envs.VLLM_GLM5_MARLIN_DECODE_CUDA
-            or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
-        ):
+        from vllm.ampere_marlin import note_removed_flags
+
+        note_removed_flags()
+        if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
             from vllm.ampere_marlin import require_extension
 
             require_extension()

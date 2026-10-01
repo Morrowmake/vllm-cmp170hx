@@ -258,11 +258,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # allocate-once per (device, E) and its Triton kernels compile on first
     # launch. Only with VLLM_GLM5_PP_MARLIN_PREFILL or
     # VLLM_GLM5_TP4_MARLIN_PREFILL.
-    if (
-        envs.VLLM_GLM5_PP_MARLIN_PREFILL
-        or envs.VLLM_GLM5_TP4_MARLIN_PREFILL
-        or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
-    ):
+    if envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
         from vllm.ampere_prefill.pp_marlin_prefill import (
             warmup_from_worker as warmup_pp_marlin_prefill,
         )

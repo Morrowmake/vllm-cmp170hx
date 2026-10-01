@@ -28,7 +28,7 @@ MID = "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS"
 
 @pytest.fixture(autouse=True)
 def isolated_flags(monkeypatch):
-    for name in (DECODE, "VLLM_GLM5_MARLIN_PREFILL_CUDA", "VLLM_GLM5_PP_MARLIN_PREFILL",
+    for name in (DECODE, "VLLM_GLM5_PP_MARLIN_PREFILL",
                  "VLLM_GLM5_TP4_MARLIN_PREFILL", "VLLM_GLM5_DECODE_KERNELS"):
         monkeypatch.setenv(name, "0")
     monkeypatch.delenv(VARIANT, raising=False)

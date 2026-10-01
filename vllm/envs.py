@@ -253,7 +253,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TP4_MARLIN_PREFILL: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
-    VLLM_GLM5_MARLIN_PREFILL_CUDA: bool = False
+    VLLM_GLM5_MARLIN_PREFILL_CUDA: str = ""
     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
     VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
@@ -2061,14 +2061,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
     ),
-    # Optional prebuilt sm_80 Marlin kernels. Enabling either flag requires
-    # vllm._ampere_marlin_C; startup fails if it is missing or incompatible.
+    # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
+    # requires vllm._ampere_marlin_C; startup fails if it is missing or
+    # incompatible.
     "VLLM_GLM5_MARLIN_DECODE_CUDA": lambda: bool(
         int(os.getenv("VLLM_GLM5_MARLIN_DECODE_CUDA", "0"))
     ),
-    "VLLM_GLM5_MARLIN_PREFILL_CUDA": lambda: bool(
-        int(os.getenv("VLLM_GLM5_MARLIN_PREFILL_CUDA", "0"))
-    ),
+    # Removed: the compiled Marlin prefill. Still declared so an old setting
+    # is recognised; a non-zero value is ignored with one startup warning
+    # (vllm/ampere_marlin.py::note_removed_flags).
+    "VLLM_GLM5_MARLIN_PREFILL_CUDA": lambda: os.getenv(
+        "VLLM_GLM5_MARLIN_PREFILL_CUDA", ""
+    ).strip(),
     # Reduction order of the compiled decode kernels when
     # VLLM_GLM5_MARLIN_DECODE_CUDA is on: "orig" (default) splits the w13
     # projection four ways along K (faster, different fp32 summation order);

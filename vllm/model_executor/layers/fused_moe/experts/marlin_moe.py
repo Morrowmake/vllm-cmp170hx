@@ -751,7 +751,6 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             if (
                 envs.VLLM_GLM5_PP_MARLIN_PREFILL
                 or envs.VLLM_GLM5_TP4_MARLIN_PREFILL
-                or envs.VLLM_GLM5_MARLIN_PREFILL_CUDA
             ):
                 from vllm.ampere_prefill.pp_marlin_prefill import maybe_apply
 
