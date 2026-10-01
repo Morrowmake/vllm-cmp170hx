@@ -256,6 +256,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_PREFILL_CUDA: bool = False
     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
     VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
+    VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
+    VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -2080,6 +2082,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS": lambda: bool(
         int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS", "0"))
     ),
+    # Whole-expert (N=2048) compiled decode for multi-request batches, at the
+    # row ranges of _ROWS ("lo-hi[,lo-hi...]" within 9..64; default 9-32, the
+    # most rows one PP4 step verifies with DEPTHS 7,5 and 8 sequences). The
+    # N=2048 scratch grows to the largest row count named there.
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MULTI", "0"))
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS": lambda: os.getenv(
+        "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS", "9-32"
+    ).strip(),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
     # VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE is also set *and* peer access is

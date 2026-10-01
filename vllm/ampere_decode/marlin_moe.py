@@ -17,6 +17,8 @@ Persistent buffers are shared by serialized calls on each device, as are the
 released alignment buffers. No CUDA source compilation occurs here.
 """
 
+import functools
+
 import torch
 
 import vllm.envs as envs
@@ -32,6 +34,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 MAX_TOKENS = 32
 _SCRATCH_TOKENS = {512: MAX_TOKENS, 2048: 8}
+# Whole-expert multi-request rows: VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS ranges.
+PP_MULTI_MIN, PP_MULTI_MAX = 9, 64
 W13_ROWS = 64
 _WORKSPACES: dict = {}
 # W13 fp32 partial planes per variant (the original kernel splits K four ways).
@@ -39,14 +43,50 @@ _W13_PLANES = {"orig": 4, "exact": 1}
 _RETIRED: list = []
 
 
+@functools.lru_cache(maxsize=8)
+def _parse_ranges(raw: str) -> tuple[tuple[int, int], ...] | None:
+    """"lo-hi[,lo-hi...]" -> ranges inside PP_MULTI_MIN..PP_MULTI_MAX; None if
+    malformed (the gate then stays closed); () if empty."""
+    out = []
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        try:
+            a, b = int(lo), int(hi if sep else lo)
+        except ValueError:
+            return None
+        if not PP_MULTI_MIN <= a <= b <= PP_MULTI_MAX:
+            return None
+        out.append((a, b))
+    return tuple(out)
+
+
+def pp_multi_ranges() -> tuple[tuple[int, int], ...]:
+    if not envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI:
+        return ()
+    return _parse_ranges(envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS) or ()
+
+
+def _scratch_tokens(N: int) -> int:
+    """Rows the persistent scratch of width N is sized for."""
+    base = _SCRATCH_TOKENS.get(N, 0)
+    if N == 2048:
+        base = max([base] + [hi for _, hi in pp_multi_ranges()])
+    return base
+
+
 def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
     """TP4 small batches and the measured whole-expert PP4 decode batches
-    (4 and 8 rows; 5-7 rows too with VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS)."""
+    (4 and 8 rows; 5-7 rows too with VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS; the
+    multi-request row ranges of VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS)."""
     return (
         intermediate_size == 512 and 1 <= num_tokens <= MAX_TOKENS
         or intermediate_size == 2048 and (
             num_tokens in (4, 8)
             or 5 <= num_tokens <= 7 and envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS
+            or num_tokens >= PP_MULTI_MIN and any(
+                lo <= num_tokens <= hi for lo, hi in pp_multi_ranges())
         )
     )
 
@@ -76,7 +116,7 @@ def _workspaces(device, N: int, max_tokens: int, *, create: bool):
         return None
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Marlin decode scratch must be warmed before CUDA capture")
-    capacity = max(_SCRATCH_TOKENS.get(N, 0), max_tokens)
+    capacity = max(_scratch_tokens(N), max_tokens)
     rows = capacity * TOPK_GATE
     padded = (rows + E_GATE * 7 + 7) // 8 * 8
     if ws is not None:
@@ -183,9 +223,10 @@ def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
         return False
     logger.info_once(
         "Compiled Marlin MoE decode active (VLLM_GLM5_MARLIN_DECODE_CUDA): "
-        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in %s; "
+        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in %s%s; "
         "variant=%s (VLLM_GLM5_MARLIN_DECODE_VARIANT).",
-        "4..8" if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS else "{4, 8}", variant(),
+        "4..8" if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS else "{4, 8}",
+        "".join(", %d..%d" % r for r in pp_multi_ranges()), variant(),
     )
     run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids, activation)
     return True
@@ -240,7 +281,7 @@ def warmup(device, N=512, max_tokens=None):
 
     require_extension()
     if max_tokens is None:
-        max_tokens = _SCRATCH_TOKENS[N]
+        max_tokens = _scratch_tokens(N)
     device = torch.device(device)
     with torch.cuda.device(device):
         ws = _workspaces(device, N, max_tokens, create=True)
@@ -277,7 +318,24 @@ def warmup_from_worker(worker):
                 "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS is set but the gate is closed "
                 "(expert width N=%d per rank, not the whole-expert 2048).", N,
             )
-    capacity = _SCRATCH_TOKENS.get(N, 0)
+    if envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI:
+        raw = envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS
+        ranges = _parse_ranges(raw)
+        if N != 2048 or not ranges:
+            logger.info_once(
+                "VLLM_GLM5_MARLIN_DECODE_PP_MULTI is set but the gate is closed "
+                "(%s).", "expert width N=%d per rank, not the whole-expert 2048" % N
+                if N != 2048 else "%r is not lo-hi ranges within %d..%d"
+                % (raw, PP_MULTI_MIN, PP_MULTI_MAX),
+            )
+        else:
+            logger.info_once(
+                "[ampere-marlin] whole-expert compiled decode for multi-request rows "
+                "%s (VLLM_GLM5_MARLIN_DECODE_PP_MULTI, _ROWS), scratch %d rows, "
+                "variant=%s.", ",".join("%d..%d" % r for r in ranges),
+                _scratch_tokens(N), variant(),
+            )
+    capacity = _scratch_tokens(N)
     if compiled_regime(capacity, N):
         from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
             deterministic_moe_align_mode,
