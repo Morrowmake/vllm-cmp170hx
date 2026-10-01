@@ -178,7 +178,13 @@ class AdaptiveKConfig:
                     raise ValueError("adaptive_k.accept must be a mapping.")
                 # The acceptance-aware choice may pick any depth from the
                 # shallowest load width up to the deepest one.
-                allowed = tuple(range(min(by_load), max(by_load) + 1))
+                min_depth = int(raw_accept.get("min_depth", min(by_load)))
+                if not 1 <= min_depth <= min(by_load):
+                    raise ValueError(
+                        "adaptive_k.accept.min_depth must be between 1 "
+                        "and the shallowest load width"
+                    )
+                allowed = tuple(range(min_depth, max(by_load) + 1))
                 costs = tuple(float(c) for c in raw_accept.get("costs", ()))
                 if len(costs) != len(allowed) or min(costs, default=0.0) <= 0:
                     raise ValueError(
@@ -213,7 +219,7 @@ class AdaptiveKConfig:
                     accept_decay=decay,
                 )
             return cls(
-                min_k=min(by_load),
+                min_k=allowed[0],
                 max_k=max(by_load),
                 ema=ema,
                 margin=margin,

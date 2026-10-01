@@ -7,8 +7,8 @@ import pytest
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.spec_decode.dynamic.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
 from vllm.v1.request import RequestStatus
+from vllm.v1.spec_decode.dynamic.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
 from vllm.v1.structured_output import StructuredOutputManager
 
 
@@ -464,3 +464,84 @@ def test_adaptive_k_does_not_corrupt_the_async_placeholder_list():
 
     scheduler.schedule()
     assert shared == [-1, -1, -1], "the shared placeholder list was mutated"
+
+
+def test_acceptance_depth_two_uses_matching_cost_index_and_capture_range():
+    config = AdaptiveKConfig.from_dict(
+        {
+            "by_load": [7, 5, 3],
+            "accept": {
+                "min_depth": 2,
+                "costs": [1.0, 1.2, 1.4, 1.6, 1.8, 2.0],
+                "costs_multi": [1.0, 1.2, 1.4, 1.6, 1.8, 2.0],
+            },
+        },
+        7,
+    )
+    assert config.allowed == (2, 3, 4, 5, 6, 7)
+    assert config.max_reqs_for(2, 8) == 8
+    policy = AdaptiveKPolicy(config)
+    for _ in range(20):
+        policy.observe("poor", 3, 0)
+    assert policy.select_by_acceptance(["poor"], 7) == 2
+    for _ in range(20):
+        policy.observe("other", 7, 7)
+    policy.forget("poor")
+    fresh = AdaptiveKPolicy(config)
+    assert policy.select_by_acceptance(["poor"], 7) == fresh.select_by_acceptance(
+        ["poor"], 7
+    )
+
+
+def test_depth_two_default_does_not_extend_existing_capture_range():
+    config = AdaptiveKConfig.from_dict(
+        {"by_load": [7, 5, 3], "accept": {"costs": [1.0, 1.1, 1.2, 1.3, 1.4]}}, 7
+    )
+    assert config.allowed == (3, 4, 5, 6, 7)
+    assert config.max_reqs_for(2, 8) == 0
+
+
+@pytest.mark.parametrize("minimum", [0, 4])
+def test_acceptance_minimum_cannot_exceed_load_cap(minimum):
+    with pytest.raises(ValueError, match="min_depth"):
+        AdaptiveKConfig.from_dict(
+            {
+                "by_load": [7, 5, 3],
+                "accept": {"min_depth": minimum, "costs": [1.0] * 6},
+            },
+            7,
+        )
+
+
+def test_depth_two_needs_measured_tables_outside_forced_calibration(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.config import SpeculativeConfig
+
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_DEPTH2", "1")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", "")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI", "")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE", "")
+    config = SimpleNamespace(
+        target_parallel_config=SimpleNamespace(pipeline_parallel_size=4)
+    )
+    with pytest.raises(ValueError, match="measured"):
+        SpeculativeConfig._glm5_accept_depth_config(config, [7, 5, 3])
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE", "force_depth")
+    result = SpeculativeConfig._glm5_accept_depth_config(config, [7, 5, 3])
+    assert result["min_depth"] == 2
+    assert len(result["costs"]) == len(result["costs_multi"]) == 6
+
+
+@pytest.mark.parametrize("table", ["1,1,1,1,1", "1,1,1,1,1,inf", "1,1,1,1,1,nan"])
+def test_depth_two_rejects_short_or_nonfinite_tables(monkeypatch, table):
+    from types import SimpleNamespace
+
+    from vllm.config import SpeculativeConfig
+
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_DEPTH2", "1")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", table)
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI", table)
+    config = SimpleNamespace(target_parallel_config=None)
+    with pytest.raises(ValueError, match="positive entries"):
+        SpeculativeConfig._glm5_accept_depth_config(config, [7, 5, 3])
