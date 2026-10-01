@@ -584,6 +584,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     ) -> None:
         # Cleared on every call; set only by the fused sm_80 paths below.
         self._ampere_kda_normed = False
+        kda_recover = getattr(self, "_kda_recover", False)
         # f_a / g_a are passed only with VLLM_GLM5_DECODE_KDA_V2 (see forward):
         # g1 is then None and g2 an unfilled buffer.
         deferred = f_a is not None
@@ -665,7 +666,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # whatever the v2 shape gate says (the per-draft-position path has no
         # state pages to write to). A mixed step handles its spec rows below.
         if (
-            self._kda_recover
+            kda_recover
             and use_spec
             and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)
             and attn_metadata_narrowed.num_prefills == 0
@@ -845,7 +846,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         # --- causal conv1d: spec (draft-verify) path ---
         # (VLLM_GLM5_KDA_RECOVER: the recover verify below does its own conv.)
-        if use_spec and not self._kda_recover:
+        if use_spec and not kda_recover:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
@@ -908,7 +909,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
             else None
         )
-        if use_spec and self._kda_recover:
+        if use_spec and kda_recover:
             # Mixed prefill + verify step: the spec rows go through the recover
             # verify (conv + recurrence, records, no state writes) and stay
             # unnormalised; forward() norms the whole step.

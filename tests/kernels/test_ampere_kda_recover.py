@@ -374,8 +374,8 @@ def gpu_test_skip_norm_is_the_staged_output():
 
 
 def gpu_test_graph_zero_growth():
-    """Verify (captured with the forward) and commit capture with zero
-    allocation growth and replay bitwise equal to eager."""
+    """Verify and commit capture with no allocation beyond torch's own per-graph
+    capture allocation, replays allocate nothing and are bitwise equal to eager."""
     from vllm.ampere_decode import kda_decode_v2 as k2
 
     T, nseq = 8, 4
@@ -406,19 +406,36 @@ def gpu_test_graph_zero_growth():
         step()
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
+    # torch's capture machinery allocates a little per graph by itself
+    # (1,024 B for a graph holding one in-place add on this stack, the
+    # kda_decode_v2 harness calibration); the capture may allocate exactly
+    # that much and nothing more, and replays nothing.
+    scratch = torch.zeros(16, device="cuda")
+    torch.cuda.synchronize()
+    c0 = torch.cuda.memory_allocated()
+    g0 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g0):
+        scratch.add_(1.0)
+    torch.cuda.synchronize()
+    cap_overhead = torch.cuda.memory_allocated() - c0
+    del g0
+    torch.cuda.synchronize()
     m0 = torch.cuda.memory_allocated()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         step()
     torch.cuda.synchronize()
-    grow = torch.cuda.memory_allocated() - m0
-    assert grow == 0, grow
+    grow = torch.cuda.memory_allocated() - m0 - cap_overhead
+    assert grow <= 0, (grow, cap_overhead)
+    m1 = torch.cuda.memory_allocated()
     for _ in range(2):
         p.rec.copy_(rec0)
         p.conv.copy_(conv0)
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, ye) and torch.equal(p.rec, re_) and torch.equal(p.conv, ce)
+    assert torch.cuda.memory_allocated() <= m1, "replay allocated"
+    print(f"  capture growth beyond torch's own {cap_overhead} B/graph: {grow} B")
     del g
 
 
