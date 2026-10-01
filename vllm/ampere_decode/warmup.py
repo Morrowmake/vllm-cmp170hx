@@ -209,6 +209,16 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
     num_spec = int(getattr(layer, "num_spec", 0) or 0)
     tokens_per_seq = num_spec + 1
     max_seqs = int(worker.vllm_config.scheduler_config.max_num_seqs)
+    if getattr(layer, "_kda_recover", False):
+        # VLLM_GLM5_KDA_RECOVER: every spec-verify step takes the recover
+        # variants (pure and mixed), for 1..max_num_seqs sequences.
+        rplans = tuple((n, tokens_per_seq) for n in range(1, max_seqs + 1))
+        kda_decode_v2.warmup(
+            plans=rplans, device=torch.device(device), heads=heads, recover=True
+        )
+        logger.info(
+            "Warmed up sm_80 KDA recover verify for (nseq, T) in %s.", list(rplans)
+        )
     nseqs = {
         max(1, int(s) // tokens_per_seq) for s in capture_sizes if int(s) >= 1
     }

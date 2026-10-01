@@ -164,6 +164,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        # VLLM_GLM5_KDA_RECOVER (GLM-5 KDA layers): commit metadata on every
+        # spec-decode step; None otherwise.
+        self._kda_recover = None
+        if self.use_spec_decode:
+            from vllm.ampere_decode.kda_recover import (
+                BuilderRecover,
+                kda_recover_enabled,
+            )
+
+            if kda_recover_enabled(vllm_config):
+                self._kda_recover = BuilderRecover(self)
 
     def _build_chunk_metadata(
         self,
@@ -239,6 +250,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_decode_draft_tokens_cpu,
         )
         if _fused is not None:
+            if self._kda_recover is not None:
+                return self._kda_recover.wrap(_fused, m, None)
             return _fused
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
@@ -567,6 +580,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if self._kda_recover is not None:
+            return self._kda_recover.wrap(attn_metadata, m, spec_sequence_masks_cpu)
         return attn_metadata
 
     def build_for_cudagraph_capture(
