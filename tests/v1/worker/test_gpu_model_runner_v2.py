@@ -4,6 +4,7 @@
 import contextlib
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -18,7 +19,152 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def _prepare_padding_batch(monkeypatch, lengths, padding, confidence=None):
+    """Run prepare_inputs on CPU; replace only device input-building kernels."""
+    nreq, ntok = len(lengths), sum(lengths)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = nreq
+    runner.decode_query_len = 8
+    runner.input_buffers = InputBuffers(nreq, len(padding), runner.device)
+    runner.input_buffers.is_padding.copy_(padding)
+    runner.input_buffers.positions[:ntok] = torch.cat(
+        [torch.arange(10, 10 + length) for length in lengths]
+    )
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    runner.model_config = SimpleNamespace(rswa_window=None)
+    runner.adaptive_verification = None
+    runner.fast_prefill = None
+    runner.pcp_manager = None
+    runner.pp_handler = None
+    runner.speculator = SimpleNamespace(draft_confidence=confidence)
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.full(nreq, 10, dtype=np.int32),
+        num_computed_tokens=SimpleNamespace(gpu=torch.full((nreq,), 10)),
+        last_sampled_tokens=None,
+        prefill_len=SimpleNamespace(gpu=torch.zeros(nreq)),
+        draft_tokens=None,
+    )
+
+    def h2d(values, device=None, dtype=None, out=None):
+        tensor = torch.as_tensor(values, dtype=dtype)
+        return out.copy_(tensor) if out is not None else tensor
+
+    def expand(mapping, total, boundaries, _decode_len):
+        counts = boundaries[1:] - boundaries[:-1]
+        return mapping.repeat_interleave(counts), torch.cat(
+            [torch.arange(int(count)) for count in counts]
+        )
+
+    monkeypatch.setattr(model_runner_module, "async_tensor_h2d", h2d)
+    monkeypatch.setattr(model_runner_module, "expand_idx_mapping", expand)
+    monkeypatch.setattr(model_runner_module, "prepare_pos_seq_lens", lambda *a: None)
+    monkeypatch.setattr(
+        model_runner_module,
+        "combine_sampled_and_draft_tokens",
+        lambda *a: torch.arange(ntok),
+    )
+    req_ids = [str(i) for i in range(nreq)]
+    scheduler = SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            req_id: [1] * (length - 1)
+            for req_id, length in zip(req_ids, lengths)
+            if length > 1
+        },
+        has_structured_output_requests=False,
+    )
+    state = SimpleNamespace(
+        num_tokens=ntok,
+        req_ids=req_ids,
+        num_scheduled_tokens=np.array(lengths, dtype=np.int32),
+        idx_mapping_np=np.arange(nreq),
+        has_prefill=False,
+        prefill_len_np=np.zeros(nreq, dtype=np.int32),
+        num_computed_prefill_tokens_np=np.zeros(nreq, dtype=np.int32),
+        is_prefilling_np=np.zeros(nreq, dtype=np.bool_),
+    )
+    desc = SimpleNamespace(num_tokens=len(padding), num_reqs=nreq)
+    return runner, runner.prepare_inputs(scheduler, state, desc, 0)
+
+
+@pytest.mark.parametrize("generic_skip", [False, True])
+@pytest.mark.parametrize("seed", range(8))
+def test_prepare_inputs_skip_off_preserves_base_padding_and_routes(
+    monkeypatch, generic_skip, seed
+):
+    """MASK_PADDING alone must preserve the pre-skip buffer/routing contract."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_SKIP", "0")
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "1")
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", str(int(generic_skip)))
+    monkeypatch.setenv("VLLM_GLM5_DECODE_KERNELS", "1")
+    monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
+    g = torch.Generator().manual_seed(seed)
+    lengths = torch.randint(1, 9, (1 + seed % 4,), generator=g).tolist()
+    ntok = sum(lengths)
+    padding = torch.randint(0, 2, (ntok + seed % 5 + 3,), generator=g).bool()
+    expected = padding.clone()
+    # Before draft skipping, only the upstream switch initialized this buffer.
+    if generic_skip:
+        expected[:ntok] = False
+        expected[ntok:] = True
+    runner, batch = _prepare_padding_batch(monkeypatch, lengths, padding)
+    assert batch.is_padding.data_ptr() == runner.input_buffers.is_padding.data_ptr()
+    assert torch.equal(batch.is_padding, expected)
+    assert torch.equal(runner.input_buffers.is_padding, expected)
+
+    monkeypatch.setattr(mr, "_MASK_PADDING", None)
+    monkeypatch.setattr(mr, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(mr, "get_forward_context", lambda: batch)
+    ids = torch.randint(0, 288, (len(padding), 8), generator=g, dtype=torch.int32)
+    expected_ids = ids.clone()
+    if len(padding) > 8:
+        expected_ids.masked_fill_(expected[:, None], -1)
+    assert mr.mask_padding_topk_ids(ids) is ids
+    assert torch.equal(ids, expected_ids)
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("generic_skip", [False, True])
+@pytest.mark.parametrize("mask_padding", [False, True])
+def test_prepare_inputs_fills_before_applying_draft_skip(
+    monkeypatch, generic_skip, mask_padding
+):
+    """Clear stale masks first, then retain skipped live rows and graph padding."""
+    from vllm.v1.worker.gpu.spec_decode.draft_confidence import (
+        DraftConfidence,
+        FrozenCoefficients,
+    )
+
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_SKIP", "1")
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", str(int(mask_padding)))
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", str(int(generic_skip)))
+    predictor = DraftConfidence(2, 3, "cpu", FrozenCoefficients(1.0, (0.0,) * 3, 0.3))
+    predictor.positions[:2, 0] = 11
+    predictor.caps[:2] = torch.tensor([1, 2])
+    apply_mask = predictor.apply_mask
+    calls = []
+
+    def observe_fill(batch, is_prefilling):
+        calls.append(batch.is_padding.clone())
+        assert batch.is_padding.tolist() == [False] * 8 + [True] * 4
+        apply_mask(batch, is_prefilling)
+
+    monkeypatch.setattr(predictor, "apply_mask", observe_fill)
+    runner, batch = _prepare_padding_batch(
+        monkeypatch, [4, 4], torch.ones(12, dtype=torch.bool), predictor
+    )
+    expected = [False, False, True, True, False, False, False, True] + [True] * 4
+    assert len(calls) == 1
+    assert batch.is_padding.tolist() == expected
+    assert runner.input_buffers.is_padding.tolist() == expected
+    assert batch.draft_skip_mask.tolist() == expected[:8]
+    assert not torch.cuda.is_initialized()
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
