@@ -228,6 +228,8 @@ def use_ampere_kda_decode(
 # Shapes the fused v2 kernel is validated for (vllm/ampere_decode/
 # kda_decode_v2.py): the TP=4 GLM-5.3-Flash rank shape, up to 5 tokens per
 # sequence (its gate workspace holds 8 token rows) and up to 8 sequences.
+# At 16 heads VLLM_GLM5_DECODE_KDA_V2_DEEP=1 raises the token bound to
+# _KDA_V2_MAX_TOKENS_PER_SEQ_EXT (draft depth 5..7 steps).
 _KDA_V2_HEADS = 16
 # Pipeline parallel keeps all 64 KDA heads on one card. There the fused step
 # only wins for one sequence (graph replay, distinct state slots, one CMP
@@ -240,7 +242,22 @@ _KDA_V2_HEADS = 16
 _KDA_V2_WIDE_HEADS = 64
 _KDA_V2_HEAD_DIM = 128
 _KDA_V2_MAX_TOKENS_PER_SEQ = 5
+_KDA_V2_MAX_TOKENS_PER_SEQ_EXT = 8
 _KDA_V2_MAX_SEQS = 8
+
+
+def kda_v2_max_tokens_per_seq(num_heads: int) -> int:
+    """Tokens per sequence the v2 gate admits at `num_heads` heads.
+
+    5, or 8 (the kernel's gate workspace rows) at the 16-head
+    (tensor-parallel) shape with VLLM_GLM5_DECODE_KDA_V2_DEEP=1. The 64-head
+    shape is validated only up to 5.
+    """
+    from vllm import envs
+
+    if num_heads == _KDA_V2_HEADS and envs.VLLM_GLM5_DECODE_KDA_V2_DEEP:
+        return _KDA_V2_MAX_TOKENS_PER_SEQ_EXT
+    return _KDA_V2_MAX_TOKENS_PER_SEQ
 
 
 def use_ampere_kda_decode_v2(
@@ -268,7 +285,7 @@ def use_ampere_kda_decode_v2(
         return False
     if num_tokens < num_seqs or num_tokens % num_seqs:
         return False
-    if num_tokens // num_seqs > _KDA_V2_MAX_TOKENS_PER_SEQ:
+    if num_tokens // num_seqs > kda_v2_max_tokens_per_seq(num_heads):
         return False
     if num_tokens > envs.VLLM_GLM5_DECODE_KDA_MAX_TOKENS:
         return False

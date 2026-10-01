@@ -15,7 +15,8 @@ replaces, in meaning,
 and advances `conv_state` and `rec_state` in place exactly as they do.
 Called from the spec-decode branch of vllm/models/glm5next/common/kda.py when
 VLLM_GLM5_DECODE_KDA_V2=1 (see use_ampere_kda_decode_v2 for the covered
-shapes: 16 heads of 128, T <= 5 tokens per sequence, <= 8 sequences; 64
+shapes: 16 heads of 128, T <= 5 tokens per sequence (<= 8 with
+VLLM_GLM5_DECODE_KDA_V2_DEEP=1), <= 8 sequences; 64
 heads of 128 for one sequence under pipeline parallel).
 
 SCHEDULE.  nseq * H * NV CTAs of 1 or 2 warps (see _select), NV V-slices of
