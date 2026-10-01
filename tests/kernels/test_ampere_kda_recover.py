@@ -202,10 +202,17 @@ def test_commit_reference_replays_per_position_states():
 
 
 def test_import_does_not_initialise_cuda():
-    import importlib
+    """In a fresh interpreter: an earlier test in the same process (or the
+    GPU part of this file) may already have initialised CUDA."""
+    import subprocess
+    import sys
 
-    importlib.reload(kr)
-    assert torch.cuda.is_initialized() is False
+    code = ("import torch, vllm.ampere_decode.kda_recover; "
+            "print(torch.cuda.is_initialized())")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       env=dict(os.environ), timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout.strip().splitlines()[-1] == "False", r.stdout[-500:]
 
 
 # ------------------------------------------------------------------ GPU tests
