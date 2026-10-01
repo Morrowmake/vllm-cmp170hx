@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_TOOL_CHOICE_NONE_MASK: bool = True
+    VLLM_GLM5_DFLASH_BOUNDARY_CACHE: bool = False
     VLLM_GLM5_DFLASH_SKIP: bool = False
     VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS: str = ""
     VLLM_GLM5_DFLASH_CONFIDENCE_LOG: str = ""
@@ -1866,6 +1867,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": lambda: bool(
         int(os.getenv("VLLM_GLM5_TOOL_CHOICE_NONE_MASK", "1"))
+    ),
+    "VLLM_GLM5_DFLASH_BOUNDARY_CACHE": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_BOUNDARY_CACHE", "0"))
     ),
     "VLLM_GLM5_DFLASH_DEPTH2": lambda: bool(
         int(os.getenv("VLLM_GLM5_DFLASH_DEPTH2", "0"))
