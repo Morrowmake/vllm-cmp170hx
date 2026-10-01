@@ -104,6 +104,8 @@ class InputBatch:
     # Longest query the batch may contain. Set when a cudagraph descriptor promises
     # a query length this batch's own split does not reach, so attention metadata
     # stays valid for every replay the graph serves.
+    draft_skip_mask: torch.Tensor | None = None
+
     max_query_len: int | None = None
 
     # Arms the KV-sharing fast prefill path for this step. Absent for dummy

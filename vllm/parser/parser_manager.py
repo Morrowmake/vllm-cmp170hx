@@ -154,6 +154,14 @@ class ParserManager:
         t_cls = tool_parser_cls
 
         class _Parser(DelegatingParser):
+            adjust_request_when_tool_choice_none = any(
+                getattr(
+                    getattr(adapter_cls, "_parser_engine_cls", None),
+                    "adjust_request_when_tool_choice_none",
+                    False,
+                )
+                for adapter_cls in (r_cls, t_cls)
+            )
             reasoning_parser_cls = r_cls
             tool_parser_cls = t_cls
             tool_strict_level = strict_level

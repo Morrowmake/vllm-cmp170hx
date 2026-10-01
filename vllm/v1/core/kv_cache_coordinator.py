@@ -82,6 +82,7 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        use_dflash_boundary: bool = False,
     ):
         self.kv_cache_config = kv_cache_config
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
@@ -108,6 +109,22 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+
+        # DFlash context KV is projected per target position; its query KV
+        # starts after the accepted context and is overwritten by context KV
+        # before that position can enter a hashed block. It needs no EAGLE
+        # lookahead block. Only explicitly marked draft SWA groups qualify;
+        # target attention and the unannotated fallback keep their replay rule.
+        self.dflash_boundary_group_ids = (
+            {
+                i
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                if g.is_eagle_group and type(g.kv_cache_spec) is SlidingWindowSpec
+            }
+            if use_dflash_boundary
+            else set()
+        )
+        self.eagle_group_ids -= self.dflash_boundary_group_ids
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state
@@ -150,7 +167,7 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
         # Match Mamba checkpoints to Eagle's attention replay boundary.
-        if use_eagle:
+        if use_eagle and (not use_dflash_boundary or self.eagle_group_ids):
             for manager in self.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.drop_eagle_checkpoint_block = True
@@ -626,6 +643,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
+        use_dflash_boundary: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -640,6 +658,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            use_dflash_boundary=use_dflash_boundary,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -1016,6 +1035,7 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
+    use_dflash_boundary: bool = False,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -1060,4 +1080,5 @@ def get_kv_cache_coordinator(
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
         allow_partial_hash_hits=allow_partial_hash_hits,
+        use_dflash_boundary=use_dflash_boundary,
     )

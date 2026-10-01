@@ -9,7 +9,6 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.pp_draft_tail import (
     TailPayloadLayout,
@@ -17,6 +16,7 @@ from vllm.v1.worker.gpu.pp_draft_tail import (
     pack_tail_payload,
     run_draft_tail,
 )
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 logger = init_logger(__name__)
@@ -244,6 +244,14 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        from vllm.v1.worker.gpu.spec_decode.draft_confidence import (
+            create_draft_confidence,
+        )
+
+        if type(self) is DFlash2Speculator:
+            self.draft_confidence = create_draft_confidence(
+                vllm_config, self.max_num_reqs, self.num_speculative_steps, device
+            )
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.top_k = int(draft_config[self._candidate_top_k_key])
         self.candidate_sampler = CandidateSampler(
@@ -290,7 +298,11 @@ class DFlash2Speculator(DFlashSpeculator):
         if not hasattr(self, "widths"):
             self.max_width = self.width = self.num_speculative_steps
             self.widths = (self.max_width,)
-        for attr in ("_tail_layouts", "_tail_row_ids_by_width", "_anchor_indices_by_width"):
+        for attr in (
+            "_tail_layouts",
+            "_tail_row_ids_by_width",
+            "_anchor_indices_by_width",
+        ):
             if not hasattr(self, attr):
                 setattr(self, attr, {})
         for k in self.widths:
@@ -309,10 +321,9 @@ class DFlash2Speculator(DFlashSpeculator):
             )
             # Row r's anchor token sits at input_ids[r * (1 + k)], the rows
             # _score_candidates reads.
-            self._anchor_indices_by_width[k] = (
-                torch.arange(self.max_num_reqs, dtype=torch.int64, device=self.device)
-                * (1 + k)
-            )
+            self._anchor_indices_by_width[k] = torch.arange(
+                self.max_num_reqs, dtype=torch.int64, device=self.device
+            ) * (1 + k)
         self._tail_staging = torch.zeros(
             self._tail_layouts[self.max_width].nbytes(self.max_num_reqs),
             dtype=torch.uint8,
@@ -521,6 +532,16 @@ class DFlash2Speculator(DFlashSpeculator):
             self.draft_logits,
             self.use_fp64_gumbel,
         )
+        if getattr(self, "draft_confidence", None) is not None:
+            self.draft_confidence.predict(
+                self.candidate_sampler.scores.view(-1, self.top_k)[:num_sample].view(
+                    num_reqs, self.num_speculative_steps, self.top_k
+                ),
+                self.sample_idx_mapping[:num_sample],
+                self.sample_pos[:num_sample],
+                self.temperature,
+                self.num_speculative_steps,
+            )
         if self.enable_adaptive_verification:
             self._maybe_predict_acceptance(
                 self.candidate_sampler.scores[:num_reqs].flatten(0, 1),

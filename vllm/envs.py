@@ -214,10 +214,16 @@ if TYPE_CHECKING:
     VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
+    VLLM_GLM5_TOOL_CHOICE_NONE_MASK: bool = True
+    VLLM_GLM5_DFLASH_BOUNDARY_CACHE: bool = False
+    VLLM_GLM5_DFLASH_SKIP: bool = False
+    VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS: str = ""
+    VLLM_GLM5_DFLASH_CONFIDENCE_LOG: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
     VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
     VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH: bool = False
+    VLLM_GLM5_DFLASH_DEPTH2: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
@@ -1898,6 +1904,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # row is unchanged; the unreachable tail is simply not allocated.
     "VLLM_GLM5_DRAFTER_ROPE_FIT": lambda: bool(
         int(os.getenv("VLLM_GLM5_DRAFTER_ROPE_FIT", "0"))
+    ),
+    "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TOOL_CHOICE_NONE_MASK", "1"))
+    ),
+    "VLLM_GLM5_DFLASH_BOUNDARY_CACHE": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_BOUNDARY_CACHE", "0"))
+    ),
+    "VLLM_GLM5_DFLASH_DEPTH2": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_DEPTH2", "0"))
+    ),
+    "VLLM_GLM5_DFLASH_SKIP": lambda: bool(int(os.getenv("VLLM_GLM5_DFLASH_SKIP", "0"))),
+    "VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS", ""
+    ),
+    "VLLM_GLM5_DFLASH_CONFIDENCE_LOG": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_CONFIDENCE_LOG", ""
     ),
     # Load-adaptive DFlash draft depth. The drafter produces the widest block
     # every step and each step verifies a prefix whose length follows the

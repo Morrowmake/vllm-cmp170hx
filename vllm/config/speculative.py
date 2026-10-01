@@ -1996,7 +1996,11 @@ class SpeculativeConfig:
         10.5 % with pipeline parallelism) and the hysteresis."""
         import vllm.envs as envs
 
-        allowed = list(range(min(by_load), max(by_load) + 1))
+        depth2 = envs.VLLM_GLM5_DFLASH_DEPTH2
+        minimum = 2 if depth2 else min(by_load)
+        if minimum > min(by_load):
+            raise ValueError("Depth 2 requires load widths of at least 2")
+        allowed = list(range(minimum, max(by_load) + 1))
 
         def parse(raw: str) -> list[float] | None:
             try:
@@ -2006,17 +2010,42 @@ class SpeculativeConfig:
 
         raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS
         costs = parse(raw)
+        calibration = depth2 and bool(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE)
+        raw_multi = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI
+        if depth2 and not raw and not raw_multi and calibration:
+            costs = [1.0] * len(allowed)
+            raw = ",".join(map(str, costs))
+            raw_multi = raw
+            logger.info_once(
+                "GLM-5 depth-2 calibration active: provisional costs; "
+                "forced-depth measurement only (VLLM_GLM5_DFLASH_DEPTH2)"
+            )
+        elif depth2 and (not raw or not raw_multi):
+            raise ValueError(
+                "VLLM_GLM5_DFLASH_DEPTH2 requires measured COSTS and "
+                "COSTS_MULTI for depths 2 through the maximum"
+            )
+
         if not raw:
             pp = getattr(self.target_parallel_config, "pipeline_parallel_size", 1)
             per_depth = 0.105 if (pp or 1) > 1 else 0.08
             costs = [round(1.0 + per_depth * (k - allowed[0]), 4) for k in allowed]
-        raw_multi = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI
         costs_multi = parse(raw_multi) if raw_multi else []
 
         def valid(c) -> bool:
-            return bool(c) and len(c) == len(allowed) and min(c) > 0
+            from math import isfinite
+
+            return (
+                bool(c)
+                and len(c) == len(allowed)
+                and all(isfinite(value) and value > 0 for value in c)
+            )
 
         if not valid(costs) or (raw_multi and not valid(costs_multi)):
+            if depth2:
+                raise ValueError(
+                    f"Depth-2 cost tables need positive entries for {allowed}"
+                )
             logger.warning_once(
                 "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: "
                 "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS=%r / _COSTS_MULTI=%r need one "
@@ -2035,6 +2064,13 @@ class SpeculativeConfig:
             config["prior"] = min(max(prior, 0.01), 0.99)
         if costs_multi:
             config["costs_multi"] = costs_multi
+        if depth2:
+            config["min_depth"] = 2
+            logger.info_once(
+                "GLM-5 depth-2 policy active "
+                "(VLLM_GLM5_DFLASH_DEPTH2): costs for depths %s",
+                tuple(allowed),
+            )
         return config
 
     def verify_equal_vocab_size_if_draft_model(self):

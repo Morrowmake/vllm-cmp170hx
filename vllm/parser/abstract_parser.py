@@ -92,6 +92,9 @@ class Parser:
     ``ReasoningParser`` / ``ToolParser`` pair.
     """
 
+    # Some formats need decode constraints even when tool calls are disabled.
+    adjust_request_when_tool_choice_none: bool = False
+
     # Class-level parser classes for compatibility with existing patterns
     # Subclasses should override these if they use specific parser classes
     reasoning_parser_cls: type[ReasoningParser] | None = None

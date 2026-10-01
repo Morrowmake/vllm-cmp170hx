@@ -193,6 +193,7 @@ class ResponsesRequest(OpenAIBaseModel):
     metadata: Metadata | None = None
     model: str | None = None
     logit_bias: dict[str, float] | None = None
+    bad_words: list[str] = Field(default_factory=list)
     parallel_tool_calls: bool | None = True
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
@@ -488,6 +489,7 @@ class ResponsesRequest(OpenAIBaseModel):
             ),
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
+            bad_words=self.bad_words,
             extra_args=extra_args,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             skip_special_tokens=self.skip_special_tokens,

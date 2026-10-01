@@ -39,7 +39,6 @@ from vllm.distributed.aux_output_connector.worker import (
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu import mem_attribution
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -82,6 +81,7 @@ from vllm.v1.watermarking.spec_decode import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu import mem_attribution
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -1598,6 +1598,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else None
             ),
         )
+        confidence = getattr(self.speculator, "draft_confidence", None)
+        if confidence is not None and confidence.coefficients is not None:
+            is_prefilling = async_tensor_h2d(
+                batch_req_state.is_prefilling_np, device=self.device
+            )
+            confidence.apply_mask(input_batch, is_prefilling)
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
         return input_batch
@@ -2307,7 +2313,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.observe_verification(
-                    input_batch.idx_mapping, num_sampled, num_rejected
+                    input_batch.idx_mapping, num_sampled, num_rejected, input_batch
                 )
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The

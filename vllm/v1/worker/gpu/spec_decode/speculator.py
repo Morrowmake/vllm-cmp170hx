@@ -181,6 +181,7 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         self.use_acceptance_estimator = self.enable_adaptive_verification
         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
+        self.draft_confidence = None
 
         self.draft_logits: torch.Tensor | None = None
         if self.speculative_config.draft_sample_method == "probabilistic":
@@ -459,6 +460,7 @@ class DraftModelSpeculator(BaseSpeculator):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
+        input_batch=None,
     ) -> None:
         """Fold the target's verdict on the last drafts into the estimator.
 
@@ -467,6 +469,8 @@ class DraftModelSpeculator(BaseSpeculator):
         """
         if self.acceptance_estimator is not None:
             self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
+        if self.draft_confidence is not None and input_batch is not None:
+            self.draft_confidence.observe(input_batch, num_sampled, num_rejected)
 
     def prepare_watermarking(
         self, contexts: torch.Tensor, watermarking: torch.Tensor
