@@ -186,6 +186,18 @@ def _check_placeholder_boundary(temperature, device, cap):
     )
     sampled, counts = rejection_sample(**args)
     assert counts.item() == cap + 1
+    # The real RecoverSSM commit plan receives this sampled-input prefix.
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import _prepare_commit_plan_kernel
+
+    plan = [torch.empty(1, dtype=torch.int32, device=device) for _ in range(4)]
+    _prepare_commit_plan_kernel[(1,)](
+        counts, None, torch.ones(1, dtype=torch.int32, device=device),
+        args["cu_num_logits"], None, None, *plan, 0, 1, 1,
+        counts.stride(0), 0, 1, 1, 0, 0, 0,
+        SPEC_QUERY_LEN=4, HAS_REQUEST_INDICES=False, ALIGN_MODE=False,
+    )
+    assert plan[0].item() == cap + 1
+    assert not padding[:plan[0].item()].any()
     # Slots beyond num_sampled are uninitialised and never emitted.
     assert sampled[0, : counts.item()].tolist() == list(range(1, cap + 2))
 
@@ -353,3 +365,39 @@ def test_compiled_mask_matches_eager_without_device_to_host_reads():
     )
     assert torch.equal(result, b.draft_skip_mask)
     assert torch.equal(padding, b.is_padding)
+
+
+def test_skip_uses_glm_mask_without_generic_moe_flag(monkeypatch, tmp_path):
+    from vllm.v1.worker.gpu.spec_decode.draft_confidence import create_draft_confidence
+
+    coefficients = tmp_path / "frozen.json"
+    coefficients.write_text(
+        json.dumps(
+            dict(
+                version=1,
+                calibrated=True,
+                slope=1.0,
+                intercepts=[0.0] * 3,
+                threshold=0.3,
+            )
+        )
+    )
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_SKIP", "1")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS", str(coefficients))
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "0")
+    monkeypatch.delenv("VLLM_GLM5_DFLASH_CONFIDENCE_LOG", raising=False)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=SimpleNamespace(
+            enable_adaptive_verification=False, draft_sample_method="greedy"
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "0")
+    with pytest.raises(ValueError, match="VLLM_GLM5_MOE_MASK_PADDING=1"):
+        create_draft_confidence(config, 2, 3, "cpu")
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "1")
+    assert create_draft_confidence(config, 2, 3, "cpu").coefficients is not None

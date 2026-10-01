@@ -69,7 +69,8 @@ def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     hold. In place keeps the tensor's identity, which the sm_80 fused decode
     routing uses to hand over its own alignment; batches it covers
     (<= VLLM_GLM5_DECODE_MOE_MAX_TOKENS rows, captured at exact sizes) are
-    skipped. A larger batch that the fused router v2 covered (up to 32 rows)
+    skipped unless draft skipping is enabled. A larger batch that the fused
+    router v2 covered (up to 32 rows)
     had its alignment computed before the mask; that handoff is dropped here
     so the alignment is recomputed from the masked ids, unless the router
     already masked exactly these rows inside its launch
@@ -90,7 +91,11 @@ def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
                 "GLM-5 MoE padding mask active: padding rows are routed to no "
                 "expert (VLLM_GLM5_MOE_MASK_PADDING=1; set 0 to disable)"
             )
-    if not _MASK_PADDING or topk_ids.shape[0] <= _MASK_MIN_ROWS:
+    from vllm import envs
+
+    if not _MASK_PADDING or (
+        topk_ids.shape[0] <= _MASK_MIN_ROWS and not envs.VLLM_GLM5_DFLASH_SKIP
+    ):
         return topk_ids
     if not is_forward_context_available():
         return topk_ids
