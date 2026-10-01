@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """bf16 copies of the mHC prenorm projection `fn` for decode v2
-(VLLM_GLM5_DECODE_MHC_V2_FN_BF16).
+(VLLM_GLM5_DECODE_MHC_V2_FN_BF16, on by default; read only for M <= 12).
 
-CPU: the flag is off by default; copies are registered only when every `fn`
+CPU: the flag is on by default; kernel A gets the bf16 copy only for M <= FN_BF16_MAX_TOKENS; copies are registered only when every `fn`
 value is a bf16 value; lookups reject other tensors; the banners go through the
 real vLLM logger; both kernel-A variants compile for sm_80 with a bf16 `fn`.
 GPU (sm_80, skipped otherwise): every output is bitwise equal between the fp32
@@ -74,15 +74,33 @@ def _logged(fn, *args):
     return result, handler.lines
 
 
-def test_flag_defaults_off():
+def test_flag_defaults_on_and_kill_switch(monkeypatch):
+    assert envs.VLLM_GLM5_DECODE_MHC_V2_FN_BF16 is True
+    monkeypatch.setenv(FLAG, "0")
     assert envs.VLLM_GLM5_DECODE_MHC_V2_FN_BF16 is False
+
+
+def test_bf16_only_up_to_twelve_rows():
+    assert v2.FN_BF16_MAX_TOKENS == 12
+    model = _Model(1)
+    v2.register_fn_bf16(model)
+    fn = model.layers[0].hc_attn_fn
+    for M in range(1, 65):
+        got = v2._select_fn(fn, M, HC, HIDDEN)
+        if M <= 12:
+            assert got.dtype == torch.bfloat16 and got is v2._fn_bf16(fn), M
+        else:
+            assert got is fn, M
+    assert v2._select_fn(fn, 4, 2, HIDDEN) is fn  # hc != 4: no Gluon kernel A
+    v2._FN_BF16.clear()
+    assert v2._select_fn(fn, 4, HC, HIDDEN) is fn  # nothing registered
 
 
 def test_registers_exact_copies():
     model = _Model(3)
     n, lines = _logged(v2.register_fn_bf16, model)
     assert n == 6 and len(v2._FN_BF16) == 6
-    assert any("reads exact bf16 fn copies" in line for line in lines), lines
+    assert any("reads exact bf16 fn copies for M <= 12" in line for line in lines), lines
     for layer in model.layers:
         for p in (layer.hc_attn_fn, layer.hc_ffn_fn):
             bf = v2._fn_bf16(p)
@@ -173,7 +191,7 @@ def _dispatch(monkeypatch, kw):
     return tlmod.mhc_fused_post_pre_tilelang(**kw)
 
 
-MS = (1, 2, 3, 4, 5, 8, 9, 16, 17, 32)
+MS = (1, 2, 3, 4, 5, 8, 9, 12, 13, 16, 17, 24, 32)
 
 
 @gpu
@@ -188,8 +206,18 @@ def test_bf16_fn_bitwise_equal(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
     assert v2.register_fn_bf16(model) == 2
     v2.warmup(MS)
+    seen = []
+    real = v2._select_fn
+
+    def spy(f, M, hc, hidden):
+        out = real(f, M, hc, hidden)
+        seen.append((M, out.dtype))
+        return out
+
+    monkeypatch.setattr(v2, "_select_fn", spy)
     for M in MS:
         got = _dispatch(monkeypatch, _case(M, fn, 40 + M))
+        assert seen[-1] == (M, torch.bfloat16 if M <= 12 else torch.float32), seen[-1]
         for a, b in zip(got, outs[M]):
             assert torch.equal(a, b), M
         # the bf16 copy passed straight to the v2 kernel entry (the TileLang
