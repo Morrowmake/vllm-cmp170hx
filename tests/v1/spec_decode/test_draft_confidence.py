@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -138,12 +141,36 @@ def test_cap_uses_survival_not_independent_position_thresholds():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 def test_gpu_placeholder_boundary_uses_last_live_target_distribution(temperature):
+    _check_placeholder_boundary(temperature, "cuda", cap=1)
+
+
+def _check_placeholder_boundary(temperature, device, cap):
+    from vllm.v1.worker.gpu.spec_decode.draft_confidence import _apply_mask_compiled
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 
-    device = "cuda"
+    p = DraftConfidence(2, 3, device, FrozenCoefficients(1.0, (0.0,) * 3, 0.3))
+    p.positions[0, 0] = 11
+    p.caps[0] = cap
+    b = batch()
+    padding = b.is_padding.to(device)
+    skip = _apply_mask_compiled(
+        b.query_start_loc.to(device),
+        b.idx_mapping.to(device),
+        b.positions.to(device),
+        padding,
+        b.logits_indices.to(device),
+        p.positions,
+        p.caps,
+        torch.tensor([False], device=device),
+        p.sentinel,
+    )
+    # Reference loop: row cap stays live to supply the replacement token.
+    expected_skip = [row > cap for row in range(4)]
+    assert skip.tolist() == padding.tolist() == expected_skip
     logits = torch.full((4, 8), -float("inf"), device=device)
     logits[torch.arange(4, device=device), torch.arange(1, 5, device=device)] = 0
-    proposals = torch.tensor([0, 1, -1, -1], device=device)
+    logits[skip] = float("nan")
+    proposals = torch.arange(4, device=device).masked_fill(skip, -1)
     args = dict(
         target_logits=logits,
         draft_logits=None,
@@ -158,8 +185,27 @@ def test_gpu_placeholder_boundary_uses_last_live_target_distribution(temperature
         num_speculative_steps=3,
     )
     sampled, counts = rejection_sample(**args)
-    assert counts.item() == 2
-    assert sampled[0].tolist() == [1, 2, -1, -1]
+    assert counts.item() == cap + 1
+    # Slots beyond num_sampled are uninitialised and never emitted.
+    assert sampled[0, : counts.item()].tolist() == list(range(1, cap + 2))
+
+
+def test_cpu_compiled_mask_and_interpreted_rejection_stop_at_last_live_row():
+    # Triton's interpreter must be enabled before importing the kernels.
+    code = (
+        "import runpy; "
+        f"check = runpy.run_path({__file__!r})['_check_placeholder_boundary']; "
+        "[check(temperature, 'cpu', cap) "
+        "for temperature in (0.0, 1.0) for cap in range(4)]"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES=""),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
