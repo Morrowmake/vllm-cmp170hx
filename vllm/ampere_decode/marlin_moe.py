@@ -41,16 +41,17 @@ _WORKSPACES: dict = {}
 # W13 fp32 partial planes per variant (the original kernel splits K four ways).
 _W13_PLANES = {"orig": 4, "exact": 1}
 _RETIRED: list = []
-# The whole-expert (N=2048) scratch is created only after the KV cache is sized
-# (kernel_warmup opens it). Earlier calls -- the profile run and the CUDA-graph
-# memory profiling, which runs capture warmups before KV sizing -- take the
-# released kernels, so the scratch is never charged against the KV cache.
-_LATE_SCRATCH_N = (2048,)
+# The decode scratch (TP4 shards N=512 and whole experts N=2048) is created only
+# after the KV cache is sized (kernel_warmup opens it). Earlier calls -- the
+# profile run and the CUDA-graph memory profiling, which runs capture warmups
+# before KV sizing -- take the released kernels, so the scratch is never
+# charged against the KV cache.
+_LATE_SCRATCH_N = (512, 2048)
 _late_scratch_open = False
 
 
 def open_late_scratch() -> None:
-    """Allow the whole-expert scratch from now on (called after KV sizing)."""
+    """Allow the decode scratch from now on (called after KV sizing)."""
     global _late_scratch_open
     _late_scratch_open = True
 
@@ -228,7 +229,7 @@ def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
             create=not early and not torch.cuda.is_current_stream_capturing(),
         )
         if ws is None:
-            why = ("whole-expert scratch is allocated after KV-cache sizing"
+            why = ("decode scratch is allocated after KV-cache sizing"
                    if early else "scratch not warmed before CUDA capture")
     if why is not None:
         logger.info_once(
@@ -353,8 +354,8 @@ def warmup_from_worker(worker):
     capacity = _scratch_tokens(N)
     if N in _LATE_SCRATCH_N and _late_scratch_open:
         logger.info_once(
-            "[ampere-marlin] whole-expert decode scratch active after KV-cache "
-            "sizing (%d rows); profiling used the released kernels.", capacity,
+            "[ampere-marlin] decode scratch active after KV-cache sizing "
+            "(N=%d, %d rows); profiling used the released kernels.", N, capacity,
         )
     if compiled_regime(capacity, N):
         from vllm.model_executor.layers.fused_moe.moe_align_block_size import (

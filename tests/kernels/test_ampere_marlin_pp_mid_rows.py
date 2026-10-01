@@ -427,8 +427,8 @@ def test_multi_graph_replay(weights, monkeypatch, name, M):
 
 # ---------------------- whole-expert scratch only after KV sizing (CPU) ----
 
-@pytest.mark.parametrize("width,M", [(2048, 4), (2048, 6), (2048, 16), (512, 4)])
-def test_whole_expert_scratch_waits_for_kv_sizing(monkeypatch, width, M):
+@pytest.mark.parametrize("width,M", [(2048, 4), (2048, 6), (2048, 16), (512, 4), (512, 32)])
+def test_decode_scratch_waits_for_kv_sizing(monkeypatch, width, M):
     from types import SimpleNamespace
 
     monkeypatch.setenv(DECODE, "1")
@@ -448,10 +448,9 @@ def test_whole_expert_scratch_waits_for_kv_sizing(monkeypatch, width, M):
     def apply():
         return decode.maybe_apply(pp_helpers._layer(n=width), out, **args)
 
-    if width == 2048:
-        # profile run / graph-memory profiling: released kernels, nothing allocated
-        assert apply() is False and decode._WORKSPACES == {} and not calls
-        decode.open_late_scratch()
+    # profile run / graph-memory profiling: released kernels, nothing allocated
+    assert apply() is False and decode._WORKSPACES == {} and not calls
+    decode.open_late_scratch()
     assert apply() is True and len(calls) == 1
     (ws,) = decode._WORKSPACES.values()
     assert ws["max_tokens"] == decode._scratch_tokens(width)
