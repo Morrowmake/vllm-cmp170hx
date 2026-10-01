@@ -40,10 +40,14 @@ _RETIRED: list = []
 
 
 def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
-    """TP4 small batches and the measured whole-expert PP4 decode batches."""
+    """TP4 small batches and the measured whole-expert PP4 decode batches
+    (4 and 8 rows; 5-7 rows too with VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS)."""
     return (
         intermediate_size == 512 and 1 <= num_tokens <= MAX_TOKENS
-        or intermediate_size == 2048 and num_tokens in (4, 8)
+        or intermediate_size == 2048 and (
+            num_tokens in (4, 8)
+            or 5 <= num_tokens <= 7 and envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS
+        )
     )
 
 
@@ -179,8 +183,9 @@ def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
         return False
     logger.info_once(
         "Compiled Marlin MoE decode active (VLLM_GLM5_MARLIN_DECODE_CUDA): "
-        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in {4, 8}; "
-        "variant=%s (VLLM_GLM5_MARLIN_DECODE_VARIANT).", variant(),
+        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in %s; "
+        "variant=%s (VLLM_GLM5_MARLIN_DECODE_VARIANT).",
+        "4..8" if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS else "{4, 8}", variant(),
     )
     run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids, activation)
     return True
@@ -261,6 +266,17 @@ def warmup_from_worker(worker):
         return
     tp = worker.vllm_config.parallel_config.tensor_parallel_size
     N = int(getattr(cfg, "moe_intermediate_size", 0)) // tp
+    if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS:
+        if N == 2048:
+            logger.info_once(
+                "[ampere-marlin] whole-expert compiled decode at 4..8 rows "
+                "(VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS), variant=%s.", variant(),
+            )
+        else:
+            logger.info_once(
+                "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS is set but the gate is closed "
+                "(expert width N=%d per rank, not the whole-expert 2048).", N,
+            )
     capacity = _SCRATCH_TOKENS.get(N, 0)
     if compiled_regime(capacity, N):
         from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
