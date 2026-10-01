@@ -11,6 +11,7 @@ from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import ToolNamespaceConfig
 
+from vllm import envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -146,6 +147,15 @@ class OnlineRenderer:
             model_name=model_config.model,
             is_harmony=self.use_harmony,
         )
+
+        if self.parser is not None and getattr(
+            self.parser, "adjust_request_when_tool_choice_none", False
+        ):
+            logger.info_once(
+                "GLM tool_choice=none decode mask: %s "
+                "(VLLM_GLM5_TOOL_CHOICE_NONE_MASK)",
+                "enabled" if envs.VLLM_GLM5_TOOL_CHOICE_NONE_MASK else "disabled",
+            )
 
         self.chat_template = chat_template
         self.chat_template_content_format: ChatTemplateContentFormatOption = (
@@ -776,6 +786,7 @@ class OnlineRenderer:
                 parser.reasoning_parser_cls is not None
                 or tool_choice != "none"
                 or is_mistral_grammar_eligible
+                or parser.adjust_request_when_tool_choice_none
             )
             if should_adjust_request:
                 if not isinstance(request, ChatCompletionRequest | ResponsesRequest):

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+from vllm import envs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.parser.engine.events import EventType
@@ -182,6 +183,18 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
 
 class Glm47MoeParser(ParserEngine):
     """GLM-4.7 parser backed by the declarative parser engine."""
+
+    adjust_request_when_tool_choice_none = True
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if request.tool_choice == "none" and not envs.VLLM_GLM5_TOOL_CHOICE_NONE_MASK:
+            return request
+        request = super().adjust_request(request)
+        if request.tool_choice == "none" and TOOL_CALL_START not in request.bad_words:
+            request.bad_words = [*request.bad_words, TOOL_CALL_START]
+        return request
 
     def __init__(
         self,
