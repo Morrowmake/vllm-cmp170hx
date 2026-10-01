@@ -36,6 +36,18 @@ from vllm.v1.worker.mamba_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 
+def _state_index_check() -> bool:
+    """VLLM_GLM5_STATE_INDEX_CHECK (debug, off by default): see
+    vllm.ampere_prefill.state_index_check."""
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_STATE_INDEX_CHECK:
+        return False
+    from vllm.ampere_prefill import state_index_check as sic
+
+    return sic.enabled()
+
+
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
@@ -222,6 +234,19 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        if _state_index_check():
+            from vllm.ampere_prefill import state_index_check as sic
+
+            self._sic_tables = [block_tables[gid] for gid in mamba_group_ids]
+            self._sic_num_blocks = kv_cache_config.num_blocks
+            self._sic_block_size = mamba_spec.block_size
+            idx = input_batch.idx_mapping[:num_reqs]
+            sic.check_align_copies(
+                "pre-copy", self._sic_tables, self.max_num_reqs,
+                kv_cache_config.num_blocks, idx,
+                *sic.precopy_plan(self._mamba_src_col_gpu, self._mamba_state_idx_gpu,
+                                  self._mamba_src_off_gpu, idx),
+            )
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -348,6 +373,10 @@ class MambaHybridModelState(DefaultModelState):
             self.recoverssm.record_step(
                 attn_metadata, attn_groups, for_capture=for_capture
             )
+        if not for_capture and _state_index_check():
+            from vllm.ampere_prefill import state_index_check as sic
+
+            sic.check_attn_metadata(attn_metadata, self.vllm_config)
         return attn_metadata
 
     def postprocess_state(
@@ -396,6 +425,17 @@ class MambaHybridModelState(DefaultModelState):
             and num_computed_tokens is not None
             and self._mamba_ctx is not None
         ):
+            if _state_index_check() and getattr(self, "_sic_tables", None):
+                from vllm.ampere_prefill import state_index_check as sic
+
+                sic.check_align_copies(
+                    "post-copy", self._sic_tables, self.max_num_reqs,
+                    self._sic_num_blocks, idx_mapping,
+                    *sic.postcopy_plan(self.num_accepted_tokens_gpu,
+                                       self._mamba_state_idx_gpu,
+                                       num_computed_tokens, idx_mapping,
+                                       self._sic_block_size),
+                )
             self._mamba_ctx.run_fused_postprocess_align(
                 num_reqs,
                 self.num_accepted_tokens_gpu,

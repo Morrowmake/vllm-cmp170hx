@@ -58,7 +58,8 @@ Every launch configuration is fixed (no runtime autotune), so the result is a
 pure function of the inputs and bitwise reproducible run to run and boot to
 boot. No float atomics. Nothing is allocated outside the call and there is no
 host sync apart from ``prepare_chunk_indices``, which is cached per
-``cu_seqlens`` tensor (once per step, shared with the upstream path).
+``cu_seqlens`` tensor and its contents (once per step, shared with the
+upstream path).
 """
 
 import itertools
@@ -1088,6 +1089,12 @@ def chunk_kda_with_fused_gate(
         q, k, v, raw_g = (x.reshape(1, B * T, H, x.shape[-1]) for x in (q, k, v, raw_g))
         beta = beta.reshape(1, B * T, H)
     assert q.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
+    # The state pass reads one initial-state row per sequence of cu_seqlens.
+    if initial_state is not None and initial_state.shape[0] < cu_seqlens.shape[0] - 1:
+        raise ValueError(
+            f"initial_state has {initial_state.shape[0]} rows for "
+            f"{cu_seqlens.shape[0] - 1} sequences"
+        )
     BT = FLA_CHUNK_SIZE
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices)

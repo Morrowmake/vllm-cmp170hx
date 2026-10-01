@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
     VLLM_GLM5_PP_KDA_PREFILL: bool = False
+    VLLM_GLM5_STATE_INDEX_CHECK: bool = False
     VLLM_GLM5_TP4_KDA_PREFILL: bool = False
     VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_GLM5_DECODE_KERNELS: bool = False
@@ -1654,6 +1655,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upstream path. Off by default.
     "VLLM_GLM5_PP_KDA_PREFILL": lambda: bool(
         int(os.getenv("VLLM_GLM5_PP_KDA_PREFILL", "0"))
+    ),
+    # Debug: range-check every KDA/Mamba state index (GDN metadata, align-mode
+    # pre-/post-copy block columns and block ids) on the host before the
+    # kernels use it; raises instead of addressing outside the state pool.
+    # Synchronizes every step. Off by default.
+    "VLLM_GLM5_STATE_INDEX_CHECK": lambda: bool(
+        int(os.getenv("VLLM_GLM5_STATE_INDEX_CHECK", "0"))
     ),
     # The same sm_80 KDA chunked prefill with tensor parallel 4 (16 heads per
     # card), for prefill chunks of up to 3460 tokens (the TP token budget) and
