@@ -284,12 +284,17 @@ class AdaptiveKPolicy:
     # Acceptance-aware depth: per request, decayed counts of accepted drafts
     # and of rejections (a geometric model of per-draft acceptance; a step
     # whose drafts were all accepted adds successes and no failure, so no
-    # censoring correction is needed), plus model-wide counts for the prior.
+    # censoring correction is needed). A request's depth depends only on its
+    # own history and on the batch it runs in: new requests start from the
+    # fixed configured prior and the hysteresis reference is per request, so
+    # an identical request run alone repeats exactly whatever ran before it.
     _acc_s: dict[str, float] = field(default_factory=dict)
     _acc_f: dict[str, float] = field(default_factory=dict)
-    _acc_global_s: float = 0.0
-    _acc_global_f: float = 0.0
-    _accept_last: int | None = None
+    _accept_last: dict[str, int] = field(default_factory=dict)
+    # Model-wide observed counts, for the log line only (never read by the
+    # choice).
+    _obs_s: float = 0.0
+    _obs_f: float = 0.0
 
     def __post_init__(self) -> None:
         # Seed the prior so the very first steps behave like fixed k=max
@@ -362,25 +367,32 @@ class AdaptiveKPolicy:
             self._acc_s[req_id] = d * self._acc_s.get(req_id, 0.0) + accepted
             self._acc_f[req_id] = d * self._acc_f.get(req_id, 0.0) + rejected
             gd = 0.999
-            self._acc_global_s = gd * self._acc_global_s + accepted
-            self._acc_global_f = gd * self._acc_global_f + rejected
+            self._obs_s = gd * self._obs_s + accepted
+            self._obs_f = gd * self._obs_f + rejected
 
     def forget(self, req_id: str) -> None:
         self._ema.pop(req_id, None)
         self._pending_padded.pop(req_id, None)
         self._acc_s.pop(req_id, None)
         self._acc_f.pop(req_id, None)
+        self._accept_last.pop(req_id, None)
 
     # ------------------------------------------------- acceptance-aware depth
 
     def accept_prior(self) -> float:
-        """Model-wide per-draft acceptance, seeded at the configured prior."""
-        a = self.config.accept_strength
-        s, f = self._acc_global_s, self._acc_global_f
-        return (s + a * self.config.accept_prior) / (s + f + a)
+        """The fixed per-draft acceptance new requests start from (config,
+        never adapted at run time: a model-wide running mean would make a
+        request's depth depend on the requests before it)."""
+        return self.config.accept_prior
+
+    def observed_acceptance(self) -> float:
+        """Model-wide observed per-draft acceptance (logging only)."""
+        total = self._obs_s + self._obs_f
+        return self._obs_s / total if total else float("nan")
 
     def accept_rate(self, req_id: str) -> float:
-        """This request's per-draft acceptance, shrunk towards the prior."""
+        """This request's per-draft acceptance, shrunk towards the fixed
+        prior."""
         a = self.config.accept_strength
         p0 = self.accept_prior()
         s = self._acc_s.get(req_id, 0.0)
@@ -413,7 +425,10 @@ class AdaptiveKPolicy:
             for k, cost in candidates
         }
         best = max(scores, key=lambda k: (scores[k], -k))
-        last = self._accept_last
+        # Hysteresis against the depth these requests last ran at (only when
+        # they agree on one; a request's own history, never another's).
+        lasts = {self._accept_last.get(r) for r in req_ids}
+        last = lasts.pop() if len(lasts) == 1 else None
         if (
             last is not None
             and last in scores
@@ -421,7 +436,8 @@ class AdaptiveKPolicy:
             and scores[best] <= scores[last] * (1.0 + cfg.accept_hysteresis)
         ):
             best = last
-        self._accept_last = best
+        for r in req_ids:
+            self._accept_last[r] = best
         return best
 
     # ------------------------------------------------------------------ policy
@@ -481,9 +497,10 @@ class AdaptiveKPolicy:
         if self.config.accept:
             logger.info(
                 "Adaptive SD: %d steps, mean k=%.2f, per-draft acceptance "
-                "prior=%.3f, %s",
+                "observed=%.3f (prior %.2f), %s",
                 total,
                 mean_k,
+                self.observed_acceptance(),
                 self.accept_prior(),
                 hist,
             )

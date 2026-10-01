@@ -218,6 +218,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
@@ -1888,6 +1889,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST": lambda: float(
         os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST", "0.03")
+    ),
+    # Per-draft acceptance a new request starts from (fixed; never adapted at
+    # run time, so a request alone repeats exactly).
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR": lambda: float(
+        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR", "0.75")
     ),
     # Relative step costs for steps of two or more requests (empty: COSTS).
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI": lambda: os.getenv(

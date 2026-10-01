@@ -153,7 +153,7 @@ def test_the_load_width_caps_the_choice():
     assert policy.select_by_acceptance(["code"], cap=3) == 3
 
 
-def test_a_new_request_starts_at_the_prior():
+def test_a_new_request_starts_at_the_fixed_prior():
     policy = _policy()
     assert policy.accept_rate("new") == pytest.approx(0.75)
     # At the 0.75 prior the deepest draft already pays at TP costs.
@@ -161,8 +161,10 @@ def test_a_new_request_starts_at_the_prior():
     rng = random.Random(3)
     for i in range(20):
         _feed(policy, f"old{i}", 0.4, 30, rng)
-    assert policy.accept_prior() < 0.5
-    assert policy.accept_rate("fresh") < 0.5
+    # Other requests' acceptance never moves the prior a new request starts from.
+    assert policy.accept_prior() == 0.75
+    assert policy.accept_rate("fresh") == pytest.approx(0.75)
+    assert policy.observed_acceptance() < 0.5  # logged only
 
 
 def test_hysteresis_holds_a_near_tie():
@@ -375,3 +377,74 @@ def test_force_file_pins_the_depth(tmp_path, monkeypatch):
     req.spec_token_ids = list(range(11, 18))
     scheduler.schedule()
     assert scheduler.cur_num_spec_tokens != 9
+
+
+# ------------------------------------------------- level-1 determinism
+
+
+def _run_alone(policy, req, pattern, cap=7):
+    """One request alone: each step's accepted count is a fixed function of the
+    step and the depth (an identical request repeats the same outcomes)."""
+    depths = []
+    for t, limit in enumerate(pattern):
+        k = policy.select_by_acceptance([req], cap)
+        depths.append(k)
+        policy.observe(req, k, min(k, limit))
+    policy.forget(req)
+    return depths
+
+
+@pytest.mark.parametrize("raw", [K7, ACC])
+def test_identical_requests_choose_identical_depths_after_unrelated_traffic(raw):
+    cap = 7 if raw is K7 else 5
+    policy = AdaptiveKPolicy(AdaptiveKConfig.from_dict(raw, cap))
+    rng = random.Random(13)
+    pattern = [rng.choice([0, 1, 2, 3, 5, 7, 7, 7]) for _ in range(80)]
+    first = _run_alone(policy, "a", pattern, cap)
+    # Unrelated traffic: low- and high-acceptance requests, alone and batched,
+    # leaving whatever hysteresis or statistics state they would.
+    for i in range(30):
+        _feed(policy, f"x{i}", rng.choice([0.2, 0.95]), 20, rng)
+        policy.select_by_acceptance([f"x{i}"], cap)
+        policy.select_by_acceptance([f"x{i}", f"y{i}"], min(cap, 5))
+    second = _run_alone(policy, "b", pattern, cap)
+    assert first == second
+    if raw is K7:
+        assert len(set(first)) > 1  # the pattern exercises depth changes
+    # The same on a fresh policy: no hidden dependence on the policy's age.
+    third = _run_alone(AdaptiveKPolicy(AdaptiveKConfig.from_dict(raw, cap)), "c", pattern, cap)
+    assert first == third
+
+
+def test_scheduler_depth_sequence_is_repeatable_alone():
+    """Through the scheduler's own selection: a lone request's depths do not
+    depend on requests that ran before it."""
+    base = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192,
+                            num_speculative_tokens=7)
+    spec = base.vllm_config.speculative_config
+    spec.adaptive_k, spec.adaptive_k_config = K7, AdaptiveKConfig.from_dict(K7, 7)
+    scheduler = Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
+                          block_size=base.block_size, log_stats=True,
+                          structured_output_manager=StructuredOutputManager(base.vllm_config))
+    rng = random.Random(14)
+    pattern = [rng.choice([0, 2, 7, 7]) for _ in range(40)]
+
+    def run(req):
+        scheduler.running = [req]
+        req.status = req.status
+        depths = []
+        for limit in pattern:
+            req.spec_token_ids = list(range(11, 18))
+            k, _ = scheduler._select_adaptive_k()
+            depths.append(k)
+            scheduler.adaptive_k.observe(req.request_id, k, min(k, limit))
+        scheduler.adaptive_k.forget(req.request_id)
+        scheduler.running = []
+        return depths
+
+    a, b = create_requests(num_requests=2)
+    first = run(a)
+    for i in range(10):
+        _feed(scheduler.adaptive_k, f"z{i}", 0.3, 30, rng)
+        scheduler.adaptive_k.select_by_acceptance([f"z{i}"], 7)
+    assert run(b) == first

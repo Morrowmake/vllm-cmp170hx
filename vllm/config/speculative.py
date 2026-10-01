@@ -2030,6 +2030,9 @@ class SpeculativeConfig:
             "costs": costs,
             "hysteresis": max(0.0, min(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST, 0.5)),
         }
+        prior = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR
+        if prior != 0.75:
+            config["prior"] = min(max(prior, 0.01), 0.99)
         if costs_multi:
             config["costs_multi"] = costs_multi
         return config
