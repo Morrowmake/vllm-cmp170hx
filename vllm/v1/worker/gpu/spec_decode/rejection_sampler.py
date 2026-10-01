@@ -297,6 +297,11 @@ class RejectionSampler:
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        if input_batch.draft_skip_mask is not None:
+            # Placeholder proposals reject at the last live row, whose target
+            # distribution supplies the replacement; dead-row logits are unused.
+            draft_sampled = draft_sampled.masked_fill(input_batch.draft_skip_mask, -1)
+
         pos = input_batch.positions[input_batch.logits_indices]
 
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
