@@ -135,8 +135,17 @@ def check_kda_metadata(layer: str, md, pool: int, num_tokens: int) -> None:
         _range(problems, "decode state index",
                None if ns_idx is None else ns_idx[: md.num_decodes], pool)
     n_spec = int(md.num_spec_decodes or 0)
+    # VLLM_GLM5_KDA_RECOVER: one state per request. Only column 0 of the spec
+    # state table is filled and read (the fused verify path leaves the other
+    # columns of its persistent buffer unwritten), and the verify reads
+    # num_accepted = 1; the query still spans up to num_spec + 1 tokens.
+    commit = getattr(md, "recover_commit", None)
     if n_spec > 0 and md.spec_state_indices_tensor is not None:
-        sp = _host(md.spec_state_indices_tensor[:n_spec])
+        sp_dev = md.spec_state_indices_tensor[:n_spec]
+        width = int(sp_dev.shape[1]) if sp_dev.dim() == 2 else 1
+        if commit is not None and sp_dev.dim() == 2:
+            sp_dev = sp_dev[:, :1]
+        sp = _host(sp_dev)
         _range(problems, "spec state index", sp, pool)
         cols = int(sp.shape[1]) if sp.dim() == 2 else 1
         acc = _host(md.num_accepted_tokens)
@@ -149,9 +158,13 @@ def check_kda_metadata(layer: str, md, pool: int, num_tokens: int) -> None:
         if sq is not None:
             sq = sq[: n_spec + 1]
             _cu(problems, "spec_query_start_loc", sq, num_tokens)
-            if sq.numel() > 1 and int((sq[1:] - sq[:-1]).max()) > cols:
+            if sq.numel() > 1 and int((sq[1:] - sq[:-1]).max()) > width:
                 problems.append(
-                    f"spec query lengths {(sq[1:] - sq[:-1]).tolist()} > {cols} state columns")
+                    f"spec query lengths {(sq[1:] - sq[:-1]).tolist()} > {width} "
+                    f"token columns")
+        if commit is not None:
+            _check_recover_commit(problems, commit, n_spec, pool,
+                                  int(md.num_prefills) + int(md.num_decodes) + n_spec)
     if problems:
         detail = (f"{layer}: pool {pool}, prefills {md.num_prefills}, decodes "
                   f"{md.num_decodes}, spec {n_spec}, tokens {num_tokens}; "
@@ -159,6 +172,27 @@ def check_kda_metadata(layer: str, md, pool: int, num_tokens: int) -> None:
                   f"cu {None if ns_cu is None else ns_cu.tolist()[:40]}")
         logger.error("state index check failed: %s | %s", "; ".join(problems), detail)
         raise StateIndexError("; ".join(problems) + " | " + detail)
+
+
+def _check_recover_commit(problems: list[str], commit, n_spec: int, pool: int,
+                          num_seqs: int) -> None:
+    """The commit metadata of VLLM_GLM5_KDA_RECOVER (kda_recover.py): the
+    state rows the commit replays from and the batch rows it reads."""
+    si = _host(commit.state_indices)
+    if si is not None and si.numel() != n_spec:
+        problems.append(f"recover commit: {si.numel()} state rows for {n_spec} spec decodes")
+    _range(problems, "recover commit state index", si, pool)
+    ri = _host(commit.request_indices)
+    if ri is not None:
+        if ri.numel() != n_spec:
+            problems.append(
+                f"recover commit: {ri.numel()} request rows for {n_spec} spec decodes")
+        _range(problems, "recover commit request index", ri, num_seqs)
+    cq = _host(commit.query_start_loc)
+    if cq is not None and cq.numel() != n_spec + 1:
+        problems.append(
+            f"recover commit: query_start_loc has {cq.numel()} entries "
+            f"for {n_spec} spec decodes")
 
 
 def check_gather_mapping(idx_mapping: torch.Tensor, max_num_reqs: int) -> None:

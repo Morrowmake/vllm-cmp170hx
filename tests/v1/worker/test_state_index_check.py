@@ -81,6 +81,77 @@ def test_spec_rows_accepted_column_and_query_length():
         sic.check_kda_metadata("l", bad, 415, 17)
 
 
+def _recover_md(state_cols, accepted, qsl, commit_state=None, request_indices=None,
+                num_prefills=0, num_decodes=0):
+    """GDN metadata as VLLM_GLM5_KDA_RECOVER builds it: num_accepted = 1 and
+    only column 0 of the spec state table written (the rest is whatever the
+    persistent torch.empty buffer holds)."""
+    sp = t(state_cols)
+    n = sp.shape[0]
+    commit = SimpleNamespace(
+        state_indices=sp[:, 0] if commit_state is None else t(commit_state),
+        query_start_loc=t(qsl),
+        request_indices=None if request_indices is None else t(request_indices),
+        block_table=None, num_computed_tokens=None, block_size=None)
+    return md(num_prefills=num_prefills, num_decodes=num_decodes, num_spec_decodes=n,
+              num_actual_tokens=qsl[-1], spec_state_indices_tensor=sp,
+              num_accepted_tokens=t(accepted), spec_query_start_loc=t(qsl),
+              recover_commit=commit)
+
+
+def test_recover_reads_only_column_zero():
+    # Columns 1..7 hold uninitialised values (negative / beyond the pool): not
+    # read under recover, so they must not fail the check.
+    garbage = [-1765, 9_999_999, 0, 7, -3, 123456, 2]
+    m = _recover_md([[5] + garbage, [9] + garbage], [1, 1], [0, 8, 16])
+    sic.check_kda_metadata("l", m, 415, 16)
+    # The same table without recover is a real violation.
+    m.recover_commit = None
+    with pytest.raises(sic.StateIndexError, match="spec state index"):
+        sic.check_kda_metadata("l", m, 415, 16)
+
+
+def test_recover_query_spans_token_columns_not_state_columns():
+    # depth 7: 8-token verify per request against one state column
+    sic.check_kda_metadata("l", _recover_md([[5] + [0] * 7], [1], [0, 8]), 415, 8)
+    with pytest.raises(sic.StateIndexError, match="token columns"):
+        sic.check_kda_metadata("l", _recover_md([[5] + [0] * 7], [1], [0, 9]), 415, 9)
+
+
+def test_recover_column_zero_and_accepted_still_checked():
+    with pytest.raises(sic.StateIndexError, match="spec state index"):
+        sic.check_kda_metadata("l", _recover_md([[415] + [0] * 7], [1], [0, 8]), 415, 8)
+    # the recover verify reads num_accepted = 1 only
+    with pytest.raises(sic.StateIndexError, match="num_accepted_tokens"):
+        sic.check_kda_metadata("l", _recover_md([[5] + [0] * 7], [3], [0, 8]), 415, 8)
+
+
+def test_recover_commit_metadata_checked():
+    with pytest.raises(sic.StateIndexError, match="recover commit state index"):
+        sic.check_kda_metadata(
+            "l", _recover_md([[5] + [0] * 7], [1], [0, 8], commit_state=[-1]), 415, 8)
+    # mixed step: one prefill + one spec decode; batch row 2 does not exist
+    m = _recover_md([[5] + [0] * 7], [1], [0, 8], request_indices=[2], num_prefills=1)
+    m.non_spec_state_indices_tensor = t([3])
+    m.non_spec_query_start_loc = t([0, 4])
+    m.has_initial_state = torch.tensor([True])
+    with pytest.raises(sic.StateIndexError, match="recover commit request index"):
+        sic.check_kda_metadata("l", m, 415, 8)
+    m.recover_commit.request_indices = t([1])
+    sic.check_kda_metadata("l", m, 415, 8)
+
+
+def test_recover_metadata_class_is_checked(monkeypatch):
+    """Glm5KDARecoverMetadata is a GDNAttentionMetadata, so check_attn_metadata
+    reaches it (and its recover_commit field) on every step."""
+    from vllm.ampere_decode.kda_recover import Glm5KDARecoverMetadata
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    assert issubclass(Glm5KDARecoverMetadata, GDNAttentionMetadata)
+    assert "recover_commit" in {f.name for f in
+                                __import__("dataclasses").fields(Glm5KDARecoverMetadata)}
+
+
 def test_align_copy_columns_and_block_ids():
     table = torch.zeros(4, 64, dtype=torch.int32)
     table[0, :3] = t([0, 12, 13])
