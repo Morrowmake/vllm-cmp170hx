@@ -74,6 +74,9 @@ logger = init_logger(__name__)
 # fp32 `fn` storage pointer -> (fp32 tensor, exact bf16 copy); filled before capture.
 _FN_BF16: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 FN_NAMES = ("hc_attn_fn", "hc_ffn_fn")
+# The bf16 copy is read only for M <= this (one CMP 170HX, 90 real fn per step,
+# graph replay: 1.7-2.6 % faster per call at M 5..12, slower at M 24 and 32).
+FN_BF16_MAX_TOKENS = 12
 
 
 def register_fn_bf16(model) -> int:
@@ -98,10 +101,22 @@ def register_fn_bf16(model) -> int:
         copies.append((p, bf))
     for p, bf in copies:
         _FN_BF16[p.data_ptr()] = (p, bf)
-    logger.info("mHC decode v2 reads exact bf16 fn copies "
+    logger.info("mHC decode v2 reads exact bf16 fn copies for M <= %d "
                 "(VLLM_GLM5_DECODE_MHC_V2_FN_BF16): %d tensors, %.1f MiB.",
-                len(copies), sum(bf.numel() * 2 for _, bf in copies) / 2**20)
+                FN_BF16_MAX_TOKENS, len(copies),
+                sum(bf.numel() * 2 for _, bf in copies) / 2**20)
     return len(copies)
+
+
+def _select_fn(fn: torch.Tensor, M: int, hc: int, hidden: int) -> torch.Tensor:
+    """The `fn` kernel A reads: the registered bf16 copy for M <= FN_BF16_MAX_TOKENS
+    on the hc == 4 Gluon kernels, else ``fn`` itself."""
+    if (_FN_BF16 and M <= FN_BF16_MAX_TOKENS and fn.dtype == torch.float32
+            and hc == 4 and hidden % HB_GLU == 0):
+        bf = _fn_bf16(fn)
+        if bf is not None:
+            return bf
+    return fn
 
 
 def _fn_bf16(fn: torch.Tensor) -> torch.Tensor | None:
@@ -1114,10 +1129,7 @@ def mhc_fused_post_pre(
     pf = post_layer_mix.reshape(M, hc).contiguous()
     cf = comb_res_mix.reshape(M, hc, hc).contiguous()
     fnf = fn.contiguous()
-    if _FN_BF16 and fnf.dtype == torch.float32 and hc == 4 and hidden % HB_GLU == 0:
-        bf = _fn_bf16(fnf)
-        if bf is not None:
-            fnf = bf
+    fnf = _select_fn(fnf, M, hc, hidden)
     assert fnf.dtype == torch.float32 or (hc == 4 and hidden % HB_GLU == 0), \
         "a bf16 fn is read only by the hc == 4 Gluon kernels"
     nw = norm_weight
@@ -1203,7 +1215,7 @@ def warmup(ms, hidden=4096, hc=4, sinkhorn=20, device="cuda"):
         mhc_fused_post_pre(
             rms_eps=1e-5, hc_pre_eps=1e-6, hc_sinkhorn_eps=1e-6,
             hc_post_mult_value=2.0, sinkhorn_repeat=sinkhorn, **case)
-        if _FN_BF16 and hc == 4 and hidden % HB_GLU == 0:
+        if _FN_BF16 and M <= FN_BF16_MAX_TOKENS and hc == 4 and hidden % HB_GLU == 0:
             # the bf16-fn specialisation of kernel A, compiled before capture too
             case["fn"] = case["fn"].to(torch.bfloat16)
             mhc_fused_post_pre(

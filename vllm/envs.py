@@ -191,7 +191,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MHC_V2: bool = False
     VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
-    VLLM_GLM5_DECODE_MHC_V2_FN_BF16: bool = False
+    VLLM_GLM5_DECODE_MHC_V2_FN_BF16: bool = True
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_ROUTE_V2: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
@@ -1727,9 +1727,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mHC v2 reads a bf16 copy of each prenorm projection `fn` (made once before
     # graph capture, only where every fp32 value is exactly a bf16 value, as in
     # checkpoints that store `fn` in bf16) and upcasts it in the kernel: half
-    # the `fn` bytes per call, bitwise-identical results.
+    # the `fn` bytes per call, bitwise-identical results. Used for M <= 12
+    # tokens (FN_BF16_MAX_TOKENS in mhc_decode_v2.py; measured faster there,
+    # slower at 24/32). On by default; 0 is the kill switch.
     "VLLM_GLM5_DECODE_MHC_V2_FN_BF16": lambda: bool(
-        int(os.getenv("VLLM_GLM5_DECODE_MHC_V2_FN_BF16", "0"))
+        int(os.getenv("VLLM_GLM5_DECODE_MHC_V2_FN_BF16", "1"))
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
