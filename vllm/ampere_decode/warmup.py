@@ -115,6 +115,8 @@ def _warmup_mhc_v2(model, device, capture_sizes, gate) -> None:
         logger.info("sm_80 mHC decode v2 requested but its gate is closed "
                     "(hc=%d, hidden=%d); using the previous paths.", hc, hidden)
         return
+    if envs.VLLM_GLM5_DECODE_MHC_V2_FN_BF16:
+        mhc_decode_v2.register_fn_bf16(model)
     mhc_decode_v2.warmup(ms, hidden=hidden, hc=hc, sinkhorn=sinkhorn, device=device)
     logger.info("sm_80 mHC decode v2 on for M <= %d; warmed up M in %s.", bound, ms)
 

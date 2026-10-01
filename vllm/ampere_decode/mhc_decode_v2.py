@@ -46,6 +46,12 @@ TileLang kernel's (mean and max error within ~1.05x of it at M = 4..25), and
     column normalisation, whose quotient gets one FMA correction (rounding
     errors of the earlier normalisations are absorbed by the later ones; the
     last one's are not), and the sigmoids use a Newton-refined reciprocal.
+`fn` may also be read as bf16 (VLLM_GLM5_DECODE_MHC_V2_FN_BF16): an exact copy
+made before capture by `register_fn_bf16` when every fp32 value is a bf16 value
+(the checkpoint stores `fn` in bf16). Kernel A stages it in shared memory as
+bf16 and upcasts on the shared-memory load, so the tf32 hi/lo split and every
+product see the same fp32 values as before; the fp32 path compiles to the same
+SASS as without this option.
 Gated as before on bitwise determinism and CUDA-graph capture. The two bf16
 rounding points of the op are kept exactly:
   * `mixes` and `sqrsum` are accumulated from the pre-rounding fp32
@@ -60,6 +66,50 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# fp32 `fn` storage pointer -> (fp32 tensor, exact bf16 copy); filled before capture.
+_FN_BF16: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+FN_NAMES = ("hc_attn_fn", "hc_ffn_fn")
+
+
+def register_fn_bf16(model) -> int:
+    """Make the bf16 copies of every mHC `fn` of ``model`` (call before CUDA
+    graph capture). Returns the number registered; registers none unless every
+    `fn` round-trips through bf16 exactly."""
+    fns = [p for name, p in model.named_parameters()
+           if name.rsplit(".", 1)[-1] in FN_NAMES and p.dtype == torch.float32
+           and p.dim() == 2]
+    if not fns:
+        logger.info("VLLM_GLM5_DECODE_MHC_V2_FN_BF16 is set but the gate is closed "
+                    "(no fp32 mHC fn on this rank); reading fp32 fn.")
+        return 0
+    copies = []
+    for p in fns:
+        bf = p.detach().to(torch.bfloat16).contiguous()
+        if not torch.equal(bf.float(), p.detach()):
+            logger.info("VLLM_GLM5_DECODE_MHC_V2_FN_BF16 is set but the gate is "
+                        "closed (an mHC fn holds values that are not bf16); "
+                        "reading fp32 fn.")
+            return 0
+        copies.append((p, bf))
+    for p, bf in copies:
+        _FN_BF16[p.data_ptr()] = (p, bf)
+    logger.info("mHC decode v2 reads exact bf16 fn copies "
+                "(VLLM_GLM5_DECODE_MHC_V2_FN_BF16): %d tensors, %.1f MiB.",
+                len(copies), sum(bf.numel() * 2 for _, bf in copies) / 2**20)
+    return len(copies)
+
+
+def _fn_bf16(fn: torch.Tensor) -> torch.Tensor | None:
+    ent = _FN_BF16.get(fn.data_ptr())
+    if ent is None or ent[0] is not fn and (
+            ent[0].shape != fn.shape or ent[0].stride() != fn.stride()):
+        return None
+    return ent[1]
 
 
 def num_sms():
@@ -307,7 +357,9 @@ def _mma3_smem(hsh, hsl, sb, acc_s, acc_t, acc_b, z, LA: gl.constexpr, LB: gl.co
     for kc in gl.static_range(HB // 16):
         ah = hsh.slice(kc * 16, 16, dim=1).load(LA)
         al = hsl.slice(kc * 16, 16, dim=1).load(LA)
-        b = sb.slice(kc * 16, 16, dim=0).load(LB)
+        # fn in shared memory is fp32 or bf16 (exact bf16 copy); the upcast is
+        # a no-op for fp32 and exact for bf16, so every product is unchanged.
+        b = sb.slice(kc * 16, 16, dim=0).load(LB).to(gl.float32)
         bh = _tf32_hi(b)
         acc_s = mma_v2(al, bh, acc_s)
         acc_t = mma_v2(ah, b - bh, acc_t)
@@ -395,10 +447,10 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     nf = gl.arange(0, NP2, layout=gl.SliceLayout(0, LF))
     fmask = (kf < HB)[:, None] & (nf < NOUT)[None, :] & (_clk_now() >= 0)
     fbase = fn_ptr + nf[None, :] * (HC * HIDDEN) + ks * HB + kf[:, None]
-    s0 = gl.allocate_shared_memory(gl.float32, [HB, NP2], SF)
-    s1 = gl.allocate_shared_memory(gl.float32, [HB, NP2], SF)
-    s2 = gl.allocate_shared_memory(gl.float32, [HB, NP2], SF)
-    s3 = gl.allocate_shared_memory(gl.float32, [HB, NP2], SF)
+    s0 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [HB, NP2], SF)
+    s1 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [HB, NP2], SF)
+    s2 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [HB, NP2], SF)
+    s3 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [HB, NP2], SF)
     async_copy.async_copy_global_to_shared(s0, fbase, mask=fmask)
     async_copy.commit_group()
     async_copy.async_copy_global_to_shared(s1, fbase + HIDDEN, mask=fmask)
@@ -525,10 +577,10 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     fmask = (fh[:, None, None] < 2) & (fk[None, :, None] < KH) & (fnn[None, None, :] < NOUT)
     fbase = (fn_ptr + fnn[None, None, :] * (HC * HIDDEN) + ks * HB
              + fh[:, None, None] * KH + fk[None, :, None])
-    s0 = gl.allocate_shared_memory(gl.float32, [2, KH, NP2], SF)
-    s1 = gl.allocate_shared_memory(gl.float32, [2, KH, NP2], SF)
-    s2 = gl.allocate_shared_memory(gl.float32, [2, KH, NP2], SF)
-    s3 = gl.allocate_shared_memory(gl.float32, [2, KH, NP2], SF)
+    s0 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [2, KH, NP2], SF)
+    s1 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [2, KH, NP2], SF)
+    s2 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [2, KH, NP2], SF)
+    s3 = gl.allocate_shared_memory(fn_ptr.dtype.element_ty, [2, KH, NP2], SF)
 
     th = gl.arange(0, 2, layout=gl.SliceLayout(1, gl.SliceLayout(2, LT)))
     tk = gl.arange(0, KH, layout=gl.SliceLayout(0, gl.SliceLayout(2, LT)))
@@ -623,16 +675,16 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     b3 = gl.convert_layout(n3, LB)
     async_copy.wait_group(3)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s0.permute([0, 2, 1]).load(LA), b0, acc_s, acc_t, acc_b, z, KH)
+    acc_s, acc_t, acc_b = _mma3(s0.permute([0, 2, 1]).load(LA).to(gl.float32), b0, acc_s, acc_t, acc_b, z, KH)
     async_copy.wait_group(2)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s1.permute([0, 2, 1]).load(LA), b1, acc_s, acc_t, acc_b, z, KH)
+    acc_s, acc_t, acc_b = _mma3(s1.permute([0, 2, 1]).load(LA).to(gl.float32), b1, acc_s, acc_t, acc_b, z, KH)
     async_copy.wait_group(1)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s2.permute([0, 2, 1]).load(LA), b2, acc_s, acc_t, acc_b, z, KH)
+    acc_s, acc_t, acc_b = _mma3(s2.permute([0, 2, 1]).load(LA).to(gl.float32), b2, acc_s, acc_t, acc_b, z, KH)
     async_copy.wait_group(0)
     gl.barrier()
-    acc_s, acc_t, acc_b = _mma3(s3.permute([0, 2, 1]).load(LA), b3, acc_s, acc_t, acc_b, z, KH)
+    acc_s, acc_t, acc_b = _mma3(s3.permute([0, 2, 1]).load(LA).to(gl.float32), b3, acc_s, acc_t, acc_b, z, KH)
     # the two k-half partials meet in shared memory (one barrier); gl.sum over the
     # warp-distributed batch dim lowers to a longer shuffle + smem sequence.
     SR: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
@@ -1047,7 +1099,7 @@ def mhc_fused_post_pre(
     assert residual.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
     assert post_layer_mix.dtype == torch.float32
     assert comb_res_mix.dtype == torch.float32
-    assert fn.dtype == torch.float32
+    assert fn.dtype in (torch.float32, torch.bfloat16)
     assert hc_scale.dtype == torch.float32 and hc_base.dtype == torch.float32
     assert norm_weight is not None, "the decode path always fuses the input RMSNorm"
 
@@ -1062,6 +1114,12 @@ def mhc_fused_post_pre(
     pf = post_layer_mix.reshape(M, hc).contiguous()
     cf = comb_res_mix.reshape(M, hc, hc).contiguous()
     fnf = fn.contiguous()
+    if _FN_BF16 and fnf.dtype == torch.float32 and hc == 4 and hidden % HB_GLU == 0:
+        bf = _fn_bf16(fnf)
+        if bf is not None:
+            fnf = bf
+    assert fnf.dtype == torch.float32 or (hc == 4 and hidden % HB_GLU == 0), \
+        "a bf16 fn is read only by the hc == 4 Gluon kernels"
     nw = norm_weight
     if nw.dtype != torch.bfloat16:
         nw = nw.to(torch.bfloat16)
@@ -1145,4 +1203,10 @@ def warmup(ms, hidden=4096, hc=4, sinkhorn=20, device="cuda"):
         mhc_fused_post_pre(
             rms_eps=1e-5, hc_pre_eps=1e-6, hc_sinkhorn_eps=1e-6,
             hc_post_mult_value=2.0, sinkhorn_repeat=sinkhorn, **case)
+        if _FN_BF16 and hc == 4 and hidden % HB_GLU == 0:
+            # the bf16-fn specialisation of kernel A, compiled before capture too
+            case["fn"] = case["fn"].to(torch.bfloat16)
+            mhc_fused_post_pre(
+                rms_eps=1e-5, hc_pre_eps=1e-6, hc_sinkhorn_eps=1e-6,
+                hc_post_mult_value=2.0, sinkhorn_repeat=sinkhorn, **case)
     torch.cuda.synchronize()

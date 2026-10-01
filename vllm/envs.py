@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MHC_V2: bool = False
     VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
+    VLLM_GLM5_DECODE_MHC_V2_FN_BF16: bool = False
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_ROUTE_V2: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
@@ -1720,6 +1721,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", "32")
+    ),
+    # mHC v2 reads a bf16 copy of each prenorm projection `fn` (made once before
+    # graph capture, only where every fp32 value is exactly a bf16 value, as in
+    # checkpoints that store `fn` in bf16) and upcasts it in the kernel: half
+    # the `fn` bytes per call, bitwise-identical results.
+    "VLLM_GLM5_DECODE_MHC_V2_FN_BF16": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_MHC_V2_FN_BF16", "0"))
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
