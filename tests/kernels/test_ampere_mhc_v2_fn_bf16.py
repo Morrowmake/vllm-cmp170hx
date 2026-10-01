@@ -192,8 +192,9 @@ def test_bf16_fn_bitwise_equal(monkeypatch):
         got = _dispatch(monkeypatch, _case(M, fn, 40 + M))
         for a, b in zip(got, outs[M]):
             assert torch.equal(a, b), M
-        # the direct bf16 entry gives the same as the registry lookup
-        direct = _dispatch(monkeypatch, _case(M, v2._fn_bf16(fn), 40 + M))
+        # the bf16 copy passed straight to the v2 kernel entry (the TileLang
+        # dispatch accepts only the model's fp32 fn) gives the same results
+        direct = v2.mhc_fused_post_pre(**_case(M, v2._fn_bf16(fn), 40 + M))
         for a, b in zip(direct, outs[M]):
             assert torch.equal(a, b), M
 

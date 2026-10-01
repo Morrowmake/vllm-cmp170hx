@@ -208,6 +208,9 @@ def test_graph_replay_mid_rows(weights, monkeypatch, name, M):
     out = torch.empty_like(x)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):  # scratch is per stream: warm the capture stream
+        decode.warmup(x.device, N=2048, max_tokens=M)
+    stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         decode.run(layer, out, x, weights["w1"], weights["w2"], tw, ids,
@@ -406,6 +409,9 @@ def test_multi_graph_replay(weights, monkeypatch, name, M):
     out = torch.empty_like(x)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):  # scratch is per stream: warm the capture stream
+        decode.warmup(x.device, N=2048, max_tokens=M)
+    stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         decode.run(layer, out, x, weights["w1"], weights["w2"], tw, ids,
