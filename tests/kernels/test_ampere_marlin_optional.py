@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Optional extension startup contracts, guarded dispatch, and graph padding."""
+"""Optional extension startup contracts, guarded decode dispatch, and graph padding.
+The compiled prefill was removed: its old flag is recognised and ignored."""
 
 import importlib
 import importlib.util
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -46,13 +48,33 @@ def test_disabled_does_not_import_optional_library(monkeypatch):
     assert prefill.enabled_shapes() == {}
 
 
-@pytest.mark.parametrize("decode_flag,prefill_flag", [(True, False), (False, True)])
-def test_independent_flags(monkeypatch, decode_flag, prefill_flag):
-    monkeypatch.setenv(DECODE, str(int(decode_flag)))
-    monkeypatch.setenv(PREFILL, str(int(prefill_flag)))
-    assert envs.VLLM_GLM5_MARLIN_DECODE_CUDA is decode_flag
-    assert envs.VLLM_GLM5_MARLIN_PREFILL_CUDA is prefill_flag
-    assert (2048 in prefill.enabled_shapes()) is prefill_flag
+@pytest.mark.parametrize("value,warned", [("1", True), ("0", False), ("", False)])
+def test_removed_prefill_flag_is_ignored(monkeypatch, value, warned):
+    from vllm.logger import _print_warning_once
+
+    monkeypatch.setenv(PREFILL, value)
+    assert envs.VLLM_GLM5_MARLIN_PREFILL_CUDA == value
+    assert PREFILL in envs.environment_variables  # no "Unknown vLLM environment variable"
+    assert prefill.enabled_shapes() == {}
+    assert not hasattr(prefill, "compiled_regime")
+    assert "prefill_gemm" not in ampere_marlin._SCHEMA_ARGUMENTS
+    _print_warning_once.cache_clear()
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    lg = logging.getLogger(ampere_marlin.__name__)
+    handler, level = Grab(), lg.level
+    lg.setLevel(logging.INFO)
+    lg.addHandler(handler)
+    try:
+        ampere_marlin.note_removed_flags()
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(level)
+    assert any("VLLM_GLM5_MARLIN_PREFILL_CUDA=1 is ignored" in x for x in lines) is warned, lines
 
 
 def test_decode_variant_defaults_to_orig_and_validates(monkeypatch):
@@ -126,15 +148,6 @@ def test_decode_regime_boundaries(tokens, width, expected):
     assert decode.compiled_regime(tokens, width) is expected
 
 
-@pytest.mark.parametrize("tokens,width,expected", [
-    (383, 2048, False), (384, 2048, True), (2304, 2048, True),
-    (2305, 2048, False), (2312, 2048, False),
-    (1728, 512, False), (2304, 1024, False),
-])
-def test_prefill_regime_boundaries(tokens, width, expected):
-    assert prefill.compiled_regime(tokens, width) is expected
-
-
 @pytest.mark.parametrize("case,reason", [
     ("expert_map", "expert map"), ("fp8", "activation quantisation"),
     ("lora", "LoRA"), ("int64_ids", "int32"), ("bias", "w1_bias"),
@@ -160,8 +173,8 @@ def test_unsupported_decode_leaves_output_untouched(monkeypatch, case, reason):
     assert torch.equal(output, torch.full_like(output, 3.0))
 
 
-def test_compiled_prefill_respects_released_threshold(monkeypatch):
-    monkeypatch.setenv(PREFILL, "1")
+def test_released_prefill_thresholds(monkeypatch):
+    monkeypatch.setenv(PREFILL, "1")  # removed flag: changes nothing
     monkeypatch.setenv("VLLM_GLM5_PP_MARLIN_PREFILL", "1")
     monkeypatch.setenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "1000")
     monkeypatch.setenv("VLLM_GLM5_TP4_MARLIN_PREFILL", "1")
@@ -170,26 +183,19 @@ def test_compiled_prefill_respects_released_threshold(monkeypatch):
     assert prefill.enabled_shapes()[512][1] == 700
 
 
-@pytest.mark.parametrize("width,python_on,minimum,budget,expected", [
-    (512, False, 384, 3460, (0, 0)),
-    (512, True, 384, 3460, (3460, 0)),
-    (2048, False, 384, 2312, (0, 2304)),
-    (2048, True, 384, 2312, (2312, 2304)),
-    (2048, False, 384, 383, (0, 0)),
-    (2048, True, 2400, 3000, (3000, 0)),
-    (1024, True, 384, 2312, (0, 0)),
+@pytest.mark.parametrize("width,python_on,budget,expected", [
+    (512, False, 3460, 0), (512, True, 3460, 3460),
+    (2048, False, 2312, 0), (2048, True, 2312, 2312), (1024, True, 2312, 0),
 ])
-def test_warmup_allocations_follow_admitted_width_and_tokens(
-    monkeypatch, width, python_on, minimum, budget, expected,
-):
-    monkeypatch.setenv(PREFILL, "1")
+def test_warmup_allocations_follow_admitted_width(monkeypatch, width, python_on, budget,
+                                                  expected):
+    monkeypatch.setenv(PREFILL, "1")  # removed flag: allocates nothing by itself
     python_flag = (
         "VLLM_GLM5_TP4_MARLIN_PREFILL" if width == 512
         else "VLLM_GLM5_PP_MARLIN_PREFILL"
     )
     monkeypatch.setenv(python_flag, str(int(python_on)))
-    monkeypatch.setenv(python_flag + "_MIN_TOKENS", str(minimum))
-    assert prefill._warmup_capacities(width, budget) == expected
+    assert prefill._warmup_capacity(width, budget) == expected
 
 
 has_extension = importlib.util.find_spec("vllm._ampere_marlin_C") is not None
@@ -198,7 +204,6 @@ gpu = pytest.mark.skipif(
     reason="requires CUDA and the optional prebuilt extension",
 )
 decode_weights = tp_helpers.hp.weights
-prefill_weights = pp_helpers.weights
 
 
 @gpu
@@ -249,55 +254,15 @@ def test_decode_accuracy_padding_and_graph(decode_weights, monkeypatch, M, activ
 
 
 @gpu
-def test_prefill_wide_accuracy_and_graph_replay(prefill_weights):
-    if torch.cuda.get_device_capability() != (8, 0):
-        pytest.skip("SM 8.0 kernels")
-    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-
-    hp = pp_helpers
-    M = 384
-    layer = hp._gpu_layer(prefill_weights)
-    x, tw, ids = hp._inputs(M, 321)
-    ws13 = torch.empty(M * 8, 2048, device=x.device, dtype=x.dtype)
-    ws2 = torch.empty(M * 8 * 4096, device=x.device, dtype=x.dtype)
-    buf = prefill._buffers(x.device, 288, M * 8, create=True)
-    output = torch.empty_like(x)
-    args = (layer, output, x, prefill_weights["w1"], prefill_weights["w2"],
-            tw, ids, MoEActivation.SILU, ws13, ws2, buf)
-    prefill.run(*args, wide=False)
-    baseline = output.clone()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        prefill.run(*args, wide=True)
-    stream.synchronize()
-    eager = output.clone()
-    rows = torch.arange(M, device=x.device)
-    reference = hp.reference_fp64(x, prefill_weights, tw, ids, rows)
-    candidate_mean, candidate_max = hp._err(eager, reference)
-    baseline_mean, baseline_max = hp._err(baseline, reference)
-    assert candidate_mean <= 1.10 * baseline_mean
-    assert candidate_max <= 1.25 * baseline_max
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        prefill.run(*args, wide=True)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(output, eager)
-
-
-@gpu
 def test_optional_scratch_is_separate_across_streams():
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-    workspaces, reductions = [], []
+    workspaces = []
     device = torch.device("cuda:0")
     for stream in streams:
         with torch.cuda.stream(stream):
             decode.warmup(device)
             workspaces.append(decode._workspaces(device, 512, 32, create=False))
-            reductions.append(prefill._reduce_scratch(device, create=True))
     for key in ("part", "h", "c3", "ctr", "sorted", "experts", "ntpp"):
         assert workspaces[0][key].data_ptr() != workspaces[1][key].data_ptr()
-    assert reductions[0].data_ptr() != reductions[1].data_ptr()
     for stream in streams:
         stream.synchronize()

@@ -34,18 +34,9 @@ _SCHEMA_ARGUMENTS = {
         "Tensor Tensor int int int float Tensor",
         "",
     ),
-    "prefill_gemm": (
-        "a c_or_none b_q_weight b_bias_or_none b_scales a_scales global_scale "
-        "b_zeros_or_none workspace sorted_token_ids expert_ids "
-        "num_tokens_past_padded topk_weights moe_block_size top_k "
-        "mul_topk_weights b_type_id size_m size_n size_k use_atomic_add "
-        "use_fp32_reduce is_zp_float thread_k thread_n blocks_per_sm c_tmp",
-        "Tensor Optional[Tensor] Tensor Optional[Tensor] Tensor Optional[Tensor] "
-        "Optional[Tensor] Optional[Tensor] Tensor Tensor Tensor Tensor Tensor "
-        "int int bool int int int int bool bool bool int int int Tensor",
-        "Tensor",
-    ),
 }
+# The library may still export prefill_gemm (built before the compiled prefill
+# was removed); it is neither validated nor called.
 
 
 def _runtime_build_info() -> dict:
@@ -84,6 +75,20 @@ def _validate_extension(module) -> None:
             raise ValueError(f"missing CUDA implementation: {qualified}")
 
 
+def note_removed_flags() -> None:
+    """One warning when a removed compiled-Marlin flag is still set."""
+    import os
+
+    value = os.environ.get("VLLM_GLM5_MARLIN_PREFILL_CUDA", "").strip()
+    if value not in ("", "0"):
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning_once(
+            "VLLM_GLM5_MARLIN_PREFILL_CUDA=%s is ignored: the compiled Marlin "
+            "prefill was removed; MoE prefill uses the released kernels "
+            "(VLLM_GLM5_PP_MARLIN_PREFILL / VLLM_GLM5_TP4_MARLIN_PREFILL).", value)
+
+
 def require_extension():
     """Return validated operators, or fail with installation instructions.
 
@@ -102,8 +107,8 @@ def require_extension():
             "is missing or incompatible. Install a matching prebuilt package or "
             "rebuild this vLLM installation with VLLM_BUILD_AMPERE_MARLIN=1 "
             "using the current PyTorch/CUDA environment. To use the released "
-            "kernels instead, set VLLM_GLM5_MARLIN_DECODE_CUDA=0 and "
-            f"VLLM_GLM5_MARLIN_PREFILL_CUDA=0 before restarting. Detail: {exc}"
+            "kernels instead, set VLLM_GLM5_MARLIN_DECODE_CUDA=0 before "
+            f"restarting. Detail: {exc}"
         ) from exc
     _OPS = torch.ops._ampere_marlin_C
     return _OPS

@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MHC_V2: bool = False
     VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
+    VLLM_GLM5_DECODE_MHC_V2_FN_BF16: bool = False
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_ROUTE_V2: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
@@ -252,8 +253,11 @@ if TYPE_CHECKING:
     VLLM_GLM5_TP4_MARLIN_PREFILL: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
-    VLLM_GLM5_MARLIN_PREFILL_CUDA: bool = False
+    VLLM_GLM5_MARLIN_PREFILL_CUDA: str = ""
     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
+    VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
+    VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
+    VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1720,6 +1724,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", "32")
     ),
+    # mHC v2 reads a bf16 copy of each prenorm projection `fn` (made once before
+    # graph capture, only where every fp32 value is exactly a bf16 value, as in
+    # checkpoints that store `fn` in bf16) and upcasts it in the kernel: half
+    # the `fn` bytes per call, bitwise-identical results.
+    "VLLM_GLM5_DECODE_MHC_V2_FN_BF16": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_MHC_V2_FN_BF16", "0"))
+    ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")
     ),
@@ -2050,14 +2061,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
     ),
-    # Optional prebuilt sm_80 Marlin kernels. Enabling either flag requires
-    # vllm._ampere_marlin_C; startup fails if it is missing or incompatible.
+    # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
+    # requires vllm._ampere_marlin_C; startup fails if it is missing or
+    # incompatible.
     "VLLM_GLM5_MARLIN_DECODE_CUDA": lambda: bool(
         int(os.getenv("VLLM_GLM5_MARLIN_DECODE_CUDA", "0"))
     ),
-    "VLLM_GLM5_MARLIN_PREFILL_CUDA": lambda: bool(
-        int(os.getenv("VLLM_GLM5_MARLIN_PREFILL_CUDA", "0"))
-    ),
+    # Removed: the compiled Marlin prefill. Still declared so an old setting
+    # is recognised; a non-zero value is ignored with one startup warning
+    # (vllm/ampere_marlin.py::note_removed_flags).
+    "VLLM_GLM5_MARLIN_PREFILL_CUDA": lambda: os.getenv(
+        "VLLM_GLM5_MARLIN_PREFILL_CUDA", ""
+    ).strip(),
     # Reduction order of the compiled decode kernels when
     # VLLM_GLM5_MARLIN_DECODE_CUDA is on: "orig" (default) splits the w13
     # projection four ways along K (faster, different fp32 summation order);
@@ -2065,6 +2080,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_MARLIN_DECODE_VARIANT": env_with_choices(
         "VLLM_GLM5_MARLIN_DECODE_VARIANT", "orig", ["orig", "exact"]
     ),
+    # Whole-expert (pipeline-parallel, N=2048) compiled decode also at 5-7
+    # rows (draft depths 4-6 of one request), not only at 4 and 8. Needs
+    # VLLM_GLM5_MARLIN_DECODE_CUDA=1; the variant above applies unchanged.
+    "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS", "0"))
+    ),
+    # Whole-expert (N=2048) compiled decode for multi-request batches, at the
+    # row ranges of _ROWS ("lo-hi[,lo-hi...]" within 9..64; default 9-32, the
+    # most rows one PP4 step verifies with DEPTHS 7,5 and 8 sequences). The
+    # N=2048 scratch grows to the largest row count named there.
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MULTI", "0"))
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS": lambda: os.getenv(
+        "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS", "9-32"
+    ).strip(),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
     # VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE is also set *and* peer access is

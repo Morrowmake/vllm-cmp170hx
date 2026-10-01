@@ -40,12 +40,13 @@ python csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out vllm
 The standalone command also accepts `--build-dir DIR` and `--verbose`.
 It writes `_ampere_marlin_C.abi3.so`. Runtime never compiles CUDA source.
 
-Both runtime flags default to `0` and are independent:
+The runtime flags default to `0`:
 
 | Flag | Guarded regime |
 | --- | --- |
-| `VLLM_GLM5_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, exactly 4 or 8 tokens |
-| `VLLM_GLM5_MARLIN_PREFILL_CUDA=1` | PP4 intermediate width 2048, 384–2304 tokens inclusive |
+| `VLLM_GLM5_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, 4 or 8 tokens |
+| `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS=1` (with the above) | PP4 width 2048, also 5–7 tokens |
+| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI=1` (with the above) | PP4 width 2048, the token ranges of `VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` (`lo-hi[,lo-hi...]` within 9–64, default `9-32`) |
 
 `VLLM_GLM5_MARLIN_DECODE_VARIANT` selects the decode reduction order: `orig`
 (default) splits the first projection four ways along K into fixed-order fp32
@@ -59,30 +60,28 @@ routing, hidden width 4096, uint4b8 group-128 weights, and SiLU with clamp
 10.0. Expert maps, LoRA, activation quantization, zero points, biases,
 global scales and router weighting on input are excluded. Decode also
 retains the released path when torch-based deterministic alignment is
-selected. Unsupported shapes retain the released kernels, including the
-TP4 Python split-align/cost-cover prefill improvements when enabled.
-The compiled prefill flag can enable its supported PP4 split path without
-requiring the older Python prefill flag; an explicitly configured Python
-prefill minimum remains respected.
-PP4 decode batches other than 4/8 tokens and prefills above 2304 tokens keep
-the released path. TP4 prefill never selects the optional compiled kernel.
+selected. Unsupported shapes retain the released kernels.
 
 The decode schedule retains routing and padding semantics, slot-order
-summation, shared-expert handling and final reduction. The prefill schedule
-retains split alignment, its cost-optimal cover and activation/sum behavior,
-using wide tiles only for 32/48/64-row lists. Optional scratch is reserved
-per device and stream before CUDA-graph capture, including PP workers.
-Decode scratch covers 32 tokens for TP4 and only 8 for PP4. Excluded widths
-do not reserve optional scratch: TP4 prefill uses only its released buffers.
+summation, shared-expert handling and final reduction. Optional scratch is
+reserved per device and stream before CUDA-graph capture, including PP
+workers: 32 tokens for TP4, and for PP4 8 tokens or the largest row count of
+`VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` when that switch is on.
 Fully masked graph padding rows remain don't-care, as with released kernels.
 
-With both flags off, the optional extension is not imported or loaded.
-Explicitly enabling either flag validates the binary at worker startup,
-before model loading/serving. A missing binary, mismatched PyTorch/C++ ABI
-or CUDA major version, or missing/incompatible operators raises an actionable
+MoE prefill always uses the released Marlin kernels (with the split-block
+schedules of `VLLM_GLM5_PP_MARLIN_PREFILL` / `VLLM_GLM5_TP4_MARLIN_PREFILL`).
+The former compiled prefill flag `VLLM_GLM5_MARLIN_PREFILL_CUDA` is ignored
+with one startup warning; libraries built before its removal still contain an
+unused `prefill_gemm` operator.
+
+With the decode flag off, the optional extension is not imported or loaded.
+Enabling it validates the binary at worker startup, before model
+loading/serving. A missing binary, mismatched PyTorch/C++ ABI or CUDA major
+version, or missing/incompatible operators raises an actionable
 `RuntimeError`; it never silently disables the requested extension. CUDA
 toolkit minor versions within the same major are accepted. Rebuild against
-the current environment or set both flags to `0` and restart to recover.
+the current environment or set the flag to `0` and restart to recover.
 
 ## Selecting Linear Backends per Quantization
 

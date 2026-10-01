@@ -6870,10 +6870,6 @@ class GPUModelRunner(
             from vllm.ampere_decode.marlin_moe import warmup_from_worker
 
             warmup_from_worker(self)
-        if envs.VLLM_GLM5_MARLIN_PREFILL_CUDA:
-            from vllm.ampere_prefill.pp_marlin_prefill import warmup_from_worker
-
-            warmup_from_worker(self)
         if profiler is None:
             profiler = nullcontext()
         if num_warmups is None:
