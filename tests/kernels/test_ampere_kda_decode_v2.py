@@ -37,6 +37,7 @@ PW = CONV_DIM + H + 2 * KA
 ENV = ("VLLM_GLM5_DECODE_KERNELS", "VLLM_GLM5_DECODE_KDA",
        "VLLM_GLM5_DECODE_KDA_V2", "VLLM_GLM5_DECODE_KDA_MAX_TOKENS",
        "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS", "VLLM_GLM5_DECODE_KDA_V2_DEEP",
+       "VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE",
        "VLLM_GLM5_DECODE_MHC", "VLLM_GLM5_DECODE_MOE_ROUTING")
 
 
@@ -196,6 +197,37 @@ def test_gate_deep_extends_16_heads_only():
         assert not use_ampere_kda_decode_v2(5, 40, H, D, w, w)      # bound
         e.set(VLLM_GLM5_DECODE_KDA_V2_DEEP=0)
         assert not use_ampere_kda_decode_v2(1, 6, H, D, w, w)
+    finally:
+        e.undo()
+
+
+def test_gate_deep_wide_64_heads_one_sequence():
+    """VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE=1 opens T = 6..8 at 64 heads for one
+    sequence only; VLLM_GLM5_DECODE_KDA_V2_DEEP does not; 16 heads unaffected."""
+    os.environ.pop("VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE", None)
+    from vllm import envs
+
+    assert envs.VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE is False
+    e = _Env()
+    try:
+        e.set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_V2=1)
+        w, w64 = _w(), _w(shape=(64 * D, D))
+        e.set(VLLM_GLM5_DECODE_KDA_V2_DEEP=1)
+        for t in (6, 7, 8):
+            assert not use_ampere_kda_decode_v2(1, t, 64, D, w64, w64), t
+        e.set(VLLM_GLM5_DECODE_KDA_V2_DEEP=0, VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE=1)
+        assert ad.kda_v2_max_tokens_per_seq(64) == 8
+        assert ad.kda_v2_max_tokens_per_seq(H) == 5
+        for t in range(1, 9):
+            assert use_ampere_kda_decode_v2(1, t, 64, D, w64, w64), t
+        assert not use_ampere_kda_decode_v2(1, 9, 64, D, w64, w64)
+        assert not use_ampere_kda_decode_v2(1, 6, H, D, w, w)        # 16 heads: DEEP only
+        e.set(VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS=2)
+        assert use_ampere_kda_decode_v2(2, 10, 64, D, w64, w64)      # T 5: wide bound
+        for t in (6, 7, 8):
+            assert not use_ampere_kda_decode_v2(2, 2 * t, 64, D, w64, w64), t
+        e.set(VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS=0)
+        assert not use_ampere_kda_decode_v2(1, 8, 64, D, w64, w64)
     finally:
         e.undo()
 
@@ -662,12 +694,120 @@ def gpu_test_64_heads_one_sequence():
         g.update(saved)
 
 
+def gpu_test_64_heads_deep():
+    """64 heads, one sequence, T = 6..8: with VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE=1
+    ON (v2) matches OFF (the unfused path) within the bf16/fp32 bands, is
+    run-to-run bitwise and replays a captured graph bitwise; with the switch at
+    0 ON is bitwise OFF. The slot pool holds every slot in use."""
+    import vllm.models.glm5next.common.kda as kmod
+    from vllm.ampere_decode import kda_decode_v2
+
+    g = globals()
+    saved = {k: g[k] for k in ("H", "PROJ", "CONV_DIM", "PW")}
+    g["H"] = 64
+    g["PROJ"] = g["H"] * D
+    g["CONV_DIM"] = 3 * g["PROJ"]
+    g["PW"] = g["CONV_DIM"] + g["H"] + 2 * KA
+    try:
+        for wide in (1, 0):
+            e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA=1,
+                           VLLM_GLM5_DECODE_KDA_V2=1,
+                           VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE=wide)
+            try:
+                for T in (6, 7, 8):
+                    kda_decode_v2.warmup(plans=((1, T),), heads=64)
+                    on, off, p0, meta, x = _pair(1, T=T, seed=80 + T)
+                    assert on.kv_cache[1].shape[0] >= T + 1
+                    y1, c1, r1 = _run(on, x, meta, p0)
+                    y0, c0, r0 = _run(off, x, meta, p0)
+                    if not wide:
+                        assert not on._ampere_kda_normed
+                        assert torch.equal(y1, y0) and torch.equal(c1, c0) \
+                            and torch.equal(r1, r0), T
+                        continue
+                    assert on._ampere_kda_normed and not off._ampere_kda_normed
+                    tol = 2.0 * 2 ** -8 * float(y0.float().abs().max())
+                    dy = float((y1.float() - y0.float()).abs().max())
+                    assert dy <= tol, (T, dy, tol)
+                    assert torch.equal(c1, c0), T
+                    d = (r1 - r0).abs()
+                    assert float(d.max()) < 3e-2 and \
+                        float((d > 1e-4).float().mean()) < 1e-3, (T, float(d.max()))
+                    y2, c2, r2 = _run(on, x, meta, p0)
+                    assert torch.equal(y2, y1) and torch.equal(c2, c1) \
+                        and torch.equal(r2, r1), T
+                    if T == 8:
+                        conv, rec = on.kv_cache
+                        saved_fc = kmod.get_forward_context
+                        kmod.get_forward_context = lambda: types.SimpleNamespace(
+                            attn_metadata={on.prefix: meta})
+                        try:
+                            side = torch.cuda.Stream()
+                            side.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(side):
+                                on.forward(x.clone(), None)
+                            torch.cuda.current_stream().wait_stream(side)
+                            torch.cuda.synchronize()
+                            xg = x.clone()
+                            gr = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(gr):
+                                yg = on.forward(xg, None)
+                        finally:
+                            kmod.get_forward_context = saved_fc
+                        conv.copy_(p0[0])
+                        rec.copy_(p0[1])
+                        gr.replay()
+                        torch.cuda.synchronize()
+                        assert torch.equal(yg, y1) and torch.equal(conv, c1) \
+                            and torch.equal(rec, r1)
+                        del gr
+                    print(f"  64 heads T={T}: out diff {dy:.2e} (tol {tol:.2e}), "
+                          f"state max {float(d.max()):.2e}")
+            finally:
+                e.undo()
+    finally:
+        g.update(saved)
+
+
+def gpu_test_warmup_64_heads_depth7():
+    """64 heads, num_spec = 7: the deep-wide switch warms (1, 8) only."""
+    from vllm.ampere_decode import kda_decode_v2
+    from vllm.ampere_decode.warmup import warmup_ampere_decode
+
+    class _KDA(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._conv_state_dim_first = False
+            self.local_num_heads, self.head_dim, self.num_spec = 64, D, 7
+            w = torch.zeros(64 * D, KA, device="cuda", dtype=torch.bfloat16)
+            self.f_b_proj = types.SimpleNamespace(weight=w)
+            self.g_b_proj = types.SimpleNamespace(weight=w)
+
+    model = torch.nn.Sequential(_KDA())
+    worker = types.SimpleNamespace(
+        get_model=lambda: model, device="cuda",
+        vllm_config=types.SimpleNamespace(
+            scheduler_config=types.SimpleNamespace(max_num_seqs=8)))
+    for wide, want in ((0, []), (1, [(1, 8)])):
+        e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_MHC=0,
+                       VLLM_GLM5_DECODE_MOE_ROUTING=0, VLLM_GLM5_DECODE_KDA=0,
+                       VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE=wide)
+        try:
+            kda_decode_v2._WARMED.clear()
+            warmup_ampere_decode(worker, [1, 2, 4, 8, 16, 24, 32])
+            got = sorted({(k[0], k[1]) for k in kda_decode_v2._WARMED})
+            assert got == want, (wide, got)
+        finally:
+            e.undo()
+
+
 CPU_TESTS = (test_env_default_is_off, test_gate_needs_master_and_family_flag,
              test_gate_covers_exactly_the_validated_shapes,
              test_gate_at_64_heads_takes_one_sequence,
              test_env_wide_max_seqs_default_is_one,
              test_gate_checks_the_weights, test_env_deep_default_is_off,
              test_gate_deep_extends_16_heads_only,
+             test_gate_deep_wide_64_heads_one_sequence,
              test_import_does_not_initialise_cuda)
 GPU_TESTS = (gpu_test_on_matches_off, gpu_test_fallback_is_bitwise_off,
              gpu_test_off_is_the_unfused_composition,
@@ -675,7 +815,8 @@ GPU_TESTS = (gpu_test_on_matches_off, gpu_test_fallback_is_bitwise_off,
              gpu_test_warmup_covers_the_capture_plans,
              gpu_test_64_heads_one_sequence, gpu_test_deep_on_matches_off,
              gpu_test_deep_deterministic_and_capturable,
-             gpu_test_warmup_depth7_plans)
+             gpu_test_warmup_depth7_plans, gpu_test_64_heads_deep,
+             gpu_test_warmup_64_heads_depth7)
 
 if pytest is not None:
     _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(),
@@ -693,6 +834,8 @@ if pytest is not None:
     test_gpu_deep_deterministic_and_capturable = _needs_gpu(
         gpu_test_deep_deterministic_and_capturable)
     test_gpu_warmup_depth7_plans = _needs_gpu(gpu_test_warmup_depth7_plans)
+    test_gpu_64_heads_deep = _needs_gpu(gpu_test_64_heads_deep)
+    test_gpu_warmup_64_heads_depth7 = _needs_gpu(gpu_test_warmup_64_heads_depth7)
 
 
 def _main():

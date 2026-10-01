@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_KDA_V2: bool = False
     VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS: int = 1
     VLLM_GLM5_DECODE_KDA_V2_DEEP: bool = False
+    VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE: bool = False
     VLLM_GLM5_FLA_PIN_AUTOTUNE: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
@@ -1763,6 +1764,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default.
     "VLLM_GLM5_DECODE_KDA_V2_DEEP": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_KDA_V2_DEEP", "0"))
+    ),
+    # The same extension (up to 8 tokens) for the 64-head layout (pipeline
+    # parallel, all KDA heads on one card), one sequence only. Separate from
+    # VLLM_GLM5_DECODE_KDA_V2_DEEP so each layout is enabled on its own
+    # measurement. Off by default.
+    "VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_KDA_V2_DEEP_WIDE", "0"))
     ),
     # Pin every @triton.autotune'd kernel of the vendored flash-linear-attention
     # ops and the GLM-5 KDA chunked-prefill kernels to ONE config per autotune
