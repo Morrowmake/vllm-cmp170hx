@@ -183,7 +183,9 @@ def test_gate_deep_extends_16_heads_only():
         assert ad.kda_v2_max_tokens_per_seq(64) == 5
         for nseq in range(1, 9):
             for t in range(1, 9):
-                assert use_ampere_kda_decode_v2(nseq, nseq * t, H, D, w, w), (nseq, t)
+                want = t <= 5 or nseq <= 4
+                got = use_ampere_kda_decode_v2(nseq, nseq * t, H, D, w, w)
+                assert got == want, (nseq, t, got)
         assert not use_ampere_kda_decode_v2(1, 9, H, D, w, w)
         assert not use_ampere_kda_decode_v2(9, 72, H, D, w, w)
         for t in (6, 7, 8):
@@ -315,7 +317,10 @@ def _run(layer, x, meta, pools0):
 
 
 def _pair(nseq, T=4, seed=1, env=None):
-    on, off = _layer(True, seed=seed, T=T), _layer(False, seed=seed, T=T)
+    # slots 1 .. nseq * T: the pool must hold nseq * T + 1 of them
+    nslot = max(64, nseq * T + 2)
+    on = _layer(True, seed=seed, T=T, nslot=nslot)
+    off = _layer(False, seed=seed, T=T, nslot=nslot)
     pools0 = (on.kv_cache[0].clone(), on.kv_cache[1].clone())
     slots = [[1 + s * T + t for t in range(T)] for s in range(nseq)]
     acc = [1 + s % T for s in range(nseq)]
@@ -482,6 +487,7 @@ def gpu_test_deep_on_matches_off():
     """T = 6..8 (draft depth 5..7) with VLLM_GLM5_DECODE_KDA_V2_DEEP=1: ON
     (v2) agrees with OFF (thin_gemm + v1) as gpu_test_on_matches_off does at
     T = 4; with the default bound the same shapes are bitwise OFF."""
+    # nseq 8 stays on the v1 path even with the switch (gate by sequences)
     for deep, expect_v2 in ((1, True), (0, False)):
         e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA=1,
                        VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP=deep)
@@ -492,7 +498,7 @@ def gpu_test_deep_on_matches_off():
                     on, off, p0, meta, x = _pair(nseq, T=T, seed=100 + 10 * T + nseq)
                     y1, c1, r1 = _run(on, x, meta, p0)
                     y0, c0, r0 = _run(off, x, meta, p0)
-                    if not expect_v2:
+                    if not expect_v2 or nseq > 4:
                         assert torch.equal(y1, y0) and torch.equal(c1, c0) \
                             and torch.equal(r1, r0), (T, nseq)
                         continue
@@ -518,7 +524,7 @@ def gpu_test_deep_deterministic_and_capturable():
     e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA=1,
                    VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP=1)
     try:
-        for nseq in (1, 8):
+        for nseq in (1, 4):
             T = 8
             _warm(nseq, T)
             on, _, p0, meta, x = _pair(nseq, T=T, seed=151 + nseq)
@@ -556,7 +562,7 @@ def gpu_test_deep_deterministic_and_capturable():
 
 def gpu_test_warmup_depth7_plans():
     """num_spec = 7: the default bound warms no v2 plan (today's behaviour);
-    VLLM_GLM5_DECODE_KDA_V2_DEEP=1 warms (nseq, 8) for nseq 1..8."""
+    VLLM_GLM5_DECODE_KDA_V2_DEEP=1 warms (nseq, 8) for nseq 1..4."""
     from vllm.ampere_decode import kda_decode_v2
     from vllm.ampere_decode.warmup import warmup_ampere_decode
 
@@ -575,7 +581,7 @@ def gpu_test_warmup_depth7_plans():
         vllm_config=types.SimpleNamespace(
             scheduler_config=types.SimpleNamespace(max_num_seqs=8)))
     sizes = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
-    for deep, want in ((0, []), (1, [(n, 8) for n in range(1, 9)])):
+    for deep, want in ((0, []), (1, [(n, 8) for n in range(1, 5)])):
         e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_MHC=0,
                        VLLM_GLM5_DECODE_MOE_ROUTING=0, VLLM_GLM5_DECODE_KDA=0,
                        VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP=deep)

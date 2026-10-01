@@ -342,7 +342,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if self._kda_v2 and self.local_num_heads == 16:
                 logger.info_once(
                     "sm_80 KDA decode v2 deep: up to 8 tokens per sequence "
-                    "(draft depth 5..7) at 16 heads "
+                    "(draft depth 5..7), up to 4 sequences, at 16 heads "
                     "(VLLM_GLM5_DECODE_KDA_V2_DEEP=1)."
                 )
             else:

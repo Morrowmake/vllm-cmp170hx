@@ -1758,8 +1758,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Extend the fused v2 KDA decode step from up to 5 to up to 8 tokens per
     # sequence (draft depth 5..7 steps, which otherwise take the v1 fused
-    # kernel) at 16 heads per card (tensor parallel). The 64-head layout
-    # stays at 5. Off by default.
+    # kernel) at 16 heads per card (tensor parallel), for up to 4 sequences
+    # (slower than the v1 path at 8). The 64-head layout stays at 5. Off by
+    # default.
     "VLLM_GLM5_DECODE_KDA_V2_DEEP": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_KDA_V2_DEEP", "0"))
     ),

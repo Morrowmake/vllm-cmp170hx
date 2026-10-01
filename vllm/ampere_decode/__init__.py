@@ -243,6 +243,11 @@ _KDA_V2_WIDE_HEADS = 64
 _KDA_V2_HEAD_DIM = 128
 _KDA_V2_MAX_TOKENS_PER_SEQ = 5
 _KDA_V2_MAX_TOKENS_PER_SEQ_EXT = 8
+# Above 5 tokens per sequence v2 beats the v1 path only up to 4 sequences
+# (one card, graph replay, us/layer v1 path -> v2: T=8 at 1/2/4 sequences
+# 35.9->24.5, 45.8->29.0, 81.7->54.7; at 8 sequences T=6 124.5->146.4 and
+# T=8 151.9->172.7), so the deep range is gated by sequences too.
+_KDA_V2_DEEP_MAX_SEQS = 4
 _KDA_V2_MAX_SEQS = 8
 
 
@@ -285,7 +290,13 @@ def use_ampere_kda_decode_v2(
         return False
     if num_tokens < num_seqs or num_tokens % num_seqs:
         return False
-    if num_tokens // num_seqs > kda_v2_max_tokens_per_seq(num_heads):
+    tokens_per_seq = num_tokens // num_seqs
+    if tokens_per_seq > kda_v2_max_tokens_per_seq(num_heads):
+        return False
+    if (
+        tokens_per_seq > _KDA_V2_MAX_TOKENS_PER_SEQ
+        and num_seqs > _KDA_V2_DEEP_MAX_SEQS
+    ):
         return False
     if num_tokens > envs.VLLM_GLM5_DECODE_KDA_MAX_TOKENS:
         return False
