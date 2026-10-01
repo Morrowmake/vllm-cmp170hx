@@ -90,8 +90,13 @@ class MambaHybridModelState(DefaultModelState):
         # kernel reusing the postprocess copy machinery, so the per-step src
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        from vllm.ampere_decode.kda_recover import kda_recover_enabled
+
         self.recoverssm = (
-            RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
+            RecoverSSMState()
+            if self.cache_config.use_kda_recoverssm
+            or kda_recover_enabled(vllm_config)
+            else None
         )
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(

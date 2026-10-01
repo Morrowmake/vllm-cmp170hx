@@ -168,6 +168,42 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.model_config.dtype, self.cache_config.mamba_cache_dtype
         )
 
+    def get_kv_cache_spec(self, vllm_config: VllmConfig):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is not None and getattr(self, "_kda_recover", False):
+            # The verify keeps one state per request: no draft-position pages.
+            import dataclasses
+
+            spec = dataclasses.replace(spec, num_speculative_blocks=0)
+        return spec
+
+    def _init_kda_recover(self, config, vllm_config: VllmConfig, prefix: str) -> None:
+        import re
+
+        from vllm.ampere_decode.kda_recover import (
+            RecordPool,
+            layer_records,
+            records_rows,
+        )
+
+        kda_layers = [
+            i for i, t in enumerate(config.layer_types) if t == "linear_attention"
+        ]
+        m = re.search(r"layers\.(\d+)\.", prefix + ".")
+        if m is None or int(m.group(1)) not in kda_layers:
+            raise ValueError(f"VLLM_GLM5_KDA_RECOVER: no KDA layer index in {prefix!r}")
+        self._kda_recover = True
+        self._kda_recover_index = kda_layers.index(int(m.group(1)))
+        device = torch.empty(0).device
+        if device.type == "cpu" and torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        self._kda_recover_pool = RecordPool.get(
+            device, len(kda_layers), records_rows(vllm_config)
+        )
+        self._kda_recover_records = layer_records(
+            self._kda_recover_pool, self._kda_recover_index
+        )
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -338,6 +374,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 "gated delta rule + gated RMSNorm in one kernel "
                 "(VLLM_GLM5_DECODE_KDA_V2=1)."
             )
+        if _envs.VLLM_GLM5_DECODE_KDA_V2_DEEP:
+            if self._kda_v2 and self.local_num_heads == 16:
+                logger.info_once(
+                    "sm_80 KDA decode v2 deep: up to 8 tokens per sequence "
+                    "(draft depth 5..7), up to 4 sequences, at 16 heads "
+                    "(VLLM_GLM5_DECODE_KDA_V2_DEEP=1)."
+                )
+            else:
+                logger.info_once(
+                    "VLLM_GLM5_DECODE_KDA_V2_DEEP=1 has no effect: needs "
+                    "VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_V2=1 and "
+                    "16 KDA heads per card (this layer: %d).",
+                    self.local_num_heads,
+                )
+
+        # VLLM_GLM5_KDA_RECOVER (vllm/ampere_decode/kda_recover.py): one state
+        # per request; the verify stores per-token records instead of states.
+        self._kda_recover = False
+        if self._kda_v2:
+            from vllm.ampere_decode.kda_recover import kda_recover_enabled
+
+            if kda_recover_enabled(vllm_config):
+                self._init_kda_recover(config, vllm_config, prefix)
 
         additional_config = vllm_config.additional_config
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
@@ -525,6 +584,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     ) -> None:
         # Cleared on every call; set only by the fused sm_80 paths below.
         self._ampere_kda_normed = False
+        kda_recover = getattr(self, "_kda_recover", False)
         # f_a / g_a are passed only with VLLM_GLM5_DECODE_KDA_V2 (see forward):
         # g1 is then None and g2 an unfilled buffer.
         deferred = f_a is not None
@@ -601,6 +661,48 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # validated for (use_ampere_kda_decode_v2). Otherwise the deferred
         # projections are materialised here and everything below runs as
         # without the switch. See vllm/ampere_decode/kda_decode_v2.py.
+        # --- VLLM_GLM5_KDA_RECOVER: verify from the single state, records only ---
+        # A pure spec-verify step runs the fused v2 kernel in RECOVER mode
+        # whatever the v2 shape gate says (the per-draft-position path has no
+        # state pages to write to). A mixed step handles its spec rows below.
+        if (
+            kda_recover
+            and use_spec
+            and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)
+            and attn_metadata_narrowed.num_prefills == 0
+            and attn_metadata_narrowed.num_decodes == 0
+        ):
+            from vllm.ampere_decode.kda_decode_v2 import kda_decode_v2
+
+            assert deferred and spec_state_indices_tensor is not None
+            assert num_accepted_tokens is not None and spec_query_start_loc is not None
+            kda_decode_v2(
+                qkv_proj_states,
+                beta,
+                f_a[:num_actual_tokens],
+                g_a[:num_actual_tokens],
+                self.f_b_proj.weight,
+                self.g_b_proj.weight,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                self.o_norm.weight,
+                recurrent_state,
+                spec_state_indices_tensor[:, 0][:num_spec_decodes],
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                spec_query_start_loc[: num_spec_decodes + 1],
+                self.num_spec + 1,
+                self.A_log.view(-1),
+                self.dt_bias,
+                lower_bound=lower_bound,
+                eps=self.o_norm.eps,
+                out=core_attn_out[0, :num_actual_tokens].unsqueeze(0),
+                records=self._kda_recover_records,
+            )
+            self._ampere_kda_normed = True
+            return
+
         if deferred:
             from vllm.ampere_decode import use_ampere_kda_decode_v2
 
@@ -743,7 +845,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
 
         # --- causal conv1d: spec (draft-verify) path ---
-        if use_spec:
+        # (VLLM_GLM5_KDA_RECOVER: the recover verify below does its own conv.)
+        if use_spec and not kda_recover:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
@@ -806,7 +909,49 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
             else None
         )
-        if use_spec:
+        if use_spec and kda_recover:
+            # Mixed prefill + verify step: the spec rows go through the recover
+            # verify (conv + recurrence, records, no state writes) and stay
+            # unnormalised; forward() norms the whole step.
+            from vllm.ampere_decode.kda_decode_v2 import kda_decode_v2
+
+            assert deferred and spec_token_indx is not None
+            assert spec_state_indices_tensor is not None
+            assert num_accepted_tokens is not None and spec_query_start_loc is not None
+            core_attn_out_spec = torch.empty(
+                1,
+                qkv_spec.shape[0],
+                self.local_num_heads,
+                self.head_dim,
+                dtype=qkv_spec.dtype,
+                device=qkv_spec.device,
+            )
+            kda_decode_v2(
+                qkv_spec,
+                beta_spec.contiguous(),
+                f_a[:num_actual_tokens].index_select(0, spec_token_indx),
+                g_a[:num_actual_tokens].index_select(0, spec_token_indx),
+                self.f_b_proj.weight,
+                self.g_b_proj.weight,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                self.o_norm.weight,
+                recurrent_state,
+                spec_state_indices_tensor[:, 0][:num_spec_decodes],
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                spec_query_start_loc[: num_spec_decodes + 1],
+                self.num_spec + 1,
+                self.A_log.view(-1),
+                self.dt_bias,
+                lower_bound=lower_bound,
+                eps=self.o_norm.eps,
+                out=core_attn_out_spec,
+                records=self._kda_recover_records,
+                skip_norm=True,
+            )
+        elif use_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None

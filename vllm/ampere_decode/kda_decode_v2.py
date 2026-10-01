@@ -15,7 +15,8 @@ replaces, in meaning,
 and advances `conv_state` and `rec_state` in place exactly as they do.
 Called from the spec-decode branch of vllm/models/glm5next/common/kda.py when
 VLLM_GLM5_DECODE_KDA_V2=1 (see use_ampere_kda_decode_v2 for the covered
-shapes: 16 heads of 128, T <= 5 tokens per sequence, <= 8 sequences; 64
+shapes: 16 heads of 128, T <= 5 tokens per sequence (<= 8 with
+VLLM_GLM5_DECODE_KDA_V2_DEEP=1), <= 8 sequences; 64
 heads of 128 for one sequence under pipeline parallel).
 
 SCHEDULE.  nseq * H * NV CTAs of 1 or 2 warps (see _select), NV V-slices of
@@ -55,6 +56,16 @@ same four bf16 roundings as the unfused path (g1, g2, conv output, recurrence
 output), fp32 recurrent state, MMA only on bf16 x bf16 operands, every float
 reduction fixed-shape -> bitwise deterministic run to run.  The only atomics
 are int32 arrival counters.
+
+RECOVER (VLLM_GLM5_KDA_RECOVER, see vllm/ampere_decode/kda_recover.py): the
+initial state comes from the request's single state slot (column 0) and, in
+place of one recurrent state per token, every token stores its correction
+c_t = (v_t - (h*e_t).k_t) * beta_t, its normalised key k_t and its decay gate
+e_t (all fp32) to per-row records; no recurrent state is written.  The
+rank-1 update is written as an explicit fma(c, k, h*e) (the same instruction
+the unfused form compiles to), so the commit's replay of the accepted tokens
+reproduces the per-token states bitwise.  SKIP_NORM leaves the recurrence
+output unnormalised (the mixed prefill + verify step norms it afterwards).
 
 CUDA-GRAPH SAFE: no autotune, no host sync, no .item(); `warmup()` compiles
 and allocates the counters and the workspace before capture; counters
@@ -217,6 +228,9 @@ def _kda_decode_v2_kernel(
     ctr,                     # [nseq * H] int32 epilogue arrival counters (self-resetting)
     gctr,                    # [nseq * H] int32 gate arrival counters (reset by the epilogue)
     ws,                      # [heads, WS_T, 2 * D] fp32: decay gate | sigmoid(g2)
+    rc,                      # RECOVER: [rows, WS_T, H, D] fp32 corrections
+    rk,                      # RECOVER: [rows, WS_T, H, D] fp32 normalised keys
+    re,                      # RECOVER: [rows, WS_T, H, D] fp32 decay gates
     scale,
     eps,
     stride_x_t,
@@ -250,6 +264,8 @@ def _kda_decode_v2_kernel(
     DC: gl.constexpr,
     SW: gl.constexpr,
     NW: gl.constexpr,
+    RECOVER: gl.constexpr = False,
+    SKIP_NORM: gl.constexpr = False,
 ):
     gl.static_assert(CONV_K == 4, "conv window is specialised to width 4")
     gl.static_assert(NV > 1, "the gate chunks are shared across >= 2 slices")
@@ -292,7 +308,10 @@ def _kda_decode_v2_kernel(
     srow = gl.load(ssm_idx + i_n * stride_sidx_seq + o_sw * stride_sidx_tok,
                    mask=o_sw < n_sidx_tok, other=0).to(gl.int64)
     T = eos - bos
-    s_init = gl.sum(gl.where(o_sw == acc - 1, srow, 0), 0)
+    if RECOVER:
+        s_init = gl.sum(gl.where(o_sw == 0, srow, 0), 0)
+    else:
+        s_init = gl.sum(gl.where(o_sw == acc - 1, srow, 0), 0)
     # T == 0, or NULL_BLOCK_ID (padded batch entry): nothing to do
     if (T == 0) | (s_init <= 0) | (c_slot <= 0):
         return
@@ -406,16 +425,27 @@ def _kda_decode_v2_kernel(
 
             b_h = b_h * e3
             b_v = (b_v - gl.sum(gl.sum(b_h * k3, 0), 1)) * b_beta
-            b_h = b_h + gl.expand_dims(gl.expand_dims(b_v, 1), 0) * k3
+            if RECOVER:
+                cb, kb = gl.broadcast(gl.expand_dims(gl.expand_dims(b_v, 1), 0), k3)
+                b_h = gl.fma(cb, kb, b_h)
+            else:
+                b_h = b_h + gl.expand_dims(gl.expand_dims(b_v, 1), 0) * k3
             b_o = gl.sum(gl.sum(b_h * q3, 0), 1)
 
-            # Store the state unless the next token overwrites the same slot.
-            s_t = gl.sum(gl.where(o_sw == t, srow, 0), 0)
-            t_n = gl.where(t + 1 < T, t + 1, t)
-            s_n = gl.sum(gl.where(o_sw == t_n, srow, 0), 0)
-            live = (s_t > 0) & ((t_n == t) | (s_n != s_t))
-            if live:
-                gl.store(rec + s_t * stride_rec_slot + i_h * D * D + off3, b_h)
+            if RECOVER:
+                p_r = ((i_n * WS_T + t) * H + i_h) * D
+                gl.store(rc + p_r + o_vs, b_v)
+                if i_v == 0:
+                    gl.store(rk + p_r + o_jh * DC + o_ch, k3)
+                    gl.store(re + p_r + o_jh * DC + o_ch, e3)
+            else:
+                # Store the state unless the next token overwrites the same slot.
+                s_t = gl.sum(gl.where(o_sw == t, srow, 0), 0)
+                t_n = gl.where(t + 1 < T, t + 1, t)
+                s_n = gl.sum(gl.where(o_sw == t_n, srow, 0), 0)
+                live = (s_t > 0) & ((t_n == t) | (s_n != s_t))
+                if live:
+                    gl.store(rec + s_t * stride_rec_slot + i_h * D * D + off3, b_h)
 
             p_o = out + (bos + t) * stride_out_t + i_h * D + o_vs
             gl.store(p_o, b_o.to(gl.bfloat16), cache_modifier=".cg")
@@ -450,23 +480,29 @@ def _kda_decode_v2_kernel(
         w2 = gl.where(is_keep, gl.load(p_c2 + (off + 1 + o_s) * stride_cs_tok, mask=m_k, other=0.0),
                       gl.load(p_x0 + 2 * PROJ, mask=m_x, other=0.0))
 
-        # gated RMSNorm over the whole head
-        o_te = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(1, LE)), 1)
-        m_te = o_te < T
-        g2s = gl.load(p_ws + o_te * WS_W + D + o_d2, mask=m_te, other=0.0,
-                      cache_modifier=".cg")
-        nw = gl.expand_dims(gl.load(norm_w + o_de).to(gl.float32), 0)
-        p_ot = out + (bos + o_te) * stride_out_t + i_h * D + o_d2
-        b_o = gl.load(p_ot, mask=m_te, other=0.0,
-                      cache_modifier=".cg").to(gl.float32)
-        gl.barrier()
-        gl.store(p_c0 + o_s * stride_cs_tok, w0, mask=m_s)
-        gl.store(p_c1 + o_s * stride_cs_tok, w1, mask=m_s)
-        gl.store(p_c2 + o_s * stride_cs_tok, w2, mask=m_s)
-        b_rstd = 1.0 / gl.sqrt(gl.sum(b_o * b_o, 1) / D + eps)
-        b_y = b_o * gl.expand_dims(b_rstd, 1) * nw
-        b_y = b_y * g2s
-        gl.store(p_ot, b_y.to(gl.bfloat16), mask=m_te)
+        if SKIP_NORM:
+            gl.barrier()
+            gl.store(p_c0 + o_s * stride_cs_tok, w0, mask=m_s)
+            gl.store(p_c1 + o_s * stride_cs_tok, w1, mask=m_s)
+            gl.store(p_c2 + o_s * stride_cs_tok, w2, mask=m_s)
+        else:
+            # gated RMSNorm over the whole head
+            o_te = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(1, LE)), 1)
+            m_te = o_te < T
+            g2s = gl.load(p_ws + o_te * WS_W + D + o_d2, mask=m_te, other=0.0,
+                          cache_modifier=".cg")
+            nw = gl.expand_dims(gl.load(norm_w + o_de).to(gl.float32), 0)
+            p_ot = out + (bos + o_te) * stride_out_t + i_h * D + o_d2
+            b_o = gl.load(p_ot, mask=m_te, other=0.0,
+                          cache_modifier=".cg").to(gl.float32)
+            gl.barrier()
+            gl.store(p_c0 + o_s * stride_cs_tok, w0, mask=m_s)
+            gl.store(p_c1 + o_s * stride_cs_tok, w1, mask=m_s)
+            gl.store(p_c2 + o_s * stride_cs_tok, w2, mask=m_s)
+            b_rstd = 1.0 / gl.sqrt(gl.sum(b_o * b_o, 1) / D + eps)
+            b_y = b_o * gl.expand_dims(b_rstd, 1) * nw
+            b_y = b_y * g2s
+            gl.store(p_ot, b_y.to(gl.bfloat16), mask=m_te)
 
 
 _CTR: dict = {}
@@ -492,13 +528,19 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
                   conv_bias, norm_weight, rec_state, conv_state_indices,
                   ssm_state_indices, num_accepted_tokens, cu_seqlens,
                   max_query_len, a_log, g_bias, lower_bound=-5.0, eps=1e-5,
-                  l2_eps=1e-6, scale=None, out=None):
+                  l2_eps=1e-6, scale=None, out=None, records=None,
+                  skip_norm=False):
     """One fused KDA decode step including f_b_proj and g_b_proj.
 
     `qkv`, `beta`, `f_a`, `g_a` are read, never written.  `conv_state` and
     `rec_state` advance in place.  `out` doubles as the staging buffer for the
     unnormalised recurrence output, so its contents are transient during the
     launch.
+
+    `records` (RecoverSSM verify): a (corrections, keys, gates) triple of
+    fp32 [>= nseq, _WS_T, H, D] tensors; the initial state is read from
+    column 0 of `ssm_state_indices` and no recurrent state is written.
+    `skip_norm` (RecoverSSM only) leaves `out` unnormalised.
     """
     M, _ = qkv.shape
     H = a_log.shape[0]
@@ -515,6 +557,12 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
     assert w_f.stride(1) == 1 and w_g.stride(1) == 1
     assert f_a.stride(1) == 1 and g_a.stride(1) == 1 and qkv.stride(1) == 1
     assert D % DC == 0 and D % 16 == 0 and KA % 16 == 0
+    assert not skip_norm or records is not None, "skip_norm needs records"
+    if records is not None:
+        for r in records:
+            assert r.dtype == torch.float32 and r.is_contiguous()
+            assert r.shape[1:] == (_WS_T, H, D)
+            assert r.shape[0] >= cu_seqlens.numel() - 1
 
     nseq = cu_seqlens.numel() - 1
     assert nseq * H <= _CTR_SLOTS, "arrival counter buffer too small"
@@ -533,6 +581,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
         qkv, f_a, g_a, w_f, w_g, conv_state, conv_weight, conv_bias, beta,
         norm_weight, out, rec_state, cu_seqlens, conv_state_indices, ssm,
         num_accepted_tokens, a_log, g_bias, ctr, ctr[_CTR_SLOTS:], ws,
+        *(records if records is not None else (ws, ws, ws)),
         scale, eps,
         qkv.stride(0), f_a.stride(0), g_a.stride(0),
         w_f.stride(0), w_g.stride(0),
@@ -547,6 +596,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
         BV=bv, NV=nv,
         BS=triton.next_power_of_2(CONV_K - 2 + max_query_len),
         BT=BT, WS_T=_WS_T, DC=DC, SW=triton.next_power_of_2(n_tok), NW=num_warps,
+        RECOVER=records is not None, SKIP_NORM=bool(skip_norm),
         num_warps=num_warps,
     )
     return out
@@ -555,7 +605,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
 _WARMED = set()
 
 
-def warmup(plans=((1, 4), (4, 4)), device=None, heads=16):
+def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False):
     """Compile every (nseq, T) plan and allocate the counters and the gate
     workspace before capture.
 
@@ -571,6 +621,8 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16):
     PW = CONV_DIM + H + 2 * KA
     for nseq, T in plans:
         key = (int(nseq), int(T), H, TARGET_CTAS, BV_MIN, BV_MAX, NUM_WARPS, DC)
+        if recover:
+            key = key + ("recover",)
         if key in _WARMED:
             continue
         M = nseq * T
@@ -591,8 +643,16 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16):
         nacc = torch.ones(nseq, device=dev, dtype=torch.int32)
         al = torch.zeros(H, device=dev, dtype=torch.float32)
         gbi = torch.zeros(PROJ, device=dev, dtype=torch.float32)
-        kda_decode_v2(qkv, beta, fa, ga, wf, wf, cs, cw, None, nw, rec,
-                      sidx[:, 0][:nseq], sidx, nacc, qsl, T, al, gbi)
+        if recover:
+            recs = tuple(torch.zeros(nseq, _WS_T, H, D, device=dev,
+                                     dtype=torch.float32) for _ in range(3))
+            for skip in (False, True):
+                kda_decode_v2(qkv, beta, fa, ga, wf, wf, cs, cw, None, nw, rec,
+                              sidx[:, 0][:nseq], sidx, nacc, qsl, T, al, gbi,
+                              records=recs, skip_norm=skip)
+        else:
+            kda_decode_v2(qkv, beta, fa, ga, wf, wf, cs, cw, None, nw, rec,
+                          sidx[:, 0][:nseq], sidx, nacc, qsl, T, al, gbi)
         _WARMED.add(key)
     if dev.type == "cuda":
         torch.cuda.synchronize()

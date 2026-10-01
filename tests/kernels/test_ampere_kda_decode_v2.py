@@ -36,7 +36,7 @@ CONV_DIM = 3 * PROJ
 PW = CONV_DIM + H + 2 * KA
 ENV = ("VLLM_GLM5_DECODE_KERNELS", "VLLM_GLM5_DECODE_KDA",
        "VLLM_GLM5_DECODE_KDA_V2", "VLLM_GLM5_DECODE_KDA_MAX_TOKENS",
-       "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS",
+       "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS", "VLLM_GLM5_DECODE_KDA_V2_DEEP",
        "VLLM_GLM5_DECODE_MHC", "VLLM_GLM5_DECODE_MOE_ROUTING")
 
 
@@ -160,6 +160,46 @@ def test_gate_checks_the_weights():
         e.undo()
 
 
+def test_env_deep_default_is_off():
+    os.environ.pop("VLLM_GLM5_DECODE_KDA_V2_DEEP", None)
+    from vllm import envs
+
+    assert envs.VLLM_GLM5_DECODE_KDA_V2_DEEP is False
+    assert ad.kda_v2_max_tokens_per_seq(H) == 5
+    assert ad.kda_v2_max_tokens_per_seq(64) == 5
+
+
+def test_gate_deep_extends_16_heads_only():
+    """VLLM_GLM5_DECODE_KDA_V2_DEEP=1 opens T = 6..8 at 16 heads, for up to 8
+    sequences within VLLM_GLM5_DECODE_KDA_MAX_TOKENS; 64 heads stay at 5."""
+    e = _Env()
+    try:
+        e.set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_V2=1)
+        w, w64 = _w(), _w(shape=(64 * D, D))
+        for t in (6, 7, 8):
+            assert not use_ampere_kda_decode_v2(1, t, H, D, w, w), t
+        e.set(VLLM_GLM5_DECODE_KDA_V2_DEEP=1)
+        assert ad.kda_v2_max_tokens_per_seq(H) == 8
+        assert ad.kda_v2_max_tokens_per_seq(64) == 5
+        for nseq in range(1, 9):
+            for t in range(1, 9):
+                want = t <= 5 or nseq <= 4
+                got = use_ampere_kda_decode_v2(nseq, nseq * t, H, D, w, w)
+                assert got == want, (nseq, t, got)
+        assert not use_ampere_kda_decode_v2(1, 9, H, D, w, w)
+        assert not use_ampere_kda_decode_v2(9, 72, H, D, w, w)
+        for t in (6, 7, 8):
+            assert not use_ampere_kda_decode_v2(1, t, 64, D, w64, w64), t
+        assert use_ampere_kda_decode_v2(1, 5, 64, D, w64, w64)
+        e.set(VLLM_GLM5_DECODE_KDA_MAX_TOKENS=32)
+        assert use_ampere_kda_decode_v2(4, 32, H, D, w, w)
+        assert not use_ampere_kda_decode_v2(5, 40, H, D, w, w)      # bound
+        e.set(VLLM_GLM5_DECODE_KDA_V2_DEEP=0)
+        assert not use_ampere_kda_decode_v2(1, 6, H, D, w, w)
+    finally:
+        e.undo()
+
+
 def test_import_does_not_initialise_cuda():
     import importlib
 
@@ -277,7 +317,10 @@ def _run(layer, x, meta, pools0):
 
 
 def _pair(nseq, T=4, seed=1, env=None):
-    on, off = _layer(True, seed=seed, T=T), _layer(False, seed=seed, T=T)
+    # slots 1 .. nseq * T: the pool must hold nseq * T + 1 of them
+    nslot = max(64, nseq * T + 2)
+    on = _layer(True, seed=seed, T=T, nslot=nslot)
+    off = _layer(False, seed=seed, T=T, nslot=nslot)
     pools0 = (on.kv_cache[0].clone(), on.kv_cache[1].clone())
     slots = [[1 + s * T + t for t in range(T)] for s in range(nseq)]
     acc = [1 + s % T for s in range(nseq)]
@@ -440,6 +483,117 @@ def gpu_test_warmup_covers_the_capture_plans():
         e.undo()
 
 
+def gpu_test_deep_on_matches_off():
+    """T = 6..8 (draft depth 5..7) with VLLM_GLM5_DECODE_KDA_V2_DEEP=1: ON
+    (v2) agrees with OFF (thin_gemm + v1) as gpu_test_on_matches_off does at
+    T = 4; with the default bound the same shapes are bitwise OFF."""
+    # nseq 8 stays on the v1 path even with the switch (gate by sequences)
+    for deep, expect_v2 in ((1, True), (0, False)):
+        e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA=1,
+                       VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP=deep)
+        try:
+            for T in (6, 7, 8):
+                for nseq in (1, 4, 8):
+                    _warm(nseq, T)
+                    on, off, p0, meta, x = _pair(nseq, T=T, seed=100 + 10 * T + nseq)
+                    y1, c1, r1 = _run(on, x, meta, p0)
+                    y0, c0, r0 = _run(off, x, meta, p0)
+                    if not expect_v2 or nseq > 4:
+                        assert torch.equal(y1, y0) and torch.equal(c1, c0) \
+                            and torch.equal(r1, r0), (T, nseq)
+                        continue
+                    tol = 2.0 * 2 ** -8 * float(y0.float().abs().max())
+                    dy = float((y1.float() - y0.float()).abs().max())
+                    assert dy <= tol, (T, nseq, dy, tol)
+                    assert torch.equal(c1, c0), (T, nseq)
+                    d = (r1 - r0).abs()
+                    frac = float((d > 1e-4).float().mean())
+                    assert float(d.max()) < 3e-2 and frac < 1e-3, \
+                        (T, nseq, float(d.max()), frac)
+                    print(f"  T={T} nseq={nseq}: out diff {dy:.2e} (tol {tol:.2e}), "
+                          f"state max {float(d.max()):.2e}, >1e-4 {100 * frac:.4f} %")
+            print(f"  VLLM_GLM5_DECODE_KDA_V2_DEEP={deep}: "
+                  f"{'v2 within tolerance' if expect_v2 else 'bitwise off'}")
+        finally:
+            e.undo()
+
+
+def gpu_test_deep_deterministic_and_capturable():
+    import vllm.models.glm5next.common.kda as kmod
+
+    e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA=1,
+                   VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP=1)
+    try:
+        for nseq in (1, 4):
+            T = 8
+            _warm(nseq, T)
+            on, _, p0, meta, x = _pair(nseq, T=T, seed=151 + nseq)
+            ya, ca, ra = _run(on, x, meta, p0)
+            assert on._ampere_kda_normed
+            yb, cb, rb = _run(on, x, meta, p0)
+            assert torch.equal(ya, yb) and torch.equal(ca, cb) and torch.equal(ra, rb)
+            conv, rec = on.kv_cache
+            saved = kmod.get_forward_context
+            kmod.get_forward_context = lambda: types.SimpleNamespace(
+                attn_metadata={on.prefix: meta})
+            try:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    on.forward(x, None)
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.synchronize()
+                gr = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gr):
+                    yg = on.forward(x, None)
+            finally:
+                kmod.get_forward_context = saved
+            for _ in range(2):
+                conv.copy_(p0[0])
+                rec.copy_(p0[1])
+                gr.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(yg, ya) and torch.equal(conv, ca) \
+                    and torch.equal(rec, ra), nseq
+            del gr
+    finally:
+        e.undo()
+
+
+def gpu_test_warmup_depth7_plans():
+    """num_spec = 7: the default bound warms no v2 plan (today's behaviour);
+    VLLM_GLM5_DECODE_KDA_V2_DEEP=1 warms (nseq, 8) for nseq 1..4."""
+    from vllm.ampere_decode import kda_decode_v2
+    from vllm.ampere_decode.warmup import warmup_ampere_decode
+
+    class _KDA(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._conv_state_dim_first = False
+            self.local_num_heads, self.head_dim, self.num_spec = H, D, 7
+            w = torch.zeros(PROJ, KA, device="cuda", dtype=torch.bfloat16)
+            self.f_b_proj = types.SimpleNamespace(weight=w)
+            self.g_b_proj = types.SimpleNamespace(weight=w)
+
+    model = torch.nn.Sequential(_KDA())
+    worker = types.SimpleNamespace(
+        get_model=lambda: model, device="cuda",
+        vllm_config=types.SimpleNamespace(
+            scheduler_config=types.SimpleNamespace(max_num_seqs=8)))
+    sizes = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+    for deep, want in ((0, []), (1, [(n, 8) for n in range(1, 5)])):
+        e = _Env().set(VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_MHC=0,
+                       VLLM_GLM5_DECODE_MOE_ROUTING=0, VLLM_GLM5_DECODE_KDA=0,
+                       VLLM_GLM5_DECODE_KDA_V2=1, VLLM_GLM5_DECODE_KDA_V2_DEEP=deep)
+        try:
+            kda_decode_v2._WARMED.clear()
+            warmup_ampere_decode(worker, sizes)
+            got = sorted({(k[0], k[1]) for k in kda_decode_v2._WARMED})
+            assert got == want, (deep, got)
+        finally:
+            e.undo()
+
+
 def gpu_test_64_heads_one_sequence():
     """Pipeline-parallel shape (64 heads on one card), one sequence: ON matches
     the unfused path (as gpu_test_on_matches_off), is run-to-run bitwise and
@@ -512,12 +666,16 @@ CPU_TESTS = (test_env_default_is_off, test_gate_needs_master_and_family_flag,
              test_gate_covers_exactly_the_validated_shapes,
              test_gate_at_64_heads_takes_one_sequence,
              test_env_wide_max_seqs_default_is_one,
-             test_gate_checks_the_weights, test_import_does_not_initialise_cuda)
+             test_gate_checks_the_weights, test_env_deep_default_is_off,
+             test_gate_deep_extends_16_heads_only,
+             test_import_does_not_initialise_cuda)
 GPU_TESTS = (gpu_test_on_matches_off, gpu_test_fallback_is_bitwise_off,
              gpu_test_off_is_the_unfused_composition,
              gpu_test_on_deterministic_and_capturable,
              gpu_test_warmup_covers_the_capture_plans,
-             gpu_test_64_heads_one_sequence)
+             gpu_test_64_heads_one_sequence, gpu_test_deep_on_matches_off,
+             gpu_test_deep_deterministic_and_capturable,
+             gpu_test_warmup_depth7_plans)
 
 if pytest is not None:
     _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(),
@@ -531,6 +689,10 @@ if pytest is not None:
     test_gpu_warmup_covers_the_capture_plans = _needs_gpu(
         gpu_test_warmup_covers_the_capture_plans)
     test_gpu_64_heads_one_sequence = _needs_gpu(gpu_test_64_heads_one_sequence)
+    test_gpu_deep_on_matches_off = _needs_gpu(gpu_test_deep_on_matches_off)
+    test_gpu_deep_deterministic_and_capturable = _needs_gpu(
+        gpu_test_deep_deterministic_and_capturable)
+    test_gpu_warmup_depth7_plans = _needs_gpu(gpu_test_warmup_depth7_plans)
 
 
 def _main():

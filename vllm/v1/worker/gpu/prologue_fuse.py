@@ -480,7 +480,11 @@ def try_build_gdn_spec_decode(
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     nsd = plan["num_spec_decodes"]
-    num_cols = builder.num_spec + 1
+    # VLLM_GLM5_KDA_RECOVER keeps one state column per request.
+    num_cols = (
+        1 if getattr(builder, "_kda_recover", None) is not None
+        else builder.num_spec + 1
+    )
     if block_table_tensor.dim() != 2 or block_table_tensor.shape[1] < num_cols:
         return None
     _gdn_spec_decode_meta(
