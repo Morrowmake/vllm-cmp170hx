@@ -31,12 +31,37 @@ SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 FLA_CHUNK_SIZE = 64
 
 
+def _tensor_snapshot(x: Any) -> tuple | None:
+    """What a cached result depends on besides the identity of a tensor
+    argument: storage address, view geometry and version counter (bumped by
+    every in-place write). Inference tensors keep no version counter; they get
+    ``None`` there, and their address and geometry still have to match."""
+    if not isinstance(x, torch.Tensor):
+        return None
+    try:
+        version = x._version
+    except RuntimeError:
+        version = None
+    try:
+        ptr = x.data_ptr()
+    except RuntimeError:
+        ptr = None
+    return (ptr, x.storage_offset(), tuple(x.shape), tuple(x.stride()), version)
+
+
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
     A decorator that caches the most recent results of a function with tensor inputs.
 
     This decorator will store the output of the decorated function for the most recent set of input tensors.
-    The cache is limited to a fixed size (default is 4). When the cache is full, the oldest entry will be removed.
+    The cache is limited to a fixed size (default is 8). When the cache is full, the oldest entry will be removed.
+
+    An entry is reused only for the very same argument objects whose contents
+    have not been written since the entry was stored: each tensor argument's
+    storage address, view geometry and version counter are recorded at store
+    time and compared on lookup, so a buffer rewritten in place (for example a
+    persistent ``query_start_loc`` reused across steps) is recomputed instead
+    of returning the result for its old contents.
 
     Args:
         fn (Callable[..., torch.Tensor]):
@@ -47,14 +72,14 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
             A wrapped version of the input function with single-entry caching.
     """
 
-    cache_entries: tuple[tuple | None, dict | None, Any] = []
+    cache_entries: list[tuple[tuple, dict, tuple, dict, Any]] = []
     cache_size = 8
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entries, cache_size
         for i, entry in enumerate(cache_entries):
-            last_args, last_kwargs, last_result = entry
+            last_args, last_kwargs, last_snaps, last_kwsnaps, last_result = entry
             if (
                 len(args) == len(last_args)
                 and len(kwargs) == len(last_kwargs)
@@ -62,19 +87,22 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                 and all(
                     k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
                 )
-            ):
-                cache_entries = (
-                    cache_entries[:i]
-                    + cache_entries[i + 1 :]
-                    + [(args, kwargs, last_result)]
+                and all(_tensor_snapshot(a) == s for a, s in zip(args, last_snaps))
+                and all(
+                    _tensor_snapshot(v) == last_kwsnaps[k] for k, v in kwargs.items()
                 )
+            ):
+                cache_entries = cache_entries[:i] + cache_entries[i + 1 :] + [entry]
                 return last_result
 
         result = fn(*args, **kwargs)
 
+        # Snapshot after the call: the decorated functions only read their inputs.
+        snaps = tuple(_tensor_snapshot(a) for a in args)
+        kwsnaps = {k: _tensor_snapshot(v) for k, v in kwargs.items()}
         if len(cache_entries) >= cache_size:
             cache_entries = cache_entries[1:]
-        cache_entries.append((args, kwargs, result))
+        cache_entries.append((args, kwargs, snaps, kwsnaps, result))
         return result
 
     return wrapper
