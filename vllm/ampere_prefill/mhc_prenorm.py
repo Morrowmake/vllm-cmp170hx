@@ -185,6 +185,53 @@ def _pack_fn_kernel(
 
 
 @triton.jit
+def _cvt_bf16x2(a):
+    # fp32 -> bf16, round to nearest even, two elements per instruction
+    # (cvt.rn.bf16x2.f32, sm_80's fast packed path). Same rounding as the
+    # scalar cvt.rn.bf16.f32 that `.to(tl.bfloat16)` emits element by element,
+    # so the result is bitwise identical. The first operand fills the upper
+    # half of the packed register, i.e. the second element.
+    return tl.inline_asm_elementwise("cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,r,r",
+                                     [a], dtype=tl.bfloat16, is_pure=True,
+                                     pack=2)
+
+
+@triton.jit
+def _pack_fn_x2_kernel(
+    fn_ptr, ft_ptr,
+    K, N,
+    stride_fn_n, stride_fn_k,
+    stride_tt, stride_tk, stride_tn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """`_pack_fn_kernel` with every fp32 -> bf16 rounding done in pairs.
+
+    Same hi/mid/lo split, same layout, bitwise identical output; the scalar
+    narrowing it replaces runs at a quarter of the packed rate on sm_80.
+    """
+    k0 = tl.program_id(0) * BLOCK_K
+    offs_k = k0 + tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_k = offs_k < K
+    mask_n = offs_n < N
+
+    fb = tl.load(
+        fn_ptr + offs_n[:, None] * stride_fn_n + offs_k[None, :] * stride_fn_k,
+        mask=mask_n[:, None] & mask_k[None, :], other=0.0,
+    )
+    hi = _cvt_bf16x2(fb)
+    r1 = fb - hi.to(tl.float32)
+    mid = _cvt_bf16x2(r1)
+    lo = _cvt_bf16x2(r1 - mid.to(tl.float32))
+
+    base = ft_ptr + offs_k[:, None] * stride_tk + offs_n[None, :] * stride_tn
+    tl.store(base, tl.trans(hi), mask=mask_k[:, None])
+    tl.store(base + stride_tt, tl.trans(mid), mask=mask_k[:, None])
+    tl.store(base + 2 * stride_tt, tl.trans(lo), mask=mask_k[:, None])
+
+
+@triton.jit
 def _prenorm_gemm_kernel(
     x_ptr, ft_ptr, part_ptr, psq_ptr,
     M, K, N,
@@ -347,6 +394,20 @@ def _select_reduce_config(M, split_k, sms):
     return BLOCK_M, 1
 
 
+def _pack_bf16x2() -> bool:
+    """VLLM_GLM5_PREFILL_PACK_BF16X2: pair-packed bf16 rounding in the pack."""
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_PREFILL_PACK_BF16X2:
+        return False
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "sm_80 prefill mHC pre-norm: fn pack with paired bf16 rounding "
+        "(cvt.rn.bf16x2) active (VLLM_GLM5_PREFILL_PACK_BF16X2=1)")
+    return True
+
+
 def _workspace(device, M, BLOCK_N, split_k):
     """Split-K scratch, cached per shape and never shrunk (see INTEGRATION.md)."""
     key = (device, M, BLOCK_N, split_k)
@@ -389,7 +450,8 @@ def hc_prenorm_gemm(x, fn, out=None, sqrsum=None):
     m_tiles = -(-M // BLOCK_M)
 
     PACK_K = 128
-    _pack_fn_kernel[(-(-K // PACK_K),)](
+    pack = _pack_fn_x2_kernel if _pack_bf16x2() else _pack_fn_kernel
+    pack[(-(-K // PACK_K),)](
         fn, ft,
         K, N,
         fn.stride(0), fn.stride(1),

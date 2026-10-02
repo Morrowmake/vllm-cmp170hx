@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
+    VLLM_GLM5_PREFILL_PACK_BF16X2: bool = False
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
@@ -1648,6 +1649,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode shapes) and every captured CUDA graph keeps the upstream kernel.
     "VLLM_GLM5_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_PREFILL_MIN_TOKENS", "512")
+    ),
+    # The mHC pre-norm pack of the sm_80 prefill kernels
+    # (vllm/ampere_prefill/mhc_prenorm.py) rounds fp32 to bf16 two elements
+    # per instruction (cvt.rn.bf16x2.f32) instead of one: same rounding,
+    # bitwise identical output. Needs VLLM_GLM5_PREFILL_KERNELS=1 as well.
+    # Off by default.
+    "VLLM_GLM5_PREFILL_PACK_BF16X2": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PREFILL_PACK_BF16X2", "0"))
     ),
     # Sparse MLA only: require seq_kv >= this multiple of index_topk. The tuned
     # kernel wins by manufacturing L2 reuse across queries; when the context is
