@@ -65,6 +65,10 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
+    # Bound on the tokens of any spec-decode request of the step: the batch's
+    # max_query_len (what its CUDA graph was captured for), capped at
+    # num_spec + 1. None without spec decodes.
+    spec_max_query_len: int | None = None
 
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
@@ -576,6 +580,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
+            spec_max_query_len=(
+                min(int(m.max_query_len), self.num_spec + 1)
+                if num_spec_decodes > 0
+                else None
+            ),
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

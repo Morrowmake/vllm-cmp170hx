@@ -527,4 +527,5 @@ def try_build_gdn_spec_decode(
         nums_dict=None,
         batch_ptr=None,
         token_chunk_offset_ptr=None,
+        spec_max_query_len=min(int(m.max_query_len), builder.num_spec + 1),
     )
