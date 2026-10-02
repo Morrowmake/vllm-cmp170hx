@@ -141,6 +141,7 @@ def _thin_gemm_dual_kernel(
     SPLIT_K: tl.constexpr,
     EVEN_K: tl.constexpr,
     TILED_M: tl.constexpr,
+    ROTATE_K: tl.constexpr = False,
     HI_SUB_K: tl.constexpr = 0,
     HI_KAHAN_LOOP: tl.constexpr = False,
     HI_KAHAN_REDUCE: tl.constexpr = False,
@@ -183,7 +184,17 @@ def _thin_gemm_dual_kernel(
     step = BLOCK_K * SPLIT_K
     n_iter = tl.cdiv(K, step)
     is_lo = pid_n * BLOCK_N < N_LO
-    if is_lo or HI_SUB_K == 0:
+    if ROTATE_K and is_lo:
+        # bf16 columns under the thin GEMM's K-start rotation
+        # (thin_gemm_v74._thin_gemm_kernel, line for line; EVEN_K only).
+        shift = (pid_n * 3) % n_iter
+        for i in range(n_iter):
+            j = i + shift
+            j = tl.where(j >= n_iter, j - n_iter, j)
+            x = tl.load(x_ptrs + j * step * stride_xk, mask=m_mask[:, None], other=0.0)
+            w = tl.load(w_ptrs + j * step * stride_wk, mask=n_mask[:, None], other=0.0)
+            acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+    elif is_lo or HI_SUB_K == 0:
         # bf16 columns: the incumbent's loop, line for line (bitwise the
         # merged GEMM's k columns).
         for i in range(n_iter):
@@ -260,8 +271,7 @@ def _thin_gemm_dual_kernel(
 
 def thin_gemm_dual_supported(x: torch.Tensor, w: torch.Tensor, n_lo: int) -> bool:
     """Shape gate for :func:`thin_gemm_dual` (host only, no allocation)."""
-    from vllm.ampere_thin_gemm import thin_gemm_supported
-    from vllm.ampere_thin_gemm.thin_gemm import _select_config
+    from vllm.ampere_thin_gemm import impl, thin_gemm_supported
 
     if not thin_gemm_supported(x, w, None):
         return False
@@ -269,7 +279,7 @@ def thin_gemm_dual_supported(x: torch.Tensor, w: torch.Tensor, n_lo: int) -> boo
     N = w.shape[0]
     if M < 1 or not (0 < n_lo < N):
         return False
-    BLOCK_N = _select_config(M, N, K)[1]
+    BLOCK_N = impl()._select_config(M, N, K)[1]
     return n_lo % BLOCK_N == 0
 
 
@@ -292,13 +302,11 @@ def thin_gemm_dual(
     its error against an exact product is no worse than the fp32 sgemm it
     replaces (``tests/kernels/test_ampere_idx_glue.py``).
     """
-    from vllm.ampere_thin_gemm.thin_gemm import (
-        _dummy_fp32,
-        _locks,
-        _partials,
-        _select_config,
-    )
+    from vllm.ampere_thin_gemm import impl
 
+    tg = impl()
+    _dummy_fp32, _locks, _partials, _select_config = (
+        tg._dummy_fp32, tg._locks, tg._partials, tg._select_config)
     M, K = x.shape
     N = w.shape[0]
     BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = _select_config(M, N, K)
@@ -330,6 +338,9 @@ def thin_gemm_dual(
         sp[0], sp[1], sp[2],
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=SPLIT_K,
         EVEN_K=even_k, TILED_M=(tiles_m > 1),
+        # the bf16 columns follow the thin GEMM's K-start rotation (74-SM module)
+        ROTATE_K=(hasattr(tg, "_rotate_k")
+                  and tg._rotate_k(even_k, SPLIT_K, BLOCK_M, BLOCK_N)),
         HI_SUB_K=min(hi[0], BLOCK_K), HI_KAHAN_LOOP=hi[1], HI_KAHAN_REDUCE=hi[2],
         num_warps=num_warps, num_stages=num_stages,
     )

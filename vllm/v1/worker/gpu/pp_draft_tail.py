@@ -524,9 +524,9 @@ def tail_side_stream_workspaces(device: torch.device, holder: dict) -> Iterator[
 
     with contextlib.ExitStack() as stack:
         if envs.VLLM_GLM5_THIN_GEMM:
-            from vllm.ampere_thin_gemm.thin_gemm import workspace_lane
+            from vllm.ampere_thin_gemm import impl
 
-            stack.enter_context(workspace_lane(DRAFT_TAIL_THIN_GEMM_LANE))
+            stack.enter_context(impl().workspace_lane(DRAFT_TAIL_THIN_GEMM_LANE))
         stack.enter_context(private_flashinfer_topk_workspace(device, holder))
         yield
 

@@ -99,12 +99,12 @@ def _discover_nk(worker) -> set[tuple[int, int]]:
 
 def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
     """Compile and preallocate for every (M, N, K) the graphs can replay."""
-    from vllm.ampere_thin_gemm import dispatch_threshold, use_ampere_thin_gemm
+    from vllm.ampere_thin_gemm import dispatch_threshold, impl, use_ampere_thin_gemm
 
     if not use_ampere_thin_gemm():
         return
 
-    from vllm.ampere_thin_gemm.thin_gemm import warmup
+    warmup = impl().warmup
 
     bound = dispatch_threshold()
     ms = _token_sizes(capture_sizes, bound)

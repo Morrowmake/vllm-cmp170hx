@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_GLM5_THIN_GEMM: bool = False
+    VLLM_GLM5_THIN_GEMM_V74: bool = True
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_TOOL_CHOICE_NONE_MASK: bool = True
     VLLM_GLM5_DFLASH_BOUNDARY_CACHE: bool = False
@@ -1948,6 +1949,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1"))
     ),
     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
+    # With VLLM_GLM5_THIN_GEMM on: run the 74-SM schedule of the thin GEMM
+    # (vllm/ampere_thin_gemm/thin_gemm_v74.py: re-swept rows, K-start
+    # rotation on wide tiles, release-only split-K arrival) instead of
+    # thin_gemm.py. Same semantics, within the fp64 error gate of
+    # thin_gemm.py, bitwise run to run. On by default; 0 is the kill switch
+    # (thin_gemm.py unchanged). Read once per process.
+    "VLLM_GLM5_THIN_GEMM_V74": lambda: bool(
+        int(os.getenv("VLLM_GLM5_THIN_GEMM_V74", "1"))
+    ),
     # Size the DFlash drafter's RoPE cos/sin cache to the reachable positions
     # (max_model_len plus a small query margin) instead of the drafter config's
     # max_position_embeddings. Rows are position-indexed, so every reachable

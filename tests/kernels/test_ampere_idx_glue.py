@@ -472,8 +472,10 @@ def _check_remap_cache(dev):
 
 def _check_dual_gemm(dev, ms=(1, 4, 16, 32)):
     from vllm.ampere_decode.idx_glue import thin_gemm_dual
-    from vllm.ampere_thin_gemm.thin_gemm import thin_gemm
+    from vllm.ampere_thin_gemm import impl
 
+    # the thin GEMM module in use (VLLM_GLM5_THIN_GEMM_V74 picks it)
+    thin_gemm = impl().thin_gemm
     g = _gen(5)
     n = HEAD_DIM + N_HEAD
     w = (torch.randn(n, HIDDEN, generator=g) * 0.02).to(torch.bfloat16)
@@ -720,8 +722,10 @@ def _main(argv):
 
         ig.triton_fp8_e4m3_native = e4m3.triton_fp8_e4m3_native
         import vllm.ampere_thin_gemm.thin_gemm as tg
+        import vllm.ampere_thin_gemm.thin_gemm_v74 as tg74
 
         tg._num_sms_cache = 70
+        tg74._num_sms_cache = 74
     dev = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
     (CHECKS if dev == "cpu" else GPU_CHECKS)[name](dev)
     print(f"PASS {name}")

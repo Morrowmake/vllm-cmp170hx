@@ -71,6 +71,7 @@ _MIN_K = 128
 __all__ = [
     "ampere_thin_gemm",
     "dispatch_threshold",
+    "impl",
     "thin_gemm_supported",
     "thin_linear",
     "use_ampere_thin_gemm",
@@ -88,6 +89,28 @@ def use_ampere_thin_gemm() -> bool:
     if not envs.VLLM_GLM5_THIN_GEMM:
         return False
     return _device_supported()
+
+
+@functools.cache
+def impl():
+    """The kernel module in use: ``thin_gemm_v74`` (``VLLM_GLM5_THIN_GEMM_V74``,
+    the default) or ``thin_gemm``. Both export the same functions (``thin_gemm``,
+    ``warmup``, ``workspace_lane`` and the helpers ``idx_glue`` shares).
+
+    Resolved once per process on first use, so every caller (dispatch, warmup,
+    the PP draft-tail workspace lane, the indexer's merged GEMM) sees the same
+    module and its workspaces. Importing it never happens with
+    ``VLLM_GLM5_THIN_GEMM`` off: only the thin-GEMM paths call this.
+    """
+    if envs.VLLM_GLM5_THIN_GEMM_V74:
+        from vllm.ampere_thin_gemm import thin_gemm_v74 as mod
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info_once(
+            "sm_80 thin GEMM v74 schedule active [VLLM_GLM5_THIN_GEMM_V74=1]")
+    else:
+        from vllm.ampere_thin_gemm import thin_gemm as mod
+    return mod
 
 
 def dispatch_threshold() -> int:
@@ -146,9 +169,7 @@ def ampere_thin_gemm(
     job, not a bug.
     """
     if thin_gemm_supported(x, weight, bias):
-        from vllm.ampere_thin_gemm.thin_gemm import thin_gemm
-
-        return thin_gemm(x, weight)
+        return impl().thin_gemm(x, weight)
     return torch.nn.functional.linear(x, weight, bias)
 
 
@@ -161,7 +182,5 @@ def thin_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     consumed by ``F.linear`` directly (N=128, K=4096, 11 calls/step, 1.27x).
     """
     if use_ampere_thin_gemm() and thin_gemm_supported(x, weight, None):
-        from vllm.ampere_thin_gemm.thin_gemm import thin_gemm
-
-        return thin_gemm(x, weight)
+        return impl().thin_gemm(x, weight)
     return torch.nn.functional.linear(x, weight)
