@@ -1798,7 +1798,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (VLLM_GLM5_DECODE_MHC_V2, same M bound): blocked bf16 fn copy, the exact
     # lo(fn) term skipped, one-barrier finish at M <= 16, scale-vector Sinkhorn.
     # Within the fp64 error gate of v2, bitwise run to run. The bf16 copy is
-    # still governed by VLLM_GLM5_DECODE_MHC_V2_FN_BF16 and read at M <= 12.
+    # still governed by VLLM_GLM5_DECODE_MHC_V2_FN_BF16 and read at M <= 16.
     # On by default; 0 is the kill switch (v2 unchanged).
     "VLLM_GLM5_DECODE_MHC_V3": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_MHC_V3", "1"))

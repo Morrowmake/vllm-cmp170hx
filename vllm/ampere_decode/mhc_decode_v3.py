@@ -93,9 +93,9 @@ FN_NAMES = ("hc_attn_fn", "hc_ffn_fn")
 # The bf16 copy is read only for M <= this.  Plain layout (v2): 1.7-2.6 % faster per
 # call at M 5..12, slower at M 24 and 32.  Blocked layout (74 SMs, 240-deep graph
 # rotation, 3 repeats): M 13 +3.3 %, 16 +1.9 %, 24 +0.5 % (noise), 32 -1.7 %.
-# Kept at v2's bound (12); above it the fp32 `fn` is read (still EXACT when the
-# registered copy exists, so the result is unchanged).
-FN_BF16_MAX_TOKENS = 12
+# Above it the fp32 `fn` is read (still EXACT when the registered copy exists, so
+# the result is unchanged).
+FN_BF16_MAX_TOKENS = 16
 
 
 def _block_fn(bf: torch.Tensor, hc: int) -> torch.Tensor:

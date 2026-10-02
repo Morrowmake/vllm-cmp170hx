@@ -9,7 +9,7 @@ the flag and its kill switch; the v3 gate is exactly the v2 gate plus the flag;
 the dispatch in `mhc_fused_post_pre_tilelang` reaches v3 when it is on and v2
 (unchanged) when it is off; the blocked bf16 `fn` copy addresses the same
 element as the plain layout for every (n, stream, hidden slice) kernel A reads;
-the copy is read only for M <= 12; registration rules; warmup registers only
+the copy is read only for M <= 16; registration rules; warmup registers only
 the module that runs; every kernel specialisation compiles for sm_80.
 GPU (sm_80, skipped otherwise): error against an FP64 recomputation no worse
 than v2's (summed mean <= 1.10x, max <= 1.25x on post_mix and comb_mix;
@@ -172,14 +172,14 @@ def test_blocked_layout_addresses_the_same_elements():
     assert (fs_n, fs_j, fs_k) == (hb, NOUT * hb, HC * NOUT * hb)
 
 
-def test_bf16_copy_only_up_to_twelve_rows():
-    assert v3.FN_BF16_MAX_TOKENS == 12
+def test_bf16_copy_only_up_to_sixteen_rows():
+    assert v3.FN_BF16_MAX_TOKENS == 16
     model = _Model(1)
     v3.register_fn_bf16(model)
     fn = model.layers[0].hc_attn_fn
     for M in range(1, 65):
         got, blocked = v3._select_fn(fn, M, HC, HIDDEN)
-        if M <= 12:
+        if M <= 16:
             assert blocked and got is v3._fn_bf16(fn) and got.dtype == torch.bfloat16, M
         else:
             assert not blocked and got is fn, M
@@ -192,7 +192,7 @@ def test_registers_blocked_exact_copies():
     model = _Model(2)
     n, lines = _logged(v3.register_fn_bf16, model)
     assert n == 4 and len(v3._FN_BF16) == 4
-    assert any("mHC decode v3 reads exact blocked bf16 fn copies for M <= 12" in line
+    assert any("mHC decode v3 reads exact blocked bf16 fn copies for M <= 16" in line
                for line in lines), lines
     for layer in model.layers:
         for p in (layer.hc_attn_fn, layer.hc_ffn_fn):
@@ -357,7 +357,7 @@ def test_gpu_accuracy_vs_v2_no_floor(monkeypatch):
 @gpu
 def test_gpu_registered_copy_is_bitwise_the_fp32_run():
     """EXACT and the blocked copy change no bit: registered (blocked bf16 at
-    M <= 12, EXACT fp32 above) vs unregistered fp32 fn at every M."""
+    M <= 16, EXACT fp32 above) vs unregistered fp32 fn at every M."""
     from tests.kernels import test_ampere_decode_mhc_v2 as base
 
     model = _Model(1, dev="cuda", seed=5)
@@ -372,7 +372,7 @@ def test_gpu_registered_copy_is_bitwise_the_fp32_run():
         for a, b in zip(got, plain[M]):
             assert torch.equal(a, b), M
         # a bf16 fn passed directly (plain layout, EXACT) gives the same bits
-        if M <= 12:
+        if M <= 16:
             direct = v3.mhc_fused_post_pre(**base._kw(_case(M, fn.to(torch.bfloat16), 40 + M)))
             for a, b in zip(direct, plain[M]):
                 assert torch.equal(a, b), M
