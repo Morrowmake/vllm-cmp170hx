@@ -384,7 +384,8 @@ class Scheduler(SchedulerInterface):
             logger.info_once(
                 "DFlash boundary cache lookup active "
                 "(VLLM_GLM5_DFLASH_BOUNDARY_CACHE): context blocks matched "
-                "without draft lookahead; target replay safety preserved"
+                "without draft lookahead; local prompt tails stay unpadded; "
+                "target replay safety preserved"
             )
         elif envs.VLLM_GLM5_DFLASH_BOUNDARY_CACHE:
             logger.info_once(
@@ -1410,6 +1411,16 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                        # A local prompt tail must match the cold prefill shape.
+                        # Resumed decodes and external KV loads keep padding.
+                        and not (
+                            self.kv_cache_manager.coordinator.dflash_boundary_group_ids
+                            and request.status == RequestStatus.WAITING
+                            and num_new_local_computed_tokens > 0
+                            and num_external_computed_tokens == 0
+                            and request.num_output_tokens == 0
+                            and num_computed_tokens < request.num_prompt_tokens
+                        )
                     ):
                         padded_num_tokens = 1 + self.cur_num_spec_tokens
                         # Pad only when there is room for the sampled token(s).
