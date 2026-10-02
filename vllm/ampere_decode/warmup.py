@@ -186,6 +186,7 @@ def _warmup_kda(worker, model, device, capture_sizes, gate) -> None:
         max(1, int(s) // tokens_per_seq) for s in capture_sizes if int(s) >= 1
     }
     nseqs.update(range(1, max_seqs + 1))
+    # (VLLM_GLM5_DECODE_KDA_STEP_TILE does not apply to v1: it keeps the window.)
     plans = [
         (n, tokens_per_seq)
         for n in sorted(nseqs)
@@ -214,7 +215,12 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
     if getattr(layer, "_kda_recover", False):
         # VLLM_GLM5_KDA_RECOVER: every spec-verify step takes the recover
         # variants (pure and mixed), for 1..max_num_seqs sequences.
-        rplans = tuple((n, tokens_per_seq) for n in range(1, max_seqs + 1))
+        rts = (
+            range(1, tokens_per_seq + 1)
+            if getattr(layer, "_kda_step_tile", False)
+            else (tokens_per_seq,)
+        )
+        rplans = tuple((n, t) for t in rts for n in range(1, max_seqs + 1))
         kda_decode_v2.warmup(
             plans=rplans, device=torch.device(device), heads=heads, recover=True
         )
@@ -225,12 +231,18 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
         max(1, int(s) // tokens_per_seq) for s in capture_sizes if int(s) >= 1
     }
     nseqs.update(range(1, max_seqs + 1))
+    tlist = (
+        range(1, tokens_per_seq + 1)
+        if getattr(layer, "_kda_step_tile", False)
+        else (tokens_per_seq,)
+    )
     plans = [
-        (n, tokens_per_seq)
+        (n, t)
+        for t in tlist
         for n in sorted(nseqs)
         if use_ampere_kda_decode_v2(
             n,
-            n * tokens_per_seq,
+            n * t,
             heads,
             head_dim,
             layer.f_b_proj.weight,

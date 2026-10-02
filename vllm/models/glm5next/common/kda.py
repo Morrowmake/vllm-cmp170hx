@@ -154,6 +154,29 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
+def _kda_tile(step_bound: int | None, window: int, keep_same_rows: bool = False) -> int:
+    """max_query_len for the fused KDA decode kernels (v2 and the recover
+    verify): the step's bound on tokens per request when known
+    (VLLM_GLM5_DECODE_KDA_STEP_TILE), else the full speculative window.
+
+    `keep_same_rows` (recover verify): keep the window unless the token tile
+    (next power of two) shrinks; with the same token tile only the conv tile
+    would change, which measured slower for the recover verify at 8 requests
+    (T 6: +0.214 ms/step over 34 layers on one card).
+    The v1 kernel keeps the window: its reductions run over the [token tile,
+    D] block, so its results change bitwise with the tile."""
+    if step_bound is None:
+        return window
+    t = max(1, min(int(step_bound), int(window)))
+    if keep_same_rows and _next_pow2(t) == _next_pow2(window):
+        return window
+    return t
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << (max(1, int(n)) - 1).bit_length()
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
@@ -389,6 +412,21 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     self.local_num_heads,
                 )
 
+        # VLLM_GLM5_DECODE_KDA_STEP_TILE: token tile from the step's bound.
+        self._kda_step_tile = bool(
+            _envs.VLLM_GLM5_DECODE_KERNELS and _envs.VLLM_GLM5_DECODE_KDA_STEP_TILE
+        )
+        if self._kda_step_tile:
+            logger.info_once(
+                "sm_80 KDA decode step tile: token tile sized from each step's max "
+                "tokens per request (VLLM_GLM5_DECODE_KDA_STEP_TILE=1)."
+            )
+        elif _envs.VLLM_GLM5_DECODE_KDA_STEP_TILE:
+            logger.info_once(
+                "VLLM_GLM5_DECODE_KDA_STEP_TILE=1 has no effect: "
+                "VLLM_GLM5_DECODE_KERNELS is off."
+            )
+
         # VLLM_GLM5_KDA_RECOVER (vllm/ampere_decode/kda_recover.py): one state
         # per request; the verify stores per-token records instead of states.
         self._kda_recover = False
@@ -619,6 +657,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
         use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
+        # VLLM_GLM5_DECODE_KDA_STEP_TILE: the fused kernels' token tile from
+        # the step's bound (None: the full num_spec + 1 window, as before).
+        kda_tile = (
+            getattr(attn_metadata_narrowed, "spec_max_query_len", None)
+            if getattr(self, "_kda_step_tile", False)
+            else None
+        )
         # Safe-gate checkpoints use the bounded sigmoid variant.
         safe_gate = self.kda_safe_gate
         lower_bound = self.kda_lower_bound
@@ -692,7 +737,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 spec_state_indices_tensor,
                 num_accepted_tokens,
                 spec_query_start_loc[: num_spec_decodes + 1],
-                self.num_spec + 1,
+                _kda_tile(kda_tile, self.num_spec + 1, keep_same_rows=True),
                 self.A_log.view(-1),
                 self.dt_bias,
                 lower_bound=lower_bound,
@@ -746,7 +791,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     spec_state_indices_tensor,
                     num_accepted_tokens,
                     spec_query_start_loc[: num_spec_decodes + 1],
-                    spec_state_indices_tensor.size(-1),
+                    _kda_tile(kda_tile, spec_state_indices_tensor.size(-1)),
                     self.A_log.view(-1),
                     self.dt_bias,
                     lower_bound=lower_bound,
@@ -942,7 +987,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 spec_state_indices_tensor,
                 num_accepted_tokens,
                 spec_query_start_loc[: num_spec_decodes + 1],
-                self.num_spec + 1,
+                _kda_tile(kda_tile, self.num_spec + 1, keep_same_rows=True),
                 self.A_log.view(-1),
                 self.dt_bias,
                 lower_bound=lower_bound,
