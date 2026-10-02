@@ -12,9 +12,10 @@ schedule table differs from thin_gemm's in exactly the re-swept rows; the
 rotation predicate; with no rotation and no split-K the v74 kernel compiles to
 the same SASS as thin_gemm's (and differs once rotation is on).
 GPU (sm_80, skipped otherwise): every production (N, K) at M 1..32 against an
-FP64 recomputation: mean error <= 1.10x thin_gemm's, every element within one
-bf16 ulp of thin_gemm's, bitwise equal to thin_gemm where neither the config
-nor the rotation changed; bitwise run to run and out= == out=None; CUDA-graph
+FP64 recomputation: summed mean error <= 1.10x thin_gemm's and max error <=
+1.25x thin_gemm's (the 74-SM schedule reorders the K reduction, so single
+elements may move by more than one bf16 ulp), bitwise equal to thin_gemm where
+neither the config nor the rotation changed; bitwise run to run and out= == out=None; CUDA-graph
 replay == eager with zero allocation growth; the merged indexer GEMM's bf16
 columns stay bitwise the v74 thin GEMM's.
 """
@@ -226,11 +227,6 @@ def _xw(M, N, K, seed):
     return x.cuda(), w.cuda(), x.double() @ w.double().t()
 
 
-def _ulp(t):
-    a = t.abs().double().clamp_min(2.0 ** -126)
-    return torch.exp2(torch.floor(torch.log2(a)) - 7)
-
-
 @gpu
 @pytest.mark.parametrize("nk", NK)
 def test_gpu_accuracy_vs_thin_gemm(nk):
@@ -238,7 +234,7 @@ def test_gpu_accuracy_vs_thin_gemm(nk):
     N, K = nk
     v1.warmup([nk], MS)
     v74.warmup([nk], MS)
-    se1 = se74 = 0.0
+    se1 = se74 = mx1 = mx74 = 0.0
     for M in MS:
         x, w, ref = _xw(M, N, K, seed=N + K + M)
         a = v1.thin_gemm(x, w)
@@ -249,17 +245,19 @@ def test_gpu_accuracy_vs_thin_gemm(nk):
         torch.cuda.synchronize()
         assert torch.equal(b, b2) and torch.equal(b, out), (M, "run to run / out=")
         assert torch.isfinite(b).all()
-        d = (b.double() - a.double()).abs().cpu()
-        assert (d <= _ulp(a.cpu())).all(), (M, "more than one bf16 ulp from thin_gemm")
         bm, bn, bk, sk, _, _ = v74._select_config(M, N, K)
         same_cfg = v1._select_config(M, N, K) == v74._select_config(M, N, K)
         even_k = K % (bk * sk) == 0
         if same_cfg and sk == 1 and not v74._rotate_k(even_k, sk, bm, bn):
             assert torch.equal(a, b), (M, "unchanged config must be bitwise")
         ref = ref.cpu()
-        se1 += float((a.double().cpu() - ref).abs().mean())
-        se74 += float((b.double().cpu() - ref).abs().mean())
-    assert se74 <= 1.10 * se1, (nk, se74 / se1)
+        e1 = (a.double().cpu() - ref).abs()
+        e74 = (b.double().cpu() - ref).abs()
+        se1 += float(e1.mean())
+        se74 += float(e74.mean())
+        mx1, mx74 = max(mx1, float(e1.max())), max(mx74, float(e74.max()))
+    assert se74 <= 1.10 * se1, (nk, "mean", se74 / se1)
+    assert mx74 <= 1.25 * mx1, (nk, "max", mx74 / mx1)
 
 
 @gpu

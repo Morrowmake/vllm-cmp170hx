@@ -371,6 +371,7 @@ def _make_capture_runner(captured: bool) -> GPUModelRunner:
     runner.cudagraph_manager = SimpleNamespace(
         needs_capture=lambda: captured,
         capture=lambda *args, **kwargs: None,
+        warn_on_missing_adaptive_graphs=lambda: None,
     )
     runner.lora_config = None
     runner.maybe_setup_dummy_loras = lambda _cfg: contextlib.nullcontext()

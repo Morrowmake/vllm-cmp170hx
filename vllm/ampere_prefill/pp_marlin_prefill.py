@@ -282,7 +282,7 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
         logger.info_once(
             "Marlin MoE prefill compiled tiles active (%s, N=%d): w13 %s, w2 %s "
             "by block-list size; other lists Marlin's own choice.",
-            TILE_TABLES[N][0], N, tables["w13"], tables["w2"])
+            TILE_TABLES[N][0], N, str(tables["w13"]), str(tables["w2"]))
         compiled = (op, tables, c_tmp)
     else:
         if why_not is not None:

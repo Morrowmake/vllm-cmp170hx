@@ -163,6 +163,24 @@ def test_without_the_op_the_released_kernels_run(monkeypatch):
                    (16, (-1, -1, -1))]
 
 
+@pytest.mark.parametrize("op", ["OP", None])
+def test_open_gate_hands_the_compiled_tiles_to_run(monkeypatch, op):
+    """maybe_apply with the gate open: the compiled tiles (or None when the op
+    is missing) reach run(), and the banners log (hashable arguments)."""
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(FLAG + "_MIN_TOKENS", "384")
+    monkeypatch.setattr(pmp, "gate_reason", lambda *a, **k: None)
+    monkeypatch.setattr(pmp, "_buffers", lambda *a, **k: {"t_max": 1 << 20})
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    tables = pmp.TILE_TABLES[512][1]
+    got = (op, tables, "C_TMP", None) if op else (None, None, None, "absent")
+    monkeypatch.setattr(pmp, "compiled_tiles", lambda *a, **k: got)
+    ran = []
+    monkeypatch.setattr(pmp, "run", lambda *a, **k: ran.append(k["compiled"]))
+    assert pmp.maybe_apply(hp._layer(n=512), **tp4._maybe_args(1728)) is True
+    assert ran == [("OP", tables, "C_TMP") if op else None]
+
+
 def _kernels(text):
     return sorted(set(re.findall(r"Marlin<([^>]*)>", text)))
 
