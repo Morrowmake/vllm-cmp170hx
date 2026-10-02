@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_GLM5_PREFILL_PACK_BF16X2: bool = False
+    VLLM_GLM5_INDEXER_DECODE_RAW_K: bool = True
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
@@ -1657,6 +1658,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Off by default.
     "VLLM_GLM5_PREFILL_PACK_BF16X2": lambda: bool(
         int(os.getenv("VLLM_GLM5_PREFILL_PACK_BF16X2", "0"))
+    ),
+    # DSA indexer decode logits (vllm/v1/attention/ops/triton_mqa_logits.py,
+    # Triton path) on sm_80: dequantize the e4m3 K tiles by bit placement
+    # (raw bf16 = value * 2^-120, 2^60 folded into Q and the head weights)
+    # instead of through fp32. Bitwise identical logits on sm_80, where the
+    # tensor cores were verified to keep the bf16 subnormal inputs this
+    # produces; other devices keep the fp32 dequant. On by default; 0 is the
+    # kill switch.
+    "VLLM_GLM5_INDEXER_DECODE_RAW_K": lambda: bool(
+        int(os.getenv("VLLM_GLM5_INDEXER_DECODE_RAW_K", "1"))
     ),
     # Sparse MLA only: require seq_kv >= this multiple of index_topk. The tuned
     # kernel wins by manufacturing L2 reuse across queries; when the context is

@@ -309,10 +309,19 @@ def _paged_mqa_logits_kernel(
     D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     PAGE_BYTES: tl.constexpr,
+    RAW_K: tl.constexpr = False,
 ):
     """One program: one request's next_n Q rows x ``tiles_per_prog``
     consecutive KV pages (one page = one BLOCK_SIZE tile). Q is dequantized
-    once; pages past the request's longest row are skipped."""
+    once; pages past the request's longest row are skipped.
+
+    ``RAW_K``: K tiles are raw bf16 bits (value * 2^-120, bit placement only)
+    and Q and the head weights carry 2^60 each, as in the prefill kernel.
+    Every power-of-two scale is exact and no product or partial sum leaves
+    the fp32 normal range, so the logits are bitwise those of the default
+    path provided the MMA keeps bf16 subnormal inputs (14 of the 256 e4m3
+    codes land there); the PTX ISA leaves that unspecified, so the caller
+    only takes this path on sm_80, where it was verified on all 256 codes."""
     b = tl.program_id(0)
     pid_n = tl.program_id(1)
     t = tl.arange(0, NEXT_N_P2)
@@ -337,20 +346,28 @@ def _paged_mqa_logits_kernel(
         mask=(rt < NEXT_N)[:, None],
         other=0,
     )
-    q = e4m3_bits_to_f32_fast(q_u8).to(tl.bfloat16)  # [NEXT_N_P2*H, D]
+    if RAW_K:
+        q = (e4m3_bits_to_f32_fast(q_u8) * _TWO60).to(tl.bfloat16)
+    else:
+        q = e4m3_bits_to_f32_fast(q_u8).to(tl.bfloat16)  # [NEXT_N_P2*H, D]
     orow = b * NEXT_N + t
     w = tl.load(
         w_ptr + orow[:, None] * stride_wm + tl.arange(0, H)[None, :],
         mask=tmask[:, None],
         other=0.0,
     )  # [NEXT_N_P2, H]
+    if RAW_K:
+        w = w * _TWO60
     pos = tl.arange(0, BLOCK_SIZE)
 
     for tile in tl.range(t_begin, t_end):
         blk = tl.load(bt_ptr + b * stride_bt + tile).to(tl.int64)
         k_base = blk * PAGE_BYTES
         k_u8 = tl.load(kv_u8_ptr + k_base + pos[:, None] * D + d[None, :])
-        k = e4m3_bits_to_f32_fast(k_u8).to(tl.bfloat16)  # [BLOCK_SIZE, D]
+        if RAW_K:
+            k = e4m3_bits_to_bf16_raw(k_u8)  # [BLOCK_SIZE, D], value * 2^-120
+        else:
+            k = e4m3_bits_to_f32_fast(k_u8).to(tl.bfloat16)  # [BLOCK_SIZE, D]
         kscale = tl.load(kv_f32_ptr + (k_base + BLOCK_SIZE * D) // 4 + pos)
         acc = tl.dot(q, tl.trans(k))  # [NEXT_N_P2*H, BLOCK_SIZE] fp32
         acc = tl.reshape(acc, (NEXT_N_P2, H, BLOCK_SIZE))
@@ -364,6 +381,30 @@ def _paged_mqa_logits_kernel(
             s,
             mask=tmask[:, None] & (kidx < max_model_len)[None, :],
         )
+
+
+@functools.cache
+def _sm80(index: int) -> bool:
+    return torch.cuda.get_device_capability(index) == (8, 0)
+
+
+def _decode_raw_k(device: torch.device) -> bool:
+    """VLLM_GLM5_INDEXER_DECODE_RAW_K: raw-bit K dequant in the decode logits."""
+    from vllm import envs
+    from vllm.logger import init_logger
+
+    if not envs.VLLM_GLM5_INDEXER_DECODE_RAW_K:
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if not _sm80(index):
+        init_logger(__name__).info_once(
+            "VLLM_GLM5_INDEXER_DECODE_RAW_K=1 but the device is not sm_80; "
+            "the indexer decode logits keep the fp32 K dequant")
+        return False
+    init_logger(__name__).info_once(
+        "DSA indexer decode logits: raw-bit e4m3 K dequant active "
+        "(VLLM_GLM5_INDEXER_DECODE_RAW_K=1)")
+    return True
 
 
 # (data_ptr, numel, uint8 flat view, fp32 flat view) of the last paged cache
@@ -491,6 +532,7 @@ def fp8_paged_mqa_logits_triton(
         D=D,
         BLOCK_SIZE=block_size,
         PAGE_BYTES=page_bytes,
+        RAW_K=_decode_raw_k(q8.device),
         num_warps=num_warps,
         num_stages=num_stages,
     )
