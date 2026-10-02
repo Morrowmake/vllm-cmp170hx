@@ -189,6 +189,8 @@ class CustomAllreduce:
         self.mnnvl_multimem_rs_local_ptr = 0
         self.mnnvl_multimem_rs_multicast_ptr = 0
         self.mnnvl_only = False
+        # Flags-in-data two-shot path (custom_all_reduce_flags.py); None = off.
+        self._flags = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -342,6 +344,8 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        if envs.VLLM_CUSTOM_ALLREDUCE_FLAGS:
+            self._init_flags(same_node)
         self._init_mnnvl_buffer(
             max(
                 max_mnnvl_all_gather_size * world_size,
@@ -360,6 +364,58 @@ class CustomAllreduce:
             )
             self.close()
             self.disabled = True
+
+    def _init_flags(self, same_node: bool) -> None:
+        """Set up the flags-in-data two-shot path, or log why it stays off.
+
+        Every rank reaches the same decision: the gate inputs are the same on
+        all ranks, and the extension load is agreed before any collective.
+        """
+        from vllm.distributed.device_communicators import (
+            custom_all_reduce_flags as flags,
+        )
+        from vllm.platforms.cuda import pcie_p2p_custom_allreduce_allowed
+
+        capability = current_platform.get_device_capability()
+        reason = flags.gate_reason(
+            self.world_size,
+            same_node,
+            None if capability is None else tuple(capability),
+            current_platform.is_cuda(),
+            pcie_p2p_custom_allreduce_allowed(),
+        )
+        if reason is None:
+            loaded = True
+            try:
+                flags.load_module()
+            except Exception as error:  # compiler missing or failing
+                logger.warning("Flags-in-data all-reduce extension: %s", error)
+                loaded = False
+            if not _all_ranks_true(self.group, loaded):
+                reason = "the extension did not build on every rank"
+        if reason is not None:
+            logger.info_once(
+                "Custom all-reduce flags-in-data path requested "
+                "(VLLM_CUSTOM_ALLREDUCE_FLAGS=1) but off: %s",
+                reason,
+                scope="global",
+            )
+            return
+        self._flags = flags.FlagsAllreduce(
+            self.group,
+            self.device,
+            self.rank,
+            envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES,
+            self.create_shared_buffer,
+            self.free_shared_buffer,
+        )
+        logger.info_once(
+            "Custom all-reduce flags-in-data two-shot kernel on for bf16 "
+            "messages up to %d bytes (VLLM_CUSTOM_ALLREDUCE_FLAGS=1); larger "
+            "messages and other dtypes keep the existing kernel",
+            self._flags.max_bytes,
+            scope="global",
+        )
 
     def _init_mnnvl_buffer(self, stage_size: int) -> None:
         if torch_symm_mem is None or not current_platform.is_cuda():
@@ -541,6 +597,12 @@ class CustomAllreduce:
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
+        if self._flags is not None and self._flags.eligible(input):
+            if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+                # warm-up before capture: mimic the allocation pattern
+                return torch.empty_like(input)
+            # Reads `input` in place: no IPC registration and no staging copy.
+            return self._flags.all_reduce(input)
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(input, registered=True)
@@ -708,6 +770,9 @@ class CustomAllreduce:
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+            if self._flags is not None:
+                self._flags.close()
+                self._flags = None
             self.mnnvl_peer_buffers = None
             self.mnnvl_handle = None
             self.mnnvl_buffer = None

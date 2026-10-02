@@ -129,6 +129,9 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE: bool = False
     VLLM_CUSTOM_ALLREDUCE_ALGO: str = ""
+    VLLM_CUSTOM_ALLREDUCE_FLAGS: bool = False
+    VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES: int = 262144
+    VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR: str | None = None
     VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE: int = 8192 * 1024
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
@@ -1345,6 +1348,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whitespace stripping, raising on anything else the way the kernel
     # throws at its first all-reduce.
     "VLLM_CUSTOM_ALLREDUCE_ALGO": lambda: _custom_allreduce_algo(),
+    # Flags-in-data two-shot all-reduce for bf16 messages up to
+    # VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES at TP4 over PCIe peer-to-peer
+    # (device_communicators/custom_all_reduce_flags.py). Bitwise identical to
+    # the two-stage kernel. Off unless set.
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS": lambda: bool(
+        int(os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", "0"))
+    ),
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", "262144")
+    ),
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR": lambda: os.getenv(
+        "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR", None
+    ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
@@ -3238,6 +3254,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_XLA_CACHE_PATH",
         "VLLM_CONFIG_ROOT",
         "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR",
+        "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR",
         # Testing only (a forced setup failure); decided before any compile.
         "VLLM_GLM5_HOST_ALLREDUCE_TEST_FAIL_RANK",
         "LD_LIBRARY_PATH",
