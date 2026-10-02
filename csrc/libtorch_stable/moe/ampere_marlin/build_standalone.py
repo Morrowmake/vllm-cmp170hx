@@ -54,7 +54,7 @@ def build(out: Path, build_dir: Path, verbose: bool) -> None:
         name=NAME,
         sources=[str(HERE / source) for source in
                  ("decode.cu", "decode_orig.cu", "ops.cu", "kernels_sm80.cu",
-                  "module.cpp")],
+                  "prefill_tiles.cu", "kernels_tiles_sm80.cu", "module.cpp")],
         extra_include_paths=[str(CSRC)],
         extra_cuda_cflags=cuda_flags,
         extra_cflags=[*flags, *maps],

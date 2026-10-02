@@ -270,6 +270,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_TP4_MARLIN_PREFILL: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
+    VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED: bool = True
     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
     VLLM_GLM5_MARLIN_PREFILL_CUDA: str = ""
     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
@@ -2181,6 +2182,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
+    ),
+    # With VLLM_GLM5_TP4_MARLIN_PREFILL: run the split-list Marlin GEMMs through
+    # the optional library's prefill_tile_gemm (vllm._ampere_marlin_C) with the
+    # TP4 tile table of vllm/ampere_prefill/pp_marlin_prefill.py (w13 on
+    # (64,512) tiles, w2 on (64,256) tiles at 2 CTAs/SM for the 64/48/32-row
+    # lists). Without the library or its op, the released kernels run. On by
+    # default; 0 is the kill switch (released split path unchanged).
+    "VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED", "1"))
     ),
     # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
     # requires vllm._ampere_marlin_C; startup fails if it is missing or

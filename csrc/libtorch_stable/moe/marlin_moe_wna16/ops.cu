@@ -330,6 +330,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 #ifdef MARLIN_MOE_K64_CHAINS
     // Two K warp rows, independent of the K128 global fetch width.
     thread_tfg = thread_config_t{thread_k, thread_n, thread_n};
+#elif defined(MARLIN_MOE_TILE_THREADS_ALONG_N)
+    // thread_k 64 tiles put every warp along N (thread_n / 2 threads, at least
+    // 4 warps, at most 8): (64,128) -> 128, (64,256) -> 128, (64,512) -> 256.
+    int nthr = thread_k == 64 ? std::min(256, std::max(128, thread_n / 2))
+                              : std::min(256, thread_k * thread_n / 64);
+    thread_tfg = thread_config_t{thread_k, thread_n, nthr};
 #else
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
 #endif
@@ -390,6 +396,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
+#ifdef MARLIN_MOE_CHECK_RESIDENT_BLOCKS
+  if (exec_cfg.blocks_per_sm > 1) {
+    // the stream-K spin locks need every CTA of the grid resident at once
+    int occ = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, num_threads,
+                                                  max_shared_mem);
+    STD_TORCH_CHECK(occ >= exec_cfg.blocks_per_sm, "occupancy ", occ,
+                    " < blocks_per_sm ", exec_cfg.blocks_per_sm);
+  }
+#endif
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(

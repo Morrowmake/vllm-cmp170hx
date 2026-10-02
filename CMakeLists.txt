@@ -1441,6 +1441,8 @@ if(VLLM_BUILD_AMPERE_MARLIN)
     "csrc/libtorch_stable/moe/ampere_marlin/decode_orig.cu"
     "csrc/libtorch_stable/moe/ampere_marlin/ops.cu"
     "csrc/libtorch_stable/moe/ampere_marlin/kernels_sm80.cu"
+    "csrc/libtorch_stable/moe/ampere_marlin/prefill_tiles.cu"
+    "csrc/libtorch_stable/moe/ampere_marlin/kernels_tiles_sm80.cu"
     "csrc/libtorch_stable/moe/ampere_marlin/module.cpp")
   set_gencode_flags_for_srcs(SRCS "${AMPERE_MARLIN_SRC}" CUDA_ARCHS "8.0")
   set(AMPERE_MARLIN_FLAGS ${VLLM_GPU_FLAGS})
