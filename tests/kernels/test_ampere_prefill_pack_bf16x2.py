@@ -153,9 +153,12 @@ def test_rne_reference_matches_torch():
 def _fn_cases(device="cuda"):
     g = torch.Generator(device=device).manual_seed(0)
     yield "randn", torch.randn(N, K, generator=g, device=device) * 0.05
-    # every value an exact bf16 rounding tie (both parities, both signs,
-    # finite: exponent field < 0xFF), then fp32 subnormals of both signs
-    hi = torch.randint(0, 0x7F80, (N, K), generator=g, device=device,
+    # every value an exact bf16 rounding tie (both parities, both signs).
+    # Normal exponents only, and below 0x7F (hi < 0x7F00): a tie at the top
+    # binade rounds hi to inf, then mid = -inf and lo = NaN, and NaN bit
+    # patterns differ between the GPU and torch's CPU cast (not a rounding
+    # difference; both GPU kernels agree there, which "wide" also covers).
+    hi = torch.randint(0x0080, 0x7F00, (N, K), generator=g, device=device,
                        dtype=torch.int32)
     sign = torch.randint(0, 2, (N, K), generator=g, device=device,
                          dtype=torch.int32) << 31
@@ -185,8 +188,8 @@ def test_pack_bitwise_on_equals_off():
         a = _pack(mp._pack_fn_kernel, fn)
         b = _pack(mp._pack_fn_x2_kernel, fn)
         torch.cuda.synchronize()
-        assert torch.equal(a[:, :, :N].view(torch.int16),
-                           b[:, :, :N].view(torch.int16)), name
+        diff = int((a[:, :, :N].view(torch.int16) != b[:, :, :N].view(torch.int16)).sum())
+        assert diff == 0, (name, "on vs off", diff)
         if name not in ("randn", "ties"):
             continue
         # and both are the CPU split
@@ -195,8 +198,9 @@ def test_pack_bitwise_on_equals_off():
         mid = r1.to(torch.bfloat16)
         lo = (r1 - mid.float()).to(torch.bfloat16)
         ref = torch.stack([hi, mid, lo]).transpose(1, 2)
-        assert torch.equal(b[:, :, :N].cpu().view(torch.int16),
-                           ref.contiguous().view(torch.int16)), name
+        diff = int((b[:, :, :N].cpu().view(torch.int16)
+                    != ref.contiguous().view(torch.int16)).sum())
+        assert diff == 0, (name, "vs CPU split", diff)
 
 
 @needs_sm80
