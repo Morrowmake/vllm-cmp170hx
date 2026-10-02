@@ -187,6 +187,8 @@ def _dispatch(monkeypatch, kw):
 
     monkeypatch.setenv("VLLM_GLM5_DECODE_KERNELS", "1")
     monkeypatch.setenv("VLLM_GLM5_DECODE_MHC_V2", "1")
+    # v3 (default on) takes v2's place in the dispatch; these tests are v2's
+    monkeypatch.setenv("VLLM_GLM5_DECODE_MHC_V3", "0")
     monkeypatch.setattr(ad, "_SM80_CACHE", True)
     return tlmod.mhc_fused_post_pre_tilelang(**kw)
 

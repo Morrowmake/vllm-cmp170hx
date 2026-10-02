@@ -41,6 +41,7 @@ import torch
 __all__ = [
     "use_ampere_mhc_decode",
     "use_ampere_mhc_decode_v2",
+    "use_ampere_mhc_decode_v3",
     "use_ampere_moe_routing",
     "use_ampere_kda_decode",
     "use_ampere_kda_decode_v2",
@@ -155,6 +156,28 @@ def use_ampere_mhc_decode_v2(
     if hc_mult != 4 or hidden_size <= 0 or hidden_size % 1024:
         return False
     return _is_sm80()
+
+
+def use_ampere_mhc_decode_v3(
+    num_tokens: int,
+    hc_mult: int,
+    hidden_size: int,
+    *,
+    norm_weight: object | None = _PRESENT,
+) -> bool:
+    """Gate for vllm/ampere_decode/mhc_decode_v3.py::mhc_fused_post_pre.
+
+    Exactly the v2 gate plus ``VLLM_GLM5_DECODE_MHC_V3`` (default on), checked
+    before v2: v3 replaces v2 wherever v2 would run, and with the flag at 0 the
+    v2 path runs unchanged.
+    """
+    from vllm import envs
+
+    if not envs.VLLM_GLM5_DECODE_MHC_V3:
+        return False
+    return use_ampere_mhc_decode_v2(
+        num_tokens, hc_mult, hidden_size, norm_weight=norm_weight
+    )
 
 
 def use_ampere_moe_routing(

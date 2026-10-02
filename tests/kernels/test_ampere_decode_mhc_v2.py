@@ -76,6 +76,8 @@ def _on(env, sm80=True):
     import vllm.ampere_decode as ad
     env.setenv("VLLM_GLM5_DECODE_KERNELS", "1")
     env.setenv("VLLM_GLM5_DECODE_MHC_V2", "1")
+    # v3 (default on) takes v2's place in the dispatch; these tests are v2's
+    env.setenv("VLLM_GLM5_DECODE_MHC_V3", "0")
     env.delenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS")
     env._saved_cache = ad._SM80_CACHE
     ad._SM80_CACHE = sm80

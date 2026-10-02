@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MHC_V2: bool = False
     VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_MHC_V2_FN_BF16: bool = True
+    VLLM_GLM5_DECODE_MHC_V3: bool = True
     VLLM_GLM5_DECODE_MOE_MAX_TOKENS: int = 8
     VLLM_GLM5_DECODE_MOE_ROUTE_V2: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
@@ -1792,6 +1793,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # slower at 24/32). On by default; 0 is the kill switch.
     "VLLM_GLM5_DECODE_MHC_V2_FN_BF16": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_MHC_V2_FN_BF16", "1"))
+    ),
+    # mHC v3 (vllm/ampere_decode/mhc_decode_v3.py) wherever the v2 gate is open
+    # (VLLM_GLM5_DECODE_MHC_V2, same M bound): blocked bf16 fn copy, the exact
+    # lo(fn) term skipped, one-barrier finish at M <= 16, scale-vector Sinkhorn.
+    # Within the fp64 error gate of v2, bitwise run to run. The bf16 copy is
+    # still governed by VLLM_GLM5_DECODE_MHC_V2_FN_BF16 and read at M <= 12.
+    # On by default; 0 is the kill switch (v2 unchanged).
+    "VLLM_GLM5_DECODE_MHC_V3": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DECODE_MHC_V3", "1"))
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_DECODE_MOE_MAX_TOKENS", "8")

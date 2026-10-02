@@ -925,7 +925,39 @@ def mhc_fused_post_pre_tilelang(
     num_tokens = residual_flat.shape[0]
     x_flat = x.view(num_tokens, hidden_size)
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
-    from vllm.ampere_decode import use_ampere_mhc_decode, use_ampere_mhc_decode_v2
+    from vllm.ampere_decode import (
+        use_ampere_mhc_decode,
+        use_ampere_mhc_decode_v2,
+        use_ampere_mhc_decode_v3,
+    )
+
+    if use_ampere_mhc_decode_v3(
+        num_tokens, hc_mult, hidden_size, norm_weight=norm_weight
+    ):
+        # v3 where v2 would run (VLLM_GLM5_DECODE_MHC_V3, default on); same
+        # signature and outputs. With the flag at 0 the v2 branch below runs.
+        from vllm.ampere_decode.mhc_decode_v3 import (
+            mhc_fused_post_pre as _mhc_v3,
+        )
+
+        return _mhc_v3(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
 
     if use_ampere_mhc_decode_v2(
         num_tokens, hc_mult, hidden_size, norm_weight=norm_weight

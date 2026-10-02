@@ -94,14 +94,24 @@ def _warmup_mhc(model, device, capture_sizes, gate) -> None:
 
 
 def _warmup_mhc_v2(model, device, capture_sizes, gate) -> None:
-    """Compile the v2 mHC kernels for every capture size its gate accepts.
+    """Compile the v2 (or, under ``VLLM_GLM5_DECODE_MHC_V3``, v3) mHC kernels
+    for every capture size its gate accepts.
 
-    The v2 kernels keep no module-level buffers (outputs and split partials are
-    allocated per call, from the graph pool during capture), so compiling
-    before capture is all that is needed.
+    The v2/v3 kernels keep no module-level buffers (outputs and split partials
+    are allocated per call, from the graph pool during capture), so compiling
+    before capture is all that is needed. Only the module that will run
+    registers its bf16 ``fn`` copies.
     """
     from vllm import envs
-    from vllm.ampere_decode import mhc_decode_v2
+
+    if envs.VLLM_GLM5_DECODE_MHC_V3:
+        from vllm.ampere_decode import mhc_decode_v3 as mhc_decode_v2
+
+        name = "v3"
+    else:
+        from vllm.ampere_decode import mhc_decode_v2
+
+        name = "v2"
 
     layer = _find_module(model, "mhc_fused_post_pre_op")
     if layer is None:
@@ -112,13 +122,19 @@ def _warmup_mhc_v2(model, device, capture_sizes, gate) -> None:
     bound = envs.VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS
     ms = [m for m in _token_sizes(capture_sizes, bound) if gate(m, hc, hidden)]
     if not ms:
-        logger.info("sm_80 mHC decode v2 requested but its gate is closed "
-                    "(hc=%d, hidden=%d); using the previous paths.", hc, hidden)
+        logger.info("sm_80 mHC decode %s requested but its gate is closed "
+                    "(hc=%d, hidden=%d); using the previous paths.", name, hc,
+                    hidden)
         return
     if envs.VLLM_GLM5_DECODE_MHC_V2_FN_BF16:
         mhc_decode_v2.register_fn_bf16(model)
     mhc_decode_v2.warmup(ms, hidden=hidden, hc=hc, sinkhorn=sinkhorn, device=device)
-    logger.info("sm_80 mHC decode v2 on for M <= %d; warmed up M in %s.", bound, ms)
+    if name == "v3":
+        logger.info("sm_80 mHC decode v3 on for M <= %d [VLLM_GLM5_DECODE_MHC_V3=1]; "
+                    "warmed up M in %s.", bound, ms)
+    else:
+        logger.info("sm_80 mHC decode v2 on for M <= %d; warmed up M in %s.",
+                    bound, ms)
 
 
 def _moe_shape(worker, model) -> tuple[int, int] | None:
