@@ -177,13 +177,46 @@ def _gemv_tc_config(M, K):
     `_gemv_tc_part`).  Whole op at M = 2 / 1: one launch 9.81 / 10.18
     us against the FMA GEMV + single-CTA routing's 11.42 / 9.87, so only M = 1
     keeps the two-launch path.
+
+    num_stages per M, 74 SMs, graph-replay timers (isolated / contended next
+    to the TP4 and PP4 shared expert, us; split 8 x 128 chunks either way, so
+    the logits are bitwise the same):
+
+        ns    M=4 iso/tp4/pp4     M=8 iso/tp4/pp4    M=16 iso/tp4  M=24 iso/tp4
+        3     9.23 16.32 26.49    9.33 16.69 27.27   9.69 17.53    10.04 15.71
+        4     9.16 15.99 24.56    9.23 16.33 25.01   9.98 17.45    10.00 19.59
+        5     9.42 16.03 23.52    9.49 16.39 23.95  10.30 17.69    10.24 19.04
+
+    With 4 stages (3 of the 4 chunks in flight) the GEMV queues more of its
+    HBM requests ahead of the co-running GEMM's; at M <= 8 that wins both
+    columns.  From M = 16 the larger x tile makes the extra stage cost more
+    than it buys (M = 24 loses 25 % contended), so those keep 3.
+
+    BLOCK_E 64 (40 GEMV CTAs, each expert tile twice as wide; every logit's
+    K order is unchanged, so still bitwise) with the per-pair alignment tail,
+    same timers:
+
+        be, ns   M=4 iso/tp4/pp4    M=8 iso/tp4/pp4    M=12 iso/tp4  M=16
+        32, 4/3  8.67 15.57 23.76   8.75 15.75 23.67   8.96 16.46    9.13 16.88
+        64, 4    9.00 14.96 22.95   9.12 15.44 24.82   9.26 15.84    9.38 16.54
+
+                 M=24 iso/tp4   M=32 iso/tp4
+        32, 3    9.62 15.41     9.87 19.24
+        64, 4   10.11 15.91    10.26 17.81
+
+    Fewer, fatter CTAs cost ~0.3 us isolated but win more contended (75 % of
+    the score), except at M = 24, which keeps the 72-CTA config (as does
+    M > 32, never a decode batch here).
     """
     if M <= 1:
         return None
     bm = max(16, _next_pow2(M))
     if bm > _TC_MAX_BM:
         return None
-    cfg = (bm, 32, 128, 8, 4, 3)
+    if 17 <= M <= 24 or M > 32:
+        cfg = (bm, 32, 128, 8, 4, 3)
+    else:
+        cfg = (bm, 64, 128, 8, 4, 4)
     if K % (cfg[2] * cfg[3]):
         return None
     return cfg
@@ -330,6 +363,76 @@ def _route_keys(x, bias, e0, E: tl.constexpr, EW: tl.constexpr):
     return packed
 
 
+@triton.constexpr_function
+def _clog2(n):
+    return int(n).bit_length() - 1
+
+
+@triton.jit
+def _bit_ind(n_dims: tl.constexpr, j: tl.constexpr):
+    """[1]*..+[2]+..[1] arange: 1 where flat-index bit j is set."""
+    ar = tl.arange(0, 2)
+    return tl.reshape(ar, [1] * (n_dims - j - 1) + [2] + [1] * j)
+
+
+@triton.jit
+def _bit_cas(x, flip, i: tl.constexpr):
+    """One compare-exchange layer on flat-index bit i of hypercube x
+    (triton.language.standard._compare_and_swap, int64 only)."""
+    n_dims: tl.constexpr = _clog2(x.numel)
+    y = x ^ tl.xor_sum(x, n_dims - 1 - i, True)
+    return tl.where((x > y) != (flip ^ _bit_ind(n_dims, i)), y, x)
+
+
+@triton.jit
+def _bit_merge(x, stage: tl.constexpr, order: tl.constexpr):
+    """Bitonic merge of runs of 2**stage: order 0 ascending, 1 descending,
+    2 alternating by flat-index bit `stage`."""
+    if order == 2:
+        flip = _bit_ind(_clog2(x.numel), stage)
+    else:
+        flip = order
+    for i in tl.static_range(stage):
+        x = _bit_cas(x, flip, stage - 1 - i)
+    return x
+
+
+@triton.jit
+def _top_k_288(pa, pb, K: tl.constexpr, EA: tl.constexpr, EB: tl.constexpr):
+    """Exact top-K (descending) of [1, EA] ++ [1, EB] packed int64 keys.
+
+    Both tiles are sorted into alternating runs of K and halved stage by
+    stage, interleaved (the EB tile's work in the EA tile's shuffle shadow).
+    Once the EA tile is down to EB candidates, ONE `tl.gather` (one smem
+    round) re-lays them out like the EB tile - which every warp holds whole -
+    so the remaining halvings, which would otherwise each cross warps through
+    shared memory, are warp-local.  The EB tile's top-K ascending against the
+    EA tile's descending gives a bitonic sequence: one max + one merge."""
+    LK: tl.constexpr = _clog2(K)
+    NA: tl.constexpr = _clog2(EA)
+    NB: tl.constexpr = _clog2(EB)
+    ha = tl.reshape(pa, [2] * NA)
+    hb = tl.reshape(pb, [2] * NB)
+    for i in tl.static_range(1, LK + 1):
+        ha = _bit_merge(ha, i, 2 if i < NA else 1)
+        hb = _bit_merge(hb, i, 2 if i < NB else 0)
+    for s in tl.static_range(NA - NB):
+        ha = tl.max(ha, axis=NA - s - 1 - LK)
+        # (EB == K: this is the last halving, so it sorts descending)
+        ha = _bit_merge(ha, LK, 2 if (NB > LK or s < NA - NB - 1) else 1)
+    # ha: EB candidates spread over the warps; move them to hb's layout.
+    flat = tl.reshape(hb, [EB])
+    idx = (flat & 0).to(tl.int32) + tl.arange(0, EB)
+    ha = tl.reshape(tl.gather(tl.reshape(ha, [EB]), idx, 0), [2] * NB)
+    for s in tl.static_range(NB - LK):
+        ha = tl.max(ha, axis=NB - s - 1 - LK)
+        ha = _bit_merge(ha, LK, 2 if s < NB - LK - 1 else 1)
+        hb = tl.max(hb, axis=NB - s - 1 - LK)
+        hb = _bit_merge(hb, LK, 2 if s < NB - LK - 1 else 0)
+    c = tl.maximum(tl.reshape(ha, [1, K]), tl.reshape(hb, [1, K]))
+    return tl.reshape(_bit_merge(tl.reshape(c, [2] * LK), LK, 1), [1, K])
+
+
 @triton.jit
 def _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, m0,
                 stride_lm, stride_le, routed_scaling_factor,
@@ -422,13 +525,16 @@ def _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, m0,
         # guard (a single padded 512 tile WOULD need `tl.where(valid_e, p,
         # INT64_MIN)`: `E - 1 - e` goes negative past e = 287 and a
         # sign-extended low word outranks every legitimate key).
-        ta = tl.topk(pa, BLOCK_K)
-        if EB > 0:
-            tb = tl.topk(pb, BLOCK_K)
-            top = tl.topk(tl.join(ta, tb).reshape([BLOCK_M, 2 * BLOCK_K]),
-                          BLOCK_K)
+        if EB > 0 and BLOCK_M == 1:
+            top = _top_k_288(pa, pb, BLOCK_K, EA, EB)
         else:
-            top = ta
+            ta = tl.topk(pa, BLOCK_K)
+            if EB > 0:
+                tb = tl.topk(pb, BLOCK_K)
+                top = tl.topk(tl.join(ta, tb).reshape([BLOCK_M, 2 * BLOCK_K]),
+                              BLOCK_K)
+            else:
+                top = ta
         # One [BLOCK_M, BLOCK_K] gather where the loop did BLOCK_K dependent
         # [BLOCK_M] ones, each behind its own reduction.
         sel_i = (E - 1 - (top & 0xFFFFFFFF)).to(tl.int32)
@@ -695,6 +801,45 @@ def _fused_route_align_kernel(
 
 
 @triton.jit
+def _pair_ids(topk_ids_ptr, i0, CH: tl.constexpr, NUMEL: tl.constexpr):
+    """Expert ids of pairs [i0, i0 + CH); -1 where there is no pair to place
+    (past NUMEL, or a padding row's -1)."""
+    i = i0 + tl.arange(0, CH)
+    return tl.load(topk_ids_ptr + i, mask=i < NUMEL, other=-1,
+                   cache_modifier=".cg")
+
+
+@triton.jit
+def _place_pairs(src, w1, e_raw, i0, sorted_ids_ptr, expert_ids_ptr,
+                 NUMEL: tl.constexpr, TOPK: tl.constexpr, BS: tl.constexpr,
+                 NG: tl.constexpr, CH: tl.constexpr):
+    """Place pairs [i0, i0 + CH): sorted_ids[excl[e] + rank] = pair index,
+    and expert_ids of every block that a pair of rank j*BS opens.
+
+    rank(m, e) = #{m' < m : row m' chose e} = popc of the lower rows' bits of
+    e's column words; the pair of rank j*BS of expert e opens block
+    (excl[e] + j*BS) / BS of e's padded region, so exactly e's ceil(cnt/BS)
+    blocks are written."""
+    i = i0 + tl.arange(0, CH)
+    vi = e_raw >= 0
+    e = tl.where(vi, e_raw, 0)
+    m = i // TOPK
+    low = (tl.full([CH], 1, tl.int32) << (m % 32)) - 1
+    g0 = m // 32
+    pk = tl.gather(src, e, 0)
+    ex = (pk >> 32).to(tl.int32)
+    wg = pk.to(tl.int32)
+    rank = libdevice.popc(tl.where(g0 > 0, wg, wg & low))
+    if NG > 1:
+        wg1 = tl.gather(w1, e, 0)
+        rank += libdevice.popc(tl.where(g0 > 1, wg1,
+                                        tl.where(g0 == 1, wg1 & low, 0)))
+    pos = ex + rank
+    tl.store(sorted_ids_ptr + pos, i.to(tl.int32), mask=vi)
+    tl.store(expert_ids_ptr + pos // BS, e, mask=vi & (rank % BS == 0))
+
+
+@triton.jit
 def _route_align_rows(
     pid, logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr,
     sorted_ids_ptr, expert_ids_ptr, ntpp_ptr, col_ptr, arrive_ptr,
@@ -704,7 +849,7 @@ def _route_align_rows(
     BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr,
     BLOCK_N: tl.constexpr, FILL_P: tl.constexpr,
     EA: tl.constexpr, EB: tl.constexpr, BITONIC: tl.constexpr,
-    RENORM: tl.constexpr, G: tl.constexpr, BLOCK_J: tl.constexpr,
+    RENORM: tl.constexpr, G: tl.constexpr,
     pad_ptr=None, HAS_PAD: tl.constexpr = False,
 ):
     """Routing CTA `pid` of G = cdiv(M, BLOCK_M), and the alignment in
@@ -723,11 +868,14 @@ def _route_align_rows(
         rank(m, e)  = #{m' < m : row m' selected e}
                     = sum_{g < m/32} popc(col[g, e]) + popc(col[m/32, e] & low)
         sorted_ids[excl[e] + rank(m, e)] = m * TOPK + slot
+        expert_ids[(excl[e] + rank(m, e)) / BS] = e   where rank % BS == 0
 
     The rank is an explicit count, and nothing written depends on which CTA
     arrives last, so the outputs are bitwise deterministic.  (The pairwise
-    rank this replaces was O(pairs^2) in one CTA: 23.6 us at M=32.)  The last
-    CTA leaves `col` and the arrival counter at zero.
+    rank this replaces was O(pairs^2) in one CTA: 23.6 us at M=32.)  Both
+    scatters are per pair, in chunks of one pair per thread, so the last CTA
+    pays no E-wide or pair-vector layout conversion.  The last CTA leaves
+    `col` and the arrival counter at zero.
 
     HAS_PAD: padding rows (`pad_ptr`) set no column bit and their ids are -1
     (`_route_tile`), so the counts, offsets and ranks are those of the real
@@ -736,6 +884,10 @@ def _route_align_rows(
     """
     NUMEL: tl.constexpr = M * TOPK
     NG: tl.constexpr = (M + 31) // 32
+    # The last CTA's tail handles at most two column words (M <= 64) and at
+    # most four 128-pair chunks (BLOCK_N <= 512).
+    tl.static_assert(NG <= 2)
+    tl.static_assert(BLOCK_N <= 512)
     m0 = pid * BLOCK_M
     sel_i, keep = _route_tile(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr,
                               m0, stride_lm, stride_le,
@@ -761,38 +913,53 @@ def _route_align_rows(
         # global gather (which cost two more serialized round trips).
         offs_e = tl.arange(0, BLOCK_E)
         valid_e = offs_e < E
-        i = tl.arange(0, BLOCK_N)
-        vi = i < NUMEL
-        e = tl.load(topk_ids_ptr + i, mask=vi, other=0, cache_modifier=".cg")
-        if HAS_PAD:
-            vi = vi & (e >= 0)          # padding pairs (id -1) are not placed
-            e = tl.where(vi, e, 0)
-        m = i // TOPK
-        low = (tl.full([BLOCK_N], 1, tl.int32) << (m % 32)) - 1
-        cnt = tl.zeros([BLOCK_E], tl.int32)
-        rank = tl.zeros([BLOCK_N], tl.int32)
-        for g in tl.static_range(NG):
-            w = tl.load(col_ptr + g * E + offs_e, mask=valid_e, other=0,
-                        cache_modifier=".cg")
-            cnt += libdevice.popc(w)
-            wg = tl.gather(w, e, 0)
-            wg = tl.where(g < m // 32, wg, tl.where(g == m // 32, wg & low, 0))
-            rank += libdevice.popc(wg)
+        # Pairs in chunks of at most 128 (one per thread of the 4-warp CTA):
+        # a [256] pair vector is 2 per thread, the layout of its vectorised
+        # load, while the sorted_ids / expert_ids scatters want 1 per thread,
+        # and every scatter then paid smem layout conversions.  All chunks
+        # are loaded up front so the pair ids still cost ONE round trip.
+        CH: tl.constexpr = BLOCK_N if BLOCK_N < 128 else 128
+        NCH: tl.constexpr = BLOCK_N // CH
+        e0 = _pair_ids(topk_ids_ptr, 0, CH, NUMEL)
+        if NCH > 1:
+            e1 = _pair_ids(topk_ids_ptr, CH, CH, NUMEL)
+        if NCH > 2:
+            e2 = _pair_ids(topk_ids_ptr, 2 * CH, CH, NUMEL)
+            e3 = _pair_ids(topk_ids_ptr, 3 * CH, CH, NUMEL)
+        w0 = tl.load(col_ptr + offs_e, mask=valid_e, other=0,
+                     cache_modifier=".cg")
+        cnt = libdevice.popc(w0)
+        w1 = w0
+        if NG > 1:
+            w1 = tl.load(col_ptr + E + offs_e, mask=valid_e, other=0,
+                         cache_modifier=".cg")
+            cnt += libdevice.popc(w1)
         padded = tl.where(valid_e, ((cnt + BS - 1) // BS) * BS, 0)
-        excl = tl.cumsum(padded, axis=0) - padded
-        tl.store(ntpp_ptr, tl.sum(padded))
-        # An expert appears at most once per row, so at most cdiv(M, BS)
-        # blocks: one 2-D masked store instead of a loop of layout changes.
-        nblk_e = padded // BS
-        blk0 = excl // BS
-        jj = tl.arange(0, BLOCK_J)
-        tl.store(expert_ids_ptr + blk0[:, None] + jj[None, :],
-                 offs_e.to(tl.int32)[:, None]
-                 + tl.zeros([BLOCK_E, BLOCK_J], tl.int32),
-                 mask=valid_e[:, None] & (jj[None, :] < nblk_e[:, None]))
-        ex = tl.gather(excl, e, 0)
-        tl.store(sorted_ids_ptr + ex + rank, i.to(tl.int32), mask=vi)
-        tl.debug_barrier()
+        incl = tl.cumsum(padded, axis=0)
+        excl = incl - padded
+        # num_tokens_post_pad = the inclusive scan's last element (padded is
+        # 0 past E), stored by its owner thread: no second CTA reduction.
+        # [BLOCK_E] -> [BLOCK_E // 4, 4] keeps each thread's 4 registers in
+        # one row, so the row max is register-local and the [BLOCK_E // 4]
+        # result is one per thread, the layout the scalar store wants.
+        RQ: tl.constexpr = BLOCK_E // 4
+        tail = tl.max(tl.reshape(incl, [RQ, 4]), axis=1)
+        rq = tl.arange(0, RQ)
+        tl.store(ntpp_ptr + rq * 0, tail, mask=rq == RQ - 1)
+        # excl[e] and col word 0 of e travel in ONE packed smem gather.
+        src = (excl.to(tl.int64) << 32) | (w0.to(tl.int64) & 0xFFFFFFFF)
+        _place_pairs(src, w1, e0, 0, sorted_ids_ptr, expert_ids_ptr,
+                     NUMEL, TOPK, BS, NG, CH)
+        if NCH > 1:
+            _place_pairs(src, w1, e1, CH, sorted_ids_ptr, expert_ids_ptr,
+                         NUMEL, TOPK, BS, NG, CH)
+        if NCH > 2:
+            _place_pairs(src, w1, e2, 2 * CH, sorted_ids_ptr, expert_ids_ptr,
+                         NUMEL, TOPK, BS, NG, CH)
+            _place_pairs(src, w1, e3, 3 * CH, sorted_ids_ptr, expert_ids_ptr,
+                         NUMEL, TOPK, BS, NG, CH)
+        # Each thread zeroes exactly the column words it loaded itself
+        # (same [BLOCK_E] layout), so no barrier is needed before the reset.
         for g in tl.static_range(NG):
             tl.store(col_ptr + g * E + offs_e, tl.zeros([BLOCK_E], tl.int32),
                      mask=valid_e)
@@ -807,11 +974,27 @@ def _route_align_rows(
 
 
 @triton.jit
-def _ld_acquire(ptr):
-    """`ld.acquire.gpu` of one int32, in every thread that executes it."""
+def _spin_one_thread(ptr, target):
+    """Thread 0 of the CTA spins on `ld.acquire.gpu [ptr]` until it reads
+    >= target; every other thread falls through.  Follow with a CTA barrier.
+    (A trailing `atomic_add(ptr, 0, sem="acquire")` is NOT an acquire:
+    Triton drops an atomic whose result is unused.)"""
     return tl.inline_asm_elementwise(
-        "ld.acquire.gpu.global.b32 $0, [$1];", "=r,l", [ptr],
-        dtype=tl.int32, is_pure=False, pack=1)
+        """{
+        .reg .pred p;
+        .reg .u32 t;
+        .reg .s32 v;
+        mov.u32 t, %tid.x;
+        setp.ne.u32 p, t, 0;
+        @p bra SPIN_DONE_${:uid};
+        SPIN_LOOP_${:uid}:
+        ld.acquire.gpu.global.b32 v, [$1];
+        setp.lt.s32 p, v, $2;
+        @p bra SPIN_LOOP_${:uid};
+        SPIN_DONE_${:uid}:
+        mov.u32 $0, 0;
+        }""", "=r,l,r", [ptr, target], dtype=tl.int32, is_pure=False,
+        pack=1)
 
 
 @triton.jit
@@ -826,7 +1009,7 @@ def _moe_route_kernel(
     SPLIT: tl.constexpr,
     BLOCK_K: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_N: tl.constexpr,
     FILL_P: tl.constexpr, EA: tl.constexpr, EB: tl.constexpr,
-    BITONIC: tl.constexpr, RENORM: tl.constexpr, BLOCK_J: tl.constexpr,
+    BITONIC: tl.constexpr, RENORM: tl.constexpr,
     pad_ptr=None, HAS_PAD: tl.constexpr = False,
 ):
     """THE WHOLE OP IN ONE LAUNCH.  grid (cdiv(E, GBE) * SPLIT + M,).
@@ -853,13 +1036,13 @@ def _moe_route_kernel(
                       M, K, E, GBM, GBE, GBK, SPLIT)
     else:
         row = pid - NGEMV
-        # Every thread polls with `ld.acquire.gpu`, so each of them has
-        # acquired the GEMV CTAs' release increments before it reads a
-        # partial.  (A trailing `atomic_add(ptr, 0, sem="acquire")` is NOT an
-        # acquire here: Triton drops an atomic whose result is unused.)
-        done = _ld_acquire(arrive_ptr + 1)
-        while done < NGEMV:
-            done = _ld_acquire(arrive_ptr + 1)
+        # ONE thread per routing CTA polls with `ld.acquire.gpu`; the other
+        # 127 wait at the barrier.  Its acquire synchronises with the GEMV
+        # CTAs' release increments and `bar.sync` orders it before every
+        # thread's partial loads below (causality is transitive through the
+        # CTA barrier).  With all 128 threads polling, M routing CTAs kept
+        # 128 x M L2 requests to one line in flight for the whole GEMV.
+        _spin_one_thread(arrive_ptr + 1, NGEMV)
         tl.debug_barrier()
         offs_e = tl.arange(0, BLOCK_E)
         ve = offs_e < E
@@ -875,7 +1058,7 @@ def _moe_route_kernel(
                           stride_lm, 1, routed_scaling_factor,
                           M, E, BS, MNP, NBLK, TOPK, BLOCK_K, 1, BLOCK_E,
                           BLOCK_N, FILL_P, EA, EB, BITONIC, RENORM, M,
-                          BLOCK_J, pad_ptr, HAS_PAD)
+                          pad_ptr, HAS_PAD)
 
 
 # --- public API -------------------------------------------------------------
@@ -987,7 +1170,6 @@ def moe_route(x, weight, bias, topk=8, block_size=8, num_experts=288,
             GBM=gbm, GBE=gbe, GBK=gbk, SPLIT=split,
             BLOCK_K=bk, BLOCK_E=be, BLOCK_N=bn, FILL_P=fill,
             EA=ea, EB=eb, BITONIC=bit, RENORM=bool(renormalize),
-            BLOCK_J=_next_pow2(triton.cdiv(M, block_size)),
             pad_ptr=pad, HAS_PAD=pad is not None,
             num_warps=gnw, num_stages=gns)
     else:

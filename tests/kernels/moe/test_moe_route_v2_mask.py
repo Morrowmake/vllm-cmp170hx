@@ -91,7 +91,6 @@ def _rows_launch(logits, bias, bs, is_padding=None):
         BLOCK_E=be, BLOCK_N=bn,
         FILL_P=triton.next_power_of_2(triton.cdiv(max(mnp, nblk), M)),
         EA=ea, EB=eb, BITONIC=bit, RENORM=True,
-        BLOCK_J=triton.next_power_of_2(triton.cdiv(M, bs)),
         pad_ptr=pad, HAS_PAD=pad is not None,
     )
     # the scratch is left at zero by every launch (graph-replay invariant)
@@ -103,7 +102,7 @@ try:
     import triton
     import triton.language as tl
 
-    from vllm.ampere_decode.moe_route import _route_align_rows
+    from vllm.ampere_decode.moe_route import _route_align_rows, _top_k_288
 
     @triton.jit
     def _rows_kernel(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr,
@@ -115,16 +114,29 @@ try:
                      BLOCK_E: tl.constexpr, BLOCK_N: tl.constexpr,
                      FILL_P: tl.constexpr, EA: tl.constexpr, EB: tl.constexpr,
                      BITONIC: tl.constexpr, RENORM: tl.constexpr,
-                     BLOCK_J: tl.constexpr, pad_ptr=None,
+                     pad_ptr=None,
                      HAS_PAD: tl.constexpr = False):
         _route_align_rows(tl.program_id(0), logits_ptr, bias_ptr, topk_w_ptr,
                           topk_ids_ptr, sorted_ids_ptr, expert_ids_ptr,
                           ntpp_ptr, col_ptr, arrive_ptr, stride_lm, 1,
                           routed_scaling_factor, M, E, BS, MNP, NBLK, TOPK,
                           BLOCK_K, 1, BLOCK_E, BLOCK_N, FILL_P, EA, EB,
-                          BITONIC, RENORM, M, BLOCK_J, pad_ptr, HAS_PAD)
+                          BITONIC, RENORM, M, pad_ptr, HAS_PAD)
+
+    @triton.jit
+    def _topk_kernel(a_ptr, b_ptr, net_ptr, ref_ptr, K: tl.constexpr,
+                     EA: tl.constexpr, EB: tl.constexpr):
+        pa = tl.load(a_ptr + tl.arange(0, EA))[None, :]
+        pb = tl.load(b_ptr + tl.arange(0, EB))[None, :]
+        ok = tl.arange(0, K)[None, :]
+        tl.store(net_ptr + ok, _top_k_288(pa, pb, K, EA, EB))
+        ta = tl.topk(pa, K)
+        tb = tl.topk(pb, K)
+        tl.store(ref_ptr + ok,
+                 tl.topk(tl.join(ta, tb).reshape([1, 2 * K]), K))
 except Exception:  # pragma: no cover - triton missing
     _rows_kernel = None
+    _topk_kernel = None
 
 cpu = pytest.mark.skipif(not INTERPRET or _rows_kernel is None,
                          reason="needs TRITON_INTERPRET=1")
@@ -230,6 +242,77 @@ def test_cpu_all_padding_but_one_row():
     assert torch.equal(ti1, masked)
     assert _same_align(al1, _align(masked, bs), bs)
     assert int(al1[2]) == TOPK * bs       # 8 experts, one block each
+
+
+def _packed_keys(key):
+    """`_route_keys`' packing of fp32 keys [E]: monotone(bits) << 32 |
+    (E - 1 - e), as int64."""
+    b = key.to(torch.float32).view(torch.int32).to(torch.int64)
+    mono = torch.where(b < 0, b ^ 0x7FFFFFFF, b)
+    return (mono << 32) | (E - 1 - torch.arange(E, dtype=torch.int64))
+
+
+def _tie_keys(kind, seed):
+    g = torch.Generator().manual_seed(seed)
+    if kind == "random":
+        return torch.randn(E, generator=g)
+    if kind == "all_equal":
+        return torch.full((E,), 0.75)
+    if kind == "few_values":          # many exact ties, both signs
+        return (torch.randint(-3, 4, (E,), generator=g) * 0.25).float()
+    if kind == "ties_at_the_cut":     # 12 equal maxima straddle top-8
+        k = torch.randn(E, generator=g) - 5.0
+        k[torch.randperm(E, generator=g)[:12]] = 1.5
+        return k
+    if kind == "remainder_tile_wins":  # the 32-wide tile holds the top-8
+        k = torch.randn(E, generator=g) - 5.0
+        k[256:] = 2.0 + torch.randn(32, generator=g)
+        return k
+    if kind == "signed_zero":
+        k = torch.full((E,), -0.0)
+        k[::2] = 0.0
+        return k
+    raise ValueError(kind)
+
+
+@cpu
+@pytest.mark.parametrize("k", [4, 8])
+@pytest.mark.parametrize("kind", ["random", "all_equal", "few_values",
+                                  "ties_at_the_cut", "remainder_tile_wins",
+                                  "signed_zero"])
+@pytest.mark.parametrize("seed", range(4))
+def test_cpu_top_k_network_is_exact(k, kind, seed):
+    """The 256 + 32 top-k network returns exactly the K largest packed keys,
+    descending, and the same as the tl.topk form it replaced: the keys are
+    unique (expert index in the low word), so exact ties go to the lower
+    index either way."""
+    keys = _packed_keys(_tie_keys(kind, 100 * seed + k))
+    net = torch.empty(k, dtype=torch.int64)
+    old = torch.empty(k, dtype=torch.int64)
+    _topk_kernel[(1,)](keys[:256].contiguous(), keys[256:].contiguous(),
+                       net, old, K=k, EA=256, EB=32)
+    want = torch.sort(keys, descending=True).values[:k]
+    assert torch.equal(net, want)
+    assert torch.equal(old, want)
+
+
+@cpu
+@pytest.mark.parametrize("m", [2, 4, 5, 8, 12, 16, 24, 32])
+def test_cpu_exact_ties_go_to_the_lower_index(m):
+    """Logits on a coarse grid (many exact ties): ids are the stable
+    descending order by logit, the lower expert index first."""
+    from vllm.ampere_decode import marlin_block_size_m
+
+    bs = marlin_block_size_m(m, TOPK, E)
+    g = torch.Generator().manual_seed(4000 + m)
+    logits = torch.randint(-2, 3, (m, E), generator=g).float() * 0.5
+    logits[0] = 0.25                       # one row entirely tied
+    bias = torch.zeros(E)
+    _, ti, al = _rows_launch(logits, bias, bs)
+    want = torch.sort(-logits, dim=1, stable=True).indices[:, :TOPK]
+    assert torch.equal(ti, want.to(torch.int32))
+    assert _same_align(al, _align(ti.clone(), bs), bs)
+    assert _tail_is_sentinel(al, m * TOPK, bs)
 
 
 # ------------------------------------------------ host handoff (CPU, no kernel)
