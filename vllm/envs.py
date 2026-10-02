@@ -182,7 +182,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
-    VLLM_GLM5_PREFILL_PACK_BF16X2: bool = False
+    VLLM_GLM5_PREFILL_PACK_BF16X2: bool = True
     VLLM_GLM5_INDEXER_DECODE_RAW_K: bool = True
     VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY: bool = False
@@ -1655,9 +1655,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (vllm/ampere_prefill/mhc_prenorm.py) rounds fp32 to bf16 two elements
     # per instruction (cvt.rn.bf16x2.f32) instead of one: same rounding,
     # bitwise identical output. Needs VLLM_GLM5_PREFILL_KERNELS=1 as well.
-    # Off by default.
+    # On by default; 0 is the kill switch.
     "VLLM_GLM5_PREFILL_PACK_BF16X2": lambda: bool(
-        int(os.getenv("VLLM_GLM5_PREFILL_PACK_BF16X2", "0"))
+        int(os.getenv("VLLM_GLM5_PREFILL_PACK_BF16X2", "1"))
     ),
     # DSA indexer decode logits (vllm/v1/attention/ops/triton_mqa_logits.py,
     # Triton path) on sm_80: dequantize the e4m3 K tiles by bit placement

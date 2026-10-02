@@ -33,20 +33,21 @@ needs_cuobjdump = pytest.mark.skipif(not ampere_sass.available(),
 
 
 # --------------------------------------------------------------------- CPU
-def test_flag_declared_default_off(monkeypatch):
+def test_flag_declared_default_on(monkeypatch):
     from vllm import envs
 
     monkeypatch.delenv(FLAG, raising=False)
     assert FLAG in envs.environment_variables
-    assert envs.environment_variables[FLAG]() is False
-    monkeypatch.setenv(FLAG, "1")
     assert envs.environment_variables[FLAG]() is True
+    monkeypatch.setenv(FLAG, "0")
+    assert envs.environment_variables[FLAG]() is False
+    assert f"    {FLAG}: bool = True\n" in open(envs.__file__).read()
 
 
 def test_dispatch_follows_the_flag(monkeypatch):
-    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "0")
     assert mp._pack_bf16x2() is False
-    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.delenv(FLAG, raising=False)
     assert mp._pack_bf16x2() is True
 
 
@@ -79,7 +80,7 @@ def test_banner_goes_through_the_vllm_logger(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
     seen = _banners(mp._pack_bf16x2)
     assert any("paired bf16 rounding" in m and FLAG + "=1" in m for m in seen), seen
-    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "0")
     assert _banners(mp._pack_bf16x2) == []
 
 
@@ -103,10 +104,7 @@ def test_hc_prenorm_gemm_launches_the_selected_pack(monkeypatch, on):
     monkeypatch.setattr(mp, "_prenorm_gemm_kernel", _Launch("gemm", log))
     monkeypatch.setattr(mp, "_prenorm_reduce_kernel", _Launch("reduce", log))
     monkeypatch.setattr(mp, "num_sms", lambda *_: 74)
-    if on:
-        monkeypatch.setenv(FLAG, "1")
-    else:
-        monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "1" if on else "0")
     monkeypatch.delenv("VLLM_GLM5_PRENORM_REDUCE_FP64", raising=False)
     x = torch.empty(1728, K, dtype=torch.bfloat16, device="meta")
     fn = torch.empty(N, K, dtype=torch.float32, device="meta")
@@ -209,7 +207,7 @@ def test_hc_prenorm_gemm_on_equals_off(monkeypatch, M):
     g = torch.Generator(device="cuda").manual_seed(M)
     x = (torch.randn(M, K, generator=g, device="cuda")).to(torch.bfloat16)
     fn = torch.randn(N, K, generator=g, device="cuda") * 0.05
-    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "0")
     o0, s0 = mp.hc_prenorm_gemm(x, fn)
     o0, s0 = o0.clone(), s0.clone()
     monkeypatch.setenv(FLAG, "1")
