@@ -493,7 +493,8 @@ def route_v2_masks_padding(num_tokens: int) -> bool:
     """Whether route v2 applies the padding mask inside its launch at this
     batch size: VLLM_GLM5_MOE_MASK_PADDING=1 and VLLM_GLM5_MOE_ROUTE_V2_MASK=1
     (default), a batch the mask covers (above VLLM_GLM5_DECODE_MOE_MAX_TOKENS
-    rows when the decode kernels are on) and the one-launch kernel's range.
+    rows when the decode kernels are on, or any decode size with draft
+    skipping enabled) and the one-launch kernel's range.
     Outside it the mask edits the ids afterwards and drops the stash
     (`drop_fused_align`), as before. A static function of the shape, so eager
     runs, warmup and captured graphs agree."""
@@ -506,7 +507,7 @@ def route_v2_masks_padding(num_tokens: int) -> bool:
         if envs.VLLM_GLM5_DECODE_KERNELS
         else 0
     )
-    if num_tokens <= min_rows:
+    if num_tokens <= min_rows and not envs.VLLM_GLM5_DFLASH_SKIP:
         return False
     from vllm.ampere_decode.moe_route import pad_supported
 

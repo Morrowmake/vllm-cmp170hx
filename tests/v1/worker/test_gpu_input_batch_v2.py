@@ -159,3 +159,31 @@ def test_prepare_dcp_local_seq_lens_matches_reference(
         )
         assert batch.dcp_local_seq_lens is not None
         assert torch.equal(batch.dcp_local_seq_lens.cpu(), expected.to(torch.int32))
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_draft_skip_controls_padding_fill_without_generic_flag(monkeypatch, skip):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "0")
+    monkeypatch.setenv("VLLM_GLM5_MOE_MASK_PADDING", "1")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_SKIP", str(int(skip)))
+    buffers = InputBuffers(max_num_reqs=2, max_num_tokens=8, device=torch.device("cpu"))
+    buffers.is_padding.fill_(True)  # previous step's skipped rows
+
+    class StopAfterMask:
+        num_tokens = 4
+
+        @property
+        def req_ids(self):
+            raise RuntimeError("stop after preparing padding")
+
+    runner = SimpleNamespace(input_buffers=buffers)
+    with pytest.raises(RuntimeError, match="stop after preparing padding"):
+        GPUModelRunner.prepare_inputs(
+            runner, None, StopAfterMask(), SimpleNamespace(num_tokens=8), 0
+        )
+    expected = [False] * 4 + [True] * 4 if skip else [True] * 8
+    assert buffers.is_padding.tolist() == expected

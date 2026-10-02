@@ -1401,7 +1401,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
         is_padding = self.input_buffers.is_padding[:num_tokens_after_padding]
-        if envs.VLLM_MOE_SKIP_PADDING:
+        if envs.VLLM_MOE_SKIP_PADDING or envs.VLLM_GLM5_DFLASH_SKIP:
             is_padding[:num_tokens].fill_(False)
             is_padding[num_tokens:].fill_(True)
 

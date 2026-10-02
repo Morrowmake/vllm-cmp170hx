@@ -19,8 +19,10 @@ import pytest
 import torch
 
 import vllm.ampere_decode as ad
+import vllm.ampere_decode.moe_route as router_module
 from vllm.model_executor.layers.fused_moe import moe_align_block_size as mab
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+from vllm.triton_utils import tl, triton
 
 E = 288
 TOPK = 8
@@ -269,3 +271,187 @@ def test_drop_only_touches_its_own_ids():
 
 def test_no_cuda_was_initialised():
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("m", [4, 8, 16, 32])
+@pytest.mark.parametrize("in_kernel", [False, True])
+def test_skipped_drafts_have_zero_routed_slots_in_both_marlin_paths(
+    env, monkeypatch, m, in_kernel
+):
+    """Trace draft inputs through GLM routing to both Marlin align consumers.
+
+    CUDA arithmetic is replaced by a CPU router reference and launch recorder;
+    the confidence mask, route dispatch, stash and align consumers are real.
+    """
+    from vllm.ampere_decode import marlin_moe
+    from vllm.v1.worker.gpu.spec_decode.draft_confidence import (
+        DraftConfidence,
+        FrozenCoefficients,
+    )
+
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_SKIP", "1")
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "0")
+    monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", str(int(in_kernel)))
+    nreq, length = max(m // 8, 1), min(m, 8)
+    predictor = DraftConfidence(
+        nreq, length - 1, "cpu", FrozenCoefficients(1.0, (0.0,) * (length - 1), 0.3)
+    )
+    predictor.positions[:nreq, 0] = 11
+    predictor.caps[:nreq] = 1
+    batch = SimpleNamespace(
+        num_reqs=nreq,
+        query_start_loc=torch.arange(nreq + 1) * length,
+        idx_mapping=torch.arange(nreq),
+        positions=torch.arange(length).repeat(nreq) + 10,
+        is_padding=torch.zeros(m, dtype=torch.bool),
+        logits_indices=torch.arange(m),
+    )
+    predictor.apply_mask(batch, torch.zeros(nreq, dtype=torch.bool))
+    env["is_padding"] = batch.is_padding
+    if in_kernel:
+        ids, seen = _route_v2_in_kernel_mask(monkeypatch, m, m, env)
+        assert seen["is_padding"] is batch.is_padding
+    else:
+        ids = _route_v2(monkeypatch, m, m)
+    mr.mask_padding_topk_ids(ids)
+    assert (ids[batch.is_padding] == -1).all()
+    assert (ids[~batch.is_padding] >= 0).all()
+    # Released Marlin obtains its work list at this entry point.
+    released = mab.moe_align_block_size(ids, 8, E)
+    slots = released[0][: int(released[2])]
+    valid = slots[slots < ids.numel()].long()
+    assert valid.numel() == nreq * 2 * TOPK
+    assert not batch.is_padding[valid // TOPK].any()
+
+    # Compiled decode consumes the same masked alignment without rebuilding.
+    ad.stash_fused_align(ids, 8, E, released, is_padding=batch.is_padding)
+    launches = []
+
+    def gemm(*args):
+        sorted_ids, experts, ntpp = args[3:6]
+        assert sorted_ids is released[0] and experts is released[1]
+        used = sorted_ids[: int(ntpp)]
+        used = used[used < ids.numel()].long()
+        launches.append(used)
+        return 1
+
+    ops = SimpleNamespace(decode_gemm_orig=gemm, decode_act_orig=lambda *a: None)
+    monkeypatch.setenv("VLLM_GLM5_MARLIN_DECODE_VARIANT", "orig")
+    monkeypatch.setattr("vllm.ampere_marlin.require_extension", lambda: ops)
+    monkeypatch.setattr(
+        marlin_moe,
+        "_workspaces",
+        lambda *a, **kw: {
+            "h": torch.empty(m * TOPK * 512),
+            "c3": torch.empty(m * TOPK * 4096),
+            "ctr": None,
+            "part": None,
+        },
+    )
+    layer = SimpleNamespace(
+        w1_scale=None,
+        w2_scale=None,
+        activation_config=SimpleNamespace(clamp_limit=10.0),
+        moe_sum=lambda *a: None,
+    )
+    marlin_moe.run(
+        layer,
+        torch.empty(m, 4096),
+        torch.empty(m, 4096),
+        None,
+        torch.empty(1, 32),
+        torch.ones(m, TOPK),
+        ids,
+        None,
+    )
+    assert len(launches) == 2
+    for used in launches:
+        assert used.numel() == nreq * 2 * TOPK
+        assert not batch.is_padding[used // TOPK].any()
+    assert not torch.cuda.is_initialized()
+
+
+def _check_interpreted_router_tile():
+    from vllm.v1.worker.gpu.spec_decode.draft_confidence import (
+        DraftConfidence,
+        FrozenCoefficients,
+    )
+
+    @triton.jit
+    def cpu_tanh(x):
+        return 2.0 / (1.0 + tl.exp(-2.0 * x)) - 1.0
+
+    # The interpreter cannot call libdevice. This is exact at zero logits;
+    # routing numerics are outside this mask test.
+    router_module.libdevice = SimpleNamespace(tanh=cpu_tanh)
+
+    @triton.jit
+    def route(logits, bias, weights, ids, padding, keep_out):
+        m = tl.program_id(0)
+        _, keep = router_module._route_tile(
+            logits,
+            bias,
+            weights,
+            ids,
+            m,
+            288,
+            1,
+            2.5,
+            M=4,
+            E=288,
+            TOPK=8,
+            RENORM=True,
+            BLOCK_M=1,
+            BLOCK_K=8,
+            EA=256,
+            EB=32,
+            BITONIC=True,
+            pad_ptr=padding,
+            HAS_PAD=True,
+        )
+        tl.store(keep_out + m * 8 + tl.arange(0, 8), keep.reshape([8]))
+
+    predictor = DraftConfidence(1, 3, "cpu", FrozenCoefficients(1.0, (0.0,) * 3, 0.3))
+    predictor.positions[0, 0] = 11
+    predictor.caps[0] = 1
+    batch = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 4]),
+        idx_mapping=torch.tensor([0]),
+        positions=torch.arange(10, 14),
+        is_padding=torch.zeros(4, dtype=torch.bool),
+        logits_indices=torch.arange(4),
+    )
+    predictor.apply_mask(batch, torch.tensor([False]))
+    ids = torch.empty(4, TOPK, dtype=torch.int32)
+    keep = torch.empty(4, TOPK, dtype=torch.bool)
+    route[(4,)](
+        torch.zeros(4, E),
+        torch.zeros(E),
+        torch.empty(4, TOPK),
+        ids,
+        batch.is_padding,
+        keep,
+    )
+    assert (ids[2:] == -1).all() and not keep[2:].any()
+    assert (ids[:2] >= 0).all() and keep[:2].all()
+    assert not torch.cuda.is_initialized()
+
+
+def test_interpreted_router_tile_drops_skipped_drafts():
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        f"import runpy; runpy.run_path({__file__!r})"
+        "['_check_interpreted_router_tile']()"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES=""),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

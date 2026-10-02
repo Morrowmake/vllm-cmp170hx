@@ -119,7 +119,7 @@ class DraftConfidence:
             self._warm_mask()
         logger.info(
             "GLM-5 draft confidence active: skip=%d log=%d frozen=%d "
-            "(VLLM_GLM5_DFLASH_SKIP)",
+            "(VLLM_GLM5_DFLASH_SKIP; GLM-5 MoE row mask)",
             coefficients is not None,
             self.log_path is not None,
             coefficients is not None,
@@ -245,8 +245,8 @@ def create_draft_confidence(config, max_reqs, width, device):
             "Draft confidence currently requires TP-only greedy DFlash2 "
             "without adaptive verification or context parallelism"
         )
-    if enabled and not envs.VLLM_MOE_SKIP_PADDING:
-        raise ValueError("Draft skip requires VLLM_MOE_SKIP_PADDING=1")
+    if enabled and not envs.VLLM_GLM5_MOE_MASK_PADDING:
+        raise ValueError("Draft skip requires VLLM_GLM5_MOE_MASK_PADDING=1")
     coefficients = (
         FrozenCoefficients.load(envs.VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS, width)
         if enabled
