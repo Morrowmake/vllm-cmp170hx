@@ -395,13 +395,14 @@ def _decode_raw_k(device: torch.device) -> bool:
 
     if not envs.VLLM_GLM5_INDEXER_DECODE_RAW_K:
         return False
+    logger = init_logger(__name__)
     index = device.index if device.index is not None else torch.cuda.current_device()
     if not _sm80(index):
-        init_logger(__name__).info_once(
+        logger.info_once(
             "VLLM_GLM5_INDEXER_DECODE_RAW_K=1 but the device is not sm_80; "
             "the indexer decode logits keep the fp32 K dequant")
         return False
-    init_logger(__name__).info_once(
+    logger.info_once(
         "DSA indexer decode logits: raw-bit e4m3 K dequant active "
         "(VLLM_GLM5_INDEXER_DECODE_RAW_K=1)")
     return True

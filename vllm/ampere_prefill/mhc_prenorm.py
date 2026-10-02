@@ -402,7 +402,8 @@ def _pack_bf16x2() -> bool:
         return False
     from vllm.logger import init_logger
 
-    init_logger(__name__).info_once(
+    logger = init_logger(__name__)
+    logger.info_once(
         "sm_80 prefill mHC pre-norm: fn pack with paired bf16 rounding "
         "(cvt.rn.bf16x2) active (VLLM_GLM5_PREFILL_PACK_BF16X2=1)")
     return True
