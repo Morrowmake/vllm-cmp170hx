@@ -97,7 +97,8 @@ def test_warmup_and_tail_lane_go_through_impl(monkeypatch, fresh_impl):
     monkeypatch.setattr(wu, "_discover_nk", lambda worker: {(4096, 4096)})
     wu.warmup_ampere_thin_gemm(types.SimpleNamespace(device="cpu"), [1, 4, 32, 64])
     assert seen[-1][0] == "warm" and seen[-1][1][-1] == 32
-    monkeypatch.setenv("VLLM_GLM5_THIN_GEMM", "1")
+    # an attribute, not the environment: another test may have frozen envs
+    monkeypatch.setattr(envs, "VLLM_GLM5_THIN_GEMM", True, raising=False)
     monkeypatch.setattr(tail, "private_flashinfer_topk_workspace",
                         lambda device, holder: contextlib.nullcontext())
     with tail.tail_side_stream_workspaces("cpu", {}):
