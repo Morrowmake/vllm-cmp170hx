@@ -31,7 +31,8 @@ torch::stable::Tensor ampere_marlin_prefill_tile_gemm(
     bool mul_topk_weights, vllm::ScalarTypeId const& b_type_id, int64_t size_m,
     int64_t size_n, int64_t size_k, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm, torch::stable::Tensor& c_tmp);
+    int64_t blocks_per_sm, torch::stable::Tensor& c_tmp,
+    std::optional<torch::stable::Tensor> const& redo);
 
 STABLE_TORCH_LIBRARY(_ampere_marlin_C, m) {
   m.def(
@@ -59,7 +60,7 @@ STABLE_TORCH_LIBRARY(_ampere_marlin_C, m) {
       "bool mul_topk_weights, int b_type_id,"
       "int size_m, int size_n, int size_k, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float,"
-      "int thread_k, int thread_n, int blocks_per_sm, Tensor(c!) c_tmp) -> Tensor");
+      "int thread_k, int thread_n, int blocks_per_sm, Tensor(c!) c_tmp, Tensor(r!)? redo=None) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_ampere_marlin_C, CUDA, m) {

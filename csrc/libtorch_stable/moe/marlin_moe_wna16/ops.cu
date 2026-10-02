@@ -169,7 +169,12 @@ MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType a_type,
                                 int thread_m_blocks, int thread_n_blocks,
                                 int thread_k_blocks, bool m_block_size_8,
                                 bool has_zp, int group_blocks, int threads,
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+                                bool is_zp_float, int stages,
+                                bool fast_dequant = false) {
+#else
                                 bool is_zp_float, int stages) {
+#endif
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
@@ -257,7 +262,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                vllm::ScalarType const& s_type, bool has_bias, bool has_zp,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+               bool use_fp32_reduce, bool is_zp_float, int* redo,
+               int64_t redo_numel) {
+#else
                bool use_fp32_reduce, bool is_zp_float) {
+#endif
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -340,6 +350,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
 #endif
     if (blocks_per_sm == -1) blocks_per_sm = 1;
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+    // (.,512) 256-thread fast_dequant tiles stage their epilogue in their own
+    // shared memory (marlin_template.h epi_overlap): full opt-in budget.
+    STD_TORCH_CHECK(thread_n != 512 || blocks_per_sm == 1,
+                    "thread_n 512 tiles run at 1 block per SM");
+#endif
     exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
     STD_TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                     " is not divisible by thread_n = ", thread_n);
@@ -394,6 +410,54 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                     ", num_bits = ", num_bits);
   }
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  // Optimistic dequant (kernel.h): with a redo area, run the fast_dequant
+  // kernel, then the regular kernel on the tiles it listed (it exits at once
+  // if none).  Without a redo area, or without a fast_dequant twin of the
+  // chosen kernel, the regular kernel alone computes everything.
+  MarlinFuncPtr fast_kernel = MarlinDefault;
+  if (redo != nullptr) {
+    fast_kernel = get_marlin_kernel(
+        a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
+        thread_k_blocks, m_block_size_8, has_zp, group_blocks, num_threads,
+        is_zp_float, stages, /*fast_dequant=*/true);
+    // every slice may append once: at most all m-n tiles plus one extra
+    // slice per CTA (stream-K stripes)
+    const int64_t max_tiles =
+        int64_t(div_ceil(prob_m * top_k + num_experts * moe_block_size,
+                         moe_block_size)) *
+            (prob_n / thread_n) +
+        blocks;
+    STD_TORCH_CHECK(redo_numel >= 1 + max_tiles, "redo area too small: ",
+                    redo_numel, " < ", 1 + max_tiles);
+  }
+  if (fast_kernel == MarlinDefault) redo = nullptr;
+
+  for (MarlinFuncPtr k : {fast_kernel, kernel}) {
+    if (k == MarlinDefault) continue;
+    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         max_shared_mem);
+  #ifdef MARLIN_MOE_CHECK_RESIDENT_BLOCKS
+    if (exec_cfg.blocks_per_sm > 1) {
+      // the stream-K spin locks need every CTA of the grid resident at once
+      int occ = 0;
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k, num_threads,
+                                                    max_shared_mem);
+      STD_TORCH_CHECK(occ >= exec_cfg.blocks_per_sm, "occupancy ", occ,
+                      " < blocks_per_sm ", exec_cfg.blocks_per_sm);
+    }
+  #endif
+    // avoid ">>>" being formatted to "> > >"
+    // clang-format off
+    k<<<blocks, num_threads, max_shared_mem, stream>>>(
+        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
+        sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+        topk_weights_ptr, top_k, mul_topk_weights, prob_m, prob_n, prob_k, locks,
+        has_bias, use_atomic_add, use_fp32_reduce, redo);
+    // clang-format on
+  }
+}
+#else
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
 #ifdef MARLIN_MOE_CHECK_RESIDENT_BLOCKS
@@ -415,6 +479,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       has_bias, use_atomic_add, use_fp32_reduce);
   // clang-format on
 }
+#endif
 
 }  // namespace MARLIN_NAMESPACE_NAME
 
@@ -436,6 +501,9 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     int64_t blocks_per_sm
 #ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
     , torch::stable::Tensor& c_tmp
+#endif
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+    , std::optional<torch::stable::Tensor> const& redo
 #endif
     ) {
 #ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
@@ -621,6 +689,16 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
   }
 #endif
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  if (redo.has_value()) {
+    STD_TORCH_CHECK(redo->device().is_cuda() &&
+                        redo->get_device() == a.get_device() &&
+                        redo->is_contiguous() &&
+                        redo->scalar_type() ==
+                            torch::headeronly::ScalarType::Int,
+                    "redo must be contiguous int32 on A's device");
+  }
+#endif
   // Detect group size.
   int num_groups = -1;
   int group_size = -1;
@@ -769,7 +847,13 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.mutable_data_ptr(),
       a_type, b_type, c_type, s_type, has_bias, has_zp, group_size, dev,
       get_current_cuda_stream(dev), thread_k, thread_n, sms, blocks_per_sm,
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+      use_atomic_add, use_fp32_reduce, is_zp_float,
+      redo.has_value() ? static_cast<int*>(redo->mutable_data_ptr()) : nullptr,
+      redo.has_value() ? redo->numel() : 0);
+#else
       use_atomic_add, use_fp32_reduce, is_zp_float);
+#endif
 
   return c;
 }

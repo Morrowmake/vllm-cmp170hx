@@ -220,7 +220,12 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
           const bool is_zp_float   // is zero point of float16 type?
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool fast_dequant  // one-HFMA2 subnormal dequant (kernel.h)
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -250,7 +255,15 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
     bool use_fp32_reduce  // whether to use fp32 global reduce
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    // optimistic-dequant redo list (kernel.h): fast_dequant kernels append the
+    // tiles they could not compute exactly; the regular kernel with a non-null
+    // redo recomputes only those
+    int* __restrict__ redo
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -275,6 +288,15 @@ __global__ void Marlin(
     return;
   #endif
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  const bool redo_mode = !fast_dequant && redo != nullptr;
+  int redo_count = 0;
+  if (redo_mode) {
+    redo_count = redo[0];
+    if (redo_count == 0) return;
+  }
+
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   #ifdef MARLIN_MOE_EMPTY_LIST_RETURN
   // Split block lists can be empty.
@@ -342,6 +364,16 @@ __global__ void Marlin(
       has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
       has_zp && !is_zp_float && !(b_type == vllm::kU8);
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  // fast_dequant: uint4b8 -> bf16 with grouped bf16 scales in one HFMA2 per
+  // bf16x2 (matmul); scales are pre-transformed once per scale load.
+  static_assert(!fast_dequant ||
+                (b_type == vllm::kU4B8 &&
+                 std::is_same<scalar_t, nv_bfloat16>::value &&
+                 s_type == vllm::kBFloat16 && !is_a_8bit && !has_zp &&
+                 group_blocks != -1 && group_blocks >= thread_k_blocks));
+
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   float global_scale_f32 = 1.0f;
 
   static_assert(group_blocks != 0,
@@ -377,6 +409,15 @@ __global__ void Marlin(
     if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
   }
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  if (redo_mode) {
+    // only the listed tiles, each whole (DP), round-robin over the CTAs
+    part2_mn_tiles = 0;
+    part1_mn_iters = blockIdx.x < redo_count
+                         ? (redo_count - blockIdx.x + gridDim.x - 1) / gridDim.x
+                         : 0;
+  }
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
 
@@ -391,7 +432,13 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
   int slice_col_par = blockIdx.x;
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+  int redo_i = blockIdx.x;
+  int slice_col_par = redo_mode ? (redo_i < redo_count ? redo[1 + redo_i] : 0)
+                                : blockIdx.x;
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -840,6 +887,20 @@ __global__ void Marlin(
   constexpr int sh_red_size = (2 * thread_n_blocks + 1) * 16 * thread_m_blocks;
   constexpr int sh_b_size = stages * b_sh_stage;
   int4* sh_b = sh_new;
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  // Epilogue / refill overlap (explicit (x,512) 256-thread tiles, always one
+  // block per SM): the result staging buffer gets its own space after sh_a so
+  // the next tile's first stages can be fetched into sh_a/sh_b while this tile
+  // is written out.  mb4 does not fit a full-size buffer (171 KB), so it writes
+  // in passes of epi_mb m-blocks.
+  // Only the fast_dequant kernels overlap: the regular kernels keep their
+  // write-out unchanged (they serve the redo tiles and other callers).
+  constexpr bool epi_overlap = fast_dequant && threads == 256 &&
+                               thread_n_blocks == 32 && !is_a_8bit &&
+                               !m_block_size_8 && !has_zp;
+  constexpr int epi_mb = thread_m_blocks <= 3 ? thread_m_blocks : 2;
+  constexpr int sh_red_ov_size = (2 * thread_n_blocks + 1) * 16 * epi_mb;
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   int4* sh_red = sh_new;
 
   constexpr int sh_size_b_red_min =
@@ -857,13 +918,30 @@ __global__ void Marlin(
   constexpr int sh_s_size = stages * s_sh_stage;
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  // epi_overlap: staging buffer, then the finished tile's sorted ids and top-k
+  // weights (the next tile's block data overwrites sh_block_*).
+  int4* sh_red_ov = sh_a + stages * moe_block_size * a_sh_stride;
+  int32_t* sh_epi_ids = reinterpret_cast<int32_t*>(sh_red_ov + sh_red_ov_size);
+  c_scalar_t2* sh_epi_tw = reinterpret_cast<c_scalar_t2*>(sh_epi_ids + moe_block_size);
+  // block meta (moe_block_size int4 ahead of sh_new) + everything up to sh_epi_*
+  static_assert(!epi_overlap ||
+                16 * (moe_block_size + sh_b_red_bias_size + stages * zp_sh_stage +
+                      sh_s_size + stages * moe_block_size * a_sh_stride +
+                      sh_red_ov_size + moe_block_size / 2) <= 166912);
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2][b_thread_vecs];
   FragC frag_c[thread_m_blocks][is_a_8bit ? 2 : 4][2];
   FragC frag_c_tmp[thread_m_blocks][is_a_8bit ? 2 : 4][2];
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
   FragS frag_s[2][4];
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+  FragS frag_s[2][4];         // fast_dequant: s * 2^133
+  FragS frag_sc[2][4];        // fast_dequant: -8 * s
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   FragS frag_bias[2][4];
   int frag_qzp[2][num_ints_per_thread];  // Zero-points
   FragZP frag_zp;                        // Zero-points in fp16
@@ -1011,9 +1089,32 @@ __global__ void Marlin(
         if (k % b_sh_wr_iters == 0) {
           int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
           reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+          if constexpr (fast_dequant) {
+            // Exact power-of-two scalings of s while |s| bits <= kFastDequantMax;
+            // a larger scale overflows s * 2^133 to inf and the tile's sums become
+            // non-finite (redo check at the slice end). 2^133 is applied as
+            // 2^64 * 2^69 (bf16 max is ~2^128).
+            const uint32_t p64 = 0x5f805f80u, p69 = 0x62006200u, m8 = 0xc100c100u;
+  #pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+              scalar_t2 sv = frag_s[k % 2][jj][0];
+              frag_sc[k % 2][jj][0] =
+                  __hmul2(sv, *reinterpret_cast<const scalar_t2*>(&m8));
+              scalar_t2 s64 = __hmul2(sv, *reinterpret_cast<const scalar_t2*>(&p64));
+              frag_s[k % 2][jj][0] =
+                  __hmul2(s64, *reinterpret_cast<const scalar_t2*>(&p69));
+            }
+          }
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
         } else {
           reinterpret_cast<int4*>(&frag_s[1])[0] =
               reinterpret_cast<int4*>(&frag_s[0])[0];
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+          if constexpr (fast_dequant)
+            reinterpret_cast<int4*>(&frag_sc[1])[0] =
+                reinterpret_cast<int4*>(&frag_sc[0])[0];
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
         }
       }
     } else if (group_blocks2 < b_sh_wr_iters || k % b_sh_wr_iters == 0) {
@@ -1172,6 +1273,50 @@ __global__ void Marlin(
           s_quant_1, reinterpret_cast<c_scalar_t2*>(&frag_s[k2]) + 2);
     }
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+    if constexpr (fast_dequant) {
+      // bf16 bits with only the low byte set (N < 256) are exactly N * 2^-133
+      // (subnormal or smallest normal binade): the even nibbles q & 0xf are
+      // q * 2^-133 and the odd ones (q << 4 at bits 4-7) q * 2^-129, so
+      // fma(x, s * 2^133 or s * 2^129, -8 s) = bf16((q - 8) * s) with a single
+      // rounding: bit-identical to dequant (hsub2 136, exact) + scale (hmul2 s)
+      // below, one HFMA2 per bf16x2 and one shift per word.
+  #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        FragB frag_b0;
+        FragB frag_b1;
+        const uint32_t q = uint32_t(frag_b_quant[k2][0][j]);
+        const uint32_t q8 = q >> 8;
+        const uint32_t x0 = q & 0x000f000fu, x1 = q & 0x00f000f0u;
+        const uint32_t x2 = q8 & 0x000f000fu, x3 = q8 & 0x00f000f0u;
+        // s * 2^129 = (s * 2^133) * 2^-4, exact
+        const uint32_t pm4 = 0x3d803d80u;
+        scalar_t2 se = frag_s[k2][j][0], cc = frag_sc[k2][j][0];
+        scalar_t2 sp = __hmul2(se, *reinterpret_cast<const scalar_t2*>(&pm4));
+        scalar_t2 spx = __low2bfloat162(sp), ccx = __low2bfloat162(cc);
+        scalar_t2 spy = __high2bfloat162(sp), ccy = __high2bfloat162(cc);
+        scalar_t2 sex = __low2bfloat162(se), sey = __high2bfloat162(se);
+        frag_b0[0] = __hfma2(*reinterpret_cast<const scalar_t2*>(&x0), sex, ccx);
+        frag_b0[1] = __hfma2(*reinterpret_cast<const scalar_t2*>(&x1), spx, ccx);
+        frag_b1[0] = __hfma2(*reinterpret_cast<const scalar_t2*>(&x2), sey, ccy);
+        frag_b1[1] = __hfma2(*reinterpret_cast<const scalar_t2*>(&x3), spy, ccy);
+  #pragma unroll
+        for (int i = 0; i < thread_m_blocks; i++) {
+          if constexpr (m_block_size_8) {
+            mma_trans<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0, frag_b1,
+                                                 frag_c[i][j][0]);
+          } else {
+            mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0,
+                                           frag_c[i][j][0]);
+            mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b1,
+                                           frag_c[i][j][1]);
+          }
+        }
+      }
+      return;
+    }
+
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   // We have the m dimension as the inner loop in order to encourage overlapping
   // dequantization and matmul operations.
   #pragma unroll
@@ -1718,9 +1863,73 @@ __global__ void Marlin(
     __syncthreads();
   };
 
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
   // Start global fetch and register load pipelines.
   auto start_pipes = [&]() {
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+  // epi_overlap write-out of a finished tile from frag_c: staged through the
+  // dedicated sh_red_ov in passes of epi_mb m-blocks; rows/top-k weights come
+  // from the saved sh_epi_* (the next tile's block data is already loaded).
+  // Same values and rounding as write_result (bf16 of the fp32 accumulator,
+  // then the bf16 top-k product).
+  auto write_result_ov = [&](int col, int nvalid) {
+    if constexpr (epi_overlap) {
+      const int c_gl_stride = prob_n / 8;
+      constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
+      constexpr int rows_per_it = threads / (2 * thread_n_blocks);
+      const int c_gl_col = (2 * thread_n_blocks) * col + threadIdx.x % (2 * thread_n_blocks);
+      const int c_sh_wr0 = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) +
+                           (threadIdx.x % 32) % 4 + 32 * (threadIdx.x / 32);
+  #pragma unroll
+      for (int p = 0; p < thread_m_blocks; p += epi_mb) {
+  #pragma unroll
+        for (int ii = 0; ii < epi_mb; ii++) {
+          const int i = p + ii;
+          if (i < thread_m_blocks) {
+  #pragma unroll
+            for (int j = 0; j < 4; j++) {
+              int wr = c_sh_wr0 + 16 * (4 * c_sh_stride) * ii + 8 * j;
+              c_scalar_t2* r2 = reinterpret_cast<c_scalar_t2*>(sh_red_ov);
+              r2[wr] = Cdtype::nums2num2(Cdtype::float2num(frag_c[i][j][0][0]),
+                                         Cdtype::float2num(frag_c[i][j][0][1]));
+              r2[wr + (4 * c_sh_stride) * 8] =
+                  Cdtype::nums2num2(Cdtype::float2num(frag_c[i][j][0][2]),
+                                    Cdtype::float2num(frag_c[i][j][0][3]));
+              r2[wr + 4] = Cdtype::nums2num2(Cdtype::float2num(frag_c[i][j][1][0]),
+                                             Cdtype::float2num(frag_c[i][j][1][1]));
+              r2[wr + (4 * c_sh_stride) * 8 + 4] =
+                  Cdtype::nums2num2(Cdtype::float2num(frag_c[i][j][1][2]),
+                                    Cdtype::float2num(frag_c[i][j][1][3]));
+            }
+          }
+        }
+        __syncthreads();
+  #pragma unroll
+        for (int it = 0; it < 16 * epi_mb / rows_per_it; it++) {
+          const int lrow = threadIdx.x / (2 * thread_n_blocks) + rows_per_it * it;
+          const int row = 16 * p + lrow;
+          if (lrow < 16 * (thread_m_blocks - p) && row < nvalid) {
+            int4 v = sh_red_ov[c_sh_stride * lrow + threadIdx.x % (2 * thread_n_blocks)];
+            if (mul_topk_weights) {
+              c_scalar_t2 w = sh_epi_tw[row];
+              c_scalar_t2* v2 = reinterpret_cast<c_scalar_t2*>(&v);
+  #pragma unroll
+              for (int a = 0; a < 4; a++) v2[a] = __hmul2(v2[a], w);
+            }
+            C[int64_t(sh_epi_ids[row]) * c_gl_stride + c_gl_col] = v;
+          }
+        }
+        __syncthreads();
+      }
+    }
+  };
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  // Start global fetch and register load pipelines (issue part / wait part;
+  // epi_overlap writes the previous tile out in between).
+  auto start_pipes_issue = [&]() {
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   #pragma unroll
     for (int i = 0; i < stages - 1; i++) {
       if constexpr (has_zp && !is_zp_float && group_blocks == -1) {
@@ -1733,7 +1942,12 @@ __global__ void Marlin(
       }
       fetch_to_shared(i, i, i < slice_iters);
     }
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
 
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+  };
+  auto start_pipes_finish = [&]() {
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
     zero_accums();
     wait_for_stage();
     fetch_to_registers(0, 0);
@@ -1741,6 +1955,12 @@ __global__ void Marlin(
     fetch_zp_to_registers(0, 0);
     a_gl_rd_col += a_gl_rd_delta_o * (stages - 1);
   };
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  auto start_pipes = [&]() {
+    start_pipes_issue();
+    start_pipes_finish();
+  };
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   if (slice_iters) {
     start_pipes();
   }
@@ -1947,6 +2167,34 @@ __global__ void Marlin(
         }
         barrier_release(&locks[locks_off], last);
       }
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+      if constexpr (fast_dequant) {
+        // A scale > kFastDequantMax makes s * 2^133 = +-inf, so every product of its
+        // group is inf or NaN (0 * inf) and every routed row of that column sums
+        // to a non-finite value; row 0 of a block is always routed.  The final
+        // writer's result warps (after the intra-CTA k reduction only the first
+        // tb_n_warps hold sums) check the routed rows of m-block 0 of their
+        // fragments (padded rows read unspecified smem) and list the tile for the
+        // regular kernel (kernel.h); its own output is overwritten.
+        if (last) {
+          float z = 0.0f;
+          if (threadIdx.x / 32 < tb_n_warps) {
+            const int r0 = (threadIdx.x % 32) / 4;   // rows r0 and r0 + 8
+            const bool v0 = r0 < block_num_valid_tokens;
+            const bool v1 = r0 + 8 < block_num_valid_tokens;
+  #pragma unroll
+            for (int j = 0; j < 4; j++)
+  #pragma unroll
+              for (int h = 0; h < 2; h++) {
+                if (v0) z += frag_c[0][j][h][0] * 0.0f + frag_c[0][j][h][1] * 0.0f;
+                if (v1) z += frag_c[0][j][h][2] * 0.0f + frag_c[0][j][h][3] * 0.0f;
+              }
+          }
+          if (__syncthreads_or(!(z == 0.0f)) && threadIdx.x == 0)
+            redo[1 + atomicAdd(&redo[0], 1)] = par_id * n_tiles + slice_col;
+        }
+      }
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
 
       if (has_bias && last) {
         cp_async_wait<0>();
@@ -1959,12 +2207,40 @@ __global__ void Marlin(
 
       if (use_atomic_add && slice_count > 1 && slice_idx != 0)
         wait_negative_and_add(&locks[locks_off]);
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
       if (last || use_atomic_add)
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+      // epi_overlap: keep what the write-out needs (block rows, top-k weights,
+      // column, valid count), move on to the next slice and issue its first
+      // fetches, write this tile out while they are in flight, then wait.
+      const bool last_w = last;
+      const int col_w = slice_col, nvalid_w = block_num_valid_tokens;
+      if constexpr (epi_overlap) {
+        if (last_w && threadIdx.x < moe_block_size) {
+          sh_epi_ids[threadIdx.x] = sh_block_sorted_ids[threadIdx.x];
+          if (mul_topk_weights)
+            sh_epi_tw[threadIdx.x] = sh_block_topk_weights[threadIdx.x];
+        }
+        __syncthreads();   // before init_slice overwrites sh_block_*
+      } else if (last || use_atomic_add) {
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
         // only the last block in a slice actually writes the result
         write_result(last);
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+      }
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
       slice_row = 0;
       if (!in_part2) {
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
         slice_col_par += gridDim.x;
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+        if (redo_mode) {
+          redo_i += gridDim.x;
+          slice_col_par = redo_i < redo_count ? redo[1 + redo_i] : 0;
+        } else {
+          slice_col_par += gridDim.x;
+        }
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
       } else {
         slice_col_par++;
         slice_col++;
@@ -2000,8 +2276,18 @@ __global__ void Marlin(
                               threadIdx.x / zp_sh_stride) +
               zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
         }
+#ifndef MARLIN_MOE_FAST_DEQUANT_REDO
         start_pipes();
+#else /* MARLIN_MOE_FAST_DEQUANT_REDO */
+        start_pipes_issue();
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
       }
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+      if constexpr (epi_overlap) {
+        if (last_w) write_result_ov(col_w, nvalid_w);
+      }
+      if (slice_iters) start_pipes_finish();
+#endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
     }
   }
 }

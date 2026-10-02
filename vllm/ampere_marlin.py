@@ -43,7 +43,7 @@ _PREFILL_TILE_SCHEMA = (
     "b_zeros_or_none workspace sorted_token_ids expert_ids num_tokens_past_padded "
     "topk_weights moe_block_size top_k mul_topk_weights b_type_id size_m size_n "
     "size_k use_atomic_add use_fp32_reduce is_zp_float thread_k thread_n "
-    "blocks_per_sm c_tmp"
+    "blocks_per_sm c_tmp redo"
 )
 _PREFILL_TILE = None
 

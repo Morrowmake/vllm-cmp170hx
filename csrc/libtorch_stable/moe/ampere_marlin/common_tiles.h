@@ -8,7 +8,9 @@
 // and a launch asking for more than one CTA per SM checks that occupancy
 // allows it (the stream-K locks need every CTA resident). The kernel set is
 // kernel_selector_tiles.h: Marlin's own exec-config choices for 8..64-row
-// blocks plus the (64,512) and (64,256) all-warps-along-N tiles.
+// blocks plus the (64,512) and (64,256) all-warps-along-N tiles, and the
+// fast_dequant twins of the PP whole-expert set with their redo protocol
+// (MARLIN_MOE_FAST_DEQUANT_REDO, ../marlin_moe_wna16/kernel.h).
 // Nothing here changes _moe_C_stable_libtorch or the K128 prefill_gemm units.
 #pragma once
 
@@ -16,6 +18,7 @@
 #define MARLIN_MOE_PREALLOCATED_SCRATCH
 #define MARLIN_MOE_TILE_THREADS_ALONG_N
 #define MARLIN_MOE_CHECK_RESIDENT_BLOCKS
+#define MARLIN_MOE_FAST_DEQUANT_REDO
 
 #define MARLIN_NAMESPACE_NAME ampere_marlin_tiles
 #define MARLIN_MOE_KERNEL_SELECTOR \

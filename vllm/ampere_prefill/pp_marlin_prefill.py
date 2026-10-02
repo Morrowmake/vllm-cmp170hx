@@ -49,9 +49,16 @@ lists uses the (64,512) all-warps-along-N tile and w2 the (64,256) tile at
 128 threads, 2 CTAs per SM; the 16-row list keeps Marlin's own choice.
 Measured against this path's released kernels on captured 74-SM TP4 calls:
 mean and max error vs fp64 within 1.10x / 1.25x, bitwise run to run.
-``TILE_TABLES`` is keyed by N so whole-expert (N=2048) tables can join the
-same op.  The op's fp32 reduction scratch is allocated in ``warmup``; without
-the library, the op or the scratch (e.g. during a capture) the released
+At N=2048 (PP whole experts, VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED, default
+on) both GEMMs use the (64,512) tile on the 64/48/32-row lists, and every list
+GEMM runs the op's optimistic dequant: a fast_dequant kernel (one HFMA2 per
+bf16x2, exact while every scale of a tile is <= 2^-5) that lists the tiles it
+could not compute exactly in a per-GEMM ``redo`` area, then the regular kernel
+on just those tiles (it exits at once when none are listed).  The redo area
+(one row per list GEMM, its count zeroed on the device per call) is allocated
+in ``warmup``; without it (e.g. a larger call during a capture) the regular
+kernels alone run.  The op's fp32 reduction scratch is allocated in
+``warmup`` too; without the library, the op or the scratch the released
 kernels run with ``THREAD_CFG``.
 
 CUDA GRAPHS.  No host sync and no per-call allocation: the list buffers are
@@ -85,13 +92,24 @@ CLAMP_LIMIT = 10.0
 THREAD_CFG = {64: (64, 256, 1)}
 
 # Compiled tiles (prefill_tile_gemm): N -> (switch, {"w13": table, "w2": table}),
-# tables as THREAD_CFG.  N=2048 (PP4 whole experts) has none yet.
+# tables as THREAD_CFG.
 TILE_TABLES = {
     N_GATE_TP4: ("VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED", {
         "w13": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
         "w2": {64: (64, 256, 2), 48: (64, 256, 2), 32: (64, 256, 2)},
     }),
+    N_GATE: ("VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED", {
+        "w13": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
+        "w2": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
+    }),
 }
+# Widths whose list GEMMs run the optimistic fast dequant with a redo area.
+REDO_N = (N_GATE,)
+# Redo areas per device: [one row per list GEMM (w13 and w2 per block size),
+# count + listed tiles].
+_TILE_REDO: dict = {}
+_SMS: dict = {}
+MAX_BLOCKS_PER_SM = 4
 # fp32 reduction scratch of prefill_tile_gemm per device: Marlin needs at most
 # sms * 4 blocks * moe_block_size (64) * thread_n floats; sized for thread_n 512.
 _TILE_SCRATCH: dict = {}
@@ -157,6 +175,42 @@ def _tile_scratch(device: torch.device, create: bool):
         buf = torch.empty(sms * 4 * 64 * _TILE_MAX_N, dtype=torch.float32,
                           device=device)
         _TILE_SCRATCH[key] = buf
+    return buf
+
+
+def _sms(device: torch.device) -> int:
+    key = str(device)
+    n = _SMS.get(key)
+    if n is None:
+        n = torch.cuda.get_device_properties(device).multi_processor_count
+        _SMS[key] = n
+    return n
+
+
+def _redo_len(rows: int, E: int, sms: int) -> int:
+    """One redo row: the count plus one entry per listed slice; at most every
+    m-n tile (16-row blocks, thread_n >= 64: <= 64 n-tiles at N, K <= 4096)
+    plus one per CTA.  The op checks its own bound against the row length."""
+    blocks = (rows + 16 * E) // 16 + 1
+    return 1 + blocks * 64 + sms * MAX_BLOCKS_PER_SM
+
+
+def _tile_redo(device: torch.device, rows: int, E: int, create: bool):
+    """The redo area for calls of up to ``rows`` routed rows, or None when
+    it would have to be (re)allocated and ``create`` is False."""
+    from vllm.ampere_prefill.moe_split_align import SIZES
+
+    key = str(device)
+    need = _redo_len(rows, E, _sms(device))
+    buf = _TILE_REDO.get(key)
+    if buf is not None and buf.size(1) >= need:
+        return buf
+    if not create:
+        return None
+    if buf is not None:
+        _RETIRED.append(buf)      # a captured graph may still point at it
+    buf = torch.empty(2 * len(SIZES), need, dtype=torch.int32, device=device)
+    _TILE_REDO[key] = buf
     return buf
 
 
@@ -276,14 +330,28 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
         "for M >= %d.", "PP" if w2.size(1) * 16 == N_GATE else "TP4",
         flag, min_tokens)
     N = w2.size(1) * 16
+    capturing = torch.cuda.is_current_stream_capturing()
     op, tables, c_tmp, why_not = compiled_tiles(
-        N, hidden_states.device, create=not torch.cuda.is_current_stream_capturing())
+        N, hidden_states.device, create=not capturing)
     if op is not None:
         logger.info_once(
             "Marlin MoE prefill compiled tiles active (%s, N=%d): w13 %s, w2 %s "
             "by block-list size; other lists Marlin's own choice.",
             TILE_TABLES[N][0], N, str(tables["w13"]), str(tables["w2"]))
-        compiled = (op, tables, c_tmp)
+        redo = None
+        if N in REDO_N:
+            redo = _tile_redo(hidden_states.device, rows, w1.size(0),
+                              create=not capturing)
+            if redo is None:
+                logger.info_once(
+                    "Marlin MoE prefill fast dequant: no redo area for %d rows "
+                    "during a graph capture; the regular kernels run.", rows)
+            else:
+                logger.info_once(
+                    "Marlin MoE prefill fast dequant active (%s, N=%d): one-HFMA2 "
+                    "dequant, tiles with a scale above 2^-5 recomputed by the "
+                    "regular kernel.", TILE_TABLES[N][0], N)
+        compiled = (op, tables, c_tmp, redo)
     else:
         if why_not is not None:
             logger.info_once("%s; using the released Marlin kernels.", why_not)
@@ -299,7 +367,8 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     """The split path. Workspaces as ``MarlinExperts.apply`` passes them to
     ``fused_marlin_moe`` (workspace2 holds w13's and w2's outputs, workspace13
     the activation). ``compiled`` = (prefill_tile_gemm, {"w13", "w2"} tables,
-    c_tmp) runs the list GEMMs on the compiled tiles instead."""
+    c_tmp, redo or None) runs the list GEMMs on the compiled tiles instead;
+    with a redo area every list GEMM runs the optimistic fast dequant."""
     from vllm.ampere_prefill.moe_split_align import split_align
     from vllm.model_executor.layers.fused_moe.utils import _resize_cache
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -321,18 +390,23 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
 
     lists = split_align(topk_ids, E, buf)
     if compiled is not None:
-        op, tables, c_tmp = compiled
-        for bs, sorted_ids, expert_ids, ntpp in lists:
+        op, tables, c_tmp, redo = compiled
+        nl = len(lists)
+        if redo is not None:
+            redo[:, 0].zero_()       # per-GEMM tile counts (kernel.h)
+        for i, (bs, sorted_ids, expert_ids, ntpp) in enumerate(lists):
             op(hidden_states, c1, w1, None, layer.w1_scale, None, None, None,
                workspace, sorted_ids, expert_ids, ntpp, topk_weights, bs, topk,
                False, qt.id, M, 2 * N, K, False, True, False,
-               *_thread_cfg(bs, 2 * N, K, tables["w13"]), c_tmp)
+               *_thread_cfg(bs, 2 * N, K, tables["w13"]), c_tmp,
+               None if redo is None else redo[i])
         layer.activation(activation, c2, c1, topk_ids=topk_ids, expert_map=None)
-        for bs, sorted_ids, expert_ids, ntpp in lists:
+        for i, (bs, sorted_ids, expert_ids, ntpp) in enumerate(lists):
             op(c2, c3, w2, None, layer.w2_scale, None, None, None,
                workspace, sorted_ids, expert_ids, ntpp, topk_weights, bs, 1,
                True, qt.id, rows, K, N, False, True, False,
-               *_thread_cfg(bs, K, N, tables["w2"]), c_tmp)
+               *_thread_cfg(bs, K, N, tables["w2"]), c_tmp,
+               None if redo is None else redo[nl + i])
         layer.moe_sum(c3.view(M, topk, K), output, topk_ids, None)
         return
     for bs, sorted_ids, expert_ids, ntpp in lists:
@@ -375,6 +449,8 @@ def warmup(device, num_experts: int, max_tokens: int, topk: int,
             op, _, _, why = compiled_tiles(N, device, create=True)
             if why is not None:
                 logger.info_once("%s; using the released Marlin kernels.", why)
+            if op is not None and N in REDO_N:
+                _tile_redo(device, max_tokens * topk, num_experts, create=True)
         torch.cuda.synchronize(device)
 
 

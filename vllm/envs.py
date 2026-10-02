@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_TP4_MARLIN_PREFILL: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED: bool = True
+    VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED: bool = True
     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
     VLLM_GLM5_MARLIN_PREFILL_CUDA: str = ""
     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
@@ -2191,6 +2192,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default; 0 is the kill switch (released split path unchanged).
     "VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED": lambda: bool(
         int(os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED", "1"))
+    ),
+    # With VLLM_GLM5_PP_MARLIN_PREFILL: run the split-list Marlin GEMMs of the
+    # whole-expert (N=2048) prefill through the optional library's
+    # prefill_tile_gemm with the PP tile table of
+    # vllm/ampere_prefill/pp_marlin_prefill.py ((64,512) tiles for the
+    # 64/48/32-row lists in both GEMMs) and the optimistic fast dequant (tiles
+    # with a scale above 2^-5 recomputed by the regular kernel). Without the
+    # library or its op, the released kernels run. On by default; 0 is the
+    # kill switch (released split path unchanged).
+    "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": lambda: bool(
+        int(os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED", "1"))
     ),
     # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
     # requires vllm._ampere_marlin_C; startup fails if it is missing or
