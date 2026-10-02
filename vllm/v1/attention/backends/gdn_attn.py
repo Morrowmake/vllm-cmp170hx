@@ -582,7 +582,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             uniform_spec_sequence_length=uniform_spec_sequence_length,
             spec_max_query_len=(
                 min(int(m.max_query_len), self.num_spec + 1)
-                if num_spec_decodes > 0
+                if num_spec_decodes > 0 and getattr(m, "max_query_len", None)
                 else None
             ),
             nums_dict=nums_dict,
