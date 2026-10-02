@@ -180,10 +180,12 @@ def _gpu_ok():
 
 
 def _case(M, seed, dev="cuda"):
-    g = torch.Generator(device=dev).manual_seed(seed)
+    # Inputs come from the CPU generator: CUDA randn sizes its grid from the
+    # SM count, so seeded CUDA inputs differ between GPUs (and SM overrides).
+    g = torch.Generator().manual_seed(seed)
 
     def rn(*shape, mul=1.0):
-        return torch.randn(*shape, generator=g, device=dev) * mul
+        return (torch.randn(*shape, generator=g) * mul).to(dev)
 
     return dict(
         x=rn(M, HIDDEN).to(torch.bfloat16),
@@ -234,6 +236,13 @@ def _ref64(c):
 def _err(a, b):
     d = (a.to(torch.float64) - b.to(torch.float64)).abs()
     return float(d.max()), float(d.mean())
+
+
+def _bf16_ulps(a, ref):
+    """Max |a - ref| in units of one bf16 ulp of ref (normal range)."""
+    r = ref.to(torch.float64).abs().clamp_min(2.0 ** -126)
+    ulp = torch.exp2(torch.floor(torch.log2(r)) - 7)
+    return float(((a.to(torch.float64) - ref.to(torch.float64)).abs() / ulp).max())
 
 
 def _band(t, bits):
@@ -289,8 +298,8 @@ def _case_outliers(M, seed, dev="cuda"):
     positions ~1e3 larger (real residual streams reach ~5e3 there).  This is
     where the accumulation of the 24 mixes loses precision if it truncates."""
     c = _case(M, seed, dev)
-    g = torch.Generator(device=dev).manual_seed(seed + 7)
-    idx = torch.randint(0, HIDDEN, (16,), generator=g, device=dev)
+    g = torch.Generator().manual_seed(seed + 7)
+    idx = torch.randint(0, HIDDEN, (16,), generator=g).to(dev)
     res = c["residual"].float()
     res[:, :, idx] *= 1000.0
     c["residual"] = res.to(torch.bfloat16)
@@ -303,12 +312,16 @@ def test_gpu_accuracy_vs_tilelang_no_floor():
     7 token counts x 2 input kinds x 3 seeds, mean error <= 1.2x TileLang's and
     max error <= 1.25x TileLang's on post_mix, comb_mix and layer_input, and
     residual_cur bitwise equal to TileLang's.  (A per-case one-ulp floor let a
-    2.8x mean-error regression on the fp32 mixes through.)"""
+    2.8x mean-error regression on the fp32 mixes through.)  layer_input is a bf16
+    output whose fp64 reference is itself rounded to bf16, so its max error is
+    counted in bf16 ulps of the reference and may reach one ulp: a max of one ulp
+    at a larger magnitude than TileLang's worst element is not a regression."""
     from vllm.ampere_decode import mhc_decode_v2
     from vllm.model_executor.kernels.mhc import tilelang as tlmod
     env = _Env()
     ms = (1, 4, 8, 16, 17, 25, 32)
     sums = {i: [0.0, 0.0, 0.0, 0.0] for i in (1, 2, 3)}  # got mean, tl mean, got max, tl max
+    ulps = [0.0, 0.0]  # layer_input max error in bf16 ulps: got, tl
     try:
         mhc_decode_v2.warmup(ms)
         for M in ms:
@@ -330,12 +343,16 @@ def test_gpu_accuracy_vs_tilelang_no_floor():
                         s[1] += t_mean
                         s[2] = max(s[2], g_max)
                         s[3] = max(s[3], t_max)
+                    ulps[0] = max(ulps[0], _bf16_ulps(got[3], ref[3]))
+                    ulps[1] = max(ulps[1], _bf16_ulps(tl_out[3], ref[3]))
     finally:
         _restore(env)
     for i, name in ((1, "post_mix"), (2, "comb_mix"), (3, "layer_input")):
         gm, tm, gx, tx = sums[i]
         assert gm <= 1.2 * tm, (name, "mean", gm / tm)
-        assert gx <= 1.25 * tx, (name, "max", gx / tx)
+        if i < 3:
+            assert gx <= 1.25 * tx, (name, "max", gx / tx)
+    assert ulps[0] <= max(1.25 * ulps[1], 1.0), ("layer_input", "max ulps", ulps)
 
 
 @pytest.mark.skipif(not _gpu_ok(), reason="needs an sm_80 GPU")
