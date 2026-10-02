@@ -63,6 +63,8 @@ def _build_shard_plan_kernel(
     local_expanded_idx_mapping_ptr,
     local_expanded_local_pos_ptr,
     local_seq_lens_ptr,
+    draft_skip_mask_ptr,
+    local_draft_skip_mask_ptr,
     num_reqs,
     local_logits_start,
     max_num_reqs_per_rank,
@@ -140,6 +142,18 @@ def _build_shard_plan_kernel(
             mask=logit_mask,
         )
         tl.store(local_seq_lens_ptr + local_req_idx, tl.load(seq_lens_ptr + req_idx))
+        if draft_skip_mask_ptr is not None:
+            source_start = tl.load(cu_num_logits_ptr + req_idx)
+            skip = tl.load(
+                draft_skip_mask_ptr + source_start + logit_block,
+                mask=logit_mask,
+                other=False,
+            )
+            tl.store(
+                local_draft_skip_mask_ptr + local_start + logit_block,
+                skip,
+                mask=logit_mask,
+            )
 
 
 class BatchSharder:
@@ -229,6 +243,11 @@ class BatchSharder:
         local_seq_lens = torch.empty(
             num_local_reqs, dtype=torch.int32, device=self.device
         )
+        local_draft_skip_mask = (
+            torch.empty(num_local_logits, dtype=torch.bool, device=self.device)
+            if input_batch.draft_skip_mask is not None
+            else None
+        )
         if num_reqs > 0:
             _build_shard_plan_kernel[(num_reqs,)](
                 input_batch.idx_mapping,
@@ -243,6 +262,8 @@ class BatchSharder:
                 local_expanded_idx_mapping,
                 local_expanded_local_pos,
                 local_seq_lens,
+                input_batch.draft_skip_mask,
+                local_draft_skip_mask,
                 num_reqs,
                 local_logits_start,
                 max_num_reqs_per_rank,
@@ -274,6 +295,7 @@ class BatchSharder:
             seq_lens=local_seq_lens,
             seq_lens_cpu_upper_bound=local_seq_lens_cpu_upper_bound,
             logits_indices=local_logits_indices,
+            draft_skip_mask=local_draft_skip_mask,
             cu_num_logits=local_cu_num_logits,
             cu_num_logits_np=local_cu_num_logits_np,
             num_draft_tokens=num_draft_tokens,

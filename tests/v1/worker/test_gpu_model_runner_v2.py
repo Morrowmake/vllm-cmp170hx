@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +24,239 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def _check_draft_skip_warmup(sweep=False):
+    """Interpret the real input and shard kernels on warmup scheduler outputs."""
+    from unittest.mock import patch
+
+    from tests.v1.worker.test_gpu_warmup_blocks import _attention_group, _make_runner
+    from vllm.v1.worker.gpu.sample import batch_shard
+    from vllm.v1.worker.gpu.spec_decode.draft_confidence import (
+        DraftConfidence,
+        FrozenCoefficients,
+    )
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+    from vllm.v1.worker.gpu.warmup import (
+        run_mixed_prefill_decode_warmup,
+        warmup_kernels,
+    )
+
+    def h2d(values, device=None, dtype=None, out=None):
+        tensor = torch.as_tensor(values, dtype=dtype)
+        return out.copy_(tensor) if out is not None else tensor
+
+    cases = (
+        [
+            (width, nreq, pad, skip)
+            for width in (1, 3, 7)
+            for nreq in (1, 8)
+            for pad in (0, 16)
+            for skip in (True, False)
+        ]
+        if sweep
+        else [(7, 8, 0, True)]
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(model_runner_module, "async_tensor_h2d", h2d)
+        mp.setattr(torch.accelerator, "synchronize", lambda: None)
+        mp.setenv("VLLM_GLM5_MOE_MASK_PADDING", "1")
+        mp.setenv("VLLM_MOE_SKIP_PADDING", "0")
+
+        def check_case(width, nreq, pad, skip):
+            mp.setenv("VLLM_GLM5_DFLASH_SKIP", str(int(skip)))
+            warm_runner = _make_runner([_attention_group()], width + 1, width)
+            warm_runner.scheduler_config.max_num_seqs = nreq
+            warm_runner.max_num_reqs = 8
+            confidence = DraftConfidence(
+                8,
+                width,
+                "cpu",
+                FrozenCoefficients(1.0, (0.0,) * width, 0.3) if skip else None,
+            )
+            runner = GPUModelRunner.__new__(GPUModelRunner)
+            runner.device = torch.device("cpu")
+            runner.max_num_reqs = 8
+            runner.decode_query_len = width + 1
+            runner.input_buffers = InputBuffers(8, 256, runner.device)
+            runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+            runner.model_config = SimpleNamespace(rswa_window=None)
+            runner.adaptive_verification = None
+            runner.fast_prefill = None
+            runner.pcp_manager = None
+            runner.pp_handler = None
+            runner.speculator = SimpleNamespace(draft_confidence=confidence)
+            runner.req_states = SimpleNamespace(
+                num_computed_tokens_np=np.zeros(8, dtype=np.int32),
+                num_computed_tokens=SimpleNamespace(
+                    gpu=torch.zeros(8, dtype=torch.int32)
+                ),
+                prefill_len=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
+                all_token_ids=SimpleNamespace(gpu=torch.arange(128).repeat(8, 1)),
+                next_prefill_tokens=torch.zeros(8, 8, dtype=torch.int32),
+                last_sampled_tokens=torch.arange(8, dtype=torch.int32) + 20,
+                draft_tokens=torch.arange(8 * width, dtype=torch.int32).view(8, width),
+            )
+            slots = {}
+            current = None
+            steps = []
+
+            def execute(output):
+                nonlocal current
+                for req in output.scheduled_new_reqs:
+                    slot = slots.setdefault(req.req_id, len(slots))
+                    runner.req_states.prefill_len.gpu[slot] = len(req.prompt_token_ids)
+                cached = output.scheduled_cached_reqs
+                for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+                    slot = slots[req_id]
+                    runner.req_states.num_computed_tokens_np[slot] = computed
+                    runner.req_states.num_computed_tokens.gpu[slot] = computed
+                if not output.num_scheduled_tokens:
+                    return
+                ids = list(output.num_scheduled_tokens)
+                mapping = np.array([slots[r] for r in ids], dtype=np.int32)
+                computed = runner.req_states.num_computed_tokens_np[mapping]
+                prefill = runner.req_states.prefill_len.gpu[mapping].numpy()
+                prefilling = computed < prefill
+                state = SimpleNamespace(
+                    num_tokens=output.total_num_scheduled_tokens,
+                    req_ids=ids,
+                    num_scheduled_tokens=np.array(
+                        list(output.num_scheduled_tokens.values()), dtype=np.int32
+                    ),
+                    idx_mapping_np=mapping,
+                    has_prefill=bool(prefilling.any()),
+                    prefill_len_np=prefill,
+                    num_computed_prefill_tokens_np=np.minimum(computed, prefill),
+                    is_prefilling_np=prefilling,
+                )
+                # Distinct caps expose a wrong contiguous slice or owner ordering.
+                confidence.positions[mapping, 0] = torch.from_numpy(computed + 1).long()
+                confidence.caps[mapping] = torch.from_numpy(mapping % (width + 1))
+                if sweep:
+                    # One slot carries a prediction from an earlier prefix.
+                    confidence.positions[mapping[-1], 0] -= 1
+                desc = SimpleNamespace(
+                    num_tokens=state.num_tokens + pad, num_reqs=8 if pad else len(ids)
+                )
+                current = runner.prepare_inputs(output, state, desc, 0)
+                expected = []
+                for slot, length, is_prefill in zip(
+                    mapping, state.num_scheduled_tokens, prefilling
+                ):
+                    valid = (
+                        skip and not is_prefill and not (sweep and slot == mapping[-1])
+                    )
+                    expected.extend(
+                        valid and row > slot % (width + 1) for row in range(length)
+                    )
+                token_mask = torch.tensor(expected, dtype=torch.bool)
+                if skip:
+                    assert torch.equal(
+                        current.is_padding[: state.num_tokens], token_mask
+                    )
+                    assert current.is_padding[state.num_tokens :].all()
+                    assert torch.equal(
+                        current.draft_skip_mask, token_mask[current.logits_indices]
+                    )
+                steps.append(current.logits_indices.numel())
+
+            def sample(_grammar):
+                assert current is not None
+                if not sweep and not current.num_draft_tokens:
+                    return
+                global_mask = current.draft_skip_mask
+                for rank in range(4):
+                    group = SimpleNamespace(rank_in_group=rank, world_size=4)
+                    with patch.object(batch_shard, "get_tp_group", return_value=group):
+                        sharder = batch_shard.BatchSharder(8, width + 1, runner.device)
+                    local, _, _, _ = sharder.shard_sampler_inputs(current, None)
+                    owned = np.flatnonzero(current.idx_mapping_np % 4 == rank)
+                    rows = [
+                        i
+                        for req in owned
+                        for i in range(
+                            current.cu_num_logits_np[req],
+                            current.cu_num_logits_np[req + 1],
+                        )
+                    ]
+                    expected_mask = global_mask[rows] if skip else None
+                    assert torch.equal(
+                        local.logits_indices, current.logits_indices[rows]
+                    )
+                    expected = current.input_ids[local.logits_indices].clone()
+                    if skip:
+                        expected.masked_fill_(expected_mask, -1)
+
+                    def verify(
+                        _logits,
+                        _batch,
+                        _draft_logits,
+                        proposals,
+                        *_args,
+                        expected=expected,
+                    ):
+                        assert torch.equal(proposals, expected)
+                        return (
+                            torch.zeros(_batch.num_reqs, width + 1, dtype=torch.int64),
+                            torch.ones(_batch.num_reqs, dtype=torch.int32),
+                            None,
+                        )
+
+                    if local.num_draft_tokens:
+                        sampler = RejectionSampler.__new__(RejectionSampler)
+                        sampler.sampler = SimpleNamespace(
+                            compute_nans=False,
+                            sampling_states=SimpleNamespace(
+                                max_num_logprobs=lambda _: 0
+                            ),
+                            req_states=runner.req_states,
+                        )
+                        sampler._verify_in_chunks = verify
+                        sampler(torch.zeros(local.logits_indices.numel(), 64), local)
+                    if skip:
+                        assert local.draft_skip_mask.shape == local.logits_indices.shape
+                        assert torch.equal(local.draft_skip_mask, expected_mask)
+                    else:
+                        assert local.draft_skip_mask is None
+                assert current.draft_skip_mask is global_mask
+
+            warmup_kernels(warm_runner, execute, sample)
+            assert steps[1] == nreq * (width + 1)
+            if sweep:
+                slots.clear()
+                runner.req_states.num_computed_tokens_np.fill(0)
+                runner.req_states.num_computed_tokens.gpu.zero_()
+                assert run_mixed_prefill_decode_warmup(warm_runner, execute, sample, 32)
+
+        for case in cases:
+            check_case(*case)
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize(
+    "sweep", [False, True], ids=["warmup_tp4", "batch_shape_sweep"]
+)
+def test_draft_skip_mask_follows_sampler_logits_on_cpu(sweep):
+    """Warmup's actual scheduler batches must survive TP-local sampling."""
+    code = (
+        "import runpy; "
+        f"check = runpy.run_path({__file__!r})['_check_draft_skip_warmup']; "
+        f"check(sweep={sweep!r})"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=dict(
+            os.environ,
+            TRITON_INTERPRET="1",
+            CUDA_VISIBLE_DEVICES="",
+            VLLM_TARGET_DEVICE="cpu",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _prepare_padding_batch(monkeypatch, lengths, padding, confidence=None):
