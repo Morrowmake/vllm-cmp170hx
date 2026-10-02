@@ -9,6 +9,7 @@ import torch
 
 from tests.v1.core.prefix_cache.test_mamba_eagle_resume_checkpoint import _prefill
 from tests.v1.core.test_prefix_caching import make_request
+from tests.v1.core.utils import create_scheduler, mock_kv
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import init_none_hash
@@ -20,6 +21,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
 
 pytestmark = pytest.mark.cpu_test
 BLOCK = 1152
@@ -262,3 +266,156 @@ def test_scheduler_reads_boundary_flag_and_logs_gate(
         expected = BOUNDARY if active else BOUNDARY - BLOCK
         assert expected in ends
         assert scheduler.kv_cache_manager.get_computed_blocks(warm)[1] == expected
+
+
+def _boundary_scheduler(monkeypatch, enabled, *, connector=None):
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    monkeypatch.setenv("VLLM_GLM5_DFLASH_BOUNDARY_CACHE", str(int(enabled)))
+    base = create_scheduler(
+        block_size=BLOCK,
+        max_num_batched_tokens=BOUNDARY + 7,
+        max_model_len=8 * BLOCK,
+        enable_prefix_caching=True,
+        num_speculative_tokens=3,
+        use_kv_connector=connector,
+    )
+    spec = base.vllm_config.speculative_config
+    spec.method = "dflash"
+    spec.model = "dflash2"
+    spec.target_model_config = base.vllm_config.model_config
+    spec.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="dflash", architectures=["DFlash2Qwen3ForCausalLM"]
+        )
+    )
+    base.vllm_config.cache_config.mamba_cache_mode = "align"
+    return Scheduler(
+        vllm_config=base.vllm_config,
+        kv_cache_config=_manager().kv_cache_config,
+        block_size=BLOCK,
+        hash_block_size=BLOCK,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base.vllm_config),
+    )
+
+
+def _complete_step(scheduler, out, request, *, finished_recving=None):
+    sampled = (
+        [[7]] if request.num_computed_tokens >= request.num_prompt_tokens else [[]]
+    )
+    scheduler.update_from_output(
+        out,
+        ModelRunnerOutput(
+            req_ids=[request.request_id] if out.num_scheduled_tokens else [],
+            req_id_to_index={request.request_id: 0} if out.num_scheduled_tokens else {},
+            sampled_token_ids=sampled if out.num_scheduled_tokens else [],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=(
+                KVConnectorOutput(finished_recving=finished_recving)
+                if finished_recving
+                else None
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("tail", [1, 2])
+@pytest.mark.parametrize("with_decode", [False, True])
+def test_local_boundary_prompt_tail_matches_cold_shape(
+    monkeypatch, enabled, tail, with_decode
+):
+    """A fresh local hit must not widen the last prompt token into verification."""
+    scheduler = _boundary_scheduler(monkeypatch, enabled)
+    cold = make_request("cold", PREFIX[: BOUNDARY + tail], BLOCK, sha256)
+    scheduler.add_request(cold)
+    cold_steps = []
+    while cold.num_output_tokens == 0:
+        out = scheduler.schedule()
+        cold_steps.append(out.num_scheduled_tokens["cold"])
+        assert "cold" not in out.scheduled_spec_decode_tokens
+        _complete_step(scheduler, out, cold)
+    assert cold_steps == ([BOUNDARY, tail] if enabled else [2 * BLOCK, BLOCK + tail])
+    if with_decode:
+        scheduler.update_draft_token_ids(DraftTokenIds(["cold"], [[9] * 3]))
+    else:
+        scheduler.finish_requests("cold", RequestStatus.FINISHED_ABORTED)
+    warm = make_request("warm", PREFIX[: BOUNDARY + tail], BLOCK, sha256)
+    hit = scheduler.kv_cache_manager.get_computed_blocks(warm)[1]
+    assert hit == (BOUNDARY if enabled else 2 * BLOCK)
+    scheduler.add_request(warm)
+    out = scheduler.schedule()
+    expected = tail if enabled else BLOCK
+    assert out.num_scheduled_tokens["warm"] == expected
+    assert "warm" not in out.scheduled_spec_decode_tokens
+    assert any(req.req_id == "warm" for req in out.scheduled_new_reqs)
+    if with_decode:
+        assert out.scheduled_spec_decode_tokens["cold"] == [9] * 3
+    if not with_decode:
+        _complete_step(scheduler, out, warm)
+        if enabled:
+            scheduler.update_draft_token_ids(DraftTokenIds(["warm"], [[9] * 3]))
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens["warm"] == (4 if enabled else tail)
+        if enabled:
+            assert out.scheduled_spec_decode_tokens["warm"] == [9] * 3
+        else:
+            assert "warm" not in out.scheduled_spec_decode_tokens
+
+
+@pytest.mark.parametrize("has_output", [False, True])
+def test_preempted_local_boundary_request_keeps_padding(monkeypatch, has_output):
+    """Preempted prompt work and decodes retain the upstream resume shape."""
+    scheduler = _boundary_scheduler(monkeypatch, True)
+    prompt_len = BOUNDARY if has_output else BOUNDARY + 1
+    request = make_request("resumed", PREFIX[:prompt_len], BLOCK, sha256)
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens["resumed"] == BOUNDARY
+    _complete_step(scheduler, out, request)
+    assert request.num_output_tokens == int(has_output)
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, timestamp=0.0)
+    out = scheduler.schedule()
+    assert request.num_preemptions == 1
+    assert out.num_scheduled_tokens["resumed"] == 4
+    assert out.scheduled_spec_decode_tokens["resumed"] == [-1] * 3
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("local_hit", [False, True])
+def test_external_boundary_prompt_tail_keeps_padding(monkeypatch, is_async, local_hit):
+    """Neither synchronous loads nor async resumes count as fresh local hits."""
+    scheduler = _boundary_scheduler(
+        monkeypatch, True, connector=mock_kv(matched_tokens=BOUNDARY, is_async=is_async)
+    )
+    if local_hit:
+        # Build a local cache before attaching the mock transfer protocol.
+        with monkeypatch.context() as local:
+            local.setattr(scheduler, "connector", None)
+            seed = make_request("seed", PREFIX[: 2 * BLOCK + 1], BLOCK, sha256)
+            scheduler.add_request(seed)
+            while seed.num_output_tokens == 0:
+                seed_out = scheduler.schedule()
+                _complete_step(scheduler, seed_out, seed)
+            scheduler.finish_requests("seed", RequestStatus.FINISHED_ABORTED)
+        monkeypatch.setattr(
+            scheduler.connector,
+            "get_num_new_matched_tokens",
+            lambda *_: (BLOCK, is_async),
+        )
+    request = make_request("external", PREFIX[: BOUNDARY + 1], BLOCK, sha256)
+    assert scheduler.kv_cache_manager.get_computed_blocks(request)[1] == (
+        2 * BLOCK if local_hit else 0
+    )
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+    if is_async:
+        assert not out.num_scheduled_tokens
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        _complete_step(scheduler, out, request, finished_recving={"external"})
+        out = scheduler.schedule()
+    assert out.num_scheduled_tokens["external"] == 4
+    assert out.scheduled_spec_decode_tokens["external"] == [-1] * 3
