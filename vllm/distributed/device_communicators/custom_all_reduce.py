@@ -412,8 +412,10 @@ class CustomAllreduce:
         logger.info_once(
             "Custom all-reduce flags-in-data two-shot kernel on for bf16 "
             "messages up to %d bytes (VLLM_CUSTOM_ALLREDUCE_FLAGS=1); larger "
-            "messages and other dtypes keep the existing kernel",
+            "messages and other dtypes keep the existing kernel; a peer wait over "
+            "%.0f s (VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S) traps and ends the process",
             self._flags.max_bytes,
+            self._flags.limit_ns / 1e9,
             scope="global",
         )
 

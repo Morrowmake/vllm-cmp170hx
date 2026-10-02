@@ -7,6 +7,7 @@ The bitwise and timing checks against cross_device_reduce_2stage need four
 peer-connected GPUs and run outside pytest; everything here runs without a GPU.
 """
 
+import ctypes
 import logging
 import os
 import re
@@ -228,6 +229,7 @@ def _init_ca(monkeypatch, world_size=4, capability=(8, 0), p2p=True, load_ok=Tru
     class FakeFA:
         def __init__(self, group, device, rank, max_bytes, create, free):
             self.max_bytes = max_bytes
+            self.limit_ns = int(60e9)
             made.append(self)
 
     monkeypatch.setattr(flags, "FlagsAllreduce", FakeFA)
@@ -240,7 +242,7 @@ def test_init_on_banner(monkeypatch, log_capture):
     ca._init_flags(same_node=True)
     assert ca._flags is made[0] and made[0].max_bytes == 131072
     assert any(
-        "flags-in-data two-shot kernel on" in m and "131072" in m
+        "flags-in-data two-shot kernel on" in m and "131072" in m and "60 s" in m
         for m in log_capture.messages
     ), log_capture.messages
 
@@ -293,6 +295,7 @@ def test_kernel_compiles_without_local_memory(tmp_path):
     ).stdout
     assert "STL" not in sass and "LDL" not in sass
     assert "STG.E.128.STRONG.SYS" in sass and "LDG.E.128.STRONG.SYS" in sass
+    assert "BPT.TRAP" in sass  # an overrun traps; it never falls through
 
 
 HOST_TEST = r"""
@@ -376,3 +379,270 @@ def test_jit_build(tmp_path, monkeypatch):
     monkeypatch.setattr(flags, "_MODULE", None)
     m = flags.load_module()
     assert hasattr(m, "all_reduce") and hasattr(m, "fill_sentinel")
+
+
+
+# ------------------------------------------------------------ wait overrun
+def test_wait_limit_env(monkeypatch):
+    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", raising=False)
+    assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S == 60.0
+    assert flags.wait_limit_ns() == 60 * 10**9
+    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "2.5")
+    assert flags.wait_limit_ns() == 2_500_000_000
+    for bad in ("0", "-1"):
+        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", bad)
+        with pytest.raises(ValueError):
+            flags.wait_limit_ns()
+
+
+def test_kernel_source_never_falls_through():
+    src = flags.KERNEL_SRC
+    assert "spin_expired" not in src and "clock64" not in src
+    body = src[src.index("void wait_failed"):]
+    body = body[: body.index("\n}\n")]
+    assert body.rstrip().endswith("__trap();")
+    # the record is published with a system-scope release before anyone traps,
+    # and the trap waits (bounded) for the host acknowledgement
+    assert "st_release_sys_u64(c.err, 1)" in body and "c.err + 11" in body
+    assert "*published == 0u" in body
+    # both waits call it on overrun, with their phase
+    assert "wait_failed(c, 1, peer, waited)" in src
+    assert "wait_failed(c, 2, peer, waited)" in src
+
+
+REC = [1, 2, 0, 41, 1536, 1, 3, 61_000_000_000, 5, 17, 60_000_000_000, 0, 0, 0, 0, 0]
+
+
+def test_describe():
+    assert flags.describe([0] * 16) is None
+    msg = flags.describe(REC)
+    for part in ("timed out on rank 2", "61.0 s", "limit 60.0 s", "call 41",
+                 "stage 0", "1536 packs", "reduce-scatter wait for rank 3",
+                 "block 5, thread 17", "trapped", "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S"):
+        assert part in msg, (part, msg)
+    assert "all-gather" in flags.describe(REC[:5] + [2] + REC[6:])
+
+
+class _FakeModule:
+    """alloc_error_record backed by a plain host buffer."""
+
+    def __init__(self):
+        self.buf = (ctypes.c_int64 * 16)()
+        self.calls = []
+
+    def alloc_error_record(self):
+        a = ctypes.addressof(self.buf)
+        return [a, a + 1]
+
+    def all_reduce(self, *args):
+        self.calls.append(args)
+
+
+def test_error_record_watcher_reports_once():
+    import time
+
+    m = _FakeModule()
+    seen = []
+    exits = []
+    rec = flags.ErrorRecord(m, poll_s=0.01, on_error=seen.append, exit_fn=exits.append)
+    try:
+        time.sleep(0.05)
+        assert seen == []
+        for i, v in enumerate(REC):
+            m.buf[i] = v
+        deadline = time.time() + 5
+        while not seen and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(seen) == 1 and "timed out on rank 2" in seen[0]
+        assert m.buf[flags.ACK_WORD] == 1  # acknowledged after reporting
+        assert exits == [flags.EXIT_CODE]
+        rec.check()  # reported once only
+        assert len(seen) == 1 and exits == [flags.EXIT_CODE]
+    finally:
+        rec.stop()
+
+
+def test_report_logs_before_ack_and_exit(log_capture):
+    """Order matters: message out, then acknowledgement, then exit."""
+    m = _FakeModule()
+    order = []
+    lg = logging.getLogger(flags.__name__)
+    lg.addHandler(log_capture)
+    try:
+        def report(msg):
+            flags._report(msg)
+            order.append(("report", m.buf[flags.ACK_WORD]))
+
+        rec = flags.ErrorRecord(
+            m, poll_s=60, on_error=report,
+            exit_fn=lambda c: order.append(("exit", m.buf[flags.ACK_WORD], c)))
+        for i, v in enumerate(REC):
+            m.buf[i] = v
+        rec.check()
+        rec.stop()
+    finally:
+        lg.removeHandler(log_capture)
+    assert order == [("report", 0), ("exit", 1, flags.EXIT_CODE)]
+    assert any("timed out on rank 2" in x for x in log_capture.messages)
+
+
+def test_all_reduce_passes_limit_and_record(monkeypatch):
+    m = _FakeModule()
+    fa = object.__new__(flags.FlagsAllreduce)
+    fa.module, fa.ptrs, fa.rank, fa.stage_packs = m, [1, 2, 3, 4], 0, 32768
+    fa.epoch = torch.zeros(16, dtype=torch.int32)
+    fa.limit_ns = 1234
+    seen = []
+    fa.errors = flags.ErrorRecord(m, poll_s=60, on_error=seen.append,
+                                  exit_fn=lambda c: None)
+    fa._calls = 0
+    monkeypatch.setattr(flags.torch.cuda, "is_current_stream_capturing", lambda: False)
+    try:
+        x = torch.zeros(4096, dtype=torch.bfloat16)
+        fa.all_reduce(x)
+        assert m.calls[0][-2:] == (1234, fa.errors.dev_ptr)
+        m.buf[0], m.buf[1] = 1, 3  # a record appears: the periodic check reports it
+        for _ in range(flags.CHECK_EVERY - 1):
+            fa.all_reduce(x)
+        assert len(seen) == 1 and "rank 3" in seen[0]
+    finally:
+        fa.errors.stop()
+
+
+# CPU model of the overrun path: four ranks run the two-shot protocol with a
+# global clock; a rank that never pushes (dead) or pushes late (slow) is
+# modelled. Every wait is bounded by LIMIT ticks and an overrun ends that rank
+# (trap). Claims: with a dead rank, every live rank traps and no rank returns
+# from the call; with a late rank inside the limit, every rank returns the
+# exact sums and none traps.
+LIMIT = 50
+
+
+def _model(dead=None, late=None, delay=0, size=7, seed=0):
+    import random
+
+    rng = random.Random(seed)
+    R = 4
+    part = size // R
+    L = size - 3 * part
+    owner_len = [part, part, part, L]
+    x = [[rng.randint(-9, 9) for _ in range(size)] for _ in range(R)]
+    rs = [dict() for _ in range(R)]  # (src, idx) -> value
+    ag = [dict() for _ in range(R)]  # (q, idx) -> value
+    out = [[None] * size for _ in range(R)]
+    state = {r: "push" for r in range(R)}
+    waited = {r: 0 for r in range(R)}
+    clock = 0
+    trapped, returned = set(), set()
+    inflight = []
+
+    def start_time(r):
+        return delay if r == late else 0
+
+    while len(trapped) + len(returned) < R - (1 if dead is not None else 0):
+        clock += 1
+        if clock > 10_000:
+            raise AssertionError("model did not settle")
+        for r in range(R):
+            if r == dead or r in trapped or r in returned or clock < start_time(r):
+                continue
+            if state[r] == "push":
+                for q in range(R):
+                    if q != r:
+                        for i in range(owner_len[q]):
+                            inflight.append((clock + rng.randint(1, 5), "rs", q, (r, i), x[r][q * part + i]))
+                state[r] = "reduce"
+            elif state[r] == "reduce":
+                need = [(s, i) for s in range(R) if s != r for i in range(owner_len[r])]
+                if all(k in rs[r] for k in need):
+                    for i in range(owner_len[r]):
+                        v = sum(x[r][r * part + i] if s == r else rs[r][(s, i)] for s in range(R))
+                        out[r][r * part + i] = v
+                        for q in range(R):
+                            if q != r:
+                                inflight.append((clock + rng.randint(1, 5), "ag", q, (r, i), v))
+                    state[r], waited[r] = "gather", 0
+                else:
+                    waited[r] += 1
+                    if waited[r] > LIMIT:
+                        trapped.add(r)
+            elif state[r] == "gather":
+                need = [(q, i) for q in range(R) if q != r for i in range(owner_len[q])]
+                if all(k in ag[r] for k in need):
+                    for q, i in need:
+                        out[r][q * part + i] = ag[r][(q, i)]
+                    returned.add(r)
+                else:
+                    waited[r] += 1
+                    if waited[r] > LIMIT:
+                        trapped.add(r)
+        for item in [t for t in inflight if t[0] <= clock]:
+            inflight.remove(item)
+            _, kind, dst, key, v = item
+            (rs if kind == "rs" else ag)[dst][key] = v
+    exact = [sum(x[r][j] for r in range(R)) for j in range(size)]
+    return trapped, returned, out, exact
+
+
+@pytest.mark.parametrize("dead", [0, 1, 2, 3])
+@pytest.mark.parametrize("size", [1, 5, 8, 13])
+def test_model_dead_rank_traps_everyone(dead, size):
+    for seed in range(20):
+        trapped, returned, _, _ = _model(dead=dead, size=size, seed=seed)
+        assert returned == set(), "a rank returned without a peer's data"
+        assert trapped == set(range(4)) - {dead}
+
+
+@pytest.mark.parametrize("late", [0, 3])
+def test_model_late_rank_within_limit_is_exact(late):
+    for seed in range(20):
+        trapped, returned, out, exact = _model(late=late, delay=LIMIT // 2, seed=seed)
+        assert trapped == set() and returned == set(range(4))
+        assert all(o == exact for o in out)
+
+
+def test_model_late_rank_beyond_limit_traps():
+    trapped, returned, _, _ = _model(late=2, delay=4 * LIMIT)
+    assert returned == set() and {0, 1, 3} <= trapped
+
+
+# ------------------------------------------------------------ GPU: forced overrun
+OVERRUN_CHILD = r"""
+import sys, torch
+from vllm.distributed.device_communicators import custom_all_reduce_flags as f
+m = f.load_module()
+rec = f.ErrorRecord(m)
+size_bytes = 8192
+stage = 8 * f.largest_part_packs(262144)
+bufs = [torch.full((3 * stage * 16,), 0xFF, dtype=torch.uint8, device="cuda") for _ in range(4)]
+epoch = torch.zeros(16, dtype=torch.int32, device="cuda")
+x = torch.randn(size_bytes // 2, device="cuda").bfloat16()
+out = torch.empty_like(x)
+# one card plays rank 1 of 4; ranks 0, 2, 3 never push: every wait must overrun
+m.all_reduce(x, out, [b.data_ptr() for b in bufs], epoch.data_ptr(), 1, stage,
+             256, 36, f.wait_limit_ns(), rec.dev_ptr)
+torch.cuda.synchronize()
+print("RESULT RETURNED", out.float().sum().item(), flush=True)
+"""
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
+    reason="needs an sm_80 GPU",
+)
+def test_gpu_overrun_kills_process_with_message(tmp_path):
+    import sys
+    import time
+
+    script = tmp_path / "child.py"
+    script.write_text(OVERRUN_CHILD)
+    env = dict(os.environ, VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S="2")
+    t0 = time.time()
+    r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                       env=env, timeout=600)
+    took = time.time() - t0
+    assert "RESULT RETURNED" not in r.stdout
+    assert r.returncode != 0
+    assert "flags-in-data wait timed out on rank 1" in r.stderr, r.stderr[-2000:]
+    assert "limit 2.0 s" in r.stderr and "wait for rank 0" in r.stderr
+    print("child exit", r.returncode, "after %.1f s" % took)
