@@ -282,3 +282,42 @@ def test_metadata_without_a_known_pool_fails(monkeypatch):
     cfg2 = SimpleNamespace(compilation_config=SimpleNamespace(
         static_forward_context={"model.layers.0.self_attn": layer}))
     sic.check_attn_metadata({"model.layers.0.self_attn": m}, cfg2)
+
+
+
+def _gdn_prefill_md(idx, cu):
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    return GDNAttentionMetadata(
+        num_prefills=len(cu) - 1, num_prefill_tokens=cu[-1], num_decodes=0,
+        num_decode_tokens=0, num_spec_decodes=0, num_spec_decode_tokens=0,
+        num_actual_tokens=cu[-1], has_initial_state=torch.zeros(len(idx), dtype=torch.bool),
+        non_spec_state_indices_tensor=t(idx), non_spec_query_start_loc=t(cu))
+
+
+def _bind(layer, rows):
+    layer.kv_cache = (torch.zeros(rows, 2, 3), torch.zeros(rows, 2, 2, 2))
+
+
+def test_pool_follows_rebinding_profile_then_serving():
+    """Start-up binds a small profiling pool, then the serving pool: each check
+    uses the pool bound at that moment (the warm-up batch of the PP4 boot:
+    slots 3..311 against a 415-block serving pool)."""
+    name = "language_model.model.layers.6.self_attn"
+    layer = SimpleNamespace()
+    cfg = SimpleNamespace(compilation_config=SimpleNamespace(
+        static_forward_context={name: layer}))
+    cu = [0, 9, 18, 27, 36, 45, 54, 63, 72]
+    _bind(layer, 8)
+    # profiling / dummy run: its own small pool and indices inside it
+    sic.check_attn_metadata({name: _gdn_prefill_md([0] * 8, cu)}, cfg)
+    _bind(layer, 415)
+    warm = [3, 47, 91, 135, 179, 223, 267, 311]
+    sic.check_attn_metadata({name: _gdn_prefill_md(warm, cu)}, cfg)
+    # the bound is still exact: one past the serving pool fails
+    with pytest.raises(sic.StateIndexError, match="outside"):
+        sic.check_attn_metadata({name: _gdn_prefill_md(warm[:-1] + [415], cu)}, cfg)
+    # and the profiling pool still rejects serving indices while it is bound
+    _bind(layer, 8)
+    with pytest.raises(sic.StateIndexError, match="outside"):
+        sic.check_attn_metadata({name: _gdn_prefill_md(warm, cu)}, cfg)
