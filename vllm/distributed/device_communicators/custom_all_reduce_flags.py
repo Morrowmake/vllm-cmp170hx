@@ -49,18 +49,28 @@ and other dtypes keep the incumbent kernel.
 
 Safety
 ------
-Every wait is bounded by a `clock64()` budget; on timeout the thread records
-an error count in the epoch block and gives up on that pack, so a dead peer
-shows up as a wrong result and a non-zero error count, not a wedged GPU.
+A wait never gives up quietly. Every wait is bounded by
+VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S (default 60 s, measured on the GPU's
+global timer, far above any normal skew between ranks). On overrun the
+first timed-out thread writes rank, call, stage, size, phase, the awaited
+peer and the wait time into a host-mapped error record and the kernel
+executes a trap, so the CUDA context fails and no partial result is ever
+returned. A host thread polls the record (and it is checked again every 256
+eager calls and at exit): it logs the record and ends the process. The other
+ranks then time out the same way. The incumbent kernel waits without limit.
 
 The extension is compiled on first use with torch's JIT loader and cached
 outside the source tree (VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR, else
 TORCH_EXTENSIONS_DIR, else ~/.cache/vllm/custom_all_reduce_flags).
 """
 
+import atexit
+import ctypes
 import hashlib
 import math
 import os
+import sys
+import threading
 
 import torch
 import torch.distributed as dist
@@ -74,7 +84,8 @@ WORLD_SIZE = 4
 THREADS = 256  # launch rule chosen from a threads x blocks sweep (1..32 rows)
 MAX_BLOCKS = 36
 EPOCH_WORDS = 16
-ERR_WORD = 15
+CHECK_EVERY = 256  # eager calls between host checks of the error record
+EXIT_CODE = 70
 
 KERNEL_SRC = r"""
 #include <cuda_bf16.h>
@@ -85,16 +96,13 @@ namespace arflags {
 constexpr int kRanks = 4;
 constexpr uint32_t kSentinel = 0xFFFFFFFFu;
 constexpr uint32_t kCanonicalPair = 0x7FFF7FFFu;
-#ifndef ARFLAGS_SPIN_BUDGET
-#define ARFLAGS_SPIN_BUDGET 3000000000LL
-#endif
 
 struct __align__(16) Ptrs {
   void* p[kRanks];
 };
 
 // w[0] stage (0..2), w[1] CTAs that read w[0] this call, w[2..4] packs last
-// written into each stage, w[8] calls completed, w[15] wait-budget overruns.
+// written into each stage, w[8] calls completed, w[15] timed-out waits.
 struct __align__(16) Epoch {
   uint32_t w[16];
 };
@@ -150,14 +158,46 @@ AFD uint4 sanitize(uint4 v) {
   return v;
 }
 
-AFD bool spin_expired(long long t0, Epoch* ep) {
-#if ARFLAGS_SPIN_BUDGET > 0
-  if (clock64() - t0 > (long long)ARFLAGS_SPIN_BUDGET) {
-    atomicAdd(&ep->w[15], 1u);
-    return true;
+// Error record in host-mapped memory (int64 words): [0] set, [1] rank,
+// [2] stage, [3] call, [4] size in packs, [5] phase (1 reduce-scatter wait,
+// 2 all-gather wait), [6] awaited peer, [7] waited ns, [8] block, [9] thread,
+// [10] limit ns.
+struct WaitCtx {
+  Epoch* ep;
+  long long* err;
+  unsigned long long limit_ns;
+  int rank;
+  int stage;
+  int size;
+};
+
+AFD unsigned long long now_ns() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// Overrun: record it once (first thread), make it visible to the host, trap.
+// The trap fails the CUDA context, so the caller never sees a partial result.
+__device__ __noinline__ void wait_failed(WaitCtx c, int phase, int peer,
+                                        unsigned long long waited) {
+  if (atomicAdd(&c.ep->w[15], 1u) == 0u) {
+    volatile long long* e = c.err;
+    e[1] = c.rank;
+    e[2] = c.stage;
+    e[3] = c.ep->w[8];
+    e[4] = c.size;
+    e[5] = phase;
+    e[6] = peer;
+    e[7] = (long long)waited;
+    e[8] = blockIdx.x;
+    e[9] = threadIdx.x;
+    e[10] = (long long)c.limit_ns;
+    __threadfence_system();
+    e[0] = 1;
+    __threadfence_system();
   }
-#endif
-  return false;
+  __trap();
 }
 
 // Buffer pointers in registers, selected by static index only (a dynamically
@@ -202,12 +242,12 @@ AFD uint4 reduce_owner_order(const uint4 (&v)[kRanks], int owner) {
 }
 
 AFD void wait3(const uint4* base, int rank_stride, int rank,
-               uint4 (&v)[kRanks], Epoch* ep) {
+               uint4 (&v)[kRanks], const WaitCtx& c) {
   bool ready[kRanks];
 #pragma unroll
   for (int s = 0; s < kRanks; s++) ready[s] = (s == rank);
   int remaining = kRanks - 1;
-  long long t0 = clock64();
+  const unsigned long long t0 = now_ns();
   while (remaining) {
 #pragma unroll
     for (int s = 0; s < kRanks; s++) {
@@ -220,15 +260,25 @@ AFD void wait3(const uint4* base, int rank_stride, int rank,
         }
       }
     }
-    if (remaining && spin_expired(t0, ep)) break;
+    if (remaining) {
+      unsigned long long waited = now_ns() - t0;
+      if (waited > c.limit_ns) {
+        int peer = 0;
+#pragma unroll
+        for (int s = kRanks - 1; s >= 0; s--)
+          if (!ready[s]) peer = s;
+        wait_failed(c, 1, peer, waited);
+      }
+    }
   }
 }
 
-AFD uint4 wait1(const uint4* ptr, Epoch* ep) {
+AFD uint4 wait1(const uint4* ptr, int peer, const WaitCtx& c) {
   uint4 x = ld_volatile16(ptr);
-  long long t0 = clock64();
+  const unsigned long long t0 = now_ns();
   while (dirty(x)) {
-    if (spin_expired(t0, ep)) break;
+    unsigned long long waited = now_ns() - t0;
+    if (waited > c.limit_ns) wait_failed(c, 2, peer, waited);
     x = ld_volatile16(ptr);
   }
   return x;
@@ -239,7 +289,8 @@ AFD uint4 wait1(const uint4* ptr, Epoch* ep) {
 // stage_packs >= 8*L.
 __global__ void __launch_bounds__(512, 1)
     two_shot(Ptrs bufs, const uint4* __restrict__ in, uint4* __restrict__ out,
-             Epoch* ep, int rank, int size, int stage_packs) {
+             Epoch* ep, int rank, int size, int stage_packs,
+             unsigned long long limit_ns, long long* err) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride = gridDim.x * blockDim.x;
   const int stage = ep->w[0];
@@ -248,6 +299,7 @@ __global__ void __launch_bounds__(512, 1)
   __syncthreads();
   if (threadIdx.x == 0) atomicAdd(&ep->w[1], 1u);
   const Regs4 b(bufs);
+  const WaitCtx wc{ep, err, limit_ns, rank, stage, size};
 
   const int part = size / kRanks;
   const int L = part_len(kRanks - 1, size);
@@ -274,7 +326,7 @@ __global__ void __launch_bounds__(512, 1)
   for (int idx = tid; idx < mine; idx += stride) {
     uint4 own = sanitize(in[rank * part + idx]);
     uint4 v[kRanks] = {own, own, own, own};
-    wait3(cur + idx, L, rank, v, ep);
+    wait3(cur + idx, L, rank, v, wc);
     uint4 red = sanitize(reduce_owner_order(v, rank));
     out[rank * part + idx] = red;
 #pragma unroll
@@ -291,7 +343,7 @@ __global__ void __launch_bounds__(512, 1)
     for (int i = 1; i < kRanks; i++) {
       int q = (rank + i) & (kRanks - 1);
       if (idx < part_len(q, size))
-        out[q * part + idx] = wait1(cur + (kRanks + q) * L + idx, ep);
+        out[q * part + idx] = wait1(cur + (kRanks + q) * L + idx, q, wc);
     }
   }
 
@@ -317,12 +369,14 @@ BIND_SRC = r"""
 
 void all_reduce(torch::Tensor inp, torch::Tensor out, std::vector<int64_t> bufs,
                 int64_t epoch_ptr, int64_t rank, int64_t stage_packs,
-                int64_t threads, int64_t max_blocks) {
+                int64_t threads, int64_t max_blocks, int64_t limit_ns,
+                int64_t err_dev_ptr) {
   TORCH_CHECK(inp.scalar_type() == at::kBFloat16 &&
               out.scalar_type() == at::kBFloat16);
   TORCH_CHECK(inp.numel() == out.numel());
   TORCH_CHECK(inp.nbytes() % 16 == 0 && inp.nbytes() > 0);
   TORCH_CHECK(bufs.size() == 4);
+  TORCH_CHECK(limit_ns > 0 && err_dev_ptr != 0);
   int size = static_cast<int>(inp.nbytes() / 16);
   int L = arflags::part_len(3, size);
   TORCH_CHECK(8 * L <= stage_packs, "message larger than the flags buffer");
@@ -335,7 +389,8 @@ void all_reduce(torch::Tensor inp, torch::Tensor out, std::vector<int64_t> bufs,
       p, reinterpret_cast<const uint4*>(inp.data_ptr()),
       reinterpret_cast<uint4*>(out.data_ptr()),
       reinterpret_cast<arflags::Epoch*>(epoch_ptr), static_cast<int>(rank), size,
-      static_cast<int>(stage_packs));
+      static_cast<int>(stage_packs), static_cast<unsigned long long>(limit_ns),
+      reinterpret_cast<long long*>(err_dev_ptr));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -345,9 +400,23 @@ void fill_sentinel(int64_t ptr, int64_t bytes) {
   C10_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// Host-mapped, portable error record (16 int64 words, zeroed). Returns the host
+// address and the device address; never freed (lives as long as the process).
+std::vector<int64_t> alloc_error_record() {
+  void* h = nullptr;
+  C10_CUDA_CHECK(cudaHostAlloc(&h, 16 * sizeof(int64_t),
+                               cudaHostAllocMapped | cudaHostAllocPortable));
+  memset(h, 0, 16 * sizeof(int64_t));
+  void* d = nullptr;
+  C10_CUDA_CHECK(cudaHostGetDevicePointer(&d, h, 0));
+  return {reinterpret_cast<int64_t>(h), reinterpret_cast<int64_t>(d)};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("all_reduce", &all_reduce, "flags-in-data two-shot all-reduce");
   m.def("fill_sentinel", &fill_sentinel, "fill a buffer with the sentinel");
+  m.def("alloc_error_record", &alloc_error_record,
+        "host-mapped error record for timed-out waits");
 }
 """
 
@@ -404,6 +473,74 @@ def load_module():
     return _MODULE
 
 
+def wait_limit_ns() -> int:
+    s = float(envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S)
+    if not s > 0:
+        raise ValueError(f"VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S must be > 0, got {s}")
+    return int(s * 1e9)
+
+
+_PHASES = {1: "reduce-scatter", 2: "all-gather"}
+
+
+def describe(rec) -> str | None:
+    """The error message for a record (sequence of 16 ints), or None if unset."""
+    if not rec[0]:
+        return None
+    return (
+        "Custom all-reduce flags-in-data wait timed out on rank %d after %.1f s "
+        "(limit %.1f s, VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S): call %d, stage %d, "
+        "%d packs, %s wait for rank %d (block %d, thread %d). The kernel trapped "
+        "instead of returning a partial result; rank %d never delivered its data."
+        % (rec[1], rec[7] / 1e9, rec[10] / 1e9, rec[3], rec[2], rec[4],
+           _PHASES.get(rec[5], "?"), rec[6], rec[8], rec[9], rec[6])
+    )
+
+
+class ErrorRecord:
+    """Host-mapped record the kernel fills before it traps, and its watchers.
+
+    A daemon thread polls it (host memory: no CUDA call, works after the
+    context has failed), it is checked again at interpreter exit, and callers
+    may check it. When set, the message is logged and printed and the process
+    ends with EXIT_CODE.
+    """
+
+    def __init__(self, module, poll_s: float = 0.25, on_error=None):
+        self.host_ptr, self.dev_ptr = module.alloc_error_record()
+        self._words = (ctypes.c_int64 * 16).from_address(self.host_ptr)
+        self._on_error = on_error or _die
+        self._stop = threading.Event()
+        self._reported = False
+        self._thread = threading.Thread(
+            target=self._poll, args=(poll_s,), name="flags-ar-watch", daemon=True
+        )
+        self._thread.start()
+        atexit.register(self.check)
+
+    def read(self) -> list[int]:
+        return list(self._words)
+
+    def check(self) -> None:
+        msg = describe(self.read())
+        if msg is not None and not self._reported:
+            self._reported = True
+            self._on_error(msg)
+
+    def _poll(self, poll_s: float) -> None:
+        while not self._stop.wait(poll_s):
+            self.check()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _die(msg: str) -> None:
+    logger.error(msg)
+    print(msg, file=sys.stderr, flush=True)
+    os._exit(EXIT_CODE)
+
+
 def largest_part_packs(nbytes: int) -> int:
     size = nbytes // 16
     return size - 3 * (size // WORLD_SIZE)
@@ -455,6 +592,9 @@ class FlagsAllreduce:
         self.ptrs = create_shared_buffer(self.buffer_bytes, group=group)
         self.module.fill_sentinel(self.ptrs[rank], self.buffer_bytes)
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=device)
+        self.limit_ns = wait_limit_ns()
+        self.errors = ErrorRecord(self.module)
+        self._calls = 0
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
 
@@ -473,14 +613,16 @@ class FlagsAllreduce:
             self.stage_packs,
             THREADS,
             launch_blocks(inp.nbytes),
+            self.limit_ns,
+            self.errors.dev_ptr,
         )
+        self._calls += 1
+        if self._calls % CHECK_EVERY == 0 and not torch.cuda.is_current_stream_capturing():
+            self.errors.check()
         return out
 
-    def error_count(self) -> int:
-        """Wait-budget overruns so far (synchronises the device)."""
-        return int(self.epoch[ERR_WORD].item())
-
     def close(self) -> None:
+        self.errors.check()
         if self.ptrs is not None:
             self._free(self.ptrs, rank=self.rank)
             self.ptrs = None

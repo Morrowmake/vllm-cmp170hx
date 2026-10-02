@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_ALLREDUCE_FLAGS: bool = False
     VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES: int = 262144
     VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR: str | None = None
+    VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S: float = 60.0
     VLLM_GLM5_CUSTOM_ALLREDUCE_MAX_SIZE: int = 8192 * 1024
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
@@ -1360,6 +1361,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR": lambda: os.getenv(
         "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR", None
+    ),
+    # Longest a flags-in-data all-reduce waits for a peer before it records
+    # the overrun and traps (the process then exits with the record logged).
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S": lambda: float(
+        os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "60")
     ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
