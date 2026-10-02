@@ -401,6 +401,10 @@ def test_kernel_source_never_falls_through():
     body = src[src.index("void wait_failed"):]
     body = body[: body.index("\n}\n")]
     assert body.rstrip().endswith("__trap();")
+    # the record is published with a system-scope release before anyone traps,
+    # and the trap waits (bounded) for the host acknowledgement
+    assert "st_release_sys_u64(c.err, 1)" in body and "c.err + 11" in body
+    assert "*published == 0u" in body
     # both waits call it on overrun, with their phase
     assert "wait_failed(c, 1, peer, waited)" in src
     assert "wait_failed(c, 2, peer, waited)" in src
@@ -439,7 +443,8 @@ def test_error_record_watcher_reports_once():
 
     m = _FakeModule()
     seen = []
-    rec = flags.ErrorRecord(m, poll_s=0.01, on_error=seen.append)
+    exits = []
+    rec = flags.ErrorRecord(m, poll_s=0.01, on_error=seen.append, exit_fn=exits.append)
     try:
         time.sleep(0.05)
         assert seen == []
@@ -449,24 +454,36 @@ def test_error_record_watcher_reports_once():
         while not seen and time.time() < deadline:
             time.sleep(0.01)
         assert len(seen) == 1 and "timed out on rank 2" in seen[0]
+        assert m.buf[flags.ACK_WORD] == 1  # acknowledged after reporting
+        assert exits == [flags.EXIT_CODE]
         rec.check()  # reported once only
-        assert len(seen) == 1
+        assert len(seen) == 1 and exits == [flags.EXIT_CODE]
     finally:
         rec.stop()
 
 
-def test_die_logs_and_exits(monkeypatch, log_capture):
-    codes = []
-    monkeypatch.setattr(flags.os, "_exit", codes.append)
+def test_report_logs_before_ack_and_exit(log_capture):
+    """Order matters: message out, then acknowledgement, then exit."""
+    m = _FakeModule()
+    order = []
     lg = logging.getLogger(flags.__name__)
-    h = log_capture
-    lg.addHandler(h)
+    lg.addHandler(log_capture)
     try:
-        flags._die("boom message")
+        def report(msg):
+            flags._report(msg)
+            order.append(("report", m.buf[flags.ACK_WORD]))
+
+        rec = flags.ErrorRecord(
+            m, poll_s=60, on_error=report,
+            exit_fn=lambda c: order.append(("exit", m.buf[flags.ACK_WORD], c)))
+        for i, v in enumerate(REC):
+            m.buf[i] = v
+        rec.check()
+        rec.stop()
     finally:
-        lg.removeHandler(h)
-    assert codes == [flags.EXIT_CODE]
-    assert any("boom message" in m for m in h.messages)
+        lg.removeHandler(log_capture)
+    assert order == [("report", 0), ("exit", 1, flags.EXIT_CODE)]
+    assert any("timed out on rank 2" in x for x in log_capture.messages)
 
 
 def test_all_reduce_passes_limit_and_record(monkeypatch):
@@ -476,7 +493,8 @@ def test_all_reduce_passes_limit_and_record(monkeypatch):
     fa.epoch = torch.zeros(16, dtype=torch.int32)
     fa.limit_ns = 1234
     seen = []
-    fa.errors = flags.ErrorRecord(m, poll_s=60, on_error=seen.append)
+    fa.errors = flags.ErrorRecord(m, poll_s=60, on_error=seen.append,
+                                  exit_fn=lambda c: None)
     fa._calls = 0
     monkeypatch.setattr(flags.torch.cuda, "is_current_stream_capturing", lambda: False)
     try:
@@ -626,5 +644,5 @@ def test_gpu_overrun_kills_process_with_message(tmp_path):
     assert "RESULT RETURNED" not in r.stdout
     assert r.returncode != 0
     assert "flags-in-data wait timed out on rank 1" in r.stderr, r.stderr[-2000:]
-    assert "limit 2.0 s" in r.stderr
+    assert "limit 2.0 s" in r.stderr and "wait for rank 0" in r.stderr
     print("child exit", r.returncode, "after %.1f s" % took)

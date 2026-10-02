@@ -102,7 +102,8 @@ struct __align__(16) Ptrs {
 };
 
 // w[0] stage (0..2), w[1] CTAs that read w[0] this call, w[2..4] packs last
-// written into each stage, w[8] calls completed, w[15] timed-out waits.
+// written into each stage, w[8] calls completed, w[14] error record
+// published, w[15] timed-out waits.
 struct __align__(16) Epoch {
   uint32_t w[16];
 };
@@ -161,7 +162,7 @@ AFD uint4 sanitize(uint4 v) {
 // Error record in host-mapped memory (int64 words): [0] set, [1] rank,
 // [2] stage, [3] call, [4] size in packs, [5] phase (1 reduce-scatter wait,
 // 2 all-gather wait), [6] awaited peer, [7] waited ns, [8] block, [9] thread,
-// [10] limit ns.
+// [10] limit ns, [11] host acknowledgement (set by the host after logging).
 struct WaitCtx {
   Epoch* ep;
   long long* err;
@@ -177,10 +178,26 @@ AFD unsigned long long now_ns() {
   return t;
 }
 
-// Overrun: record it once (first thread), make it visible to the host, trap.
-// The trap fails the CUDA context, so the caller never sees a partial result.
+AFD void st_release_sys_u64(long long* p, long long v) {
+  asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+
+AFD long long ld_acquire_sys_u64(const long long* p) {
+  long long v;
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+  return v;
+}
+
+// Overrun. The first timed-out thread writes the record, publishes it with a
+// system-scope release, then waits (at most kAckNs) for the host to
+// acknowledge that it has logged it (word 11). Every other timed-out thread
+// waits (at most kAckNs + 1 s) until the record is published, so no thread
+// traps before the record is complete. Then all trap: the CUDA context fails
+// and the caller never sees a partial result.
+constexpr unsigned long long kAckNs = 2000000000ull;
 __device__ __noinline__ void wait_failed(WaitCtx c, int phase, int peer,
                                         unsigned long long waited) {
+  volatile unsigned int* published = &c.ep->w[14];
   if (atomicAdd(&c.ep->w[15], 1u) == 0u) {
     volatile long long* e = c.err;
     e[1] = c.rank;
@@ -194,8 +211,17 @@ __device__ __noinline__ void wait_failed(WaitCtx c, int phase, int peer,
     e[9] = threadIdx.x;
     e[10] = (long long)c.limit_ns;
     __threadfence_system();
-    e[0] = 1;
+    st_release_sys_u64(c.err, 1);
     __threadfence_system();
+    *published = 1u;
+    __threadfence();
+    const unsigned long long t0 = now_ns();
+    while (ld_acquire_sys_u64(c.err + 11) == 0 && now_ns() - t0 < kAckNs) {
+    }
+  } else {
+    const unsigned long long t0 = now_ns();
+    while (*published == 0u && now_ns() - t0 < kAckNs + 1000000000ull) {
+    }
   }
   __trap();
 }
@@ -497,19 +523,24 @@ def describe(rec) -> str | None:
     )
 
 
+ACK_WORD = 11
+
+
 class ErrorRecord:
     """Host-mapped record the kernel fills before it traps, and its watchers.
 
     A daemon thread polls it (host memory: no CUDA call, works after the
     context has failed), it is checked again at interpreter exit, and callers
-    may check it. When set, the message is logged and printed and the process
-    ends with EXIT_CODE.
+    may check it. When set: the message is logged and printed, the record is
+    acknowledged (the kernel holds its trap until then, at most 2 s), and the
+    process ends with EXIT_CODE.
     """
 
-    def __init__(self, module, poll_s: float = 0.25, on_error=None):
+    def __init__(self, module, poll_s: float = 0.05, on_error=None, exit_fn=None):
         self.host_ptr, self.dev_ptr = module.alloc_error_record()
         self._words = (ctypes.c_int64 * 16).from_address(self.host_ptr)
-        self._on_error = on_error or _die
+        self._on_error = on_error or _report
+        self._exit = exit_fn if exit_fn is not None else os._exit
         self._stop = threading.Event()
         self._reported = False
         self._thread = threading.Thread(
@@ -526,6 +557,8 @@ class ErrorRecord:
         if msg is not None and not self._reported:
             self._reported = True
             self._on_error(msg)
+            self._words[ACK_WORD] = 1  # lets the kernel trap now
+            self._exit(EXIT_CODE)
 
     def _poll(self, poll_s: float) -> None:
         while not self._stop.wait(poll_s):
@@ -535,10 +568,9 @@ class ErrorRecord:
         self._stop.set()
 
 
-def _die(msg: str) -> None:
+def _report(msg: str) -> None:
     logger.error(msg)
     print(msg, file=sys.stderr, flush=True)
-    os._exit(EXIT_CODE)
 
 
 def largest_part_packs(nbytes: int) -> int:
