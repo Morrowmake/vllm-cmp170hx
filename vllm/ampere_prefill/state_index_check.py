@@ -90,18 +90,17 @@ def _state_pools(vllm_config) -> dict[str, int]:
     return pools
 
 
-_POOLS: dict[int, dict[str, int]] = {}
-
-
 def check_attn_metadata(attn_metadata: dict, vllm_config) -> None:
     """Range-check every GDN/KDA metadata object of one step (once per object,
-    against the smallest pool of the layers that share it)."""
+    against the smallest pool of the layers that share it).
+
+    The pools are read from the layers' current state views on every call:
+    ``bind_kv_cache`` rebinds them when the KV cache is (re)allocated (the
+    start-up profiling pool, then the serving pool), so the bound is always
+    the tensor the kernels of this step will address."""
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-    key = id(vllm_config)
-    if key not in _POOLS:
-        _POOLS[key] = _state_pools(vllm_config)
-    pools = _POOLS[key]
+    pools = _state_pools(vllm_config)
     by_md: dict[int, tuple] = {}
     for name, md in attn_metadata.items():
         if isinstance(md, GDNAttentionMetadata) and name not in pools:
