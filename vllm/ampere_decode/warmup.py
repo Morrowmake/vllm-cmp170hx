@@ -186,18 +186,12 @@ def _warmup_kda(worker, model, device, capture_sizes, gate) -> None:
         max(1, int(s) // tokens_per_seq) for s in capture_sizes if int(s) >= 1
     }
     nseqs.update(range(1, max_seqs + 1))
-    # VLLM_GLM5_DECODE_KDA_STEP_TILE: the tile follows each step's tokens per
-    # request, so every 1..num_spec + 1 can be a variant.
-    tlist = (
-        range(1, tokens_per_seq + 1)
-        if getattr(layer, "_kda_step_tile", False)
-        else (tokens_per_seq,)
-    )
+    # (VLLM_GLM5_DECODE_KDA_STEP_TILE does not apply to v1: it keeps the window.)
     plans = [
-        (n, t)
-        for t in tlist
+        (n, tokens_per_seq)
         for n in sorted(nseqs)
-        if n * t <= bound and gate(n, n * t, heads, head_dim)
+        if n * tokens_per_seq <= bound
+        and gate(n, n * tokens_per_seq, heads, head_dim)
     ]
     if not plans:
         return

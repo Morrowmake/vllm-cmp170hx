@@ -4,8 +4,8 @@
 kernels from the step's max tokens per request).
 
 CPU part: env default, the tile helper, the metadata field default.
-GPU part (skipped without CUDA): for the v1 kernel, the v2 kernel, and the v2
-recover verify (normed and SKIP_NORM), max_query_len = the step's tokens per
+GPU part (skipped without CUDA): for the v2 kernel and the v2 recover verify
+(normed and SKIP_NORM), max_query_len = the step's tokens per
 request (tile 1/2/4/8) gives bitwise the result of max_query_len = 8 (the
 full window, what is launched today): outputs, recurrent state, conv state,
 records.
@@ -49,6 +49,12 @@ def test_tile_helper():
     assert _kda_tile(4, 8) == 4
     assert _kda_tile(12, 8) == 8          # mixed step: prefill rows raise the bound
     assert _kda_tile(0, 8) == 1
+    # recover verify: the window unless the token tile shrinks
+    assert _kda_tile(4, 8, keep_same_rows=True) == 4
+    assert _kda_tile(6, 8, keep_same_rows=True) == 8
+    assert _kda_tile(5, 8, keep_same_rows=True) == 8
+    assert _kda_tile(2, 4, keep_same_rows=True) == 2
+    assert _kda_tile(3, 4, keep_same_rows=True) == 4
 
 
 def test_metadata_field_default():
@@ -113,12 +119,14 @@ def gpu_test_tile_is_bitwise_the_full_window():
                 torch.cuda.synchronize()
                 return out, rec, conv, pool
 
-            for kind in ("v1", "v2", "recover", "recover_skip"):
+            # v1 keeps the window in kda.py (not tile-invariant: its reductions
+            # run over the [token tile, D] block); it is not checked here.
+            for kind in ("v2", "recover", "recover_skip"):
                 a, b = run(kind, T), run(kind, 8)
                 if not all(_eq(x, y) for x, y in zip(a, b)):
                     bad.append((kind, T, nseq))
     assert not bad, bad
-    print("  tile = tokens per request is bitwise the 8-row window for v1, v2, recover, "
+    print("  tile = tokens per request is bitwise the 8-row window for v2, recover, "
           "recover SKIP_NORM at T 1..8 x nseq 1/4/8")
 
 
