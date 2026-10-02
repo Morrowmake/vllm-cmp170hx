@@ -495,15 +495,49 @@ def test_gpu_fused_resumed_batches(H, seqlens):
     assert fails == []
 
 
+MEAN_RATIO, MAX_RATIO = 1.10, 1.25
+
+
+def _drop_empty(c, seqlens):
+    """The same case without its zero-length sequences: identical token rows,
+    the initial states of the non-empty sequences only."""
+    keep = [n for n, L in enumerate(seqlens) if L]
+    d = dict(c)
+    d["initial_state"] = c["initial_state"][keep].clone()
+    d["cu_seqlens"] = cu_from([seqlens[n] for n in keep], device=c["buf"].device)
+    return d, keep
+
+
+def _err(y, r):
+    e = (y.double() - r).abs()
+    return float(e.max()), float(e.mean())
+
+
 @needs_sm80
 @pytest.mark.parametrize("H,seqlens", [(64, s) for s in GPU_CASES])
 def test_gpu_upstream_resumed_batches(H, seqlens):
-    # autotuned launches: not bitwise across batch layouts, so judged against
-    # the fp64 recurrence (small batches) and for finite outputs
+    """Upstream chunk path (autotuned launches, state carried in bf16: not bitwise
+    across layouts and less exact than the fused path): finite outputs, empty
+    sequences keep their initial state, and on the small batches the error
+    against the fp64 recurrence is judged relative to the same path on the same
+    sequences without the empty ones (chunk indices are identical to 1.6.0's
+    there): mean <= 1.10x, max <= 1.25x per output."""
     fails = check_batch(_upstream(), seqlens, H, "cuda", bitwise_alone=False,
-                        with_reference=sum(seqlens) <= 300)
+                        with_reference=False)
     torch.cuda.synchronize()
     assert fails == []
+    if sum(seqlens) > 300:
+        return
+    c = make_case(seqlens, H, device="cuda")
+    ro, rS = reference_fp64(c, H)
+    o, S = run(_upstream(), c)
+    d, keep = _drop_empty(c, seqlens)
+    od, Sd = run(_upstream(), d)
+    torch.cuda.synchronize()
+    for name, y, yi, r in (("o", o[0], od[0], ro), ("state", S[keep], Sd, rS[keep])):
+        (mx, mn), (imx, imn) = _err(y, r), _err(yi, r)
+        assert mn <= MEAN_RATIO * imn + 1e-12, (name, mn, imn)
+        assert mx <= MAX_RATIO * imx + 1e-12, (name, mx, imx)
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--interp":
