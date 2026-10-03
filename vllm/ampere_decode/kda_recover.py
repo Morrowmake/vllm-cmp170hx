@@ -396,7 +396,12 @@ class BuilderRecover:
 
     def __init__(self, builder) -> None:
         self.builder = builder
-        rows = builder.decode_cudagraph_max_bs
+        # One row per request the verify can see. decode_cudagraph_max_bs is
+        # bounded by the largest captured size, which is 0 without CUDA graphs
+        # (enforce_eager): the verify would then read num_accepted from an
+        # empty tensor.
+        rows = max(builder.decode_cudagraph_max_bs,
+                   builder.vllm_config.scheduler_config.max_num_seqs)
         self.ones = torch.ones(rows, dtype=torch.int32, device=builder.device)
         self.context: KDARecoverCommitContext | None = None
 
@@ -418,6 +423,8 @@ class BuilderRecover:
             return meta
         b = self.builder
         rows = meta.num_accepted_tokens.shape[0] if meta.num_accepted_tokens is not None else n
+        if rows > self.ones.shape[0]:
+            raise ValueError(f"KDA recover: {rows} rows exceed {self.ones.shape[0]}")
         request_indices = None
         pure = meta.num_prefills == 0 and meta.num_decodes == 0
         if not pure:

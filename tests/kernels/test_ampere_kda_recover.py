@@ -215,6 +215,49 @@ def test_import_does_not_initialise_cuda():
     assert r.stdout.strip().splitlines()[-1] == "False", r.stdout[-500:]
 
 
+def _recover_meta(n, rows):
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    T = 8
+    return GDNAttentionMetadata(
+        num_prefills=0, num_prefill_tokens=0, num_decodes=0, num_decode_tokens=0,
+        num_spec_decodes=n, num_spec_decode_tokens=n * T, num_actual_tokens=n * T,
+        spec_query_start_loc=torch.arange(n + 1, dtype=torch.int32) * T,
+        spec_state_indices_tensor=torch.arange(1, rows * T + 1,
+                                               dtype=torch.int32).view(rows, T),
+        num_accepted_tokens=torch.full((rows,), 3, dtype=torch.int32))
+
+
+def test_builder_ones_cover_every_request():
+    """The verify reads num_accepted from BuilderRecover.ones: without CUDA
+    graphs decode_cudagraph_max_bs is 0, and the rows must still cover every
+    request (an empty tensor is a null pointer in the kernel). With graphs the
+    rows are the captured size, as before."""
+    def builder(max_bs, max_seqs=8):
+        return types.SimpleNamespace(
+            decode_cudagraph_max_bs=max_bs, device=torch.device("cpu"), num_spec=7,
+            vllm_config=types.SimpleNamespace(
+                scheduler_config=types.SimpleNamespace(max_num_seqs=max_seqs)),
+            kv_cache_spec=types.SimpleNamespace(mamba_cache_mode="none", block_size=16))
+
+    for max_bs, want in ((0, 8), (1, 8), (64, 64), (512, 512)):
+        r = kr.BuilderRecover(builder(max_bs))
+        assert r.ones.shape == (want,) and bool((r.ones == 1).all()), (max_bs, r.ones.shape)
+    r = kr.BuilderRecover(builder(0))
+    for n in (1, 8):
+        out = r.wrap(_recover_meta(n, n), None, None)
+        acc = out.num_accepted_tokens
+        assert acc.shape == (n,) and acc.data_ptr() != 0, (n, acc.shape)
+        assert bool((acc == 1).all())
+        assert out.recover_commit.state_indices.shape == (n,)
+    try:
+        r.wrap(_recover_meta(1, 9), None, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("rows beyond the buffer must not be sliced silently")
+
+
 # ------------------------------------------------------------------ GPU tests
 
 def _inputs(nseq, T, seed, nslot, dev="cuda"):
@@ -449,7 +492,8 @@ def gpu_test_graph_zero_growth():
 CPU_TESTS = (test_env_default_is_off, test_gate, test_kv_spec_has_no_draft_state_pages,
              test_kv_capacity_tp4_depth7, test_records_bytes,
              test_commit_reference_replays_per_position_states,
-             test_import_does_not_initialise_cuda)
+             test_import_does_not_initialise_cuda,
+             test_builder_ones_cover_every_request)
 GPU_TESTS = (gpu_test_verify_and_commit_bitwise, gpu_test_commit_align_boundary,
              gpu_test_skip_norm_is_the_staged_output, gpu_test_graph_zero_growth)
 
