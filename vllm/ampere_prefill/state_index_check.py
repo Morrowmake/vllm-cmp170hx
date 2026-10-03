@@ -157,10 +157,15 @@ def check_kda_metadata(layer: str, md, pool: int, num_tokens: int) -> None:
         if sq is not None:
             sq = sq[: n_spec + 1]
             _cu(problems, "spec_query_start_loc", sq, num_tokens)
-            if sq.numel() > 1 and int((sq[1:] - sq[:-1]).max()) > width:
+            query_limit, query_storage = width, "token columns"
+            if commit is not None:
+                from vllm.ampere_decode.kda_recover import WS_T
+
+                query_limit, query_storage = WS_T, "recover record capacity"
+            if sq.numel() > 1 and int((sq[1:] - sq[:-1]).max()) > query_limit:
                 problems.append(
-                    f"spec query lengths {(sq[1:] - sq[:-1]).tolist()} > {width} "
-                    f"token columns")
+                    f"spec query lengths {(sq[1:] - sq[:-1]).tolist()} > "
+                    f"{query_limit} {query_storage}")
         if commit is not None:
             _check_recover_commit(problems, commit, n_spec, pool,
                                   int(md.num_prefills) + int(md.num_decodes) + n_spec)

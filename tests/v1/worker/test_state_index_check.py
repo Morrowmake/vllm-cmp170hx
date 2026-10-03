@@ -111,11 +111,22 @@ def test_recover_reads_only_column_zero():
         sic.check_kda_metadata("l", m, 415, 16)
 
 
-def test_recover_query_spans_token_columns_not_state_columns():
-    # depth 7: 8-token verify per request against one state column
-    sic.check_kda_metadata("l", _recover_md([[5] + [0] * 7], [1], [0, 8]), 415, 8)
-    with pytest.raises(sic.StateIndexError, match="token columns"):
-        sic.check_kda_metadata("l", _recover_md([[5] + [0] * 7], [1], [0, 9]), 415, 9)
+def test_recover_one_state_column_allows_eight_token_query():
+    sic.check_kda_metadata("l", _recover_md([[5]], [1], [0, 8]), 415, 8)
+
+
+def test_one_state_column_without_recover_rejects_eight_token_query():
+    m = _recover_md([[5]], [1], [0, 8])
+    m.recover_commit = None
+    with pytest.raises(
+        sic.StateIndexError, match=r"spec query lengths \[8\] > 1 token columns"
+    ):
+        sic.check_kda_metadata("l", m, 415, 8)
+
+
+def test_recover_query_exceeding_record_capacity_raises():
+    with pytest.raises(sic.StateIndexError, match="8 recover record capacity"):
+        sic.check_kda_metadata("l", _recover_md([[5]], [1], [0, 9]), 415, 9)
 
 
 def test_recover_column_zero_and_accepted_still_checked():
