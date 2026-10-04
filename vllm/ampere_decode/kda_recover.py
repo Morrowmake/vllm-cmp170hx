@@ -376,7 +376,8 @@ class Glm5KDARecoverMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         c = self.recover_commit
         if c is None or self.recover_context is None:
             return None
-        self.recover_context.get_context().commit(
+        context = self.recover_context.get_context()
+        context.commit(
             num_accepted_tokens, c.state_indices, c.query_start_loc,
             request_indices=c.request_indices, block_table=c.block_table,
             num_computed_tokens=c.num_computed_tokens, mamba_block_size=c.block_size)
@@ -388,6 +389,8 @@ class Glm5KDARecoverMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             block_table=c.block_table,
             num_computed_tokens=c.num_computed_tokens,
             block_size=c.block_size,
+            commit_lens=context.commit_lens[:self.num_spec_decodes],
+            source_state_indices=c.state_indices,
         )
 
 

@@ -301,6 +301,8 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             block_table=align.block_table,
             num_computed_tokens=align.num_computed_tokens,
             block_size=align.block_size,
+            commit_lens=context.commit_lens[: self.num_spec_decodes],
+            source_state_indices=commit.state_indices[: self.num_spec_decodes, 0],
         )
 
 

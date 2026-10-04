@@ -264,6 +264,14 @@ def _prepare_commit_plan_kernel(
         request_idx = tl.load(
             request_indices_ptr + spec_idx * stride_request_indices
         ).to(tl.int64)
+    # Padding/null sources and filtered mappings do not own a checkpoint.
+    # Exit before dereferencing request arrays or a block-table row.
+    if (source_state_idx <= null_block_id) | (request_idx < 0):
+        tl.store(commit_lens_ptr + spec_idx, 0)
+        tl.store(final_state_indices_ptr + spec_idx, null_block_id)
+        tl.store(boundary_state_indices_ptr + spec_idx, null_block_id)
+        tl.store(boundary_recovery_lens_ptr + spec_idx, 0)
+        return
     num_accepted = tl.load(num_accepted_ptr + request_idx * stride_num_accepted).to(
         tl.int32
     )
@@ -274,6 +282,12 @@ def _prepare_commit_plan_kernel(
     query_len = (eos - bos).to(tl.int32)
     commit_len = tl.minimum(tl.maximum(num_accepted, 0), query_len)
     commit_len = tl.minimum(commit_len, SPEC_QUERY_LEN)
+    if commit_len <= 0:
+        tl.store(commit_lens_ptr + spec_idx, 0)
+        tl.store(final_state_indices_ptr + spec_idx, null_block_id)
+        tl.store(boundary_state_indices_ptr + spec_idx, null_block_id)
+        tl.store(boundary_recovery_lens_ptr + spec_idx, 0)
+        return
 
     final_state_idx = source_state_idx
     boundary_state_idx = null_block_id
@@ -283,14 +297,22 @@ def _prepare_commit_plan_kernel(
             tl.int32
         )
         final_num_computed = num_computed + commit_len
-        final_state_col = tl.minimum(
-            final_num_computed // mamba_block_size, block_table_width - 1
-        )
+        # Columns own tokens (col * B, (col + 1) * B], just as the allocator's
+        # ceil division does. At an exact boundary the checkpoint column is
+        # also the final state; the next column need not exist yet.
+        final_state_col = tl.maximum((final_num_computed - 1) // mamba_block_size, 0)
         final_state_idx = tl.load(
             block_table_ptr
             + request_idx * stride_block_table_row
-            + final_state_col * stride_block_table_col
+            + final_state_col * stride_block_table_col,
+            mask=final_state_col < block_table_width,
+            other=null_block_id,
         ).to(tl.int64)
+        # Diagnostic in TRITON_DEBUG builds; never clamp a missing owner to
+        # a different checkpoint. Masked loads/stores remain safe in release.
+        tl.device_assert(
+            final_state_idx > null_block_id, "RecoverSSM final state has no owner"
+        )
         next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
         crosses_boundary = final_num_computed >= next_boundary
         boundary_recovery_len = next_boundary - num_computed
@@ -298,10 +320,18 @@ def _prepare_commit_plan_kernel(
             block_table_ptr
             + request_idx * stride_block_table_row
             + (next_boundary // mamba_block_size - 1) * stride_block_table_col,
-            mask=crosses_boundary,
+            mask=(
+                crosses_boundary
+                & (next_boundary // mamba_block_size - 1 >= 0)
+                & (next_boundary // mamba_block_size - 1 < block_table_width)
+            ),
             other=null_block_id,
         ).to(tl.int64)
-    valid = (source_state_idx > null_block_id) & (commit_len > 0)
+        tl.device_assert(
+            (~crosses_boundary) | (boundary_state_idx > null_block_id),
+            "RecoverSSM boundary state has no owner",
+        )
+    valid = (final_state_idx > null_block_id) & (commit_len > 0)
     tl.store(commit_lens_ptr + spec_idx, tl.where(valid, commit_len, 0))
     tl.store(
         final_state_indices_ptr + spec_idx,

@@ -7,6 +7,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.recoverssm_metadata import RecoverSSMMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -57,13 +58,14 @@ class RecoverSSMState:
             # column and reset the next-step copy bias to the neutral value.
             _postprocess_recoverssm_align_kernel[(postprocess_meta.num_spec_decodes,)](
                 idx_mapping,
-                num_sampled,
+                postprocess_meta.commit_lens,
+                postprocess_meta.source_state_indices,
                 postprocess_meta.request_indices,
                 postprocess_meta.num_computed_tokens,
                 state_indices,
                 num_accepted_tokens,
                 MAMBA_BLOCK_SIZE=postprocess_meta.block_size,
-                BLOCK_TABLE_WIDTH=postprocess_meta.block_table.shape[1],
+                stride_source_state=postprocess_meta.source_state_indices.stride(0),
             )
 
 
@@ -73,29 +75,37 @@ class RecoverSSMState:
 @triton.jit
 def _postprocess_recoverssm_align_kernel(
     idx_mapping_ptr,
-    num_sampled_ptr,
+    commit_lens_ptr,
+    source_state_indices_ptr,
     request_indices_ptr,
     num_computed_ptr,
     state_idx_ptr,
     num_accepted_ptr,
     HAS_REQUEST_INDICES: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
-    BLOCK_TABLE_WIDTH: tl.constexpr,
+    stride_source_state,
 ):
     spec_idx = tl.program_id(0)
     batch_idx = spec_idx
     if HAS_REQUEST_INDICES:
         batch_idx = tl.load(request_indices_ptr + spec_idx)
+    if batch_idx < 0:
+        return
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
     if req_state_idx < 0:
         return
-    num_sampled = tl.load(num_sampled_ptr + batch_idx)
-    num_computed = tl.load(num_computed_ptr + batch_idx)
-    tl.store(
-        state_idx_ptr + req_state_idx,
-        tl.minimum(
-            (num_computed + num_sampled) // MAMBA_BLOCK_SIZE,
-            BLOCK_TABLE_WIDTH - 1,
-        ),
-    )
+    source_state = tl.load(source_state_indices_ptr + spec_idx * stride_source_state)
+    if source_state <= NULL_BLOCK_ID:
+        return
+    commit_len = tl.load(commit_lens_ptr + spec_idx)
+    if commit_len > 0:
+        num_computed = tl.load(num_computed_ptr + batch_idx)
+        # Match the commit destination and allocator even when query/window
+        # clipping made the effective count smaller than the sampler count.
+        tl.store(
+            state_idx_ptr + req_state_idx,
+            tl.maximum((num_computed + commit_len - 1) // MAMBA_BLOCK_SIZE, 0),
+        )
+    # Zero acceptance leaves the existing source column intact. Its checkpoint
+    # has not advanced, so the next pre-copy must still use the neutral bias.
     tl.store(num_accepted_ptr + req_state_idx, 1)

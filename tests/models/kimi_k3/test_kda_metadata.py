@@ -139,7 +139,9 @@ def _make_builder(
     )
     if use_recoverssm:
         assert isinstance(builder, KimiK3KDAMetadataBuilder)
-        builder.recoverssm_context = Mock()
+        builder.recoverssm_context = Mock(
+            commit_lens=torch.ones(8, dtype=torch.int32, device=device)
+        )
     return builder
 
 
