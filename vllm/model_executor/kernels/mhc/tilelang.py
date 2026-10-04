@@ -86,12 +86,9 @@ def _hc_prenorm_gemm_outputs(
     elif _use_ampere_prefill_prenorm(num_tokens):
         from vllm.ampere_prefill.mhc_prenorm import hc_prenorm_gemm
 
-        # NB: `fn` differs per (layer, attn|ffn) -- 90 distinct tensors per
-        # prefill chunk -- and hc_prenorm_gemm re-packs it to bf16 hi/mid/lo on
-        # every call by design. Its internal pack buffer is SCRATCH keyed by
-        # (device, K, BLOCK_N), not a memo: do not "optimise" it into a cache
-        # keyed by shape or every layer will silently reuse the previous
-        # layer's weights. See tests/kernels/test_ampere_prefill.py.
+        # `fn` differs for all 90 (layer, attn|ffn) calls per prefill chunk.
+        # The leased pack is overwritten every call, not memoized weights;
+        # eager streams are ordered and captures use their allocator pool.
         hc_prenorm_gemm(x, fn, out=out, sqrsum=sqrsum)
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (

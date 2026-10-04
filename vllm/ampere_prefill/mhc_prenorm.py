@@ -56,7 +56,7 @@ operand-splitting work (`x` needs no split at all).
 dot; it is what failed the first version of this file.
 
 The three bf16 terms of `fn` are built **once per call** by `_pack_fn_kernel`
-into a cached [3, K, BLOCK_N] bf16 workspace, already transposed into the
+into a leased [3, K, BLOCK_N] bf16 workspace, already transposed into the
 layout `tl.dot` wants for its B operand.  Doing the split inside the GEMM
 instead costs 47 us at M=1152 (every one of the 18 M-tiles re-loads `fn` as
 fp32, re-splits it and re-transposes it); the packing kernel costs 6 us, and
@@ -131,10 +131,11 @@ B-operand path at BLOCK_M=128 - i.e. something other than a k-blocked
 
 import torch
 
+from vllm.ampere_prefill.mhc_prenorm_workspace import (
+    get_scratch_owner,
+    scratch_owner,
+)
 from vllm.triton_utils import tl, triton  # noqa: F401  (Triton 3.7.1)
-
-_WORKSPACE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_FN_PACK: dict[tuple, torch.Tensor] = {}
 
 
 def num_sms(device=0):
@@ -409,26 +410,18 @@ def _pack_bf16x2() -> bool:
     return True
 
 
-def _workspace(device, M, BLOCK_N, split_k):
-    """Split-K scratch, cached per shape and never shrunk (see INTEGRATION.md)."""
-    key = (device, M, BLOCK_N, split_k)
-    ws = _WORKSPACE.get(key)
-    if ws is None:
-        part = torch.empty((split_k, M, BLOCK_N), dtype=torch.float32, device=device)
-        psq = torch.empty((split_k, M), dtype=torch.float32, device=device)
-        ws = (part, psq)
-        _WORKSPACE[key] = ws
-    return ws
+def _workspace(device, M, BLOCK_N, split_k, *, owner=None):
+    """Current contiguous split-K views into a device's high-water storage."""
+    if owner is None:
+        owner = get_scratch_owner(device)
+    return owner.workspace(M, BLOCK_N, split_k)
 
 
-def _fn_pack(device, K, BLOCK_N):
-    """[3, K, BLOCK_N] bf16 hi/mid/lo scratch, cached (3.1 MB at K=16384)."""
-    key = (device, K, BLOCK_N)
-    ft = _FN_PACK.get(key)
-    if ft is None:
-        ft = torch.empty((3, K, BLOCK_N), dtype=torch.bfloat16, device=device)
-        _FN_PACK[key] = ft
-    return ft
+def _fn_pack(device, K, BLOCK_N, *, owner=None):
+    """Current bf16 hi/mid/lo scratch view; overwritten for every layer."""
+    if owner is None:
+        owner = get_scratch_owner(device)
+    return owner.fn_pack(K, BLOCK_N)
 
 
 def hc_prenorm_gemm(x, fn, out=None, sqrsum=None):
@@ -446,44 +439,45 @@ def hc_prenorm_gemm(x, fn, out=None, sqrsum=None):
 
     sms = num_sms(dev.index or 0)
     BLOCK_M, BLOCK_N, BLOCK_K, split_k, nw, ns = _select_config(M, K, N, sms)
-    part, psq = _workspace(dev, M, BLOCK_N, split_k)
-    ft = _fn_pack(dev, K, BLOCK_N)
-    m_tiles = -(-M // BLOCK_M)
+    with scratch_owner(dev) as owner:
+        part, psq = _workspace(dev, M, BLOCK_N, split_k, owner=owner)
+        ft = _fn_pack(dev, K, BLOCK_N, owner=owner)
+        m_tiles = -(-M // BLOCK_M)
 
-    PACK_K = 128
-    pack = _pack_fn_x2_kernel if _pack_bf16x2() else _pack_fn_kernel
-    pack[(-(-K // PACK_K),)](
-        fn, ft,
-        K, N,
-        fn.stride(0), fn.stride(1),
-        ft.stride(0), ft.stride(1), ft.stride(2),
-        BLOCK_N=BLOCK_N, BLOCK_K=PACK_K, num_warps=4, num_stages=1,
-    )
-    _prenorm_gemm_kernel[(m_tiles, split_k)](
-        x, ft, part, psq,
-        M, K, N,
-        x.stride(0), x.stride(1),
-        ft.stride(0), ft.stride(1), ft.stride(2),
-        part.stride(1), part.stride(2), part.stride(0),
-        psq.stride(1), psq.stride(0),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=split_k,
-        num_warps=nw, num_stages=ns,
-    )
-    r_bm, r_warps = _select_reduce_config(M, split_k, sms)
-    _prenorm_reduce_kernel[(-(-M // r_bm),)](
-        part, psq, out, sqrsum,
-        M, N,
-        part.stride(1), part.stride(2), part.stride(0),
-        psq.stride(1), psq.stride(0),
-        out.stride(1), out.stride(2),
-        BLOCK_M=r_bm, BLOCK_N=BLOCK_N, SPLIT_K=split_k,
-        num_warps=r_warps, num_stages=1,
-    )
+        PACK_K = 128
+        pack = _pack_fn_x2_kernel if _pack_bf16x2() else _pack_fn_kernel
+        pack[(-(-K // PACK_K),)](
+            fn, ft,
+            K, N,
+            fn.stride(0), fn.stride(1),
+            ft.stride(0), ft.stride(1), ft.stride(2),
+            BLOCK_N=BLOCK_N, BLOCK_K=PACK_K, num_warps=4, num_stages=1,
+        )
+        _prenorm_gemm_kernel[(m_tiles, split_k)](
+            x, ft, part, psq,
+            M, K, N,
+            x.stride(0), x.stride(1),
+            ft.stride(0), ft.stride(1), ft.stride(2),
+            part.stride(1), part.stride(2), part.stride(0),
+            psq.stride(1), psq.stride(0),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=split_k,
+            num_warps=nw, num_stages=ns,
+        )
+        r_bm, r_warps = _select_reduce_config(M, split_k, sms)
+        _prenorm_reduce_kernel[(-(-M // r_bm),)](
+            part, psq, out, sqrsum,
+            M, N,
+            part.stride(1), part.stride(2), part.stride(0),
+            psq.stride(1), psq.stride(0),
+            out.stride(1), out.stride(2),
+            BLOCK_M=r_bm, BLOCK_N=BLOCK_N, SPLIT_K=split_k,
+            num_warps=r_warps, num_stages=1,
+        )
     return out, sqrsum
 
 
 def warmup(ms, K=16384, N=24, device="cuda:0"):
-    """JIT-compile and size the workspaces for every M a graph may capture."""
+    """JIT-compile every M and size eager capacity; captures own pool storage."""
     dev = torch.device(device)
     fn = torch.zeros(N, K, dtype=torch.float32, device=dev)
     for M in ms:

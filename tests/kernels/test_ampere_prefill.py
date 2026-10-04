@@ -132,6 +132,140 @@ def test_thresholds_are_configurable(sm80):
     assert _use_ampere_prefill_sparse_mla(1152, 2304, 2048) is True
 
 
+# ------------------------------------------------- real-Torch scratch owners
+
+def test_prenorm_scratch_variable_tails_bound_live_storage():
+    """Actual selector tails retain three owners with current contiguous views."""
+    import weakref
+
+    from vllm.ampere_prefill.mhc_prenorm import (
+        _fn_pack,
+        _select_config,
+        _workspace,
+    )
+    from vllm.ampere_prefill.mhc_prenorm_workspace import ScratchOwner
+
+    owner = ScratchOwner("cpu")
+    shapes = [(m, 2048, 24) for m in (
+        1, 16, 17, 64, 65, 384, 511, 512, *range(513, 577),
+        1152, 1153, 2304, 2305, 3456,
+    )]
+    shapes += [(17, 64, 7), (65, 128, 33), (513, 1024, 24)]
+    shapes += list(reversed(shapes))
+    maxima = [0, 0, 0]
+    live = {}
+    seen_splits = set()
+    for M, K, N in shapes:
+        _, bn, _, sk, _, _ = _select_config(M, K, N, 70)
+        seen_splits.add(sk)
+        previous = (owner.part, owner.psq, owner.pack)
+        part, psq = _workspace("cpu", M, bn, sk, owner=owner)
+        ft = _fn_pack("cpu", K, bn, owner=owner)
+        assert part.shape == (sk, M, bn) and part.stride() == (M * bn, bn, 1)
+        assert psq.shape == (sk, M) and psq.stride() == (M, 1)
+        assert ft.shape == (3, K, bn) and ft.stride() == (K * bn, bn, 1)
+        assert part.is_contiguous() and psq.is_contiguous() and ft.is_contiguous()
+        for i, (view, storage) in enumerate(zip(
+            (part, psq, ft), (owner.part, owner.psq, owner.pack)
+        )):
+            maxima[i] = max(maxima[i], view.numel())
+            assert maxima[i] <= storage.numel() < 2 * maxima[i]
+            assert view.data_ptr() == storage.data_ptr()
+            if previous[i] is not None and previous[i].numel() >= view.numel():
+                assert storage is previous[i]
+            live[id(storage)] = weakref.ref(storage)
+
+        del previous, part, psq, ft, storage, view
+        assert sum(ref() is not None for ref in live.values()) == 3
+    assert len(seen_splits) > 1
+
+
+def test_prenorm_scratch_bounds_even_unreleased_growth_storage():
+    """Even retaining every old allocation cannot accumulate variable tails."""
+    from vllm.ampere_prefill.mhc_prenorm import (
+        _fn_pack,
+        _select_config,
+        _workspace,
+    )
+    from vllm.ampere_prefill.mhc_prenorm_workspace import ScratchOwner
+
+    owner = ScratchOwner("cpu")
+    pending = [{}, {}, {}]
+    for M in (1, 2, 3, 16, 17, 64, 65, 128, 129, 512, 513, 1152, 1153):
+        K = 64 + M
+        _, bn, _, sk, _, _ = _select_config(M, K, 24, 70)
+        _workspace("cpu", M, bn, sk, owner=owner)
+        _fn_pack("cpu", K, bn, owner=owner)
+        for held, storage in zip(pending, (owner.part, owner.psq, owner.pack)):
+            held[id(storage)] = storage
+            assert sum(t.numel() for t in held.values()) < 2 * storage.numel()
+
+
+def test_prenorm_scratch_growth_keeps_consumers_then_releases_storage():
+    """Growth preserves held consumer views without retaining old owners."""
+    import weakref
+
+    from vllm.ampere_prefill.mhc_prenorm import _fn_pack, _workspace
+    from vllm.ampere_prefill.mhc_prenorm_workspace import ScratchOwner
+
+    owner = ScratchOwner("cpu")
+    part, psq = _workspace("cpu", 3, 16, 2, owner=owner)
+    ft = _fn_pack("cpu", 8, 16, owner=owner)
+    part.fill_(3)
+    psq.fill_(5)
+    ft.fill_(7)
+    old = [weakref.ref(t) for t in (owner.part, owner.psq, owner.pack)]
+    bigger, bigger_sq = _workspace("cpu", 17, 32, 4, owner=owner)
+    bigger_ft = _fn_pack("cpu", 17, 32, owner=owner)
+    bigger.fill_(-1)
+    bigger_sq.fill_(-2)
+    bigger_ft.fill_(-3)
+    torch.testing.assert_close(part.sum(0), torch.full((3, 16), 6.0))
+    torch.testing.assert_close(psq.sum(0), torch.full((3,), 10.0))
+    torch.testing.assert_close(
+        torch.mv(ft[0].float().t(), torch.ones(8)), torch.full((16,), 56.0)
+    )
+    assert all(ref() is not None for ref in old)
+    del part, psq, ft
+    assert all(ref() is None for ref in old)
+    current = [weakref.ref(t) for t in (owner.part, owner.psq, owner.pack)]
+    del bigger, bigger_sq, bigger_ft, owner
+    assert all(ref() is None for ref in current)
+
+
+def test_prenorm_scratch_cpu_leases_serialize_real_consumers():
+    """Canonical device leases keep concurrent writes exclusive."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.ampere_prefill.mhc_prenorm_workspace import (
+        get_scratch_owner,
+        scratch_owner,
+    )
+
+    assert get_scratch_owner("cpu") is get_scratch_owner("cpu:0")
+
+    def consume(value):
+        for _ in range(20):
+            with scratch_owner("cpu") as owner:
+                part, psq = owner.workspace(13, 16, 4)
+                ft = owner.fn_pack(8, 16)
+                part.fill_(value)
+                psq.fill_(value + 1)
+                ft.fill_(value + 2)
+                torch.testing.assert_close(
+                    part.sum(0), torch.full((13, 16), 4.0 * value)
+                )
+                torch.testing.assert_close(
+                    psq.sum(0), torch.full((13,), 4.0 * (value + 1))
+                )
+                torch.testing.assert_close(
+                    ft.float().sum(0), torch.full((8, 16), 3.0 * (value + 2))
+                )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(consume, (1, 7)))
+
+
 # ------------------------------------------------- the bf16 hi/mid/lo split
 
 def _split3(fn: torch.Tensor):
@@ -160,7 +294,7 @@ def test_split3_is_injective_for_distinct_fn():
     """PORT HAZARD GUARD.
 
     There are 90 distinct `fn` tensors per prefill chunk (45 layers x
-    attn/ffn) and they all share the pack buffer's (device, K, BLOCK_N) key.
+    attn/ffn), sharing the leased high-water pack within each eager device.
     The pack is re-run on every call precisely so that is safe. If anyone ever
     turns that scratch buffer into a shape-keyed memo, every layer after the
     first would silently reuse the first layer's weights -- and nothing in the
@@ -310,6 +444,166 @@ def test_gpu_prenorm_graph_replay():
             assert torch.equal(sq, e_sq), M
 
 
+def _gpu_prenorm_growth_m(owner, K, N):
+    from vllm.ampere_prefill.mhc_prenorm import _select_config, num_sms
+
+    M = 1024
+    capacity = 0 if owner.part is None else owner.part.numel()
+    while True:
+        _, bn, _, sk, _, _ = _select_config(M, K, N, num_sms(owner.device.index))
+        if sk * M * bn > capacity:
+            return M
+        M *= 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_prenorm_pending_growth_and_stream_retirement():
+    """Pending old reads survive growth and repeated short-lived streams."""
+    import weakref
+
+    from vllm.ampere_prefill.mhc_prenorm import hc_prenorm_gemm
+    from vllm.ampere_prefill.mhc_prenorm_workspace import (
+        _OWNERS,
+        get_scratch_owner,
+    )
+
+    owner = get_scratch_owner("cuda")
+    dev = owner.device
+    N = 24
+    pack_capacity = 0 if owner.pack is None else owner.pack.numel()
+    K = max(2048, 128 + pack_capacity // (3 * 32))
+    large_k = 2 * K + 128
+    M = _gpu_prenorm_growth_m(owner, large_k, N)
+    g = torch.Generator(device=dev).manual_seed(31)
+    small = torch.randn(17, K, generator=g, device=dev).to(torch.bfloat16)
+    large = torch.randn(M, large_k, generator=g, device=dev).to(torch.bfloat16)
+    weights = [
+        torch.randn(N, k, generator=g, device=dev) / k ** 0.5
+        for k in (K, large_k, K, K, K, K, K, K)
+    ]
+    torch.cuda.synchronize()
+    ready = torch.cuda.Event()
+    ready.record()
+    owners_before = len(_OWNERS)
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    with torch.cuda.stream(streams[0]):
+        streams[0].wait_event(ready)
+        torch.cuda._sleep(10_000_000)
+        first, _ = hc_prenorm_gemm(small, weights[0])
+    old = [weakref.ref(t) for t in (owner.part, owner.psq, owner.pack)]
+    with torch.cuda.stream(streams[1]):
+        streams[1].wait_event(ready)
+        grown, _ = hc_prenorm_gemm(large, weights[1])
+    del streams
+    tails = []
+    for fn in weights[2:]:
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            stream.wait_event(ready)
+            result, _ = hc_prenorm_gemm(small, fn)
+            tails.append(result)
+        del stream
+    torch.cuda.synchronize()
+    assert len(_OWNERS) == owners_before
+    assert get_scratch_owner(dev) is owner
+    assert all(ref() is None for ref in old)
+    torch.testing.assert_close(
+        first[0], small.float() @ weights[0].t(), rtol=2e-3, atol=2e-3
+    )
+    torch.testing.assert_close(
+        grown[0], large.float() @ weights[1].t(), rtol=2e-3, atol=2e-3
+    )
+    for result, fn in zip(tails, weights[2:]):
+        torch.testing.assert_close(
+            result[0], small.float() @ fn.t(), rtol=2e-3, atol=2e-3
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_prenorm_capture_pools_survive_eager_growth():
+    """Two-layer graphs own pointers across eager growth and concurrent replay.
+
+    Independent pools replay on separate streams. Shared pools use the same
+    stream and serialized replay, matching vLLM's supported pool contract.
+    """
+    from vllm.ampere_prefill.mhc_prenorm import hc_prenorm_gemm, warmup
+    from vllm.ampere_prefill.mhc_prenorm_workspace import (
+        _OWNERS,
+        get_scratch_owner,
+    )
+
+    owner = get_scratch_owner("cuda")
+    dev = owner.device
+    M, K, N = 65, 1024, 24
+    warmup((M,), K=K, N=N, device=str(dev))
+    for shared in (False, True):
+        x = torch.zeros(M, K, dtype=torch.bfloat16, device=dev)
+        weights = [
+            [torch.zeros(N, K, device=dev) for _ in range(2)]
+            for _ in range(2)
+        ]
+        outputs = [
+            [torch.empty(1, M, N, device=dev) for _ in range(2)]
+            for _ in range(2)
+        ]
+        sums = [
+            [torch.empty(1, M, device=dev) for _ in range(2)]
+            for _ in range(2)
+        ]
+        stream = torch.cuda.Stream()
+        streams = [stream, stream if shared else torch.cuda.Stream()]
+        pool = torch.cuda.graph_pool_handle() if shared else None
+        graphs = []
+        owners_before = len(_OWNERS)
+        for i, capture_stream in enumerate(streams):
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=capture_stream):
+                for layer in range(2):
+                    hc_prenorm_gemm(
+                        x, weights[i][layer],
+                        out=outputs[i][layer], sqrsum=sums[i][layer],
+                    )
+            graphs.append(graph)
+        torch.cuda.synchronize()
+        assert len(_OWNERS) == owners_before
+        x.normal_()
+        for layer_weights in weights:
+            for fn in layer_weights:
+                fn.normal_(std=K ** -0.5)
+        growth_m = _gpu_prenorm_growth_m(owner, K, N)
+        eager_x = torch.ones(growth_m, K, dtype=torch.bfloat16, device=dev)
+        eager_fn = torch.ones(N, K, device=dev) / K
+        ready = torch.cuda.Event()
+        ready.record()
+        eager_stream = torch.cuda.Stream()
+        with torch.cuda.stream(eager_stream):
+            eager_stream.wait_event(ready)
+            eager_out, _ = hc_prenorm_gemm(eager_x, eager_fn)
+        for graph, replay_stream in zip(graphs, streams):
+            with torch.cuda.stream(replay_stream):
+                replay_stream.wait_event(ready)
+                graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            eager_out[0], torch.ones(growth_m, N, device=dev),
+            rtol=2e-3, atol=2e-3,
+        )
+        for i in range(2):
+            assert not torch.equal(outputs[i][0], outputs[i][1])
+            for layer in range(2):
+                eager, eager_sq = hc_prenorm_gemm(x, weights[i][layer])
+                torch.cuda.synchronize()
+                assert torch.equal(outputs[i][layer], eager)
+                assert torch.equal(sums[i][layer], eager_sq)
+        mem0 = torch.cuda.memory_allocated(dev)
+        for graph, replay_stream in zip(graphs, streams):
+            with torch.cuda.stream(replay_stream):
+                graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated(dev) == mem0
+
+
 # --------------------------------------------------------------------------
 # Standalone runner: `python tests/kernels/test_ampere_prefill.py`.
 # The vllm-dev venv has no pytest and this suite must be runnable there, so
@@ -401,11 +695,20 @@ def _main():
     for fn in (test_prenorm_token_threshold, test_sparse_mla_context_gate,
                test_sparse_mla_gate_scales_with_topk, test_thresholds_are_configurable):
         cases.append((fn.__name__, lambda mp, f=fn: f(_as_sm80(mp))))
-    for fn in (test_split3_reconstructs_fp32, test_split3_is_injective_for_distinct_fn):
+    for fn in (
+        test_split3_reconstructs_fp32,
+        test_split3_is_injective_for_distinct_fn,
+        test_prenorm_scratch_variable_tails_bound_live_storage,
+        test_prenorm_scratch_bounds_even_unreleased_growth_storage,
+        test_prenorm_scratch_growth_keeps_consumers_then_releases_storage,
+        test_prenorm_scratch_cpu_leases_serialize_real_consumers,
+    ):
         cases.append((fn.__name__, lambda mp, f=fn: f()))
     gpu_tests = (test_distinct_fn_give_distinct_results_on_gpu,
                  test_gpu_prenorm_accuracy_vs_tilelang_no_floor,
-                 test_gpu_prenorm_graph_replay)
+                 test_gpu_prenorm_graph_replay,
+                 test_gpu_prenorm_pending_growth_and_stream_retirement,
+                 test_gpu_prenorm_capture_pools_survive_eager_growth)
     for fn in gpu_tests:
         if torch.cuda.is_available():
             cases.append((fn.__name__, lambda mp, f=fn: f()))
