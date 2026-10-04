@@ -261,11 +261,13 @@ def test_builder_ones_cover_every_request():
 
 
 def _recovery_control_path(dev):
-    """Original kernels + real allocator/metadata: commit, allocate, precopy, consume."""
+    """Real allocator/metadata: commit, allocate, precopy, then consume."""
     from dataclasses import fields
 
     from vllm.models.kimi_k3.nvidia.kda_metadata import (
-        KDARecoverSSMAlignMetadata, KDARecoverSSMCommitMetadata, KimiK3KDAMetadata,
+        KDARecoverSSMAlignMetadata,
+        KDARecoverSSMCommitMetadata,
+        KimiK3KDAMetadata,
     )
     from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMCommitContext
     from vllm.v1.core.block_pool import BlockPool
@@ -273,7 +275,8 @@ def _recovery_control_path(dev):
     from vllm.v1.kv_cache_interface import MambaSpec
     from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
     from vllm.v1.worker.mamba_utils import (
-        precopy_mamba_align_fused_kernel, preprocess_mamba_align_fused_kernel,
+        precopy_mamba_align_fused_kernel,
+        preprocess_mamba_align_fused_kernel,
     )
 
     def tensor(values, dtype=torch.int32):
@@ -297,7 +300,8 @@ def _recovery_control_path(dev):
         # Flattened metadata is the same layout supplied by MambaCopyContext.
         states = (conv, rec)
         precopy_mamba_align_fused_kernel[(1, 2)](
-            cols, src_col, src_off, tensor([table.data_ptr()], torch.int64), table.stride(0),
+            cols, src_col, src_off,
+            tensor([table.data_ptr()], torch.int64), table.stride(0),
             tensor([s.data_ptr() for s in states], torch.int64),
             tensor([s.stride(0) * s.element_size() for s in states], torch.int64),
             tensor([s.element_size() for s in states]),
@@ -317,14 +321,22 @@ def _recovery_control_path(dev):
         base = _recover_meta(1, 1)
         kwargs = {f.name: getattr(base, f.name) for f in fields(base)}
         if upstream:
-            return KimiK3KDAMetadata(**kwargs, recoverssm_context=context,
+            return KimiK3KDAMetadata(
+                **kwargs, recoverssm_context=context,
                 recoverssm_commit=KDARecoverSSMCommitMetadata(
                     src[:, None], query, tensor([1]),
-                    KDARecoverSSMAlignMetadata(table, computed, 16) if table is not None else None))
-        return kr.Glm5KDARecoverMetadata(**kwargs,
+                    KDARecoverSSMAlignMetadata(table, computed, 16)
+                    if table is not None else None,
+                ),
+            )
+        return kr.Glm5KDARecoverMetadata(
+            **kwargs,
             recover_context=types.SimpleNamespace(get_context=lambda: context),
             recover_commit=kr.KDARecoverCommitMetadata(
-                src, query, tensor([1]), table, computed, 16 if table is not None else None))
+                src, query, tensor([1]), table, computed,
+                16 if table is not None else None,
+            ),
+        )
 
     for target in (15, 16, 17, 32, 48):
         for sampled, query_len, effective in ((8, 8, 8), (3, 8, 3),
@@ -344,20 +356,33 @@ def _recovery_control_path(dev):
             bt = block_table([[], [b.block_id for b in blocks]])
             rec = torch.full((12, H, D, D), -23.0, device=dev)
             rec[src.item()].fill_(2.0)
-            conv = torch.arange(12 * 10 * 4, dtype=torch.float32, device=dev).view(12, 10, 4)
+            conv = torch.arange(
+                12 * 10 * 4, dtype=torch.float32, device=dev
+            ).view(12, 10, 4)
             original_rec, original_conv = rec.clone(), conv.clone()
             records = torch.zeros(1, 3, 1, kr.WS_T, H, D, device=dev)
             records[:, 0].fill_(0.25)
             records[:, 1].fill_(0.5)
             records[:, 2].fill_(0.5)
             context = glm_context(conv, rec, records)
-            expected = kr.commit_reference(original_rec, records[0], src.item(), effective, 0)
-            expected_conv = original_conv[src.item(), effective - 1:effective + 2].clone()
-            cols, accepted = tensor([-19, -19, scheduled_col, -19]), tensor([9, 9, 9, 9])
+            expected = kr.commit_reference(
+                original_rec, records[0], src.item(), effective, 0
+            )
+            expected_conv = original_conv[
+                src.item(), effective - 1:effective + 2
+            ].clone()
+            cols, accepted = (
+                tensor([-19, -19, scheduled_col, -19]), tensor([9, 9, 9, 9])
+            )
             state = RecoverSSMState()
-            state.record_step({"layer": metadata(context, src, tensor([0, query_len]), bt,
-                                               tensor([-1000, computed]))},
-                              [[types.SimpleNamespace(layer_names=["layer"])]], for_capture=False)
+            state.record_step(
+                {"layer": metadata(
+                    context, src, tensor([0, query_len]), bt,
+                    tensor([-1000, computed]),
+                )},
+                [[types.SimpleNamespace(layer_names=["layer"])]],
+                for_capture=False,
+            )
             state.commit_step(tensor([99, sampled]), tensor([-1, 2]),
                               state_indices=cols, num_accepted_tokens=accepted)
             final_col = (target - 1) // 16
@@ -374,8 +399,12 @@ def _recovery_control_path(dev):
                 b_expected = kr.commit_reference(original_rec, records[0], src.item(),
                                                 boundary - computed, 0)
                 assert torch.equal(rec[b.block_id], b_expected)
-                assert torch.equal(conv[b.block_id, :3],
-                                   original_conv[src.item(), boundary - computed - 1:boundary - computed + 2])
+                assert torch.equal(
+                    conv[b.block_id, :3],
+                    original_conv[
+                        src.item(), boundary - computed - 1:boundary - computed + 2
+                    ],
+                )
             written_blocks = {final_block.block_id}
             if target >= boundary:
                 written_blocks.add(blocks[boundary // 16 - 1].block_id)
@@ -393,7 +422,9 @@ def _recovery_control_path(dev):
             assert torch.equal(conv[next_src.item(), :3], expected_conv)
             # The actual next commit consumes the carried recurrent checkpoint.
             before_next = rec.clone()
-            next_expected = kr.commit_reference(before_next, records[0], next_src.item(), 1, 0)
+            next_expected = kr.commit_reference(
+                before_next, records[0], next_src.item(), 1, 0
+            )
             context.commit(tensor([1]), next_src, tensor([0, 1]),
                            block_table=next_bt, num_computed_tokens=tensor([target]),
                            mamba_block_size=16)
@@ -408,16 +439,23 @@ def _recovery_control_path(dev):
             # the real cache-hit ownership and allocation paths, without mutation.
             if target % 16 == 0:
                 shared = manager.req_to_blocks["r"][final_col]
-                manager.add_local_computed_blocks("hit", manager.req_to_blocks["r"][:final_col + 1],
-                                                  target, 0)
+                manager.add_local_computed_blocks(
+                    "hit", manager.req_to_blocks["r"][:final_col + 1], target, 0
+                )
                 manager.allocate_new_blocks("hit", target + 1, target + 1)
-                hit_bt = block_table([[b.block_id for b in manager.req_to_blocks["hit"]]])
-                hit_cols, hit_accepted = tensor([-19, -19, final_col, -19]), tensor([9, 9, 1, 9])
+                hit_bt = block_table([
+                    [b.block_id for b in manager.req_to_blocks["hit"]]
+                ])
+                hit_cols, hit_accepted = (
+                    tensor([-19, -19, final_col, -19]), tensor([9, 9, 1, 9])
+                )
                 shared_before = rec[shared.block_id].clone()
                 precopy(hit_bt, rec, conv, hit_cols, hit_accepted, target, 1)
                 assert shared.ref_cnt == 2
                 assert torch.equal(rec[hit_bt[0, hit_cols[2]].item()], expected)
-                assert torch.equal(conv[hit_bt[0, hit_cols[2]].item(), :3], expected_conv)
+                assert torch.equal(
+                    conv[hit_bt[0, hit_cols[2]].item(), :3], expected_conv
+                )
                 assert torch.equal(rec[shared.block_id], shared_before)
 
     # Upstream KDA producer uses the same actual plan count and boundary column;
@@ -425,19 +463,28 @@ def _recovery_control_path(dev):
     for upstream in (False, True):
         for align in (False, True):
             rec = torch.full((3, H, D, D), 2.0, device=dev)
-            conv = torch.arange(3 * 10 * 4, dtype=torch.float32, device=dev).view(3, 10, 4)
+            conv = torch.arange(
+                3 * 10 * 4, dtype=torch.float32, device=dev
+            ).view(3, 10, 4)
             src = tensor([1])
             bt = block_table([[], [1]]) if align else None
             if upstream:
-                from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+                from vllm.model_executor.layers.mamba.mamba_utils import (
+                    is_conv_state_dim_first,
+                )
 
-                native_conv = conv.transpose(-1, -2) if is_conv_state_dim_first() else conv
+                native_conv = (
+                    conv.transpose(-1, -2) if is_conv_state_dim_first() else conv
+                )
                 layer = types.SimpleNamespace(kv_cache=(native_conv, rec,
                     torch.zeros(3, H, 8, D, device=dev),
                     torch.zeros(3, H, 8, 2 * D, device=dev)),
-                    A_log=torch.zeros(H, device=dev), dt_bias=torch.zeros(H * D, device=dev),
+                    A_log=torch.zeros(H, device=dev),
+                    dt_bias=torch.zeros(H * D, device=dev),
                     local_num_heads=H, head_dim=D, gate_lower_bound=None)
-                context = KDARecoverSSMCommitContext.create([layer], spec_query_len=8, max_num_reqs=1)
+                context = KDARecoverSSMCommitContext.create(
+                    [layer], spec_query_len=8, max_num_reqs=1
+                )
                 # Zero keys/corrections and zero raw gate halve the checkpoint
                 # each step: the three-token consumer must carry 2 -> 0.25.
                 expected = torch.full_like(rec[1], 0.25)
@@ -447,12 +494,19 @@ def _recovery_control_path(dev):
                 context = glm_context(conv, rec, records)
                 expected = rec[1] * 0.125
             state = RecoverSSMState()
-            state.record_step({"layer": metadata(context, src, tensor([0, 3]), bt,
-                                               tensor([0, 13]) if align else None, upstream)},
-                              [[types.SimpleNamespace(layer_names=["layer"])]], for_capture=False)
+            state.record_step(
+                {"layer": metadata(
+                    context, src, tensor([0, 3]), bt,
+                    tensor([0, 13]) if align else None, upstream,
+                )},
+                [[types.SimpleNamespace(layer_names=["layer"])]],
+                for_capture=False,
+            )
             cols, accepted = tensor([-7, -7, 0]), tensor([9, 9, 9])
-            state.commit_step(tensor([99, 12]), tensor([-1, 2]),
-                              state_indices=cols if align else None, num_accepted_tokens=accepted)
+            state.commit_step(
+                tensor([99, 12]), tensor([-1, 2]),
+                state_indices=cols if align else None, num_accepted_tokens=accepted,
+            )
             torch.testing.assert_close(rec[1], expected, atol=1e-6, rtol=1e-6)
             assert cols.tolist() == [-7, -7, 0]
             assert accepted.tolist() == ([9, 9, 1] if align else [9, 9, 9])
@@ -472,12 +526,17 @@ def _recovery_control_path(dev):
                         block_table([[], []]), tensor([0, 16]))
         meta.recover_commit.request_indices = tensor([request])
         state = RecoverSSMState()
-        state.record_step({"layer": meta}, [[types.SimpleNamespace(layer_names=["layer"])]], for_capture=False)
+        state.record_step(
+            {"layer": meta}, [[types.SimpleNamespace(layer_names=["layer"])]],
+            for_capture=False,
+        )
         state.commit_step(tensor([99, sampled]), tensor([-1, 2]),
                           state_indices=cols, num_accepted_tokens=accepted)
         assert bool((rec == -31).all()) and bool((conv == -17).all())
         assert cols.tolist() == [-9, -9, 0]
-        assert accepted.tolist() == ([9, 9, 1] if source > 0 and request >= 0 else [9, 9, 9])
+        assert accepted.tolist() == (
+            [9, 9, 1] if source > 0 and request >= 0 else [9, 9, 9]
+        )
         assert context.commit_lens[0].item() == 0
 
 
@@ -488,10 +547,16 @@ def test_recovery_allocator_control_path_cpu():
     import vllm
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
-    env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="",
-               PYTHONPATH=os.pathsep.join(p for p in (root, os.environ.get("PYTHONPATH")) if p))
-    result = subprocess.run([sys.executable, os.path.abspath(__file__), "recovery-control"],
-                            env=env, text=True, capture_output=True, timeout=1800)
+    env = dict(
+        os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="",
+        PYTHONPATH=os.pathsep.join(
+            p for p in (root, os.environ.get("PYTHONPATH")) if p
+        ),
+    )
+    result = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "recovery-control"],
+        env=env, text=True, capture_output=True, timeout=1800,
+    )
     assert result.returncode == 0, (
         result.stdout[-3000:] + result.stderr[-6000:])
 
@@ -735,7 +800,8 @@ CPU_TESTS = (test_env_default_is_off, test_gate, test_kv_spec_has_no_draft_state
              test_kv_capacity_tp4_depth7, test_records_bytes,
              test_commit_reference_replays_per_position_states,
              test_import_does_not_initialise_cuda,
-             test_builder_ones_cover_every_request, test_recovery_allocator_control_path_cpu)
+             test_builder_ones_cover_every_request,
+             test_recovery_allocator_control_path_cpu)
 GPU_TESTS = (gpu_test_verify_and_commit_bitwise, gpu_test_commit_align_boundary,
              gpu_test_skip_norm_is_the_staged_output, gpu_test_graph_zero_growth,
              gpu_test_recovery_allocator_control_path)
@@ -746,7 +812,9 @@ if pytest is not None:
     test_gpu_commit_align_boundary = _needs_gpu(gpu_test_commit_align_boundary)
     test_gpu_skip_norm_is_the_staged_output = _needs_gpu(gpu_test_skip_norm_is_the_staged_output)
     test_gpu_graph_zero_growth = _needs_gpu(gpu_test_graph_zero_growth)
-    test_gpu_recovery_allocator_control_path = _needs_gpu(gpu_test_recovery_allocator_control_path)
+    test_gpu_recovery_allocator_control_path = _needs_gpu(
+        gpu_test_recovery_allocator_control_path
+    )
 
 
 def _main():
