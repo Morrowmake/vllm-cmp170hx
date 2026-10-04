@@ -1,3 +1,5 @@
+<!-- Modified by Morrowmake: acceptance-adaptive draft-count documentation. -->
+
 # Speculative Decoding
 
 This document shows how to use [Speculative Decoding](https://arxiv.org/pdf/2302.01318) with vLLM to reduce inter-token latency under medium-to-low QPS (queries per second), memory-bound workloads.

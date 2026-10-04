@@ -1,3 +1,4 @@
+// Modified by Morrowmake for CMP 170HX support; see repository history.
 
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16

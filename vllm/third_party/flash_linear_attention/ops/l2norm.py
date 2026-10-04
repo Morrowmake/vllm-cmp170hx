@@ -6,6 +6,7 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import os
 

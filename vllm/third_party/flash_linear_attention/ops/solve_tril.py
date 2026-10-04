@@ -7,6 +7,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import os
 

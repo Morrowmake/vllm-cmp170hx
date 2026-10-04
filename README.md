@@ -1,3 +1,5 @@
+<!-- Modified by Morrowmake: CMP 170HX presentation and source attribution. -->
+
 <h1 align="center">vLLM for the NVIDIA CMP 170HX</h1>
 
 <p align="center">
@@ -185,3 +187,8 @@ Apache-2.0, as upstream ([LICENSE](LICENSE)). This fork is a layer on the work
 of the [vLLM project](https://github.com/vllm-project/vllm) and its
 contributors; thank you. Upstream's own README is kept at
 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
+
+Some implementations are adapted from other projects; these are not all
+independently authored patches. [Third-party sources and idea credits](docs/THIRD_PARTY.md)
+identify those adaptations, their licences and the ideas that informed our
+changes. Original component copyright and licence notices remain applicable.

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """GLM-4.7 parser for reasoning and tool calls.
 
 GLM-4.7 uses XML-like tool calls::

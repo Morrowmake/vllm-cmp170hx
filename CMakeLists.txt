@@ -1,3 +1,4 @@
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 cmake_minimum_required(VERSION 3.26)
 
 # When building directly using CMake, make sure you run the install step

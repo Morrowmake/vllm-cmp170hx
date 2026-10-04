@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Which next_n the DSA indexer decode path may hand to DeepGEMM unflattened.
 
 Getting this wrong is not a slow path but a crash: `fp8_fp4_paged_mqa_logits`

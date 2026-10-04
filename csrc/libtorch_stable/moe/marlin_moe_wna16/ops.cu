@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Modified by Morrowmake for CMP 170HX support; see repository history.
 
 /*
  * Adapted from https://github.com/IST-DASLab/marlin
