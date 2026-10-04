@@ -65,6 +65,7 @@ class RecoverSSMState:
                 state_indices,
                 num_accepted_tokens,
                 MAMBA_BLOCK_SIZE=postprocess_meta.block_size,
+                NULL_BLOCK_ID=NULL_BLOCK_ID,
                 stride_source_state=postprocess_meta.source_state_indices.stride(0),
             )
 
@@ -83,6 +84,7 @@ def _postprocess_recoverssm_align_kernel(
     num_accepted_ptr,
     HAS_REQUEST_INDICES: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
     stride_source_state,
 ):
     spec_idx = tl.program_id(0)
