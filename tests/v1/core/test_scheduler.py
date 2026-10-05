@@ -2196,8 +2196,12 @@ def test_spec_decode_padding_dropped_when_recurrent_alignment_clips(
         enable_prefix_caching=True,
         block_size=16,
     )
-    (r1,) = create_requests(num_requests=1, num_tokens=33, max_tokens=16)
-    (r2,) = create_requests(num_requests=1, num_tokens=1, max_tokens=16)
+    (r1,) = create_requests(
+        num_requests=1, num_tokens=33, max_tokens=16, req_ids=["decode"]
+    )
+    (r2,) = create_requests(
+        num_requests=1, num_tokens=1, max_tokens=16, req_ids=["cold"]
+    )
 
     scheduler.add_request(r1)
     out = scheduler.schedule()
