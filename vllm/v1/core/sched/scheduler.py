@@ -1412,13 +1412,12 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
-                        # A local prompt tail must match the cold prefill shape.
-                        # Resumed decodes and external KV loads keep padding.
+                        # A prompt tail over cached state must match the cold
+                        # prefill shape, including remote loads and preemption.
+                        # Resumed decodes keep padding.
                         and not (
                             self.kv_cache_manager.coordinator.dflash_boundary_group_ids
-                            and request.status == RequestStatus.WAITING
-                            and num_new_local_computed_tokens > 0
-                            and num_external_computed_tokens == 0
+                            and num_computed_tokens > 0
                             and request.num_output_tokens == 0
                             and num_computed_tokens < request.num_prompt_tokens
                         )

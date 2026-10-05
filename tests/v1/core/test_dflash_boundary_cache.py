@@ -366,8 +366,8 @@ def test_local_boundary_prompt_tail_matches_cold_shape(
 
 
 @pytest.mark.parametrize("has_output", [False, True])
-def test_preempted_local_boundary_request_keeps_padding(monkeypatch, has_output):
-    """Preempted prompt work and decodes retain the upstream resume shape."""
+def test_preempted_boundary_prompt_tail_preserves_real_query(monkeypatch, has_output):
+    """Preemption before token zero resumes prefill; decodes still verify."""
     scheduler = _boundary_scheduler(monkeypatch, True)
     prompt_len = BOUNDARY if has_output else BOUNDARY + 1
     request = make_request("resumed", PREFIX[:prompt_len], BLOCK, sha256)
@@ -380,14 +380,25 @@ def test_preempted_local_boundary_request_keeps_padding(monkeypatch, has_output)
     scheduler._preempt_request(request, timestamp=0.0)
     out = scheduler.schedule()
     assert request.num_preemptions == 1
-    assert out.num_scheduled_tokens["resumed"] == 4
-    assert out.scheduled_spec_decode_tokens["resumed"] == [-1] * 3
+    assert out.num_scheduled_tokens["resumed"] == (4 if has_output else 1)
+    if has_output:
+        assert out.scheduled_spec_decode_tokens["resumed"] == [-1] * 3
+    else:
+        assert "resumed" not in out.scheduled_spec_decode_tokens
+        _complete_step(scheduler, out, request)
+        assert request.num_output_tokens == 1
+        scheduler.update_draft_token_ids(DraftTokenIds(["resumed"], [[9] * 3]))
+        decode = scheduler.schedule()
+        assert decode.num_scheduled_tokens["resumed"] == 4
+        assert decode.scheduled_spec_decode_tokens["resumed"] == [9] * 3
 
 
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize("local_hit", [False, True])
-def test_external_boundary_prompt_tail_keeps_padding(monkeypatch, is_async, local_hit):
-    """Neither synchronous loads nor async resumes count as fresh local hits."""
+def test_external_boundary_prompt_tail_preserves_real_query(
+    monkeypatch, is_async, local_hit
+):
+    """Every restored prompt tail keeps one real token before its first sample."""
     scheduler = _boundary_scheduler(
         monkeypatch, True, connector=mock_kv(matched_tokens=BOUNDARY, is_async=is_async)
     )
@@ -417,5 +428,35 @@ def test_external_boundary_prompt_tail_keeps_padding(monkeypatch, is_async, loca
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         _complete_step(scheduler, out, request, finished_recving={"external"})
         out = scheduler.schedule()
-    assert out.num_scheduled_tokens["external"] == 4
-    assert out.scheduled_spec_decode_tokens["external"] == [-1] * 3
+    assert out.num_scheduled_tokens["external"] == 1
+    assert "external" not in out.scheduled_spec_decode_tokens
+    _complete_step(scheduler, out, request)
+    assert request.num_output_tokens == 1
+    scheduler.update_draft_token_ids(DraftTokenIds(["external"], [[9] * 3]))
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens["external"] == 4
+    assert decode.scheduled_spec_decode_tokens["external"] == [9] * 3
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("with_decode", [False, True])
+def test_cold_single_token_request_keeps_existing_shape(
+    monkeypatch, enabled, with_decode
+):
+    """The restored-state exemption does not change cold admissions."""
+    scheduler = _boundary_scheduler(monkeypatch, enabled)
+    if with_decode:
+        running = make_request("running", PREFIX[:2], BLOCK, sha256)
+        scheduler.add_request(running)
+        _complete_step(scheduler, scheduler.schedule(), running)
+        scheduler.update_draft_token_ids(DraftTokenIds(["running"], [[9] * 3]))
+    cold = make_request("cold-single", PREFIX[:1], BLOCK, sha256)
+    assert scheduler.kv_cache_manager.get_computed_blocks(cold)[1] == 0
+    scheduler.add_request(cold)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens["cold-single"] == (4 if with_decode else 1)
+    if with_decode:
+        assert out.scheduled_spec_decode_tokens["cold-single"] == [-1] * 3
+        assert out.scheduled_spec_decode_tokens["running"] == [9] * 3
+    else:
+        assert "cold-single" not in out.scheduled_spec_decode_tokens
