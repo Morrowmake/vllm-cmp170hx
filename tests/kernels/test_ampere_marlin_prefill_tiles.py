@@ -10,10 +10,11 @@ CPU: the switch; ``compiled_tiles`` reasons (switch off, no table for the
 width, library/op missing, no scratch during a capture); the per-GEMM tile
 table reaches the op exactly (w13 (64,512,1) and w2 (64,256,2) on the
 64/48/32-row lists, Marlin's own choice on the 16-row list); without the op the
-released kernels run with THREAD_CFG; ``prefill_tile_op`` never raises; the
-library sources declare the same 21 kernels in the selector and the
-instantiation file, including the six explicit tiles; the in-tree library, when
-present, exports prefill_tile_gemm.
+released kernels run with THREAD_CFG; ``prefill_tile_op`` never raises and
+refuses a library without the start-ordered schedule; the op gets its own
+semaphores (not the shared Marlin workspace); the library sources declare the
+same 21 kernels in the selector and the instantiation file, including the six
+explicit tiles; the in-tree library, when present, exports prefill_tile_gemm.
 GPU (sm_80 with ~12 GB free and the library; skipped otherwise): the compiled
 tiles run (spied) and against an fp64 reference stay within 1.10x mean /
 1.25x max of the incumbent's error at the TP4 call sizes and small M; bitwise
@@ -24,9 +25,15 @@ gate against the released split path and the unsplit incumbent, with
 in-range scales and with scales above 2^-5 (redo pass listed tiles);
 in-range scales give bitwise the regular kernels' output; graph replay
 equals eager (the replay zeroes stale counts) with no allocation growth.
+Progress (TP4 and PP): with every SM but one held by another kernel, as a
+collective on another stream can hold them, the compiled tiles finish on the
+one free SM (a released library waits for the held SMs), bitwise the result
+without the hold, and leave every semaphore and the start counter at zero.
 """
 
+import contextlib
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -115,6 +122,24 @@ def test_prefill_tile_op_never_raises(monkeypatch):
     assert op is None and "not built" in why
 
 
+@pytest.mark.parametrize("version", [None, 1])
+def test_library_without_ordered_schedule_keeps_the_released_kernels(
+        monkeypatch, version):
+    """A library whose prefill tiles need the whole grid resident (no
+    prefill_schedule_version 2) is not used for prefill."""
+    from types import SimpleNamespace
+
+    from vllm import ampere_marlin
+
+    info = {} if version is None else {"prefill_schedule_version": version}
+    module = SimpleNamespace(build_info=lambda: info)
+    monkeypatch.setattr(ampere_marlin, "_PREFILL_TILE", None)
+    monkeypatch.setattr(ampere_marlin.importlib, "import_module", lambda n: module)
+    monkeypatch.setattr(ampere_marlin, "_validate_extension", lambda m: None)
+    op, why = ampere_marlin.prefill_tile_op()
+    assert op is None and "every CTA resident" in why
+
+
 class _Layer:
     w1_scale = "s1"
     w2_scale = "s2"
@@ -130,7 +155,8 @@ class _Layer:
 
 
 def _run(monkeypatch, compiled, n=N, redo=None):
-    """Run pmp.run on CPU with fake lists, op and workspaces; returns the log."""
+    """Run pmp.run on CPU with fake lists, op and workspaces; returns the log.
+    The compiled op gets its own semaphores, never the shared Marlin locks."""
     import vllm.ampere_prefill.moe_split_align as sa
     from vllm.model_executor.layers.quantization.utils import marlin_utils
 
@@ -153,11 +179,11 @@ def _run(monkeypatch, compiled, n=N, redo=None):
     ws2 = torch.empty(M * TOPK * K, dtype=torch.bfloat16)
     if compiled:
         def op(*a):
-            assert a[-2] == "C_TMP" and a[8] == "locks"
+            assert a[-2] == "C_TMP" and a[8] == "TILE_LOCKS"
             r = a[-1]
             log.append(("tile", a[18], a[19], a[13], a[23], a[24], a[25],
                         None if r is None else int(r[0])))
-        compiled = (op, pmp.TILE_TABLES[n][1], "C_TMP", redo)
+        compiled = (op, pmp.TILE_TABLES[n][1], ("C_TMP", "TILE_LOCKS"), redo)
     pmp.run(_Layer(log), torch.empty(M, K), x, w1, w2, torch.zeros(M, TOPK),
             ids, "silu", ws13, ws2, buf=None, compiled=compiled or None)
     return log
@@ -211,7 +237,7 @@ def test_pp_run_passes_the_rows_in_order(monkeypatch):
             torch.zeros(M, TOPK, dtype=torch.int32), "silu",
             torch.empty(M * TOPK * K, dtype=torch.bfloat16),
             torch.empty(M * TOPK * K, dtype=torch.bfloat16), buf=None,
-            compiled=(op, pmp.TILE_TABLES[2048][1], "C_TMP", redo))
+            compiled=(op, pmp.TILE_TABLES[2048][1], ("C_TMP", "LOCKS"), redo))
     assert seen == list(range(8))
 
 
@@ -450,6 +476,131 @@ def test_compiled_graph_replay_equals_eager(weights, monkeypatch):
     assert torch.equal(out, eager)
 
 
+# One CTA per SM (the dynamic shared memory request is the whole opt-in
+# budget). flags[i] = 1 once CTA i holds its SM; a host write to
+# flags[gridDim.x], or the time limit, releases them all.
+_HOLD_SM_SRC = r"""
+extern "C" __global__ void hold_sm(volatile int* flags, unsigned long long limit_ns) {
+  extern __shared__ volatile unsigned char budget[];
+  if (threadIdx.x != 0) return;
+  budget[0] = 1;
+  unsigned long long start, now;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+  flags[blockIdx.x] = 1;
+  __threadfence_system();
+  do {
+    __nanosleep(10000);
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  } while (flags[gridDim.x] == 0 && now - start < limit_ns);
+}
+"""
+
+
+@contextlib.contextmanager
+def _all_but_one_sm_held(device, limit_s=60.0):
+    """Hold every SM of ``device`` but one with a kernel on another stream, as
+    a collective waiting for its peers can; yields once all of them run."""
+    import ctypes
+
+    from cuda.bindings import driver, nvrtc
+
+    def ok(result):
+        err, *rest = result
+        assert int(err) == 0, err
+        return rest[0] if len(rest) == 1 else None
+
+    torch.cuda.synchronize(device)
+    ok(driver.cuInit(0))
+    prog = ok(nvrtc.nvrtcCreateProgram(_HOLD_SM_SRC.encode(), b"hold_sm.cu", 0,
+                                       [], []))
+    opts = [b"--gpu-architecture=sm_80"]
+    ok(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+    cubin = b" " * ok(nvrtc.nvrtcGetCUBINSize(prog))
+    ok(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    ok(nvrtc.nvrtcDestroyProgram(prog))
+    module = ok(driver.cuModuleLoadData(cubin))
+    func = ok(driver.cuModuleGetFunction(module, b"hold_sm"))
+    dev = ok(driver.cuDeviceGet(torch.device(device).index or 0))
+    smem = ok(driver.cuDeviceGetAttribute(
+        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        dev))
+    ok(driver.cuFuncSetAttribute(
+        func, driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        smem))
+    assert ok(driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(func, 32, smem)) == 1
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    flags = torch.zeros(sms, dtype=torch.int32, pin_memory=True)
+    stream = torch.cuda.Stream(device)
+    ok(driver.cuLaunchKernel(
+        func, sms - 1, 1, 1, 32, 1, 1, smem, driver.CUstream(stream.cuda_stream),
+        ((flags.data_ptr(), int(limit_s * 1e9)), (ctypes.c_void_p, ctypes.c_ulonglong)),
+        0))
+    try:
+        deadline = time.monotonic() + 10
+        while int(flags[:sms - 1].sum()) != sms - 1:
+            assert time.monotonic() < deadline, "not every other SM was held"
+            time.sleep(0.001)
+        yield
+    finally:
+        flags[sms - 1] = 1
+        stream.synchronize()
+        ok(driver.cuModuleUnload(module))
+
+
+def _progress_with_one_free_sm(monkeypatch, layer, wd, x, tw, ti, n):
+    """Run the compiled split path with every SM but one held: it must finish
+    while they are held, bitwise as without the hold, semaphores back at 0."""
+    from vllm import ampere_marlin
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    if not _have_op():
+        pytest.skip("library without prefill_tile_gemm")
+    monkeypatch.setattr(pmp, "_TILE_SCRATCH", {})
+    monkeypatch.setattr(pmp, "_TILE_REDO", {})
+    device, M = x.device, x.size(0)
+    pmp.warmup(device, E, M, TOPK, n)
+    scratch = pmp._tile_scratch(device, create=False)
+    redo = (pmp._tile_redo(device, M * TOPK, E, create=False)
+            if n in pmp.REDO_N else None)
+    compiled = (ampere_marlin.prefill_tile_op()[0], pmp.TILE_TABLES[n][1],
+                scratch, redo)
+    buf = pmp._buffers(device, E, M * TOPK, create=False)
+    out = torch.empty_like(x)
+    ws13 = torch.empty(M * TOPK, K, dtype=torch.bfloat16, device=device)
+    ws2 = torch.empty(M * TOPK * K, dtype=torch.bfloat16, device=device)
+
+    def step():
+        pmp.run(layer, out, x, wd["w1"], wd["w2"], tw, ti, MoEActivation.SILU,
+                ws13, ws2, buf, compiled=compiled)
+
+    step()
+    torch.cuda.synchronize(device)
+    free = out.clone()
+    out.fill_(float("nan"))
+    done = torch.cuda.Event()
+    with _all_but_one_sm_held(device):
+        step()
+        done.record()
+        deadline = time.monotonic() + 15
+        while not done.query() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        finished = done.query()
+    torch.cuda.synchronize(device)
+    assert finished, "the compiled tiles waited for SMs held by another kernel"
+    assert torch.equal(out, free)
+    assert torch.count_nonzero(scratch[1]).item() == 0, "semaphores not reset"
+
+
+@gpu
+def test_compiled_progress_with_one_free_sm(weights, monkeypatch):
+    """The reported TP4 batch: two 192-token resumed prefill chunks plus a
+    4-token speculative decode (M=388). Its block lists are small, so their
+    tiles are split across many stream-K CTAs."""
+    x, tw, ti = hp._inputs(388, 5)
+    _progress_with_one_free_sm(monkeypatch, tp4._gpu_layer(weights), weights,
+                               x, tw, ti, N)
+
+
 # ------------------------------------------------- GPU, PP whole experts ----
 
 def _pp():
@@ -604,3 +755,15 @@ def test_pp_compiled_graph_replay_equals_eager(pp_weights, monkeypatch):
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() == before
     assert torch.equal(out, eager)
+
+
+@gpu
+def test_pp_compiled_progress_with_one_free_sm(pp_weights, monkeypatch):
+    """Whole experts with scales above 2^-5: the fast_dequant kernels and the
+    regular kernels' redo pass both run while every SM but one is held."""
+    pp = _pp()
+    wd = pp_weights[1]
+    x, tw, ti = pp._inputs(388, 6)
+    _progress_with_one_free_sm(monkeypatch, pp._gpu_layer(wd), wd, x, tw, ti,
+                               pp.N)
+    assert sum(pmp._TILE_REDO[str(x.device)][:, 0].tolist()) > 0

@@ -375,6 +375,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
+#ifdef MARLIN_MOE_ORDERED_STREAM_K
+  // The start counter sits at locks[blocks]: the wrapper checks sms * 4 + 1.
+  STD_TORCH_CHECK(exec_cfg.blocks_per_sm >= 1 && exec_cfg.blocks_per_sm <= 4,
+                  "blocks_per_sm = ", exec_cfg.blocks_per_sm,
+                  " is outside 1..4");
+#endif
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
@@ -438,16 +444,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     if (k == MarlinDefault) continue;
     cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          max_shared_mem);
-  #ifdef MARLIN_MOE_CHECK_RESIDENT_BLOCKS
-    if (exec_cfg.blocks_per_sm > 1) {
-      // the stream-K spin locks need every CTA of the grid resident at once
-      int occ = 0;
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k, num_threads,
-                                                    max_shared_mem);
-      STD_TORCH_CHECK(occ >= exec_cfg.blocks_per_sm, "occupancy ", occ,
-                      " < blocks_per_sm ", exec_cfg.blocks_per_sm);
-    }
-  #endif
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
     k<<<blocks, num_threads, max_shared_mem, stream>>>(
@@ -461,16 +457,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 #else
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
-#ifdef MARLIN_MOE_CHECK_RESIDENT_BLOCKS
-  if (exec_cfg.blocks_per_sm > 1) {
-    // the stream-K spin locks need every CTA of the grid resident at once
-    int occ = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, num_threads,
-                                                  max_shared_mem);
-    STD_TORCH_CHECK(occ >= exec_cfg.blocks_per_sm, "occupancy ", occ,
-                    " < blocks_per_sm ", exec_cfg.blocks_per_sm);
-  }
-#endif
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
@@ -822,6 +808,13 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
   STD_TORCH_CHECK(workspace.numel() >= min_workspace_size,
                   "workspace.numel = ", workspace.numel(),
                   " is below min_workspace_size = ", min_workspace_size);
+#ifdef MARLIN_MOE_ORDERED_STREAM_K
+  // Semaphores below the grid size, then the start counter at locks[grid]
+  // (marlin_template.h): zero-initialised, at least sms * 4 + 1 entries.
+  STD_TORCH_CHECK(workspace.numel() > sms * 4, "workspace.numel = ",
+                  workspace.numel(), " must exceed sms * 4 = ", sms * 4,
+                  " (semaphores plus the CTA start counter)");
+#endif
 
   int dev = a.get_device();
 

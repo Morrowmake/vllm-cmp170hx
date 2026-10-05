@@ -289,6 +289,29 @@ __global__ void Marlin(
     return;
   #endif
 
+#ifdef MARLIN_MOE_ORDERED_STREAM_K
+  // Stream-K CTAs wait only for CTAs of higher index in their tile (slice_idx
+  // 0 is a tile's highest CTA, see init_part2_slice). Hand the indices out in
+  // start order, highest first, so every CTA waited for has already started
+  // and stays resident until it finishes: progress no longer needs the whole
+  // grid resident at once, which a kernel on another stream (a collective
+  // waiting for its peers) can prevent. The schedule, every CTA's work and the
+  // reduction order are those of blockIdx.x order. locks[gridDim.x] counts the
+  // starts; atomicInc wraps it to 0 at the grid's last CTA, ready for the next
+  // launch. Taken before any return so that every CTA counts exactly once.
+  extern __shared__ int ordered_cta_sh[];
+  if (threadIdx.x == 0)
+    ordered_cta_sh[0] =
+        gridDim.x - 1 -
+        atomicInc(reinterpret_cast<unsigned int*>(locks + gridDim.x),
+                  gridDim.x - 1);
+  __syncthreads();
+  const int cta = ordered_cta_sh[0];
+  __syncthreads();
+#else
+  const int cta = blockIdx.x;
+#endif /* MARLIN_MOE_ORDERED_STREAM_K */
+
 #ifdef MARLIN_MOE_FAST_DEQUANT_REDO
   const bool redo_mode = !fast_dequant && redo != nullptr;
   int redo_count = 0;
@@ -414,8 +437,8 @@ __global__ void Marlin(
   if (redo_mode) {
     // only the listed tiles, each whole (DP), round-robin over the CTAs
     part2_mn_tiles = 0;
-    part1_mn_iters = blockIdx.x < redo_count
-                         ? (redo_count - blockIdx.x + gridDim.x - 1) / gridDim.x
+    part1_mn_iters = cta < redo_count
+                         ? (redo_count - cta + gridDim.x - 1) / gridDim.x
                          : 0;
   }
 #endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
@@ -434,11 +457,11 @@ __global__ void Marlin(
 
   int slice_row = 0;
 #ifndef MARLIN_MOE_FAST_DEQUANT_REDO
-  int slice_col_par = blockIdx.x;
+  int slice_col_par = cta;
 #else /* MARLIN_MOE_FAST_DEQUANT_REDO */
-  int redo_i = blockIdx.x;
+  int redo_i = cta;
   int slice_col_par = redo_mode ? (redo_i < redo_count ? redo[1 + redo_i] : 0)
-                                : blockIdx.x;
+                                : cta;
 #endif /* MARLIN_MOE_FAST_DEQUANT_REDO */
   int slice_col;
   int slice_iters =
@@ -478,9 +501,9 @@ __global__ void Marlin(
   if (part2_mn_tiles >= gridDim.x) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
+    locks_off = cta;
   } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    locks_off = (iters * cta) / k_tiles - 1;
   }
 
   int prob_m_top_k = prob_m * top_k;
@@ -585,8 +608,7 @@ __global__ void Marlin(
   // synchronization.
   bool first_init = true;
   auto init_part2_slice = [&]() {
-    slice_iters =
-        iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
+    slice_iters = iters * (cta + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) slice_iters = 0;
     if (slice_iters == 0) return;
     if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
@@ -597,7 +619,7 @@ __global__ void Marlin(
       int col_off = col_first - k_tiles * slice_col_par;
       slice_count = div_ceil(k_tiles - col_off, iters);
       if (col_off > 0) slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
+      int delta_first = iters * cta - col_first;
       if (delta_first < 0 || (col_off == 0 && delta_first == 0))
         slice_idx = slice_count - 1;
       else {
@@ -666,8 +688,8 @@ __global__ void Marlin(
   auto init_slice = [&]() {
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
-      slice_col_par = (iters * blockIdx.x) / k_tiles;
-      slice_row = (iters * blockIdx.x) % k_tiles;
+      slice_col_par = (iters * cta) / k_tiles;
+      slice_row = (iters * cta) % k_tiles;
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       update_next_moe_block_data();

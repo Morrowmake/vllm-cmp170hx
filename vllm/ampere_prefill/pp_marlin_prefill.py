@@ -57,9 +57,19 @@ could not compute exactly in a per-GEMM ``redo`` area, then the regular kernel
 on just those tiles (it exits at once when none are listed).  The redo area
 (one row per list GEMM, its count zeroed on the device per call) is allocated
 in ``warmup``; without it (e.g. a larger call during a capture) the regular
-kernels alone run.  The op's fp32 reduction scratch is allocated in
-``warmup`` too; without the library, the op or the scratch the released
-kernels run with ``THREAD_CFG``.
+kernels alone run.  The op's fp32 reduction scratch and its own zeroed
+semaphores are allocated in ``warmup`` too; without the library, the op or
+the scratch the released kernels run with ``THREAD_CFG``.
+
+PROGRESS.  Marlin's stream-K CTAs spin until the other CTAs of their tile
+have added their partial sums; the released kernels assume the whole grid is
+resident to make progress.  The op hands out CTA indices in start order
+(library prefill_schedule_version 2), so a CTA only waits for CTAs that have
+already started: a kernel on another stream that holds SMs (the prefill
+overlap's collectives) slows the GEMM but cannot stall it.  The schedule and
+the arithmetic are unchanged (bitwise the earlier library's output).  The op's
+semaphores are a separate per-device buffer of sms * 4 + 1 int32 (entry
+[grid size] counts CTA starts); every entry is zero again after each launch.
 
 CUDA GRAPHS.  No host sync and no per-call allocation: the list buffers are
 allocated once per (device, E) for max_num_batched_tokens rows by ``warmup``
@@ -110,8 +120,10 @@ REDO_N = (N_GATE,)
 _TILE_REDO: dict = {}
 _SMS: dict = {}
 MAX_BLOCKS_PER_SM = 4
-# fp32 reduction scratch of prefill_tile_gemm per device: Marlin needs at most
-# sms * 4 blocks * moe_block_size (64) * thread_n floats; sized for thread_n 512.
+# Scratch of prefill_tile_gemm per device, (c_tmp, locks): the fp32 reduction
+# scratch (Marlin needs at most sms * 4 blocks * moe_block_size (64) * thread_n
+# floats; sized for thread_n 512) and the op's zeroed int32 semaphores, one per
+# CTA of the largest grid (sms * 4) plus the CTA start counter.
 _TILE_SCRATCH: dict = {}
 _TILE_MAX_N = 512
 
@@ -172,8 +184,11 @@ def _tile_scratch(device: torch.device, create: bool):
     buf = _TILE_SCRATCH.get(key)
     if buf is None and create:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-        buf = torch.empty(sms * 4 * 64 * _TILE_MAX_N, dtype=torch.float32,
-                          device=device)
+        c_tmp = torch.empty(sms * MAX_BLOCKS_PER_SM * 64 * _TILE_MAX_N,
+                            dtype=torch.float32, device=device)
+        locks = torch.zeros(sms * MAX_BLOCKS_PER_SM + 1, dtype=torch.int32,
+                            device=device)
+        buf = (c_tmp, locks)
         _TILE_SCRATCH[key] = buf
     return buf
 
@@ -215,8 +230,8 @@ def _tile_redo(device: torch.device, rows: int, E: int, create: bool):
 
 
 def compiled_tiles(N: int, device: torch.device, create: bool):
-    """(op, tables, c_tmp, None) when the compiled tiles serve width N, else
-    (None, None, None, reason); reason None means simply not requested."""
+    """(op, tables, (c_tmp, locks), None) when the compiled tiles serve width
+    N, else (None, None, None, reason); reason None means simply not requested."""
     entry = TILE_TABLES.get(N)
     if entry is None:
         return None, None, None, None
@@ -230,11 +245,11 @@ def compiled_tiles(N: int, device: torch.device, create: bool):
     op, why = prefill_tile_op()
     if op is None:
         return None, None, None, f"{flag} is set but {why}"
-    c_tmp = _tile_scratch(device, create)
-    if c_tmp is None:
+    scratch = _tile_scratch(device, create)
+    if scratch is None:
         return None, None, None, (f"{flag} is set but its scratch is not "
                                   "allocated during a graph capture")
-    return op, tables, c_tmp, None
+    return op, tables, scratch, None
 
 
 def gate_reason(layer, hidden_states: torch.Tensor, w1: torch.Tensor,
@@ -331,7 +346,7 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
         flag, min_tokens)
     N = w2.size(1) * 16
     capturing = torch.cuda.is_current_stream_capturing()
-    op, tables, c_tmp, why_not = compiled_tiles(
+    op, tables, scratch, why_not = compiled_tiles(
         N, hidden_states.device, create=not capturing)
     if op is not None:
         logger.info_once(
@@ -351,7 +366,7 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
                     "Marlin MoE prefill fast dequant active (%s, N=%d): one-HFMA2 "
                     "dequant, tiles with a scale above 2^-5 recomputed by the "
                     "regular kernel.", TILE_TABLES[N][0], N)
-        compiled = (op, tables, c_tmp, redo)
+        compiled = (op, tables, scratch, redo)
     else:
         if why_not is not None:
             logger.info_once("%s; using the released Marlin kernels.", why_not)
@@ -367,8 +382,9 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     """The split path. Workspaces as ``MarlinExperts.apply`` passes them to
     ``fused_marlin_moe`` (workspace2 holds w13's and w2's outputs, workspace13
     the activation). ``compiled`` = (prefill_tile_gemm, {"w13", "w2"} tables,
-    c_tmp, redo or None) runs the list GEMMs on the compiled tiles instead;
-    with a redo area every list GEMM runs the optimistic fast dequant."""
+    (c_tmp, locks), redo or None) runs the list GEMMs on the compiled tiles
+    instead, with the op's own semaphores; with a redo area every list GEMM
+    runs the optimistic fast dequant."""
     from vllm.ampere_prefill.moe_split_align import split_align
     from vllm.model_executor.layers.fused_moe.utils import _resize_cache
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -390,20 +406,20 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
 
     lists = split_align(topk_ids, E, buf)
     if compiled is not None:
-        op, tables, c_tmp, redo = compiled
+        op, tables, (c_tmp, locks), redo = compiled
         nl = len(lists)
         if redo is not None:
             redo[:, 0].zero_()       # per-GEMM tile counts (kernel.h)
         for i, (bs, sorted_ids, expert_ids, ntpp) in enumerate(lists):
             op(hidden_states, c1, w1, None, layer.w1_scale, None, None, None,
-               workspace, sorted_ids, expert_ids, ntpp, topk_weights, bs, topk,
+               locks, sorted_ids, expert_ids, ntpp, topk_weights, bs, topk,
                False, qt.id, M, 2 * N, K, False, True, False,
                *_thread_cfg(bs, 2 * N, K, tables["w13"]), c_tmp,
                None if redo is None else redo[i])
         layer.activation(activation, c2, c1, topk_ids=topk_ids, expert_map=None)
         for i, (bs, sorted_ids, expert_ids, ntpp) in enumerate(lists):
             op(c2, c3, w2, None, layer.w2_scale, None, None, None,
-               workspace, sorted_ids, expert_ids, ntpp, topk_weights, bs, 1,
+               locks, sorted_ids, expert_ids, ntpp, topk_weights, bs, 1,
                True, qt.id, rows, K, N, False, True, False,
                *_thread_cfg(bs, K, N, tables["w2"]), c_tmp,
                None if redo is None else redo[nl + i])

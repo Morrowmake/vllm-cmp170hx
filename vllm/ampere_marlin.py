@@ -45,6 +45,10 @@ _PREFILL_TILE_SCHEMA = (
     "size_k use_atomic_add use_fp32_reduce is_zp_float thread_k thread_n "
     "blocks_per_sm c_tmp redo"
 )
+# build_info's prefill_schedule_version: 2 = stream-K CTA indices in start order
+# (no wait on a CTA that has not started). An older library still serves decode,
+# but its prefill tiles assume the whole grid is resident, so they are not used.
+_PREFILL_SCHEDULE_VERSION = 2
 _PREFILL_TILE = None
 
 
@@ -108,6 +112,12 @@ def prefill_tile_op():
     try:
         module = importlib.import_module("vllm._ampere_marlin_C")
         _validate_extension(module)
+        schedule = module.build_info().get("prefill_schedule_version")
+        if schedule != _PREFILL_SCHEDULE_VERSION:
+            raise ValueError(
+                f"prefill schedule version {schedule!r} needs every CTA "
+                "resident at once; rebuild the optional library "
+                "(VLLM_BUILD_AMPERE_MARLIN=1)")
         qualified = "_ampere_marlin_C::prefill_tile_gemm"
         schema = torch._C._dispatch_find_schema_or_throw(qualified, "").schema()
         names = " ".join(a.name for a in schema.arguments)
