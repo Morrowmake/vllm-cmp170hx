@@ -1412,12 +1412,12 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
-                        # A prompt tail over cached state must match the cold
-                        # prefill shape, including remote loads and preemption.
+                        # A prompt tail over cached state has no generated token
+                        # or drafts to verify. Keep its real prefill shape for
+                        # every cache source and boundary policy.
                         # Resumed decodes keep padding.
                         and not (
-                            self.kv_cache_manager.coordinator.dflash_boundary_group_ids
-                            and num_computed_tokens > 0
+                            num_computed_tokens > 0
                             and request.num_output_tokens == 0
                             and num_computed_tokens < request.num_prompt_tokens
                         )

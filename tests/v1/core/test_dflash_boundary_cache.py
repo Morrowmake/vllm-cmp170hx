@@ -393,20 +393,23 @@ def test_preempted_boundary_prompt_tail_preserves_real_query(monkeypatch, has_ou
         assert decode.scheduled_spec_decode_tokens["resumed"] == [9] * 3
 
 
+@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize("local_hit", [False, True])
-def test_external_boundary_prompt_tail_preserves_real_query(
-    monkeypatch, is_async, local_hit
+def test_external_prompt_tail_preserves_real_query(
+    monkeypatch, enabled, is_async, local_hit
 ):
     """Every restored prompt tail keeps one real token before its first sample."""
     scheduler = _boundary_scheduler(
-        monkeypatch, True, connector=mock_kv(matched_tokens=BOUNDARY, is_async=is_async)
+        monkeypatch, enabled, connector=mock_kv(matched_tokens=BOUNDARY, is_async=is_async)
     )
     if local_hit:
         # Build a local cache before attaching the mock transfer protocol.
         with monkeypatch.context() as local:
             local.setattr(scheduler, "connector", None)
-            seed = make_request("seed", PREFIX[: 2 * BLOCK + 1], BLOCK, sha256)
+            seed = make_request(
+                "seed", PREFIX[: (2 if enabled else 3) * BLOCK + 1], BLOCK, sha256
+            )
             scheduler.add_request(seed)
             while seed.num_output_tokens == 0:
                 seed_out = scheduler.schedule()
