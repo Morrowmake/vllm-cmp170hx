@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Kimi-K3 specialization of GDN attention metadata.
 
 The request classification and cudagraph staging intentionally mirror
