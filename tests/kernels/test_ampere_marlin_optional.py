@@ -162,7 +162,8 @@ def test_released_prefill_thresholds(monkeypatch):
 
 @pytest.mark.parametrize("width,python_on,budget,expected", [
     (512, False, 3460, 0), (512, True, 3460, 3460),
-    (2048, False, 2312, 0), (2048, True, 2312, 2312), (1024, True, 2312, 0),
+    (2048, False, 2312, 0), (2048, True, 2312, 2312),
+    (1024, False, 2312, 0), (1024, True, 2312, 2312), (768, True, 2312, 0),
 ])
 def test_warmup_allocations_follow_admitted_width(monkeypatch, width, python_on, budget,
                                                   expected):

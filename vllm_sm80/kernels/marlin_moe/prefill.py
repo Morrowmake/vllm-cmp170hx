@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-block Marlin W4A16 MoE prefill on sm_80 (PP whole experts, TP4 shards).
+"""Split-block Marlin W4A16 MoE prefill on sm_80 (PP whole experts, TP4/TP2 shards).
 
 WHAT.  ``VLLM_SM80_MARLIN_PREFILL``.  Under pipeline parallelism with TP=1
 every stage holds all 288 experts whole (N=2048, K=4096); under tensor
-parallel 4 every card holds all 288 sharded to N=512; the expert width picks
-the shape.  ``fused_marlin_moe`` aligns the ~64
+parallel 4 every card holds all 288 sharded to N=512; under PP=2 with TP=2
+inside each stage every card holds them sharded to N=1024; the expert width
+picks the shape.  ``fused_marlin_moe`` aligns the ~64
 rows per expert to one block size, so the last block of each expert is mostly
 padding (~1.55x the useful rows at 2304 tokens).  This path replaces the alignment with
 ``split_align`` (one block list per size 64/48/32/16, cheapest cover per
@@ -53,7 +54,8 @@ in ``warmup``; without it (e.g. a larger call during a capture) the regular
 kernels alone run.  The op's fp32 reduction scratch and its own zeroed
 semaphores are allocated in ``warmup`` too; without the library, the op or
 the scratch the released kernels run with ``THREAD_CFG``.  The TP4 (N=512)
-lists have no tile table and always run on the released kernels.
+and TP2 (N=1024) lists have no tile table and always run on the released
+kernels.
 
 PROGRESS.  Marlin's stream-K CTAs spin until the other CTAs of their tile
 have added their partial sums; the released kernels assume the whole grid is
@@ -89,6 +91,7 @@ TOPK_GATE = 8
 K_GATE = 4096
 N_GATE = 2048
 N_GATE_TP4 = 512
+N_GATE_TP2 = 1024
 GROUP_SIZE = 128
 CLAMP_LIMIT = 10.0
 
@@ -149,14 +152,15 @@ def min_rows(n: int) -> int:
 
 
 def enabled_shapes() -> dict:
-    """{N: (switch, min_tokens)} for the widths the split path may take: both
-    N=2048 (whole experts) and N=512 (TP4 shards) when
+    """{N: (switch, min_tokens)} for the widths the split path may take:
+    N=2048 (whole experts), N=512 (TP4 shards) and N=1024 (TP2 shards) when
     VLLM_SM80_MARLIN_PREFILL is set, none otherwise; min_tokens is
     :func:`min_rows` at that N."""
     out = {}
     if envs.VLLM_SM80_MARLIN_PREFILL:
         out[N_GATE] = (FLAG, min_rows(N_GATE))
         out[N_GATE_TP4] = (FLAG, min_rows(N_GATE_TP4))
+        out[N_GATE_TP2] = (FLAG, min_rows(N_GATE_TP2))
     return out
 
 
@@ -344,7 +348,8 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
         return False
     logger.info_once(
         "%s Marlin MoE prefill active (%s): split 64/48/32/16-row block lists "
-        "for M >= %d.", "PP" if w2.size(1) * 16 == N_GATE else "TP4",
+        "for M >= %d.",
+        {N_GATE: "PP", N_GATE_TP4: "TP4", N_GATE_TP2: "TP2"}[w2.size(1) * 16],
         flag, min_tokens)
     N = w2.size(1) * 16
     capturing = torch.cuda.is_current_stream_capturing()

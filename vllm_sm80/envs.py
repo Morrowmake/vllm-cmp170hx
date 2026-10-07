@@ -279,9 +279,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # in place of the upstream chunk_kda_with_fused_gate: six launches instead
     # of nine, fixed launch configurations, fp32-exact intermediates where the
     # recurrence needs them. The layer's head count picks the shape: 64 heads
-    # per card (pipeline parallel, TP=1) with chunks of up to 2312 tokens, or
-    # 16 heads per card (tensor parallel 4) with chunks of up to 3460 tokens
-    # (the TP token budget). Taken only on sm_80 with the Triton prefill
+    # per card (pipeline parallel, TP=1) or 32 heads per card (PP=2 with TP=2
+    # inside each stage) with chunks of up to 2312 tokens, or 16 heads per
+    # card (tensor parallel 4) with chunks of up to 3460 tokens (the TP token
+    # budget). Taken only on sm_80 with the Triton prefill
     # backend, head dim 128, bf16 activations, fp32 state, the safe gate at
     # -5 and at most 16 sequences per chunk; everything else keeps the
     # upstream path. Off by default.
@@ -644,8 +645,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # optional library's prefill_tile_gemm tiles ((64,512) on the 64/48/32-row
     # lists of both GEMMs, the optimistic fast dequant with tiles above a 2^-5
     # scale recomputed by the regular kernel; without the library or its op the
-    # released kernels); or tensor-parallel-4 shards (N=512) on the released
-    # kernels. Taken for M >= the moe_prefill/marlin_min_rows row of the sm80
+    # released kernels); or tensor-parallel shards on the released kernels:
+    # N=512 (tensor parallel 4) and N=1024 (PP=2 with TP=2 inside each stage).
+    # Taken for M >= the moe_prefill/marlin_min_rows row of the sm80
     # tuning table at that N. The split cover changes stream-K boundaries and
     # reduction order, so output is not bitwise equal to fused_marlin_moe.
     # Everything else keeps fused_marlin_moe. Off by default.

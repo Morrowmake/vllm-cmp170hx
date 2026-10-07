@@ -72,7 +72,7 @@ def test_flag_declared_default_off(monkeypatch):
 
 
 @pytest.mark.parametrize("value,want", [
-    ("0", ()), ("1", (64, 16)),
+    ("0", ()), ("1", (64, 32, 16)),
 ])
 def test_enabled_heads(monkeypatch, value, want):
     monkeypatch.setenv(FLAG, value)
@@ -82,7 +82,8 @@ def test_enabled_heads(monkeypatch, value, want):
 def test_banners_name_the_switch_and_head_count():
     assert kp.BANNER.startswith("GLM5 PP KDA prefill: sm_80 fused chunk path live (64 heads)")
     assert kp.TP4_BANNER.startswith("GLM5 TP4 KDA prefill: sm_80 fused chunk path live (16 heads)")
-    for banner in (kp.BANNER, kp.TP4_BANNER):
+    assert kp.TP2_BANNER.startswith("GLM5 TP2 KDA prefill: sm_80 fused chunk path live (32 heads")
+    for banner in (kp.BANNER, kp.TP4_BANNER, kp.TP2_BANNER):
         assert banner.endswith(f"; {FLAG}=1")
 
 

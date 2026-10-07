@@ -166,7 +166,7 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
             if kda_recover_enabled(vllm_config):
                 self._init_kda_recover(config, vllm_config, prefix)
 
-        # VLLM_SM80_KDA_PREFILL (64 or 16 heads): the layer part of the gate,
+        # VLLM_SM80_KDA_PREFILL (64, 32 or 16 heads): the layer part of the gate,
         # resolved once.
         self._pp_kda_prefill = False
         if _envs.VLLM_SM80_KDA_PREFILL:

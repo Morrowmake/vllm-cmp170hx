@@ -202,10 +202,12 @@ def test_moe_routing_method_is_pinned(on):
 
 
 def test_kda_shape_is_pinned(on):
-    """Only the TP4 and PP4 rank shapes (16 or 64 heads of 128) dispatch."""
+    """Only the TP4, TP2-in-PP2 and PP4 rank shapes (16, 32 or 64 heads of
+    128) dispatch."""
     assert use_ampere_kda_decode_v2(1, 4, 16, 128) is True
+    assert use_ampere_kda_decode_v2(1, 4, 32, 128) is True
     assert use_ampere_kda_decode_v2(1, 4, 64, 128) is True
-    assert use_ampere_kda_decode_v2(1, 4, 32, 128) is False
+    assert use_ampere_kda_decode_v2(1, 4, 48, 128) is False
     assert use_ampere_kda_decode_v2(1, 4, 16, 64) is False
     assert use_ampere_kda_decode_v2(0, 4, 16, 128) is False
     assert use_ampere_kda_decode_v2(8, 4, 16, 128) is False  # more seqs than tokens

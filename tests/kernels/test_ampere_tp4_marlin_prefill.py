@@ -104,7 +104,7 @@ def test_flag_defaults(monkeypatch):
 
 @pytest.mark.parametrize("value,want", [
     ("0", {}),
-    ("1", {2048: (FLAG, 384), 512: (FLAG, 700)}),
+    ("1", {2048: (FLAG, 384), 512: (FLAG, 700), 1024: (FLAG, 384)}),
 ])
 def test_enabled_shapes(monkeypatch, value, want):
     monkeypatch.setenv(FLAG, value)

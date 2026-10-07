@@ -9,14 +9,15 @@
 # notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
-"""KDA chunked prefill for GLM-5.3-Flash with 64 or 16 heads per card, sm_80.
+"""KDA chunked prefill for GLM-5.3-Flash with 64, 32 or 16 heads per card, sm_80.
 
 ``VLLM_SM80_KDA_PREFILL=1`` replaces ``chunk_kda_with_fused_gate`` of
 ``vllm/models/glm5next/nvidia/ops/third_party/kda`` at the prefill call site
 of ``vllm/models/glm5next/common/kda.py`` when all 64 heads live on one card
-(pipeline parallel, TP=1) or 16 heads per card under tensor parallel 4
+(pipeline parallel, TP=1), 32 heads per card under tensor parallel 2 inside
+each pipeline stage (PP=2, TP=2), or 16 heads per card under tensor parallel 4
 (chunks of up to 3460 tokens). The kernels take the head count from the
-inputs; the two head counts differ only in the gate. Same signature, same
+inputs; the head counts differ only in the gate. Same signature, same
 outputs: ``o [1, T, H, V]``
 in the dtype of ``v`` and ``final_state [N, H, V, K]`` fp32 (K contiguous,
 the layout the decode kernels read from the state pool).
@@ -1178,7 +1179,10 @@ def chunk_kda_with_fused_gate(
 # activations, fp32 recurrent state, A_log
 # and dt_bias, the bounded (safe) gate at lower_bound -5, l2-normalised q and
 # k, varlen cu_seqlens, and at most 16 sequences per chunk. Anything else
-# keeps the upstream path.
+# keeps the upstream path. 32 heads per card (PP=2 with TP=2 inside each
+# stage) takes the 64-head chunk bound; the kernels are head-count generic
+# (H is a launch argument and the grid's second dimension), but the launch
+# configurations were measured only at 64 and 16 heads.
 HEADS = 64
 HEAD_DIM = 128
 LOWER_BOUND = -5.0
@@ -1186,6 +1190,8 @@ MAX_TOKENS = 2312
 MAX_SEQS = 16
 TP4_HEADS = 16
 TP4_MAX_TOKENS = 3460
+TP2_HEADS = 32
+TP2_MAX_TOKENS = 2312
 
 FLAG = "VLLM_SM80_KDA_PREFILL"
 
@@ -1197,10 +1203,16 @@ TP4_BANNER = (
     "GLM5 TP4 KDA prefill: sm_80 fused chunk path live (16 heads); "
     "VLLM_SM80_KDA_PREFILL=1"
 )
+TP2_BANNER = (
+    "GLM5 TP2 KDA prefill: sm_80 fused chunk path live (32 heads; launch "
+    "configurations measured at 64 and 16 heads only, check acceptance against "
+    "the upstream path); VLLM_SM80_KDA_PREFILL=1"
+)
 
 # per local head count: (largest chunk, banner, layout named in the gate)
 _BY_HEADS = {
     HEADS: (MAX_TOKENS, BANNER, "pipeline parallel, TP=1"),
+    TP2_HEADS: (TP2_MAX_TOKENS, TP2_BANNER, "tensor parallel 2 in a pipeline stage"),
     TP4_HEADS: (TP4_MAX_TOKENS, TP4_BANNER, "tensor parallel 4"),
 }
 

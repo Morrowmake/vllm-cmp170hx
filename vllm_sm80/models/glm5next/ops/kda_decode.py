@@ -17,9 +17,10 @@ replaces, in meaning,
 and advances `conv_state` and `rec_state` in place exactly as they do.
 The one KDA decode path of vllm/models/glm5next/common/kda.py whenever
 VLLM_AMPERE_DECODE_KERNELS=1 and use_ampere_kda_decode_v2 covers the step
-(16 heads of 128 under tensor parallel: up to 8 sequences of up to 5 tokens,
-up to 4 sequences of 6..8; 64 heads of 128 under pipeline parallel: the
-measured shapes of up to 8 sequences of up to 8 tokens) on pure verify steps;
+(16 heads of 128 under tensor parallel, and 32 under PP=2 with TP=2 inside
+each stage: up to 8 sequences of up to 5 tokens, up to 4 sequences of 6..8;
+64 heads of 128 under pipeline parallel: the measured shapes of up to 8
+sequences of up to 8 tokens) on pure verify steps;
 under RecoverSSM also the spec rows of a mixed prefill + verify step
 (SKIP_NORM).
 
@@ -865,6 +866,10 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False,
 # chain. RecoverSSM (vllm_sm80/kernels/kda/recover.py), the tensor-parallel
 # default, verifies every pure step with v2 whatever this gate says.
 #
+# 32 heads per card (PP=2 with TP=2 inside each stage) takes the 16-head
+# envelope. The kernel takes H as a constexpr and the gate workspace and
+# counters scale with nseq * H; the envelope was not re-measured at 32 heads.
+#
 # 64 heads per card (pipeline parallel): the (sequences, tokens per sequence)
 # shapes in _KDA_V2_WIDE_SHAPES, where the fused step (the wide schedule
 # beyond one sequence of up to 4 tokens, see kda_decode.wide_schedule)
@@ -872,6 +877,7 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False,
 # layers per graph, 6 alternating rounds, mean <= 1.01x; the other shapes are
 # 1.02-1.15x slower there and keep the unfused chain).
 _KDA_V2_HEADS = 16
+_KDA_V2_TP2_HEADS = 32
 _KDA_V2_WIDE_HEADS = 64
 _KDA_V2_HEAD_DIM = 128
 _KDA_V2_MAX_TOKENS_PER_SEQ = 8
@@ -920,7 +926,7 @@ def use_ampere_kda_decode_v2(
         return False
     if head_dim != _KDA_V2_HEAD_DIM:
         return False
-    if num_heads == _KDA_V2_HEADS:
+    if num_heads in (_KDA_V2_HEADS, _KDA_V2_TP2_HEADS):
         if tokens_per_seq >= _KDA_V2_DEEP_FROM and num_seqs > _KDA_V2_DEEP_MAX_SEQS:
             return False
     elif num_heads == _KDA_V2_WIDE_HEADS:

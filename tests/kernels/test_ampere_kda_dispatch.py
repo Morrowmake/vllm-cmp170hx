@@ -80,12 +80,13 @@ def _w(H, dtype=torch.bfloat16, device="cpu"):
 def expected_path(H, nseq, T):
     """The 1.8 dispatch of a pure verify step: 'v2' (per-draft-slot step,
     _select schedule), 'v2w' (wide schedule) or 'unfused'. RecoverSSM layers
-    (16 heads under tensor parallel) verify every step with v2 RECOVER."""
+    (16 heads under tensor parallel) verify every step with v2 RECOVER. 32
+    heads (PP=2 with TP=2 inside each stage) take the 16-head envelope."""
     from vllm_sm80.models.glm5next.ops.kda_decode import wide_schedule
 
     if nseq < 1 or nseq > 8 or T < 1 or T > 8:
         return "unfused"
-    if H == 16:
+    if H in (16, 32):
         return "unfused" if (T >= 6 and nseq > 4) else "v2"
     if H == 64:
         if (nseq, T) not in kda_decode._KDA_V2_WIDE_SHAPES:
@@ -100,7 +101,7 @@ def test_dispatch_table_every_served_shape():
     e = _Env()
     try:
         e.set(VLLM_AMPERE_DECODE_KERNELS=1)
-        for H in (16, 64):
+        for H in (16, 32, 64):
             w = _w(H)
             for nseq in range(1, 10):
                 for T in range(1, 10):
@@ -110,7 +111,7 @@ def test_dispatch_table_every_served_shape():
         # ragged token counts, zero sequences, other head counts and widths
         assert not use_ampere_kda_decode_v2(2, 7, 16, D)
         assert not use_ampere_kda_decode_v2(0, 4, 16, D)
-        assert not use_ampere_kda_decode_v2(1, 4, 32, D)
+        assert not use_ampere_kda_decode_v2(1, 4, 48, D)
         assert not use_ampere_kda_decode_v2(1, 4, 16, 64)
         # the retired 64-head switch changes nothing
         os.environ["VLLM_GLM5_DECODE_KDA_WIDE"] = "0"
