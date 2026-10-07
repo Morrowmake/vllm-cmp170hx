@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PP_KDA_PREFILL: bool = False
     VLLM_GLM5_STATE_INDEX_CHECK: bool = False
     VLLM_GLM5_TP4_KDA_PREFILL: bool = False
+    VLLM_GLM5_TP2_KDA_PREFILL: bool = False
     VLLM_GLM5_LOCAL_LOGITS: bool = False
     VLLM_GLM5_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MHC: bool = True
@@ -273,6 +274,9 @@ if TYPE_CHECKING:
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED: bool = True
     VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED: bool = True
+    VLLM_GLM5_TP2_MARLIN_PREFILL: bool = False
+    VLLM_GLM5_TP2_MARLIN_PREFILL_MIN_TOKENS: int = 384
+    VLLM_GLM5_TP2_MARLIN_PREFILL_COMPILED: bool = False
     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
     VLLM_GLM5_MARLIN_PREFILL_CUDA: str = ""
     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
@@ -1724,6 +1728,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_TP4_KDA_PREFILL": lambda: bool(
         int(os.getenv("VLLM_GLM5_TP4_KDA_PREFILL", "0"))
     ),
+    # TP2 (32 heads per card) sm_80 KDA chunked prefill: enables the fused
+    # chunk path at the tp2pp2 shard. The kernel body is head-count-generic
+    # so this is a dispatch-table add; pinned autotune values are inherited
+    # from the TP4/PP head counts. Verify accepted/step rate against a
+    # baseline before trusting output in production.
+    "VLLM_GLM5_TP2_KDA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TP2_KDA_PREFILL", "0"))
+    ),
     "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY": lambda: bool(
         int(os.getenv("VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY", "0"))
     ),
@@ -2204,6 +2216,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kill switch (released split path unchanged).
     "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": lambda: bool(
         int(os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED", "1"))
+    ),
+    # tp2pp2 (PP=2, TP=2 inside each stage) half-expert prefill: N=1024 (288
+    # experts sharded across TP=2 inside the stage). The kernel body is
+    # already shape-generic -- this is a dispatch-table add in
+    # vllm/ampere_prefill/pp_marlin_prefill.py (TILE_TABLES[N_GATE_TP2]).
+    # Compiled tile sizes are not yet measured for N=1024 so the entry is
+    # left empty, which makes the split path fall back to Marlin's own
+    # exec-config choice (safe, not trial-and-error). Off by default.
+    "VLLM_GLM5_TP2_MARLIN_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TP2_MARLIN_PREFILL", "0"))
+    ),
+    "VLLM_GLM5_TP2_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM5_TP2_MARLIN_PREFILL_MIN_TOKENS", "384")
+    ),
+    # With VLLM_GLM5_TP2_MARLIN_PREFILL: run the split-list Marlin GEMMs
+    # through the compiled prefill_tile_gemm. Off by default: no tiles have
+    # been measured for N=1024, so the TILE_TABLES entry is empty and
+    # Marlin's own exec-config choice runs. Flip on once tiles are swept.
+    "VLLM_GLM5_TP2_MARLIN_PREFILL_COMPILED": lambda: bool(
+        int(os.getenv("VLLM_GLM5_TP2_MARLIN_PREFILL_COMPILED", "0"))
     ),
     # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
     # requires vllm._ampere_marlin_C; startup fails if it is missing or

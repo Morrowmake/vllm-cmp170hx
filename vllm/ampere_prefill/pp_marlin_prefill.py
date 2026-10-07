@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-block Marlin W4A16 MoE prefill on sm_80 (PP whole experts, TP4 shards).
+"""Split-block Marlin W4A16 MoE prefill on sm_80 (PP whole experts, TP4/TP2 shards).
 
 WHAT.  Under pipeline parallelism with TP=1 every stage holds all 288 experts
 whole (N=2048, K=4096; ``VLLM_GLM5_PP_MARLIN_PREFILL``); under tensor
 parallel 4 every card holds all 288 sharded to N=512
-(``VLLM_GLM5_TP4_MARLIN_PREFILL``).  ``fused_marlin_moe`` aligns the ~64 rows per expert
+(``VLLM_GLM5_TP4_MARLIN_PREFILL``); under the tp2pp2 layout (PP=2, TP=2 inside
+each stage) each card holds a half-expert at N=1024
+(``VLLM_GLM5_TP2_MARLIN_PREFILL``).  ``fused_marlin_moe`` aligns the ~64 rows per expert
 to one block size, so the last block of each expert is mostly padding (~1.55x
 the useful rows at 2304 tokens).  This path replaces the alignment with
 ``moe_split_align`` (one block list per size 64/48/32/16, cheapest cover per
@@ -93,6 +95,7 @@ TOPK_GATE = 8
 K_GATE = 4096
 N_GATE = 2048
 N_GATE_TP4 = 512
+N_GATE_TP2 = 1024
 GROUP_SIZE = 128
 CLAMP_LIMIT = 10.0
 
@@ -111,6 +114,12 @@ TILE_TABLES = {
     N_GATE: ("VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED", {
         "w13": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
         "w2": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
+    }),
+    # Half-expert N=1024 falls back to Marlin's own exec-config; compiled tiles
+    # not yet measured, add here when swept.
+    N_GATE_TP2: ("VLLM_GLM5_TP2_MARLIN_PREFILL_COMPILED", {
+        "w13": {},
+        "w2": {},
     }),
 }
 # Widths whose list GEMMs run the optimistic fast dequant with a redo area.
@@ -151,7 +160,8 @@ def _is_sm80(device: torch.device) -> bool:
 
 def enabled_shapes() -> dict:
     """{N: (flag, min_tokens)} for the flags that are set: N=2048 under
-    VLLM_GLM5_PP_MARLIN_PREFILL, N=512 under VLLM_GLM5_TP4_MARLIN_PREFILL."""
+    VLLM_GLM5_PP_MARLIN_PREFILL, N=512 under VLLM_GLM5_TP4_MARLIN_PREFILL,
+    N=1024 under VLLM_GLM5_TP2_MARLIN_PREFILL (tp2pp2 half-expert)."""
     out = {}
     if envs.VLLM_GLM5_PP_MARLIN_PREFILL:
         out[N_GATE] = ("VLLM_GLM5_PP_MARLIN_PREFILL",
@@ -159,6 +169,9 @@ def enabled_shapes() -> dict:
     if envs.VLLM_GLM5_TP4_MARLIN_PREFILL:
         out[N_GATE_TP4] = ("VLLM_GLM5_TP4_MARLIN_PREFILL",
                            envs.VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS)
+    if envs.VLLM_GLM5_TP2_MARLIN_PREFILL:
+        out[N_GATE_TP2] = ("VLLM_GLM5_TP2_MARLIN_PREFILL",
+                           envs.VLLM_GLM5_TP2_MARLIN_PREFILL_MIN_TOKENS)
     return out
 
 
@@ -342,7 +355,8 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
         return False
     logger.info_once(
         "%s Marlin MoE prefill active (%s): split 64/48/32/16-row block lists "
-        "for M >= %d.", "PP" if w2.size(1) * 16 == N_GATE else "TP4",
+        "for M >= %d.",
+        {N_GATE: "PP", N_GATE_TP4: "TP4", N_GATE_TP2: "TP2"}[w2.size(1) * 16],
         flag, min_tokens)
     N = w2.size(1) * 16
     capturing = torch.cuda.is_current_stream_capturing()
@@ -480,7 +494,8 @@ def warmup_from_worker(worker) -> int:
     No-op unless VLLM_GLM5_PP_MARLIN_PREFILL or VLLM_GLM5_TP4_MARLIN_PREFILL
     is set on an sm_80 device and the model has 288 routed experts; returns
     the expert count warmed (0 if not)."""
-    if not (envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL):
+    if not (envs.VLLM_GLM5_PP_MARLIN_PREFILL or envs.VLLM_GLM5_TP4_MARLIN_PREFILL
+            or envs.VLLM_GLM5_TP2_MARLIN_PREFILL):
         return 0
     device = torch.device(worker.device)
     if device.type != "cuda" or not _is_sm80(device):

@@ -399,17 +399,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 "(VLLM_GLM5_DECODE_KDA_V2=1)."
             )
         if _envs.VLLM_GLM5_DECODE_KDA_V2_DEEP:
-            if self._kda_v2 and self.local_num_heads == 16:
+            if self._kda_v2 and self.local_num_heads in (16, 32):
                 logger.info_once(
                     "sm_80 KDA decode v2 deep: up to 8 tokens per sequence "
-                    "(draft depth 5..7), up to 4 sequences, at 16 heads "
-                    "(VLLM_GLM5_DECODE_KDA_V2_DEEP=1)."
+                    "(draft depth 5..7), up to 4 sequences, at %d heads "
+                    "(VLLM_GLM5_DECODE_KDA_V2_DEEP=1).",
+                    self.local_num_heads,
                 )
             else:
                 logger.info_once(
                     "VLLM_GLM5_DECODE_KDA_V2_DEEP=1 has no effect: needs "
                     "VLLM_GLM5_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_V2=1 and "
-                    "16 KDA heads per card (this layer: %d).",
+                    "16 or 32 KDA heads per card (this layer: %d).",
                     self.local_num_heads,
                 )
 

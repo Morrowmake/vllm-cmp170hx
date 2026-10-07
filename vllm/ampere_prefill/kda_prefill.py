@@ -1186,9 +1186,17 @@ MAX_TOKENS = 2312
 MAX_SEQS = 16
 TP4_HEADS = 16
 TP4_MAX_TOKENS = 3460
+# tp2pp2 (two PP stages of two TP ranks each): each rank holds 32 of the 64
+# KDA heads. The kernel body is head-count-generic (H is a runtime kernel
+# parameter and the grid's second dim scales with H), so the only
+# shape-specific risk is pinned autotune at an unmeasured head count. Mark
+# with a dedicated flag so the launcher opts in explicitly.
+TP2_HEADS = 32
+TP2_MAX_TOKENS = 2312  # Matches pp4's chunk cap; tp2pp2 forces BLOCK_SIZE=4608 as pp4 does.
 
 FLAG = "VLLM_GLM5_PP_KDA_PREFILL"
 TP4_FLAG = "VLLM_GLM5_TP4_KDA_PREFILL"
+TP2_FLAG = "VLLM_GLM5_TP2_KDA_PREFILL"
 
 BANNER = (
     "GLM5 PP KDA prefill: sm_80 fused chunk path live (64 heads); "
@@ -1198,10 +1206,16 @@ TP4_BANNER = (
     "GLM5 TP4 KDA prefill: sm_80 fused chunk path live (16 heads); "
     "VLLM_GLM5_TP4_KDA_PREFILL=1"
 )
+TP2_BANNER = (
+    "GLM5 TP2 KDA prefill: sm_80 fused chunk path live (32 heads); "
+    "VLLM_GLM5_TP2_KDA_PREFILL=1 -- unvalidated at this head count, "
+    "verify accepted/step rate against baseline before trusting output."
+)
 
 # per local head count: (flag, largest chunk, banner, layout named in the gate)
 _BY_HEADS = {
     HEADS: (FLAG, MAX_TOKENS, BANNER, "pipeline parallel, TP=1"),
+    TP2_HEADS: (TP2_FLAG, TP2_MAX_TOKENS, TP2_BANNER, "tensor parallel 2 (tp2pp2)"),
     TP4_HEADS: (TP4_FLAG, TP4_MAX_TOKENS, TP4_BANNER, "tensor parallel 4"),
 }
 
@@ -1213,6 +1227,8 @@ def enabled_heads() -> tuple[int, ...]:
     out: tuple[int, ...] = ()
     if envs.VLLM_GLM5_PP_KDA_PREFILL:
         out += (HEADS,)
+    if getattr(envs, "VLLM_GLM5_TP2_KDA_PREFILL", False):
+        out += (TP2_HEADS,)
     if envs.VLLM_GLM5_TP4_KDA_PREFILL:
         out += (TP4_HEADS,)
     return out
