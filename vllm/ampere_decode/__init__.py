@@ -254,6 +254,12 @@ def use_ampere_kda_decode(
 # At 16 heads VLLM_GLM5_DECODE_KDA_V2_DEEP=1 raises the token bound to
 # _KDA_V2_MAX_TOKENS_PER_SEQ_EXT (draft depth 5..7 steps).
 _KDA_V2_HEADS = 16
+# tp2pp2 half-stage shard (PP=2, TP=2 inside each stage) keeps 32 KDA heads
+# per card. The v2 kernel is parametric on H (constexpr) and the gate work
+# layout scales with nseq * H, so this is a dispatch-set add: 32 heads is
+# admitted on the same (nseq, tokens-per-seq) envelope as 16 heads. Verify
+# accepted/step rate against a baseline before trusting output in production.
+_KDA_V2_TP2_HEADS = 32
 # Pipeline parallel keeps all 64 KDA heads on one card. There the fused step
 # only wins for one sequence (graph replay, distinct state slots, one CMP
 # 170HX, us/call vs the unfused path the layer takes otherwise):
@@ -278,12 +284,13 @@ def kda_v2_max_tokens_per_seq(num_heads: int) -> int:
     """Tokens per sequence the v2 gate admits at `num_heads` heads.
 
     5, or 8 (the kernel's gate workspace rows) at the 16-head
-    (tensor-parallel) shape with VLLM_GLM5_DECODE_KDA_V2_DEEP=1. The 64-head
-    shape is validated only up to 5.
+    (tensor-parallel) or 32-head (tp2pp2 half-stage) shape with
+    VLLM_GLM5_DECODE_KDA_V2_DEEP=1. The 64-head shape is validated only
+    up to 5.
     """
     from vllm import envs
 
-    if num_heads == _KDA_V2_HEADS and envs.VLLM_GLM5_DECODE_KDA_V2_DEEP:
+    if num_heads in (_KDA_V2_HEADS, _KDA_V2_TP2_HEADS) and envs.VLLM_GLM5_DECODE_KDA_V2_DEEP:
         return _KDA_V2_MAX_TOKENS_PER_SEQ_EXT
     return _KDA_V2_MAX_TOKENS_PER_SEQ
 
@@ -328,7 +335,7 @@ def use_ampere_kda_decode_v2(
     if num_heads == _KDA_V2_WIDE_HEADS:
         if num_seqs > envs.VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS:
             return False
-    elif num_heads != _KDA_V2_HEADS:
+    elif num_heads not in (_KDA_V2_HEADS, _KDA_V2_TP2_HEADS):
         return False
     for w in (w_f, w_g):
         if w is None:
