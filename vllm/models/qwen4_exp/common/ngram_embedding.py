@@ -33,6 +33,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptQuantConfigBase,
 )
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -226,6 +229,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         # Quark quantizes only Linear and MoE layers; PLE tables stay BF16.
         if isinstance(quant_config, QuarkConfig):
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        # Online quantization (--quantization int8_per_channel_weight_only, mxfp4,
+        # ...) converts Linear and MoE weights at load; PLE tables stay BF16.
+        if isinstance(quant_config, OnlineQuantizationConfig):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
