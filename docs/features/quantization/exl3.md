@@ -23,7 +23,7 @@ vllm serve ./exl3-checkpoint \
 
 The checkpoint must already be a local safetensors directory. Loading inventories actual file headers, verifies packed geometry/codebook markers and accounts for consumed, file-backed and explicitly unused tensors; the counts are logged per model. The inventory is released after the last model that uses it is loaded: the target, or the MTP draft when a speculative draft is configured (the draft is built with the target's configuration). An index cannot hide auxiliary files or override their headers. Integer rates from 1 through 8 bits are supported; 1.5-, 2.5- and 3.5-bit formats require the `mul1` codebook.
 
-Tensor-parallel cuts must preserve complete 128-channel transform blocks. Routed experts use whole-expert expert parallelism rather than splitting each expert's transform. Pipeline parallelism other than one and LoRA are rejected. Ordinary embeddings and active non-PLE weights remain on the GPU; general CPU weight offload is not supported by this path.
+Tensor-parallel cuts must preserve complete 128-channel transform blocks. Routed experts use whole-expert expert parallelism rather than splitting each expert's transform. LoRA is rejected. Pipeline parallelism remains rejected except for the experimental Qwen4Exp PP2/TP1 path described below. Ordinary embeddings and active non-PLE weights remain on the GPU; general CPU weight offload is not supported by this path.
 
 Dense layers share one fixed 32 MiB FP32 scratch per GPU, plus one for the shared-expert stream, and process rows in chunks that fit it, so neither batch size nor graph capture grows it. The routed-expert scratch is sized for the rows the selected dispatch delivers: with tensor and expert parallelism but no data parallelism, each rank's own tokens.
 
@@ -55,11 +55,49 @@ vllm serve ./qwen-exl3-checkpoint \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
-The MTP count is configurable; this example is not a measured optimum. Keep vision enabled. Validate eager execution before graph replay and test the native context independently of a shorter diagnostic boot. `tests/models/qwen4_exp/test_exl3_construction.py` builds the target and MTP draft at two-rank expert-parallel shapes on the CPU from the checkpoint's configuration and tensor headers when `VLLM_TEST_EXL3_QWEN_CHECKPOINT` names the checkpoint directory.
+The MTP count is configurable; this example is not a measured optimum. Keep vision enabled. Validate eager execution before graph replay and test the native context independently of a shorter diagnostic boot. `tests/models/qwen4_exp/test_exl3_construction.py` constructs the TP2+EP target and MTP draft plus a vision-enabled PP2 target on the meta device from the checkpoint's configuration and tensor headers when `VLLM_TEST_EXL3_QWEN_CHECKPOINT` names the checkpoint directory.
 
 `VLLM_QWEN4_ROUTER_FP32=1` selects the existing `GateLinear` BF16-by-BF16 GEMM with FP32 accumulation and FP32 router logits, without changing the stored router weights. It defaults to `0`; the model logs the selected precision at construction. This switch applies to both the target and native MTP router.
 
 `VLLM_QWEN4_MTP_PER_STREAM_NORM=1` computes a separate RMS for each native MTP hidden stream. It preserves the checkpoint's affine weight for each channel and applies the Gemma `(1 + weight)` scaling in FP32 before returning BF16. The default `0` retains one RMS over the entire concatenated hidden stack. The draft model logs the selected normalization. These are precision/normalization comparison paths, not validated default changes.
+
+### Experimental PP2
+
+Qwen3.8-Flash-Next supports `--pipeline-parallel-size 2 --tensor-parallel-size 1 --mm-encoder-tp-mode data`, with native MTP and prefix caching. The standard multimodal runner encodes images and video on the first stage; later stages receive pipeline intermediates. This layout has been validated with vision enabled, MTP3, prefix reuse, concurrent requests, and PIECEWISE graph replay. The measured configuration uses `--prefix-match-unit 4`, which divides its resolved cache groups. Other EXL3 pipeline layouts remain rejected; the existing TP2 recipe above is unchanged.
+
+Every PLE layer must belong to stage zero. Validation checks the actual `VLLM_PP_LAYER_PARTITION` before weights load. The tested 48-layer split is `26,22`; PLE layer 2 belongs to stage zero.
+
+PP2 uses this fork's compressed PLE SSD reader and breakable-graph path. TP2-only dense fast paths remain topology-gated. The measured configuration is:
+
+```bash
+VLLM_PP_LAYER_PARTITION=26,22 \
+VLLM_PP_HOP_NO_METADATA=1 VLLM_PP_PACKED_HOP=1 \
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
+VLLM_CUSTOM_ALLREDUCE_FLAGS=1 VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=0 \
+VLLM_EXL3_PLE_PLACEMENT=ssd VLLM_EXL3_PLE_NATIVE_READ=1 VLLM_EXL3_PLE_OVERLAP=1 \
+VLLM_EXL3_DENSE_MMA=1 VLLM_EXL3_DENSE_PREFILL_TC=1 VLLM_EXL3_DENSE_SPLITK=1 \
+VLLM_EXL3_MOE_PREFILL_TC=1 VLLM_EXL3_MOE_V2=1 \
+VLLM_FLA_AUTOTUNE_SKIP_SPILLING=1 VLLM_QWEN4_QSA_TOPK_CANONICAL=1 \
+VLLM_THIN_GEMM=1 VLLM_THIN_GEMM_GLUON=1 \
+vllm serve ./qwen-exl3-checkpoint \
+  --served-model-name qwen3.8-flash-next-exl3-pp2 \
+  --distributed-executor-backend mp --trust-remote-code \
+  --quantization exl3 --load-format exl3 --mm-encoder-tp-mode data \
+  --tensor-parallel-size 1 --pipeline-parallel-size 2 --enable-expert-parallel \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --attention-config '{"indexer_kv_dtype":"bf16"}' \
+  --engram-config '{"cpu_offload":false}' \
+  --max-model-len 262144 --gpu-memory-utilization 0.95 \
+  --max-num-batched-tokens 3460 --max-num-seqs 8 \
+  --long-prefill-token-threshold 0 --enable-prompt-tokens-details \
+  --enable-prefix-caching --prefix-match-unit 4 \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
+```
+
+Only stage zero allocates raw-ID PLE input buffers and short-convolution cache state. Other stages retain the aligned cache-group indices without allocating another stage's tensors. The loader accounts for checkpoint weights belonging to declared missing-stage modules; unknown local weights still fail loading. The final-stage drafter shares the target's resident embedding and head without first allocating a duplicate embedding. PLE failure masks travel as a fixed boolean intermediate tensor to the sampling rank, with an independent final copy so receive-buffer reuse cannot erase an outstanding error.
+
+The earlier PP work is documented in [AlexBrandes/vllm](https://github.com/AlexBrandes/vllm/commit/b6327e161f6e1c783444a560f73544a3d666df5f), which credits [polyuij42-del](https://github.com/polyuij42-del/qwen38-flash-next-w4a16-cmp170hx) and [nguyenthimy2022kg-alt](https://github.com/nguyenthimy2022kg-alt/Qwen-Flash-SM80-170HX). This integration retains this fork's EXL3 reader; it does not import the earlier mmap offloader, layer-role cache fallback, or host-specific tuning.
 
 ## Compressed PLE placement
 

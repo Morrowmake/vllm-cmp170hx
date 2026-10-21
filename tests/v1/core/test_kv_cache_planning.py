@@ -677,6 +677,129 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+def _asymmetric_pp2_specs():
+    """Qwen3.8-Flash-Next shape: full attention + GDN on both stages, the
+    replicated PLE short-conv state only on the first stage, the MTP
+    drafter's sliding-window layer only on the last stage."""
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
+    )
+    gdn = MambaSpec(
+        shapes=((8, 128), (8, 128, 128)),
+        dtypes=(torch.float32, torch.float32),
+        block_size=256,
+    )
+    ple = MambaSpec(
+        shapes=((16, 64),),
+        dtypes=(torch.float32,),
+        block_size=256,
+        tp_replicated=True,
+    )
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=128,
+    )
+    stage0 = {
+        "model.layers.0.ple": ple,
+        "model.layers.0.qsa.attn": full,
+        "model.layers.1.gdn": gdn,
+    }
+    stage1 = {
+        "model.layers.2.qsa.attn": full,
+        "model.layers.3.gdn": gdn,
+        "model.layers.4.mtp.draft": draft,
+    }
+    return stage0, stage1
+
+
+def test_asymmetric_pp2_allocates_only_owned_layers():
+    """A PP2 worker's config must contain tensors, and the worker views, for
+    exactly its own layers: the first stage's PLE state and the last stage's
+    drafter cache must not reach the other stage, while the group count and
+    order stay aligned so block ids index the same group everywhere."""
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    stage0, stage1 = _asymmetric_pp2_specs()
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=512))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+
+    configs = get_kv_cache_configs(
+        vllm_config, [stage0, stage1], [64 * 1024 * 1024, 64 * 1024 * 1024]
+    )
+    assert len(configs) == 2
+
+    for worker_spec, cfg in zip((stage0, stage1), configs, strict=True):
+        tensor_layers = {
+            name for tensor in cfg.kv_cache_tensors for name in tensor.layers
+        }
+        assert tensor_layers == set(worker_spec), (
+            "worker tensors must be exactly its owned layers"
+        )
+        group_layers = {
+            name for group in cfg.kv_cache_groups for name in group.layer_names
+        }
+        assert group_layers == set(worker_spec)
+
+    # The group list is the global one projected per stage: same count and
+    # order on both workers (block ids index groups positionally), disjoint
+    # ownership, empty where the stage owns nothing.
+    groups0 = [set(g.layer_names) for g in configs[0].kv_cache_groups]
+    groups1 = [set(g.layer_names) for g in configs[1].kv_cache_groups]
+    assert len(groups0) == len(groups1)
+    for a, b in zip(groups0, groups1, strict=True):
+        assert not a & b
+    ple_idx = next(i for i, a in enumerate(groups0) if "model.layers.0.ple" in a)
+    draft_idx = next(
+        i for i, b in enumerate(groups1) if "model.layers.4.mtp.draft" in b
+    )
+    assert groups1[ple_idx] == set()
+    assert groups0[draft_idx] == set()
+
+    # Allocation consumes the per-worker config without needing the other
+    # stage's modules: views exist exactly for the owned layers.
+    layout = KVCacheLayout["BLHNC"]
+    views0 = allocate_kv_cache(configs[0], torch.device("cpu"), layout, None)
+    views1 = allocate_kv_cache(configs[1], torch.device("cpu"), layout, None)
+    assert set(views0) == set(stage0)
+    assert set(views1) == set(stage1)
+    assert "model.layers.0.ple" not in views1
+    assert "model.layers.4.mtp.draft" not in views0
+
+    # The scheduler config keeps every group's index and a representative
+    # spec even for groups the sampled worker projects empty.
+    sched = generate_scheduler_kv_cache_config(configs)
+    assert len(sched.kv_cache_groups) == len(configs[0].kv_cache_groups)
+    for group in sched.kv_cache_groups:
+        assert not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+
+
+def test_allocate_kv_cache_rejects_layer_without_group():
+    """A tensor naming a layer no group contains is a planning defect and
+    must raise a descriptive error, not StopIteration."""
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    spec = new_kv_cache_spec()
+    num_blocks = 4
+    tensor = KVCacheTensor(
+        size=spec.page_size_bytes * num_blocks,
+        layers=["ghost.layer"],
+        layer_stride=spec.page_size_bytes * num_blocks,
+        block_stride=spec.page_size_bytes,
+        offset=0,
+    )
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[tensor],
+        kv_cache_groups=[KVCacheGroupSpec(["other.layer"], spec)],
+    )
+    with pytest.raises(RuntimeError, match="No KV cache group contains layer"):
+        allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout["LBNHC"], None)
+
+
 @pytest.mark.parametrize("with_draft", [False, True])
 @pytest.mark.parametrize("indexer_alignment", [None, 512])
 def test_sparse_mla_preserves_physical_row_addressing(with_draft, indexer_alignment):

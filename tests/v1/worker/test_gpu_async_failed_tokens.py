@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
-from vllm.sm80.failed_inputs import failed_request_ids
+from vllm.sm80.failed_inputs import failed_request_ids, relay_failed_tokens
 
 
 def test_failed_tokens_map_to_their_requests():
@@ -20,6 +22,42 @@ def test_failed_tokens_map_to_their_requests():
     mask[:] = False
     mask[2] = True
     assert failed_request_ids(mask, query_start_loc, req_ids) == {"a"}
+
+
+class _FailureSource(torch.nn.Module):
+    def __init__(self, mask):
+        super().__init__()
+        self.mask = mask
+
+    def take_failed_tokens(self):
+        mask, self.mask = self.mask, None
+        return mask
+
+
+def test_pp_failures_cross_hops_without_poisoning_the_next_batch():
+    first = _FailureSource(torch.tensor([False, True, False, False, True]))
+    middle = _FailureSource(torch.tensor([False, False, True, False, False]))
+    last = torch.nn.Module()
+    hop1 = SimpleNamespace(tensors={"failed_tokens": torch.empty(5, dtype=torch.bool)})
+    hop2 = SimpleNamespace(tensors={"failed_tokens": torch.empty(5, dtype=torch.bool)})
+    starts = np.array([0, 2, 4], dtype=np.int32)
+
+    relay_failed_tokens(first, None, hop1)
+    relay_failed_tokens(middle, hop1, hop2)
+    result = relay_failed_tokens(last, hop2, None)
+    # Reuse the persistent transport buffers before consuming the async result.
+    # Stale failures must clear, and reuse must not erase the previous result.
+    relay_failed_tokens(first, None, hop1)
+    relay_failed_tokens(middle, hop1, hop2)
+    healthy = relay_failed_tokens(last, hop2, None)
+    assert failed_request_ids(result.numpy(), starts, ["a", "b"]) == {"a", "b"}
+    assert failed_request_ids(healthy.numpy(), starts, ["c", "d"]) == set()
+
+
+def test_pp_fails_closed_without_a_failure_transport_field():
+    source = _FailureSource(torch.tensor([True]))
+    with pytest.raises(RuntimeError, match="failed-token transport field"):
+        relay_failed_tokens(source, None, SimpleNamespace(tensors={}))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
@@ -49,7 +87,7 @@ def test_failed_tokens_copy_outlives_the_callers_mask(failed: bool):
     model_runner_output = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0})
     mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
     mask[7] = failed
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     # Hold the copy stream back, as earlier output copies can.
     with torch.cuda.stream(copy_stream):
         torch.cuda._sleep(200_000_000)

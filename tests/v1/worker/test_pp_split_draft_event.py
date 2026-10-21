@@ -10,6 +10,7 @@ from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as mr
@@ -104,12 +105,55 @@ def test_without_split_drafts_are_written_at_consume(monkeypatch):
     assert not h.has_pending_drafts()
 
 
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_filtered_drafts_preserve_freed_and_unsampled_slots(monkeypatch, split, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    transfer = pp_utils.async_tensor_h2d
+    handler = _handler(monkeypatch, split=split)
+    handler.device = torch.device(device)
+    slot = _slot([1, 3, 5], [[11, 12, 13], [21, 22, 23], [31, 32, 33]], split)
+    slot.need_sampled_mask[2] = False
+    handler.on_req_idx_freed(3)
+    state = torch.full((8, 3), 99, dtype=torch.int64, device=device)
+    if device == "cuda":
+        monkeypatch.setattr(pp_utils, "async_tensor_h2d", transfer)
+        handler.main_stream = torch.cuda.current_stream()
+        for name in (
+            "sampled_tokens",
+            "num_sampled",
+            "num_rejected",
+            "idx_mapping",
+            "draft_tokens",
+        ):
+            setattr(slot, name, getattr(slot, name).to(device))
+        slot.event = torch.cuda.Event()
+        slot.event.record()
+        slot.draft_event = slot.event if split else None
+    handler.queue.append(slot)
+    sync_mode = torch.cuda.get_sync_debug_mode() if device == "cuda" else None
+    try:
+        if sync_mode is not None:
+            torch.cuda.set_sync_debug_mode("error")
+        result = handler.get_prev_sampled_outputs(state)
+        if split:
+            handler.apply_pending_drafts(state)
+    finally:
+        if sync_mode is not None:
+            torch.cuda.set_sync_debug_mode(sync_mode)
+    expected = torch.full((8, 3), 99, dtype=torch.int64)
+    expected[1] = torch.tensor([11, 12, 13])
+    torch.testing.assert_close(state.cpu(), expected)
+    assert result["idx_mapping"].cpu().tolist() == [1, -1, -1]
+
+
 def test_runner_rebuilds_input_ids_after_the_late_scatter(monkeypatch):
     calls = []
     monkeypatch.setattr(
         mr, "combine_sampled_and_draft_tokens", lambda *a: calls.append(a)
     )
-    applied = []
+    applied: list[str] = []
     handler = SimpleNamespace(
         has_pending_drafts=lambda: not applied,
         apply_pending_drafts=lambda state: applied.append(state),

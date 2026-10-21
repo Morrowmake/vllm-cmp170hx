@@ -468,6 +468,7 @@ def test_moe_assigns_whole_experts_from_the_ep_map(exl3_config, strategy):
         local, expert_map, _ = determine_expert_map(
             2, rank, EXPERTS, expert_placement_strategy=strategy
         )
+        assert expert_map is not None
         method = exl3_module.Exl3MoEMethod(exl3_config, prefix, _moe_config(rank))
         layer = _RoutedExperts(expert_map)
         method.create_weights(
@@ -594,8 +595,26 @@ def test_target_manifest_outlives_the_target_until_the_draft_loads(
 
     spec = SimpleNamespace(draft_model_config=object()) if draft_model else None
     assert manifest_still_needed(
-        SimpleNamespace(speculative_config=spec), is_draft
+        SimpleNamespace(
+            speculative_config=spec,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        ),
+        is_draft,
     ) is (needed)
+
+
+@pytest.mark.parametrize("is_last_rank", [False, True])
+def test_only_the_draft_owning_stage_retains_its_manifest(monkeypatch, is_last_rank):
+    from vllm.sm80.kernels.exl3 import loader
+
+    monkeypatch.setattr(
+        loader, "get_pp_group", lambda: SimpleNamespace(is_last_rank=is_last_rank)
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    assert loader.manifest_still_needed(config, is_draft=False) is is_last_rank
 
 
 def test_release_frees_the_loader_and_layer_configs(exl3_config):

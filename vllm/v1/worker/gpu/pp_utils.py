@@ -14,9 +14,9 @@ import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.sm80.worker.pp_draft_tail import RemoteDraftQueue, RemoteDrafts
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.sm80.worker.pp_draft_tail import RemoteDrafts, RemoteDraftQueue
 
 
 @dataclass
@@ -132,8 +132,6 @@ class PPHandler:
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
         # VLLM_PP_SPLIT_DRAFT_EVENT (non-last ranks with speculative decoding):
         # wait for the draft tokens separately and as late as possible.
-        import vllm.envs as envs
-
         self.split_draft_event = (
             envs.VLLM_PP_SPLIT_DRAFT_EVENT
             and not self.is_last_rank
@@ -242,8 +240,8 @@ class PPHandler:
             draft_idx_mapping = slot.idx_mapping
             if exclude_mask.any():
                 keep = ~exclude_mask
-                keep_t = torch.as_tensor(keep, device=self.device)
-                draft_tokens = draft_tokens[keep_t]
+                keep_t = async_tensor_h2d(np.flatnonzero(keep), device=self.device)
+                draft_tokens = draft_tokens.index_select(0, keep_t)
                 draft_idx_mapping = async_tensor_h2d(
                     slot.idx_mapping_np[keep], device=self.device
                 )
@@ -278,8 +276,8 @@ class PPHandler:
         if keep.all():
             idx_mapping_np = pending.idx_mapping_np
         else:
-            keep_t = torch.as_tensor(keep, device=draft_tokens.device)
-            draft_tokens = draft_tokens[keep_t]
+            keep_t = async_tensor_h2d(np.flatnonzero(keep), device=self.device)
+            draft_tokens = draft_tokens.index_select(0, keep_t)
             idx_mapping_np = pending.idx_mapping_np[keep]
         idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
         draft_tokens_to_update[idx_mapping] = draft_tokens

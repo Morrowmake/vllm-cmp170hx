@@ -1622,6 +1622,46 @@ def test_engram_thp_rejects_explicit_shared_memory():
 
 
 @pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"cpu_offload": False}, "mmap requires cpu_offload"),
+        ({"dp_shared_memory": True}, "mmap is not compatible with dp_shared_memory"),
+        ({"use_thp": True}, "mmap is not compatible with use_thp"),
+    ],
+)
+def test_engram_mmap_rejects_conflicting_storage(kwargs, match):
+    """File-backed pages cannot combine with copy-based host tables."""
+    with pytest.raises(ValueError, match=match):
+        EngramConfig(mmap=True, **kwargs)
+
+
+def test_engram_mmap_disables_shared_memory_default():
+    """Mmap tables stay private per replica even where sharing is allowed."""
+    config = EngramConfig(mmap=True)
+    config.resolve_dp_shared_memory(ParallelConfig(data_parallel_size=2))
+    assert config.dp_shared_memory is False
+
+
+@pytest.mark.parametrize(
+    "config_kwargs, parallel_kwargs, match",
+    [
+        ({}, {"tensor_parallel_size": 2}, "tensor_parallel_size=1"),
+        (
+            {"embedding_across_dp": True},
+            {"data_parallel_size": 2},
+            "unsharded embeddings",
+        ),
+        ({}, {"enable_hc_sp": True}, "sequence parallelism"),
+    ],
+)
+def test_engram_mmap_rejects_sharding(config_kwargs, parallel_kwargs, match):
+    """Mmap staging needs the whole unsharded table visible on one rank."""
+    config = EngramConfig(mmap=True, **config_kwargs)
+    with pytest.raises(ValueError, match=match):
+        config.verify_parallel_config(ParallelConfig(**parallel_kwargs))
+
+
+@pytest.mark.parametrize(
     "dp_size,load_format,multithread,error",
     [
         (1, "auto", False, "requires data_parallel_size > 1"),
@@ -1720,6 +1760,42 @@ def test_engram_model_support(
         assert resolved.engram_config.cpu_offload is True
 
 
+def test_engram_mmap_rejects_non_qwen4_exp_models():
+    """Only the Qwen4Exp PLE backend implements file-backed storage."""
+    deepseek = SimpleNamespace(
+        architecture="DeepseekV41ForCausalLM",
+        hf_text_config=SimpleNamespace(engram_layer_ids=[1]),
+    )
+    with pytest.raises(ValueError, match="Qwen4Exp"):
+        EngramConfig(mmap=True).verify_model_config(deepseek)
+    qwen = SimpleNamespace(
+        architecture="Qwen4ExpForCausalLM",
+        hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+    )
+    EngramConfig(mmap=True).verify_model_config(qwen)
+
+
+def test_engram_mmap_resolves_for_qwen4_exp():
+    """--engram-config '{"mmap": true}' keeps offload defaults and uses
+    private host tables even with co-located DP replicas."""
+    config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                architecture="Qwen4ExpForCausalLM",
+                hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+            ),
+            speculative_config=None,
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            load_config=LoadConfig(load_format="safetensors"),
+            engram_config=EngramConfig(mmap=True),
+        ),
+    )
+    VllmConfig._resolve_and_verify_engram_config(config)
+    assert config.engram_config.cpu_offload is True
+    assert config.engram_config.dp_shared_memory is False
+
+
 def test_engram_cpu_offload_default():
     assert EngramConfig().cpu_offload is True
 
@@ -1798,6 +1874,7 @@ def test_engram_hash_tracks_execution_options():
         EngramConfig(cpu_offload=False),
         EngramConfig(cpu_offload=True, embedding_across_dp=True),
         EngramConfig(cpu_offload=True, dp_shared_memory=True),
+        EngramConfig(cpu_offload=True, mmap=True),
     ]
     assert len({config.compute_hash() for config in configs}) == len(configs)
 

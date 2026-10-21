@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
+from vllm.models.qwen4_exp.nvidia.mmap_ple import Qwen4ExpPLEMmapEmbedding
+from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -26,19 +29,16 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self.mmap_ngram_embeddings: list[Qwen4ExpNGramEmbedding] = []
+        # Config validation keeps every PLE layer on the first pipeline stage.
+        # Other stages receive hidden states, not the raw IDs needed by PLE.
+        self.uses_ngram_embedding = (
+            bool(config.ple_layer_ids) and get_pp_group().is_first_rank
+        )
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
             return
-
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
-            )
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:
@@ -63,6 +63,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self.mmap_ngram_embeddings = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, Qwen4ExpNGramEmbedding)
+            and isinstance(module.ngram_embedding, Qwen4ExpPLEMmapEmbedding)
+        ]
+        for module in self.mmap_ngram_embeddings:
+            module.ngram_embedding.finalize_load()
 
     def _prepare_ngram_context(
         self,
@@ -110,6 +118,26 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
         )
+        if self.mmap_ngram_embeddings:
+            known_requests = [
+                req_id in req_states.req_id_to_index for req_id in input_batch.req_ids
+            ]
+            if any(known_requests) and not all(known_requests):
+                raise RuntimeError("PLE batch contains unknown active request IDs")
+            for module in self.mmap_ngram_embeddings:
+                if all(known_requests):
+                    module.prepare_mmap_rows(
+                        input_batch.input_ids,
+                        query_start_loc,
+                        model_inputs["ngram_context"],
+                        input_batch.num_tokens,
+                        input_batch.num_tokens_after_padding,
+                    )
+                else:
+                    # Profiling batches are not registered requests.
+                    module.ngram_embedding.zero_rows(
+                        input_batch.num_tokens_after_padding
+                    )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -141,6 +169,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        for module in self.mmap_ngram_embeddings:
+            module.ngram_embedding.zero_rows(num_tokens)
         return model_inputs
 
 

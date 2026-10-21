@@ -656,9 +656,13 @@ def get_kv_cache_config_from_groups(
     for group in kv_cache_groups:
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+        # A tensor lists the layers this worker allocates, so iterate the
+        # group's (PP-projected) layer_names, never the spec map: a group
+        # projected empty on this stage keeps its global map only for the
+        # scheduler's representative spec and must contribute no tensors.
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+            for layer_name in group.layer_names:
+                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 

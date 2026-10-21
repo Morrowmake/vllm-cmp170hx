@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build the EXL3 Qwen4Exp target and MTP draft at TP2 + EP rank shapes on CPU.
+"""Build EXL3 Qwen4Exp target/draft layouts on CPU from checkpoint headers.
 
-Uses the real checkpoint's config and EXL3 tensor headers (no weight data):
-two gloo ranks construct the model with parameters on the meta device, then
-the parent checks that every packed matrix has exactly one runtime owner per
-rank and that the ranks' slices tile it. Set
-``VLLM_TEST_EXL3_QWEN_CHECKPOINT`` to the checkpoint directory to run it.
+Uses the real checkpoint config and EXL3 tensor headers without weight data.
+Two gloo ranks construct TP2+EP target/draft models and a vision-enabled PP2
+target on the meta device. The parent checks TP weight ownership and PP vision
+stage construction. Set ``VLLM_TEST_EXL3_QWEN_CHECKPOINT`` to run it.
 """
 
 import json
@@ -86,8 +85,25 @@ def _summary(model):
     return {"linears": linears, "experts": experts, "qsa": qsa}
 
 
-def _build(rank, port, checkpoint, out):
-    os.environ.update(HF_HUB_OFFLINE="1", CUDA_VISIBLE_DEVICES="")
+def _build(
+    rank,
+    port,
+    checkpoint,
+    out,
+    tensor_parallel_size,
+    pipeline_parallel_size,
+    enable_expert_parallel,
+    build_draft,
+):
+    os.environ.update(
+        HF_HUB_OFFLINE="1",
+        CUDA_VISIBLE_DEVICES="",
+        VLLM_DISABLE_SHARED_EXPERTS_STREAM="1",
+    )
+    if pipeline_parallel_size > 1:
+        os.environ["VLLM_PP_LAYER_PARTITION"] = "26,22"
+    else:
+        os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     try:
         from vllm.config import set_current_vllm_config
         from vllm.distributed import (
@@ -107,45 +123,70 @@ def _build(rank, port, checkpoint, out):
         )
         platform.current_device = classmethod(lambda cls: torch.device("meta"))
         platform.get_device_communicator_cls = classmethod(
-            lambda cls: "vllm.distributed.device_communicators."
-            "base_device_communicator.DeviceCommunicatorBase"
+            lambda cls: (
+                "vllm.distributed.device_communicators."
+                "base_device_communicator.DeviceCommunicatorBase"
+            )
         )
         register = torch.nn.Module.register_parameter
         torch.nn.Module.register_parameter = lambda module, name, param: (
             _params_on_meta(module, name, param, register)
         )
-        vllm_config = EngineArgs(
-            model=checkpoint,
-            tensor_parallel_size=TP,
-            enable_expert_parallel=True,
-            distributed_executor_backend="external_launcher",
-            max_model_len=32768,
-            max_num_batched_tokens=3460,
-            enforce_eager=True,
-            load_format="exl3",
-            mm_encoder_tp_mode="data",
-            speculative_config={"method": "mtp", "num_speculative_tokens": 3},
-        ).create_engine_config()
+        engine_args = {
+            "model": checkpoint,
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_parallel_size": pipeline_parallel_size,
+            "enable_expert_parallel": enable_expert_parallel,
+            "distributed_executor_backend": "external_launcher",
+            "max_model_len": 32768,
+            "max_num_batched_tokens": 3460,
+            "enforce_eager": True,
+            "load_format": "exl3",
+            "mm_encoder_tp_mode": "data",
+        }
+        if build_draft:
+            engine_args["speculative_config"] = {
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+            }
+        vllm_config = EngineArgs(**engine_args).create_engine_config()
         assert vllm_config.quant_config.get_name() == "exl3"
         result = {}
         with set_current_vllm_config(vllm_config):
             init_distributed_environment(
-                world_size=TP,
+                world_size=tensor_parallel_size * pipeline_parallel_size,
                 rank=rank,
                 distributed_init_method=f"tcp://127.0.0.1:{port}",
                 local_rank=rank,
                 backend="gloo",
             )
-            initialize_model_parallel(TP)
-            spec = vllm_config.speculative_config
-            draft_config = spec.apply_draft_overrides(vllm_config)
+            initialize_model_parallel(
+                tensor_parallel_size,
+                pipeline_parallel_size,
+            )
             with set_default_torch_dtype(vllm_config.model_config.dtype):
                 target = initialize_model(vllm_config=vllm_config)
                 result["target"] = _summary(target)
-                draft = initialize_model(
-                    vllm_config=draft_config, model_config=spec.draft_model_config
-                )
-                result["draft"] = _summary(draft)
+                result["target"]["layer_range"] = [
+                    target.language_model.model.start_layer,
+                    target.language_model.model.end_layer,
+                ]
+                result["target"]["vision"] = {
+                    "language_model_only": target.language_model_only,
+                    "uses_data_parallel": target.use_data_parallel,
+                    "parameter_count": sum(
+                        parameter.numel() for parameter in target.visual.parameters()
+                    ),
+                }
+                if build_draft:
+                    spec = vllm_config.speculative_config
+                    assert spec is not None
+                    draft_config = spec.apply_draft_overrides(vllm_config)
+                    draft = initialize_model(
+                        vllm_config=draft_config,
+                        model_config=spec.draft_model_config,
+                    )
+                    result["draft"] = _summary(draft)
         Path(out, f"rank{rank}.json").write_text(json.dumps(result))
     except BaseException:
         Path(out, f"rank{rank}.error").write_text(traceback.format_exc())
@@ -158,18 +199,38 @@ def _free_port():
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def built(tmp_path_factory):
+def _run_build(
+    tmp_path_factory,
+    name,
+    *,
+    tensor_parallel_size,
+    pipeline_parallel_size,
+    enable_expert_parallel,
+    build_draft,
+):
     if CHECKPOINT is None:
         pytest.skip("VLLM_TEST_EXL3_QWEN_CHECKPOINT is not set")
     if not Path(CHECKPOINT, "quantization_config.json").is_file():
         pytest.fail(f"Not an EXL3 checkpoint: {CHECKPOINT}")
-    out = tmp_path_factory.mktemp("exl3_build")
+    out = tmp_path_factory.mktemp(name)
     context = mp.get_context("spawn")
     port = _free_port()
+    world_size = tensor_parallel_size * pipeline_parallel_size
     procs = [
-        context.Process(target=_build, args=(rank, port, CHECKPOINT, str(out)))
-        for rank in range(TP)
+        context.Process(
+            target=_build,
+            args=(
+                rank,
+                port,
+                CHECKPOINT,
+                str(out),
+                tensor_parallel_size,
+                pipeline_parallel_size,
+                enable_expert_parallel,
+                build_draft,
+            ),
+        )
+        for rank in range(world_size)
     ]
     for proc in procs:
         proc.start()
@@ -183,11 +244,46 @@ def built(tmp_path_factory):
             proc.kill()
             pytest.fail("EXL3 construction timed out")
         assert proc.exitcode == 0
+    return [
+        json.loads((out / f"rank{rank}.json").read_text()) for rank in range(world_size)
+    ]
+
+
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    ranks = _run_build(
+        tmp_path_factory,
+        "exl3_build",
+        tensor_parallel_size=TP,
+        pipeline_parallel_size=1,
+        enable_expert_parallel=True,
+        build_draft=True,
+    )
     from vllm.sm80.kernels.exl3.utils import Exl3Manifest
 
-    manifest = Exl3Manifest(CHECKPOINT, require_qwen_aux=True)
-    ranks = [json.loads((out / f"rank{r}.json").read_text()) for r in range(TP)]
-    return manifest, ranks
+    return Exl3Manifest(CHECKPOINT, require_qwen_aux=True), ranks
+
+
+@pytest.fixture(scope="module")
+def pp2_vision_built(tmp_path_factory):
+    return _run_build(
+        tmp_path_factory,
+        "exl3_pp2_vision",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+        enable_expert_parallel=True,
+        build_draft=False,
+    )
+
+
+def test_pp2_meta_construction_keeps_vision_on_first_stage(pp2_vision_built):
+    first_stage, second_stage = pp2_vision_built
+    assert first_stage["target"]["layer_range"] == [0, 26]
+    assert second_stage["target"]["layer_range"] == [26, 48]
+    vision = first_stage["target"]["vision"]
+    assert vision["language_model_only"] is False
+    assert vision["uses_data_parallel"] is True
+    assert vision["parameter_count"] > 0
 
 
 @pytest.mark.parametrize("role", ["target", "draft"])

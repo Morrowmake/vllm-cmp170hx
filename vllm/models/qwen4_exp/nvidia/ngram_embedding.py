@@ -29,6 +29,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from ..common.ops.ple import ple_ngram_ids
+from .mmap_ple import Qwen4ExpPLEMmapEmbedding
 
 logger = init_logger(__name__)
 
@@ -214,11 +215,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
+        embedding_cls: type[Qwen4ExpPLEEmbedding] = (
             Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if engram_config is not None and engram_config.mmap:
+            embedding_cls = Qwen4ExpPLEMmapEmbedding
         embedding_cls = getattr(quant_config, "ple_embedding_cls", embedding_cls)
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
@@ -236,12 +239,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
             reduce_results=not self.use_reduce_scatter,
+            **(
+                {"num_shards": self.split_ngram_parts}
+                if embedding_cls is Qwen4ExpPLEMmapEmbedding
+                else {}
+            ),
         )
         if self.ngram_embedding.supports_prefetch:
             # The side-stream lookup outlives eager-break args, whose
             # graph-pool storage later segments may reuse.
             self._prefetch_ids = torch.empty(
                 max_total_tokens, self.ngram_heads, dtype=torch.long
+            )
+        if isinstance(self.ngram_embedding, Qwen4ExpPLEMmapEmbedding):
+            self._mmap_ids = torch.empty(
+                max_total_tokens, self.ngram_heads, dtype=torch.int64
             )
         weight = self.ngram_embedding.weight
         logger.info(
@@ -384,7 +396,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
         embedding = self.ngram_embedding
-        if embedding.supports_prefetch:
+        if isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+            embeddings = embedding.view(input_ids.shape[0])
+        elif embedding.supports_prefetch:
             # Prefetch contains full tokens even when hidden states are sharded.
             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
         else:
@@ -395,6 +409,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if not self.use_sequence_parallel:
             return embeddings
         return self._sp_shard_embeddings(embeddings)
+
+    def prepare_mmap_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        num_tokens: int,
+        num_tokens_after_padding: int,
+    ) -> None:
+        """Stage the current batch's PLE rows before model execution."""
+        embedding = self.ngram_embedding
+        assert isinstance(embedding, Qwen4ExpPLEMmapEmbedding)
+        if not 0 <= num_tokens <= num_tokens_after_padding <= self._mmap_ids.shape[0]:
+            raise ValueError("PLE batch exceeds its mmap staging capacity")
+        ids = self._mmap_ids[:num_tokens]
+        if num_tokens:
+            self.compute_ngram_ids(
+                input_ids[:num_tokens],
+                query_start_loc,
+                ngram_context,
+                output=ids,
+            )
+        embedding.prepare(ids, num_tokens_after_padding)
 
     def start_prefetch(
         self,
@@ -479,11 +516,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"NVFP4 PLE shard {shard_index} {suffix} requires "
                         f"{parameter.dtype}, got {loaded_weight.dtype}"
                     )
-                parameter.weight_loader(
-                    parameter,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                )
+                if isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+                    embedding.load_shard(shard_index, loaded_weight)
+                else:
+                    parameter.weight_loader(
+                        parameter,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                    )
                 loaded.add(f"ngram_embedding.{suffix}")
                 continue
             if nvfp4_method is not None and name in (

@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm.config import CacheConfig, ParallelConfig
+from vllm.config import CacheConfig, EngramConfig, LoadConfig, ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
@@ -62,6 +62,7 @@ def test_moe_sp_rejects_pipeline_parallel() -> None:
             data_parallel_size=2,
             enable_expert_parallel=True,
             all2all_backend="allgather_reducescatter",
+            distributed_executor_backend="mp",
         ),
     )
     with (
@@ -71,8 +72,10 @@ def test_moe_sp_rejects_pipeline_parallel() -> None:
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(config)
 
 
-@pytest.mark.parametrize("use_sp", [False, True])
-def test_qwen4_exp_mtp_returns_sample_and_multi_streams(use_sp: bool) -> None:
+@pytest.mark.parametrize("use_sp,pp_size", [(False, 1), (True, 1), (False, 2)])
+def test_qwen4_exp_mtp_returns_sample_and_multi_streams(
+    use_sp: bool, pp_size: int
+) -> None:
     """MTP returns complete, contiguous outputs after gathering padded SP shards."""
     from vllm.models.qwen4_exp.nvidia.mtp import (
         Qwen4ExpMultiTokenPredictor,
@@ -106,7 +109,9 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams(use_sp: bool) -> None:
     )
     multi_hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8)
     expected_sample = multi_hidden.unflatten(-1, (2, 4)).mean(-2)
-    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    pp_group = SimpleNamespace(
+        is_first_rank=pp_size == 1, is_last_rank=True, world_size=pp_size
+    )
 
     def gather(local):
         """Supply rank 1's last token and padding for a simulated two-rank gather."""
@@ -180,29 +185,167 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
-@pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
+def test_qwen4_exp_ple_placement_follows_pipeline_partition(monkeypatch) -> None:
+    """PLE at the first-stage boundary is valid; moving it off-stage is not."""
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    text_config = _text_config(
+        num_hidden_layers=4,
+        layer_types=["linear_attention"] * 4,
+        ple_layer_ids=[2],
+    )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            hf_text_config=text_config,
             multimodal_config=None,
         ),
         parallel_config=ParallelConfig(pipeline_parallel_size=2),
         speculative_config=None,
     )
-    with patch.object(
-        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch("vllm.platforms.current_platform.is_cuda", return_value=True),
     ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
-                    vllm_config
-                )
-        else:
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "1,3")
+        with pytest.raises(ValueError, match="first pipeline stage"):
             Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,1")
+        text_config.ple_layer_ids = [2, 3]
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        text_config.ple_layer_ids = [2, 4]
+        with pytest.raises(ValueError, match="first pipeline stage"):
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def test_qwen4_exp_ple_pp_retains_non_cuda_rejection() -> None:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(),
+            multimodal_config=None,
+        ),
+        parallel_config=ParallelConfig(pipeline_parallel_size=2),
+        speculative_config=None,
+    )
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch("vllm.platforms.current_platform.is_cuda", return_value=False),
+        pytest.raises(NotImplementedError),
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def _mmap_vllm_config(
+    load_format: str = "auto",
+    load_strategy: str | None = None,
+    quantization: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(),
+            multimodal_config=None,
+            quantization=quantization,
+        ),
+        parallel_config=ParallelConfig(),
+        speculative_config=None,
+        load_config=LoadConfig(
+            load_format=load_format, safetensors_load_strategy=load_strategy
+        ),
+        engram_config=EngramConfig(mmap=True),
+    )
+
+
+def _verify_mmap_config(vllm_config: SimpleNamespace) -> None:
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch("vllm.platforms.current_platform.is_cuda", return_value=True),
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def test_qwen4_exp_ple_mmap_forces_lazy_safetensors_loader() -> None:
+    """Mmap rewrites auto defaults to the loader that keeps tables mapped."""
+    vllm_config = _mmap_vllm_config()
+    _verify_mmap_config(vllm_config)
+    assert vllm_config.load_config.load_format == "safetensors"
+    assert vllm_config.load_config.safetensors_load_strategy == "lazy"
+
+
+def test_qwen4_exp_ple_mmap_keeps_compatible_explicit_loader() -> None:
+    vllm_config = _mmap_vllm_config(load_format="safetensors", load_strategy="lazy")
+    _verify_mmap_config(vllm_config)
+    assert vllm_config.load_config.load_format == "safetensors"
+    assert vllm_config.load_config.safetensors_load_strategy == "lazy"
+
+
+@pytest.mark.parametrize(
+    "load_format, load_strategy, match",
+    [
+        ("pt", None, "safetensors loader"),
+        ("safetensors", "eager", "safetensors_load_strategy='lazy'"),
+    ],
+)
+def test_qwen4_exp_ple_mmap_rejects_copying_loader(
+    load_format: str, load_strategy: str | None, match: str
+) -> None:
+    """Reject loaders that would copy the whole table into RAM."""
+    vllm_config = _mmap_vllm_config(load_format, load_strategy)
+    with pytest.raises(ValueError, match=match):
+        _verify_mmap_config(vllm_config)
+
+
+def test_qwen4_exp_ple_mmap_rejects_exl3() -> None:
+    """EXL3 PLE tables already have dedicated storage."""
+    vllm_config = _mmap_vllm_config(quantization="exl3")
+    with pytest.raises(ValueError, match="EXL3"):
+        _verify_mmap_config(vllm_config)
+
+
+def test_qwen4_exp_ple_mmap_requires_cuda() -> None:
+    vllm_config = _mmap_vllm_config()
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch("vllm.platforms.current_platform.is_cuda", return_value=False),
+        pytest.raises(NotImplementedError, match="requires CUDA"),
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def test_qwen4_exp_ple_without_mmap_keeps_loader() -> None:
+    """Existing non-mmap PLE deployments are untouched."""
+    vllm_config = _mmap_vllm_config()
+    vllm_config.engram_config = None
+    _verify_mmap_config(vllm_config)
+    assert vllm_config.load_config.load_format == "auto"
+    assert vllm_config.load_config.safetensors_load_strategy is None
+
+
+@pytest.mark.parametrize("first_rank", [True, False])
+def test_qwen4_exp_ple_inputs_belong_to_first_pipeline_stage(first_rank) -> None:
+    model_state = object.__new__(Qwen4ExpModelState)
+    model_state.model_config = SimpleNamespace(hf_text_config=_text_config())
+    model_state.max_num_reqs = 4
+    model_state.device = torch.device("cpu")
+    model_state.model = torch.nn.Module()
+    with (
+        patch.object(MambaHybridModelState, "__init__", return_value=None),
+        patch(
+            "vllm.models.qwen4_exp.nvidia.model_state.get_pp_group",
+            return_value=SimpleNamespace(is_first_rank=first_rank),
+        ),
+    ):
+        model_state.__init__(None, None, None, model_state.device)
+
+    with patch.object(MambaHybridModelState, "prepare_dummy_inputs", return_value={}):
+        inputs = model_state.prepare_dummy_inputs(num_reqs=1, num_tokens=3)
+    if first_rank:
+        torch.testing.assert_close(
+            inputs["query_start_loc"], torch.tensor([0, 3, 3, 3, 3], dtype=torch.int32)
+        )
+        assert inputs["ngram_context"].shape == (4, model_state.ngram_context_len)
+    else:
+        assert inputs == {}
+        assert not hasattr(model_state, "ngram_context")
+        assert not hasattr(model_state, "ple_query_start_loc")
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
@@ -213,6 +356,7 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
     model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
     model_state.ple_query_start_loc = torch.empty(9, dtype=torch.int32)
+    model_state.mmap_ngram_embeddings = []
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -268,6 +412,7 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
     model_state.ple_query_start_loc = torch.empty(9, dtype=torch.int32)
+    model_state.mmap_ngram_embeddings = []
 
     with patch.object(MambaHybridModelState, "prepare_dummy_inputs", return_value={}):
         first = model_state.prepare_dummy_inputs(num_reqs=3, num_tokens=4)

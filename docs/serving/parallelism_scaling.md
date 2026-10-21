@@ -56,6 +56,54 @@ vllm serve gpt2 \
      --pipeline-parallel-size 2
 ```
 
+### Qwen4Exp on CMP 170HX
+
+Qwen3.8-Flash-Next has been validated with W4A16 AutoRound and EXL3 at
+`--tensor-parallel-size 1 --pipeline-parallel-size 2`, including native MTP,
+image/video serving, and prefix reuse. Keep every PLE layer on the first
+pipeline stage; `VLLM_PP_LAYER_PARTITION=26,22` is the tested partition for
+the 48-layer checkpoint. Use `--mm-encoder-tp-mode data` for vision.
+See the [EXL3 configuration](../features/quantization/exl3.md#experimental-pp2)
+for that loader's requirements.
+
+PP does not force eager execution or a particular prefix-match unit.
+The tested vision configuration uses `--prefix-match-unit 4`; the value must
+divide the resolved prefix-cacheable block sizes.
+
+For W4A16 checkpoints whose BF16/FP16 PLE table does not fit in host RAM,
+use `--engram-config '{"mmap":true}'`. This selects the native file-backed
+backend and lazy safetensors loading. It requires CUDA and TP=1; the default
+resident and pinned-host backends are unchanged. Only the current batch's
+rows are staged into persistent GPU buffers before model execution, so
+captured forwards do not read files or perform host transfers.
+
+The measured 48-layer W4A16 AutoRound configuration:
+
+```bash
+VLLM_PP_LAYER_PARTITION=26,22 \
+VLLM_PP_HOP_NO_METADATA=1 VLLM_PP_PACKED_HOP=1 \
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
+VLLM_CUSTOM_ALLREDUCE_FLAGS=1 VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=0 \
+vllm serve /path/to/Qwen3.8-Flash-Next-W4A16-AutoRound \
+  --served-model-name qwen3.8-flash-next-w4a16-pp2 \
+  --distributed-executor-backend mp --trust-remote-code \
+  --tensor-parallel-size 1 --pipeline-parallel-size 2 \
+  --enable-expert-parallel --mm-encoder-tp-mode data \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --engram-config '{"mmap":true}' \
+  --block-size 1680 --mamba-ssm-cache-dtype float32 \
+  --max-model-len 262144 --gpu-memory-utilization 0.95 \
+  --max-num-batched-tokens 2048 --max-num-seqs 8 \
+  --long-prefill-token-threshold 0 --enable-prompt-tokens-details \
+  --enable-prefix-caching --prefix-match-unit 4 \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
+```
+
+PP draft updates retain request-generation checks when requests finish or
+slots are reused. Filtering uses asynchronous integer-index transfers rather
+than GPU boolean indexing, including the deferred draft-event path.
+
 ## Multi-node deployment
 
 If a single node lacks sufficient GPUs to hold the model, deploy vLLM across multiple nodes. Ensure that every node provides an identical execution environment, including the model path and Python packages. Using container images is recommended because they provide a convenient way to keep environments consistent and to hide host heterogeneity.

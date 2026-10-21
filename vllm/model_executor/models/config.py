@@ -933,6 +933,35 @@ def _strip_qwen4_exp_mrope(model_config: "ModelConfig") -> None:
             rope_parameters.pop("mrope_interleaved", None)
 
 
+def _verify_qwen4_exp_ple_mmap(vllm_config: "VllmConfig") -> None:
+    """Gate file-backed PLE storage and force the lazy safetensors loader."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        raise NotImplementedError("Qwen4Exp Engram mmap requires CUDA")
+    if vllm_config.model_config.quantization == "exl3":
+        raise ValueError(
+            "Qwen4Exp Engram mmap is not supported for EXL3 checkpoints; "
+            "EXL3 PLE tables use their own storage."
+        )
+    load_config = vllm_config.load_config
+    if load_config.load_format == "auto":
+        load_config.load_format = "safetensors"
+    elif load_config.load_format != "safetensors":
+        raise ValueError(
+            "Qwen4Exp Engram mmap requires the safetensors loader, not "
+            f"{load_config.load_format!r}."
+        )
+    if load_config.safetensors_load_strategy is None:
+        load_config.safetensors_load_strategy = "lazy"
+    elif load_config.safetensors_load_strategy != "lazy":
+        raise ValueError(
+            "Qwen4Exp Engram mmap requires safetensors_load_strategy='lazy' "
+            "so PLE tables stay memory-mapped, not "
+            f"{load_config.safetensors_load_strategy!r}."
+        )
+
+
 class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConfig):
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
@@ -962,14 +991,40 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             raise NotImplementedError(
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
-        # Checked again in Qwen4ExpModelState; rejecting it here keeps the
-        # engine from loading weights first.
+        # PLE needs raw token IDs, which only the first pipeline stage receives.
+        # Validate the actual partition before loading weights; merely enabling
+        # PLE on rank zero would silently leave later PLE layers without inputs.
         if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
-                "because non-first pipeline ranks do not receive the raw input_ids "
-                "it needs. Please run with PP=1."
+            if not current_platform.is_cuda():
+                raise NotImplementedError(
+                    "Qwen4Exp PLE pipeline parallelism requires CUDA"
+                )
+            from vllm.distributed.utils import get_pp_indices
+
+            _, first_stage_end = get_pp_indices(
+                text_config.num_hidden_layers,
+                0,
+                parallel_config.pipeline_parallel_size,
             )
+            # ple_layer_ids are one-based; get_pp_indices returns an exclusive
+            # zero-based end, so the last layer of stage zero is valid here.
+            if any(
+                not 1 <= layer_id <= first_stage_end
+                for layer_id in text_config.ple_layer_ids
+            ):
+                raise ValueError(
+                    "Qwen4Exp PLE layers must all belong to the first pipeline "
+                    f"stage (layers 1..{first_stage_end}); got "
+                    f"ple_layer_ids={text_config.ple_layer_ids}. Adjust "
+                    "VLLM_PP_LAYER_PARTITION or use PP=1."
+                )
+        engram_config = getattr(vllm_config, "engram_config", None)
+        if (
+            engram_config is not None
+            and engram_config.mmap
+            and text_config.ple_layer_ids
+        ):
+            _verify_qwen4_exp_ple_mmap(vllm_config)
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)

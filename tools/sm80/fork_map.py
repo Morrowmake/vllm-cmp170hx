@@ -26,11 +26,12 @@ import argparse
 import ast
 import difflib
 import os
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import regex as re
 
 REPO = Path(__file__).resolve().parents[2]
 FORK_MD = "FORK.md"
@@ -299,9 +300,7 @@ def collect_env_vars(base: str, added: set[str]) -> tuple[str, list[EnvVar]]:
         tree = upstream_now
         upstream_base = ast.parse(git("show", f"{base}:{UPSTREAM_ENVS}").decode())
         before = env_accessors(upstream_base)
-        accessors = {
-            k: v for k, v in env_accessors(tree).items() if k not in before
-        }
+        accessors = {k: v for k, v in env_accessors(tree).items() if k not in before}
         typed = typing_declarations(tree)
         source = (
             "The names the fork added to `environment_variables` in "
@@ -414,7 +413,7 @@ def line_total(changes: list[Change]) -> int:
 
 
 def file_table(changes: list[Change]) -> list[str]:
-    out = ["| Path | Lines |", "|---|---:|"]
+    out = ["| Path | Lines |", "| --- | ---: |"]
     out += [f"| `{c.path}` | {num(c.added)} |" for c in changes]
     noun = "file" if len(changes) == 1 else "files"
     out.append(f"| **{len(changes)} {noun}** | **{line_total(changes):,}** |")
@@ -433,7 +432,7 @@ def patch_totals(changes: list[Change]) -> tuple[int, int, int, int]:
 def patch_table(changes: list[Change]) -> list[str]:
     if not changes:
         return ["None."]
-    out = ["| Path | Change | + | - | Hunks |", "|---|---|---:|---:|---:|"]
+    out = ["| Path | Change | + | - | Hunks |", "| --- | --- | ---: | ---: | ---: |"]
     for c in changes:
         out.append(
             f"| `{c.path}` | {STATUS_WORDS[c.status]} | {num(c.added)} "
@@ -455,14 +454,18 @@ def env_table(envs: list[EnvVar]) -> list[str]:
     ]
     if typed:
         out[0] += " Type and declared default come from `if TYPE_CHECKING:`."
-        out += ["", "| Name | Type | Declared default | Default |", "|---|---|---|---|"]
+        out += [
+            "",
+            "| Name | Type | Declared default | Default |",
+            "| --- | --- | --- | --- |",
+        ]
         out += [
             f"| `{e.name}` | {code(e.type)} | {code(e.declared)} | {code(e.default)} |"
             for e in envs
         ]
         out.append(f"| **{len(envs)} variables** | | | |")
     else:
-        out += ["", "| Name | Default |", "|---|---|"]
+        out += ["", "| Name | Default |", "| --- | --- |"]
         out += [f"| `{e.name}` | {code(e.default)} |" for e in envs]
         out.append(f"| **{len(envs)} variables** | |")
     return out
@@ -471,7 +474,10 @@ def env_table(envs: list[EnvVar]) -> list[str]:
 def unreferenced_table(unref: list[Unreferenced]) -> list[str]:
     if not unref:
         return ["None."]
-    out = ["| Path | Line | Name | Lines | Used by tests |", "|---|---:|---|---:|---|"]
+    out = [
+        "| Path | Line | Name | Lines | Used by tests |",
+        "| --- | ---: | --- | ---: | --- |",
+    ]
     out += [
         f"| `{u.path}` | {u.line} | `{u.name}` | {u.lines:,} | "
         f"{'yes' if u.in_tests else 'no'} |"
@@ -564,7 +570,7 @@ def render(
         "### Totals",
         "",
         "| Group | Files | + | - | Hunks |",
-        "|---|---:|---:|---:|---:|",
+        "| --- | ---: | ---: | ---: | ---: |",
     ]
     for label, group in (
         ("Product code", patched_product),
@@ -601,7 +607,7 @@ def render(
         "build files, without tests or Markdown.",
         "",
         "| Measure | Value |",
-        "|---|---:|",
+        "| --- | ---: |",
         f"| Fork-added product files | {len(fork_product):,} |",
         f"| Fork-added product lines | {line_total(fork_product):,} |",
         f"| Patched upstream files | {p_n:,} |",

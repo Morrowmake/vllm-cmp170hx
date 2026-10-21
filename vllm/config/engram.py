@@ -19,6 +19,14 @@ _NGRAM_LAYER_FIELDS = {
     "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
 }
 
+# Architectures whose CPU-offloaded tables support file-backed mmap storage.
+_MMAP_ARCHITECTURES = frozenset(
+    {
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
+
 
 def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
     """Whether the model carries n-gram embedding layers."""
@@ -35,7 +43,7 @@ class EngramConfig:
     """Configuration for Engram embedding storage and sharding."""
 
     cpu_offload: bool = True
-    """Store embedding weights in pinned CPU memory for UVA lookup."""
+    """Store embeddings on the CPU: pinned for UVA, or file-backed with mmap."""
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
@@ -54,6 +62,13 @@ class EngramConfig:
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
     startup takes longer. Requires cpu_offload without dp_shared_memory."""
 
+    mmap: bool = False
+    """Keep CPU-offloaded tables file-backed by mapping checkpoint pages
+    instead of copying them into private pinned memory. Only Qwen4Exp PLE on
+    CUDA supports it, with the lazy safetensors loader and unsharded
+    embeddings (TP=1, no cross-DP sharding or sequence parallelism);
+    incompatible with dp_shared_memory, use_thp, and EXL3 checkpoints."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
@@ -62,6 +77,12 @@ class EngramConfig:
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
             )
+        if self.mmap and not self.cpu_offload:
+            raise ValueError("mmap requires cpu_offload=True")
+        if self.mmap and self.dp_shared_memory:
+            raise ValueError("mmap is not compatible with dp_shared_memory")
+        if self.mmap and self.use_thp:
+            raise ValueError("mmap is not compatible with use_thp")
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
@@ -80,6 +101,11 @@ class EngramConfig:
                 "EngramConfig requires a model with supported Engram "
                 "embeddings and non-empty n-gram layer ids."
             )
+        if self.mmap and model_config.architecture not in _MMAP_ARCHITECTURES:
+            raise ValueError(
+                "Engram mmap storage is only supported for Qwen4Exp PLE "
+                "models; disable mmap for other architectures."
+            )
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
@@ -87,12 +113,29 @@ class EngramConfig:
             self.dp_shared_memory = (
                 self.cpu_offload
                 and not self.use_thp
+                and not self.mmap
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if self.mmap:
+            if parallel_config.tensor_parallel_size > 1:
+                raise ValueError("Engram mmap requires tensor_parallel_size=1.")
+            if self.get_parallel_size(parallel_config) > 1:
+                raise ValueError(
+                    "Engram mmap requires unsharded embeddings; disable "
+                    "embedding_across_dp."
+                )
+            if (
+                parallel_config.enable_hc_sp
+                or parallel_config.use_sequence_parallel_moe
+            ):
+                raise ValueError(
+                    "Engram mmap does not support sequence parallelism; "
+                    "disable HC/MoE SP."
+                )
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")

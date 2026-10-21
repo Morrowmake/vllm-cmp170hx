@@ -24,7 +24,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -62,7 +62,7 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.sm80.failed_inputs import take_failed_tokens
+from vllm.sm80.failed_inputs import relay_failed_tokens
 from vllm.sm80.spec_decode.aux_fc_fold import (
     mark_drafter_aux_fc_folded,
     maybe_configure_aux_fc_fold,
@@ -1607,6 +1607,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.num_new_sampled_tokens_per_step,
         )
         if getattr(self.pp_handler, "remote_drafts", None) is not None:
+            assert self.pp_handler is not None
             # Last stage with a moved draft tail: land the drafts this batch reads.
             self.pp_handler.apply_remote_drafts(
                 idx_mapping_np, self.req_states.draft_tokens
@@ -1937,7 +1938,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.adaptive_k_enabled
             and uniform_tok_count is not None
             and not dummy_run
-            and self.cudagraph_manager.is_decode_graph_miss(batch_desc)
+            and cast(
+                ModelCudaGraphManager, self.cudagraph_manager
+            ).is_decode_graph_miss(batch_desc)
         ):
             # A uniform decode batch that found no graph of the configured
             # decode mode runs PIECEWISE or eager, which would otherwise read
@@ -1951,7 +1954,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_reqs,
                     num_toks,
                     uniform_tok_count,
-                    self.cudagraph_manager.decode_cg_mode.name,
+                    cast(
+                        ModelCudaGraphManager, self.cudagraph_manager
+                    ).decode_cg_mode.name,
                     batch_desc.cg_mode.name,
                     self._adaptive_k_cg_misses,
                 )
@@ -2225,6 +2230,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        failed_tokens = relay_failed_tokens(
+            self.model,
+            model_inputs["intermediate_tensors"],
+            output_intermediate_tensors,
+        )
+
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -2237,6 +2248,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            failed_tokens=failed_tokens,
         )
 
         if not self.is_last_pp_rank:
@@ -2267,6 +2279,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        failed_tokens = self.execute_model_state.failed_tokens
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2361,7 +2374,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
-            failed_tokens=take_failed_tokens(self.model),
+            failed_tokens=failed_tokens,
             query_start_loc_np=input_batch.query_start_loc_np,
         )
 
@@ -2603,6 +2616,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
+    failed_tokens: torch.Tensor | None = None
 
 
 class BatchReqState(NamedTuple):

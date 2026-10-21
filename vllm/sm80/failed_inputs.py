@@ -28,6 +28,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.sequence import IntermediateTensors
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -58,6 +59,36 @@ def take_failed_tokens(model: nn.Module) -> torch.Tensor | None:
         if mask is not None
     ]
     return functools.reduce(torch.logical_or, masks) if masks else None
+
+
+def relay_failed_tokens(
+    model: nn.Module,
+    incoming: "IntermediateTensors | None",
+    outgoing: "IntermediateTensors | None",
+) -> torch.Tensor | None:
+    """Carry failures through PP; only the sampling rank owns the final mask."""
+    local = take_failed_tokens(model)
+    previous = incoming.tensors.get("failed_tokens") if incoming is not None else None
+    if outgoing is not None:
+        mask = outgoing.tensors.get("failed_tokens")
+        if mask is None:
+            if local is not None or previous is not None:
+                raise RuntimeError("Pipeline model has no failed-token transport field")
+            return None
+        mask.zero_()
+        if previous is not None:
+            mask.copy_(previous)
+        if local is not None:
+            mask[: local.shape[0]].logical_or_(local)
+        return None
+    if previous is None:
+        return local
+    # The next forward overwrites the persistent receive buffer. AsyncOutput
+    # must retain an independent mask until its device-to-host copy completes.
+    result = previous.clone()
+    if local is not None:
+        result[: local.shape[0]].logical_or_(local)
+    return result
 
 
 def failed_request_ids(
@@ -110,6 +141,7 @@ def handle_failed_inputs(scheduler: "Scheduler", failed_req_ids: set[str]) -> se
     Returns:
         Set of request IDs to skip in update_from_output and finish with
         FINISHED_ERROR.
+
     """
     kv_cache_manager = scheduler.kv_cache_manager
     affected: set[str] = set()

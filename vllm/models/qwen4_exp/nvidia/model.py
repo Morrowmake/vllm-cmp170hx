@@ -61,11 +61,11 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
@@ -454,12 +454,20 @@ class Qwen4ExpModel(nn.Module):
             Qwen4ExpSparseMoeBlock,
             "mlp",
         )
-        intermediate_size = config.hidden_size * config.hc_count
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], intermediate_size
+        # A fixed PP field carries request-local SSD failures to the sampling
+        # rank. The runner fills it outside graph replay before each hand-off.
+        self._pp_failed_tokens = (
+            torch.zeros(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                dtype=torch.bool,
+            )
+            if vllm_config.parallel_config.pipeline_parallel_size > 1
+            and config.ple_layer_ids
+            and vllm_config.model_config.quantization == "exl3"
+            else None
         )
 
-        self.hyper_connection_mixer: GatedResidual | None
+        self.hyper_connection_mixer: GatedResidual | PPMissingLayer
         if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
@@ -475,7 +483,7 @@ class Qwen4ExpModel(nn.Module):
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
         else:
-            self.hyper_connection_mixer = None
+            self.hyper_connection_mixer = PPMissingLayer()
 
         spec_config = vllm_config.speculative_config
         # MTP HC multi-stream outputs: when speculative method=="mtp" and the
@@ -496,6 +504,23 @@ class Qwen4ExpModel(nn.Module):
             )
         else:
             self._mtp_hidden_buffer = None
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        tensors = {
+            "hidden_states": torch.zeros(
+                batch_size,
+                self.config.hidden_size * self.config.hc_count,
+                dtype=dtype,
+                device=device,
+            )
+        }
+        if self._pp_failed_tokens is not None:
+            tensors["failed_tokens"] = torch.zeros(
+                batch_size, dtype=torch.bool, device=device
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -614,12 +639,17 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states = last_layer.mlp_hyper_connection.combine(
                     hidden_states, block_output, injection
                 )
-            return IntermediateTensors({"hidden_states": hidden_states})
+            tensors = {"hidden_states": hidden_states}
+            if self._pp_failed_tokens is not None:
+                tensors["failed_tokens"] = self._pp_failed_tokens[
+                    : hidden_states.shape[0]
+                ]
+            return IntermediateTensors(tensors)
 
         # The final mixer consumes the last pending combine and returns both
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
-        assert final_mixer is not None
+        assert not isinstance(final_mixer, PPMissingLayer)
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
@@ -674,16 +704,8 @@ class Qwen4ExpModel(nn.Module):
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )
-        # The final HC mixer only exists on the last PP rank; earlier ranks
-        # must drop its checkpoint weights instead of failing to place them.
-        ignore_prefixes = (
-            None
-            if self.hyper_connection_mixer is not None
-            else ["hyper_connection_mixer."]
-        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_prefixes=ignore_prefixes,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(

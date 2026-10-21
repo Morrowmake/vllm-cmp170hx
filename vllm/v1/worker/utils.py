@@ -598,11 +598,24 @@ def allocate_kv_cache(
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
         layer_name = tensor.layers[0]
-        group_id, group = next(
-            (group_id, group)
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if layer_name in group.layer_names
+        group_pair = next(
+            (
+                (group_id, group)
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                if layer_name in group.layer_names
+            ),
+            None,
         )
+        if group_pair is None:
+            # Planning defect, never a PP stage difference: configs are
+            # projected per worker, so a stage never receives a tensor for
+            # a layer it does not own. Fail loudly with the group layout.
+            raise RuntimeError(
+                f"No KV cache group contains layer {layer_name!r} of tensor "
+                f"layers={tensor.layers}; groups="
+                f"{[g.layer_names for g in kv_cache_config.kv_cache_groups]!r}"
+            )
+        group_id, group = group_pair
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
