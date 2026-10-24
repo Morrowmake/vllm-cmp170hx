@@ -71,6 +71,7 @@ tested them.
 | Recipe | Model | Hardware/layout | Fork version | Author |
 |---|---|---|---|---|
 | [mimo-v26-flash-cmp170hx-recipe](https://github.com/ElectroHobo/mimo-v26-flash-cmp170hx-recipe) | MiMo-V2.6-Flash-RL (NVFP4) | 4× CMP 170HX, TP=4 | `18305948acba3f4c4d912cdd56f2202d2ebd94e8` | @ElectroHobo |
+| [qwen38-flash-next-3bpw-1x-cmp170hx-recipe](https://github.com/ElectroHobo/qwen38-flash-next-3bpw-1x-cmp170hx-recipe) | Qwen3.8-Flash-Next (3 bpw AutoRound, DFlash 2 drafter) | 1× CMP 170HX, TP=1 | `18305948acba3f4c4d912cdd56f2202d2ebd94e8` | @ElectroHobo |
 
 ## Supported models
 
