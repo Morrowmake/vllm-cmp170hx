@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -301,6 +302,11 @@ class ModelRunnerOutput:
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
+
+    # Requests whose model inputs could not be produced on the worker this
+    # step (for example a failed storage read). The scheduler finishes them
+    # with FINISHED_ERROR and drops the KV computed from those inputs.
+    failed_req_ids: set[str] | None = None
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
