@@ -8,6 +8,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm_sm80.spec_decode.adaptive_k import config_of
 
 
 def draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
@@ -20,7 +21,7 @@ def draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
             vllm_config.scheduler_config.max_num_seqs,
             spec.num_speculative_tokens,
         )[1:])
-    adaptive = spec.adaptive_k_config
+    adaptive = config_of(vllm_config)
     if adaptive is not None and adaptive.draft_by_load:
         widths.update(adaptive.allowed)
     # Zero means context-KV only, not a query block (DFlashSpeculator.propose).

@@ -126,9 +126,7 @@ def test_padding_and_forget():
 def _make_scheduler(raw):
     base = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192,
                             num_speculative_tokens=5)
-    spec = base.vllm_config.speculative_config
-    spec.adaptive_k = raw
-    spec.adaptive_k_config = AdaptiveKConfig.from_dict(raw, 5)
+    base.vllm_config.additional_config = {"sm80": {"adaptive_k": raw}}
     return Sm80Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
                      block_size=base.block_size, log_stats=True,
                      structured_output_manager=StructuredOutputManager(base.vllm_config))
@@ -288,9 +286,7 @@ def test_force_file_pins_the_depth(tmp_path, monkeypatch, depth):
     monkeypatch.setenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE", str(force))
     base = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192,
                             num_speculative_tokens=7)
-    spec = base.vllm_config.speculative_config
-    spec.adaptive_k = K7
-    spec.adaptive_k_config = AdaptiveKConfig.from_dict(K7, 7)
+    base.vllm_config.additional_config = {"sm80": {"adaptive_k": K7}}
     scheduler = Sm80Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
                           block_size=base.block_size, log_stats=True,
                           structured_output_manager=StructuredOutputManager(base.vllm_config))
@@ -349,8 +345,7 @@ def test_scheduler_depth_sequence_is_repeatable_alone():
     depend on requests that ran before it."""
     base = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192,
                             num_speculative_tokens=7)
-    spec = base.vllm_config.speculative_config
-    spec.adaptive_k, spec.adaptive_k_config = K7, AdaptiveKConfig.from_dict(K7, 7)
+    base.vllm_config.additional_config = {"sm80": {"adaptive_k": K7}}
     scheduler = Sm80Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
                           block_size=base.block_size, log_stats=True,
                           structured_output_manager=StructuredOutputManager(base.vllm_config))

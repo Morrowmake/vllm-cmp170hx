@@ -11,7 +11,6 @@ import torch
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
 from vllm_sm80.envs import FORK_ENV_VARS
 from vllm_sm80.spec_decode import dspark_width as width_module
-from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
@@ -24,7 +23,6 @@ def _config(schedule=((1, 3, 5), (4, 8, 3))):
     spec = SimpleNamespace(
         num_speculative_tokens=5,
         num_speculative_tokens_per_batch_size=list(schedule),
-        adaptive_k_config=None,
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         uses_dynamic_speculative_decoding=lambda: bool(schedule),
     )
@@ -117,9 +115,9 @@ def test_widths_reuse_scheduler_lookup(schedule, expected):
 def test_adaptive_widths_require_draft_by_load():
     cfg = _config(())
     for enabled, expected in ((False, (5,)), (True, (2, 4, 5))):
-        cfg.speculative_config.adaptive_k_config = AdaptiveKConfig.from_dict(
-            {"by_load": [5, 4, 2], "draft_by_load": enabled}, 5
-        )
+        cfg.additional_config = {
+            "sm80": {"adaptive_k": {"by_load": [5, 4, 2], "draft_by_load": enabled}}
+        }
         assert width_module.draft_widths(cfg) == expected
 
 

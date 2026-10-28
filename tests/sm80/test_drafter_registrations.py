@@ -91,11 +91,12 @@ def _width_cfg(draft_by_load):
         adaptive_k.pop("draft_by_load")
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
-            adaptive_k_config=AdaptiveKConfig.from_dict(adaptive_k, 5),
+            num_speculative_tokens=5,
             draft_sample_method="greedy",
             enable_adaptive_verification=False,
         ),
         parallel_config=SimpleNamespace(data_parallel_size=1),
+        additional_config={"sm80": {"adaptive_k": adaptive_k}},
     )
 
 

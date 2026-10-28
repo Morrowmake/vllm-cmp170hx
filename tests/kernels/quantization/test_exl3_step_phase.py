@@ -41,13 +41,13 @@ def _rows_config(max_num_seqs, k=None, schedule=None, adaptive_k=None, method=No
         else SimpleNamespace(
             num_speculative_tokens=k,
             num_speculative_tokens_per_batch_size=schedule,
-            adaptive_k=adaptive_k,
             method=method,
         )
     )
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         speculative_config=speculative,
+        additional_config={"sm80": {"adaptive_k": adaptive_k}} if adaptive_k else {},
     )
 
 

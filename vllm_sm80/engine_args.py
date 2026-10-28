@@ -18,6 +18,9 @@ from vllm.utils.argparse_utils import human_readable_int
 
 from vllm_sm80.config import FAIR_PREFILL_KEYS, with_settings
 
+# Spellings create_speculative_config normalises to ``adaptive_k``.
+ADAPTIVE_K_KEYS = ("adaptive_k", "adaptive-k")
+
 PREFILL_CHUNK_WITH_DECODES_HELP = """\
 Decode-aware prefill chunk budget ("fair chunked prefill").
 
@@ -77,13 +80,23 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def from_cli_args(engine_args: Any, args: argparse.Namespace) -> None:
-    """Move the fork's settings from the parsed flags into
-    ``engine_args.additional_config``."""
+    """Move the fork's settings from the parsed flags and from
+    ``--speculative-config`` into ``engine_args.additional_config``."""
     settings: dict[str, Any] = {}
     for key in FAIR_PREFILL_KEYS:
         value = getattr(args, key, 0)
         if value:
             settings[key] = value
+    speculative_config = engine_args.speculative_config
+    if isinstance(speculative_config, dict) and any(
+        key in speculative_config for key in ADAPTIVE_K_KEYS
+    ):
+        # A copy: the parsed dict may be the parser's shared default.
+        speculative_config = dict(speculative_config)
+        for key in ADAPTIVE_K_KEYS:
+            if key in speculative_config:
+                settings["adaptive_k"] = speculative_config.pop(key)
+        engine_args.speculative_config = speculative_config
     if settings:
         engine_args.additional_config = with_settings(
             engine_args.additional_config, settings

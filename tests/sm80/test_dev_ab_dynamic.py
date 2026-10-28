@@ -167,14 +167,15 @@ def test_set_refuses_respecialized_table_atomically(monkeypatch, state, fake_swi
     assert fake_switch == before and state.generation == 0
 
 
-@pytest.mark.parametrize("attribute", ["adaptive_verification", "adaptive_k_config", "method"])
+@pytest.mark.parametrize("attribute", ["adaptive_verification", "adaptive_k", "method"])
 def test_stateful_or_other_dynamic_policies_remain_refused(monkeypatch, state, fake_switch, attribute):
     runner, _, captured = dynamic_runner(monkeypatch)
     if attribute == "adaptive_verification":
         runner.adaptive_verification = object()
+    elif attribute == "adaptive_k":
+        runner.vllm_config.additional_config = {"sm80": {"adaptive_k": {"by_load": [1]}}}
     else:
-        setattr(runner.vllm_config.speculative_config, attribute,
-                "dflash" if attribute == "method" else object())
+        runner.vllm_config.speculative_config.method = "dflash"
     with pytest.raises(RuntimeError):
         ab.capture_model_per_arm(runner, False)
     assert not captured

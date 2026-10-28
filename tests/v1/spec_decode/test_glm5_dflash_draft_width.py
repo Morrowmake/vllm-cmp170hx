@@ -40,9 +40,10 @@ def test_draft_by_load_needs_by_load():
 def test_drafter_gate(sample, adaptive, dp, expect):
     cfg = SimpleNamespace(
         speculative_config=SimpleNamespace(
-            adaptive_k_config=AdaptiveKConfig.from_dict(BY_LOAD_WIDTH, 5),
+            num_speculative_tokens=5,
             draft_sample_method=sample, enable_adaptive_verification=adaptive),
-        parallel_config=SimpleNamespace(data_parallel_size=dp))
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+        additional_config={"sm80": {"adaptive_k": BY_LOAD_WIDTH}})
     assert sm.load_following_draft_widths(cfg) == expect
 
 
@@ -52,9 +53,7 @@ def test_drafter_gate(sample, adaptive, dp, expect):
 def _make_scheduler(adaptive_k):
     base = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192,
                             num_speculative_tokens=5)
-    spec = base.vllm_config.speculative_config
-    spec.adaptive_k = adaptive_k
-    spec.adaptive_k_config = AdaptiveKConfig.from_dict(adaptive_k, 5)
+    base.vllm_config.additional_config = {"sm80": {"adaptive_k": adaptive_k}}
     return Sm80Scheduler(vllm_config=base.vllm_config,
                      kv_cache_config=base.kv_cache_config,
                      block_size=base.block_size, log_stats=True,
@@ -339,9 +338,10 @@ def test_drafter_gate_warning_logs_on_a_non_first_rank(monkeypatch, caplog_vllm)
     _not_local_first_rank(monkeypatch)
     cfg = SimpleNamespace(
         speculative_config=SimpleNamespace(
-            adaptive_k_config=AdaptiveKConfig.from_dict(BY_LOAD_WIDTH, 5),
+            num_speculative_tokens=5,
             draft_sample_method="probabilistic", enable_adaptive_verification=False),
-        parallel_config=SimpleNamespace(data_parallel_size=1))
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        additional_config={"sm80": {"adaptive_k": BY_LOAD_WIDTH}})
     assert sm.load_following_draft_widths(cfg) == ()
     assert not any("keeps its full block" in r.getMessage() for r in caplog_vllm.records)
     assert sm.load_following_draft_widths(cfg, log=True) == ()
@@ -389,9 +389,10 @@ def _width_cfg(draft_by_load):
     adaptive_k = BY_LOAD_WIDTH if draft_by_load else {"by_load": [5, 4, 3]}
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
-            adaptive_k_config=AdaptiveKConfig.from_dict(adaptive_k, 5),
+            num_speculative_tokens=5,
             draft_sample_method="greedy", enable_adaptive_verification=False),
-        parallel_config=SimpleNamespace(data_parallel_size=1))
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        additional_config={"sm80": {"adaptive_k": adaptive_k}})
 
 
 def test_conv_module_gets_a_block_tensor_only_with_width_mode():

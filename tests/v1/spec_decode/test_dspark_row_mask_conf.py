@@ -37,7 +37,6 @@ def _config(draft_sample_method="greedy"):
     spec = SimpleNamespace(
         num_speculative_tokens=MAX_DRAFT,
         num_speculative_tokens_per_batch_size=[(1, 3, 5), (4, 8, 3)],
-        adaptive_k_config=None,
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         uses_dynamic_speculative_decoding=lambda: True,
         draft_sample_method=draft_sample_method,

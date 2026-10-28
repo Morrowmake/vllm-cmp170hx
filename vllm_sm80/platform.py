@@ -27,6 +27,8 @@ where the fork needs it:
   (``vllm_sm80.dev_ab``).
 - ``check_and_update_config``: last, the fork scheduler
   (``vllm_sm80.sched.scheduler``) when no scheduler class is configured.
+- ``apply_config_platform_defaults``: upstream's, then the adaptive_k
+  settings check (``vllm_sm80.spec_decode.adaptive_k.check_settings``).
 
 ``Sm80CudaPlatform`` is chosen the way ``vllm.platforms.cuda.CudaPlatform``
 is: the NVML variant when NVML is available, else the non-NVML one.
@@ -114,6 +116,14 @@ class _Sm80CudaPlatformMixin:
         if needs_fork_communicator():
             return COMMUNICATOR_QUALNAME
         return super().get_device_communicator_cls()  # type: ignore[misc]
+
+    @classmethod
+    def apply_config_platform_defaults(cls, vllm_config) -> None:
+        """Upstream defaults, then the adaptive_k settings check."""
+        super().apply_config_platform_defaults(vllm_config)  # type: ignore[misc]
+        from vllm_sm80.spec_decode.adaptive_k import check_settings
+
+        check_settings(vllm_config)
 
     @classmethod
     def check_and_update_config(cls, vllm_config) -> None:

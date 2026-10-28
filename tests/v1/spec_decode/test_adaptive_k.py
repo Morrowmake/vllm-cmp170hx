@@ -108,10 +108,7 @@ def _make_scheduler(adaptive_k: dict | None, num_speculative_tokens: int = 3,
     speculative_config = base.vllm_config.speculative_config
     assert speculative_config is not None
     if adaptive_k is not None:
-        speculative_config.adaptive_k = adaptive_k
-        speculative_config.adaptive_k_config = AdaptiveKConfig.from_dict(
-            adaptive_k, num_speculative_tokens
-        )
+        base.vllm_config.additional_config = {"sm80": {"adaptive_k": adaptive_k}}
     return cls(
         vllm_config=base.vllm_config,
         kv_cache_config=base.kv_cache_config,
@@ -220,3 +217,27 @@ def test_scheduler_keeps_the_histogram_only_when_logging(log_interval, counted):
     assert scheduler.cur_num_spec_tokens == 3
     assert (scheduler.adaptive_k._k_counts == {3: 1}) is counted
     assert scheduler.adaptive_k._steps_since_log == int(counted)
+
+
+def test_served_speculative_config_key_reaches_the_fork_settings():
+    """`--speculative-config {"adaptive_k": ...}` keeps working as served: the
+    key leaves the speculative config (whose schema has no such field) for
+    additional_config["sm80"], where config_of reads it."""
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm_sm80.spec_decode.adaptive_k import config_of
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--speculative-config",
+            '{"method": "ngram", "num_speculative_tokens": 3,'
+            ' "adaptive_k": {"by_load": [3, 1]}}',
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    assert "adaptive_k" not in engine_args.speculative_config
+    assert engine_args.additional_config == {"sm80": {"adaptive_k": {"by_load": [3, 1]}}}
+    scheduler = _make_scheduler({"by_load": [3, 1]})
+    assert config_of(scheduler.vllm_config).by_load == (3, 1)
+    assert config_of(_make_scheduler(None).vllm_config) is None

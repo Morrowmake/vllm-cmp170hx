@@ -78,10 +78,7 @@ def _make_scheduler(adaptive_k: dict | None, num_speculative_tokens: int = 5,
     speculative_config = base.vllm_config.speculative_config
     assert speculative_config is not None
     if adaptive_k is not None:
-        speculative_config.adaptive_k = adaptive_k
-        speculative_config.adaptive_k_config = AdaptiveKConfig.from_dict(
-            adaptive_k, num_speculative_tokens
-        )
+        base.vllm_config.additional_config = {"sm80": {"adaptive_k": adaptive_k}}
     return cls(
         vllm_config=base.vllm_config,
         kv_cache_config=base.kv_cache_config,
@@ -233,13 +230,11 @@ def _graph_manager(
     )
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.num_speculative_tokens = num_speculative_tokens
-    config = AdaptiveKConfig.from_dict(adaptive_k, num_speculative_tokens)
+    vllm_config.additional_config = {"sm80": {"adaptive_k": adaptive_k}}
     spec = MagicMock()
     spec.uses_dynamic_speculative_decoding.return_value = False
     spec.num_speculative_tokens_per_batch_size = None
-    spec.uses_adaptive_k.return_value = True
-    spec.adaptive_k_draft_counts.return_value = config.allowed
-    spec.adaptive_k_config = config
+    spec.num_speculative_tokens = num_speculative_tokens
     vllm_config.speculative_config = spec
     return gpu_cudagraph_utils.CudaGraphManager(
         vllm_config=vllm_config,
@@ -406,9 +401,7 @@ def test_set_cudagraph_sizes_load_tiers(monkeypatch):
         max_num_seqs=8, max_num_batched_tokens=3460, num_speculative_tokens=5
     )
     vllm_config = base.vllm_config
-    spec = vllm_config.speculative_config
-    spec.adaptive_k = dict(BY_LOAD)
-    spec.adaptive_k_config = AdaptiveKConfig.from_dict(BY_LOAD, 5)
+    vllm_config.additional_config = {"sm80": {"adaptive_k": dict(BY_LOAD)}}
     comp = vllm_config.compilation_config
     comp.cudagraph_capture_sizes = None
     comp.max_cudagraph_capture_size = None
@@ -424,14 +417,13 @@ def test_set_cudagraph_sizes_load_tiers(monkeypatch):
 # ------------------------------------------------------------ PP draft tail
 
 
-def _tail_config(adaptive_k_config):
+def _tail_config(adaptive_k):
     spec = SimpleNamespace(
         method="dflash",
         draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
         draft_sample_method="greedy",
         enable_adaptive_verification=False,
-        uses_adaptive_k=lambda: adaptive_k_config is not None,
-        adaptive_k_config=adaptive_k_config,
+        num_speculative_tokens=5,
         uses_dynamic_speculative_decoding=lambda: False,
     )
     return SimpleNamespace(
@@ -443,10 +435,11 @@ def _tail_config(adaptive_k_config):
         ),
         use_v2_model_runner=True,
         speculative_config=spec,
+        additional_config={"sm80": {"adaptive_k": adaptive_k}} if adaptive_k else {},
     )
 
 
 def test_draft_tail_carries_load_adaptive_depth():
-    load = dt.draft_tail_gate(_tail_config(AdaptiveKConfig.from_dict(BY_LOAD, 5)), 2)
+    load = dt.draft_tail_gate(_tail_config(BY_LOAD), 2)
     assert load.enabled and load.stage == 2
     assert dt.draft_tail_gate(_tail_config(None), 2).enabled

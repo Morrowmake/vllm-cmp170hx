@@ -35,7 +35,7 @@ from vllm.v1.request import Request
 from vllm_sm80.config import fair_prefill
 from vllm_sm80.sched.step import Sm80Step
 from vllm_sm80.spec_decode import dspark_depth_hint, dspark_host_width
-from vllm_sm80.spec_decode.adaptive_k import AdaptiveKPolicy
+from vllm_sm80.spec_decode.adaptive_k import AdaptiveKPolicy, config_of
 
 logger = init_logger(__name__)
 
@@ -46,11 +46,11 @@ class Sm80SchedulerMixin:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[call-arg]
         vllm_config = self.vllm_config
-        speculative_config = vllm_config.speculative_config
 
         self.adaptive_k: AdaptiveKPolicy | None = None
-        if speculative_config is not None and speculative_config.uses_adaptive_k():
-            self.adaptive_k = AdaptiveKPolicy(speculative_config.adaptive_k_config)
+        adaptive_k_config = config_of(vllm_config)
+        if adaptive_k_config is not None:
+            self.adaptive_k = AdaptiveKPolicy(adaptive_k_config)
             by_load = self.adaptive_k.config.by_load
             logger.info_once(
                 "GLM-5 load-adaptive DFlash depth active "

@@ -66,7 +66,9 @@ def max_decode_step_rows(vllm_config) -> int:
         return max_seqs * (1 + k)
     by_batch = [k] * (max_seqs + 1)
     schedule = getattr(speculative, "num_speculative_tokens_per_batch_size", None)
-    if schedule and k > 0 and getattr(speculative, "adaptive_k", None) is None:
+    from vllm_sm80.spec_decode.adaptive_k import config_of
+
+    if schedule and k > 0 and config_of(vllm_config) is None:
         from vllm.v1.spec_decode.dynamic.utils import (
             build_dynamic_sd_schedule_lookup,
         )

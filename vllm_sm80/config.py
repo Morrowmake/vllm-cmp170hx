@@ -4,10 +4,13 @@
 
 vLLM keeps platform settings in ``additional_config`` (hashed into the
 compile cache key, carried to every engine process with the config). The
-fork's served flags land there (``vllm_sm80.engine_args``):
+fork's served flags and speculative-config keys land there
+(``vllm_sm80.engine_args``):
 
 - ``prefill_chunk_with_decodes``, ``max_num_partial_prefills``: fair chunked
-  prefill (``vllm_sm80.sched``).
+  prefill (``vllm_sm80.sched``);
+- ``adaptive_k``: the load-adaptive draft count
+  (``vllm_sm80.spec_decode.adaptive_k.config_of``).
 
 This module imports nothing from vLLM: config construction calls it.
 """
@@ -22,7 +25,7 @@ FAIR_PREFILL_KEYS = ("prefill_chunk_with_decodes", "max_num_partial_prefills")
 
 def section(vllm_config: Any) -> dict[str, Any]:
     """The fork's settings of ``vllm_config`` (empty when none are set)."""
-    additional = vllm_config.additional_config
+    additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, dict):
         return {}
     return additional.get(SECTION) or {}

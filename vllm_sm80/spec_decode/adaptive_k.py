@@ -13,6 +13,10 @@ reject vLLM's device-side ``enable_adaptive_verification``.
 Because decode runs under uniform-batch full CUDA graphs, the choice is made
 once per step for the whole batch and is always one of the draft counts that
 have captured graphs.
+
+The settings are the ``adaptive_k`` key of ``--speculative-config``, which
+``vllm_sm80.engine_args`` moves to ``additional_config["sm80"]["adaptive_k"]``;
+:func:`config_of` is the one reader of them.
 """
 
 from dataclasses import dataclass, field
@@ -364,3 +368,86 @@ class AdaptiveKPolicy:
             logger.info("Adaptive SD: %d steps, mean k=%.2f, %s", total, mean_k, hist)
         self._k_counts.clear()
         self._steps_since_log = 0
+
+
+# ----------------------------------------------------------------- settings
+
+
+def config_of(vllm_config: Any) -> AdaptiveKConfig | None:
+    """The validated adaptive-k settings of ``vllm_config``, or None when
+    load-adaptive depth is off (no ``adaptive_k`` setting, or no speculative
+    decoding)."""
+    from vllm_sm80.config import section
+
+    raw = section(vllm_config).get("adaptive_k")
+    spec = getattr(vllm_config, "speculative_config", None)
+    if raw is None or spec is None:
+        return None
+    return AdaptiveKConfig.from_dict(raw, spec.num_speculative_tokens)
+
+
+def check_settings(vllm_config: Any) -> None:
+    """Refuse adaptive_k beside another per-step width rule, validate it, and
+    drop it under data parallelism (the fork platform's
+    ``apply_config_platform_defaults``, before upstream's own data-parallel
+    check of dynamic speculative decoding)."""
+    from vllm_sm80.config import SECTION, section
+
+    if section(vllm_config).get("adaptive_k") is None:
+        return
+    spec = vllm_config.speculative_config
+    if spec is None:
+        raise ValueError("adaptive_k needs speculative decoding (--speculative-config)")
+    if spec.uses_dynamic_speculative_decoding():
+        raise ValueError(
+            "adaptive_k and num_speculative_tokens_per_batch_size both "
+            "choose the per-step draft count; enable only one."
+        )
+    if spec.enable_adaptive_verification:
+        raise ValueError(
+            "adaptive_k (host-side) and enable_adaptive_verification "
+            "(device-side) both size the verification budget; enable "
+            "only one."
+        )
+    config_of(vllm_config)  # raises on invalid settings
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        logger.warning_once(
+            "Load-adaptive speculative decoding is not supported "
+            "with data parallelism because data-parallel ranks can select "
+            "different speculative-token counts, causing DP divergence "
+            "and deadlocks. Disabling adaptive_k and falling back to "
+            "static num_speculative_tokens=%d.",
+            spec.num_speculative_tokens,
+        )
+        settings = dict(section(vllm_config))
+        del settings["adaptive_k"]
+        vllm_config.additional_config = {
+            **vllm_config.additional_config,
+            SECTION: settings,
+        }
+
+
+def adaptive_k_decode_tiers(
+    vllm_config: Any, default_max_graph_size: int
+) -> tuple[int, list[tuple[int, int]]] | None:
+    """``(max_cudagraph_capture_size, decode_tiers)`` for
+    ``VllmConfig._set_cudagraph_sizes`` under load-adaptive depth, or None.
+
+    Each draft count is verified only up to its request count, and the widest
+    batch runs at the last (configured) depth, so the graph ceiling is sized
+    from that depth. This keeps the mixed graph set of the configured depth
+    unchanged."""
+    config = config_of(vllm_config)
+    if config is None:
+        return None
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    base_query_len = config.by_load[-1] + 1
+    max_cudagraph_capture_size = min(
+        max_num_seqs * base_query_len * 2, default_max_graph_size
+    )
+    decode_tiers = [
+        (k + 1, tier_max_reqs)
+        for k in config.allowed
+        if (tier_max_reqs := config.max_reqs_for(k, max_num_seqs)) > 0
+    ]
+    return max_cudagraph_capture_size, decode_tiers

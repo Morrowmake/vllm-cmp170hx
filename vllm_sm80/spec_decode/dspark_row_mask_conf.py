@@ -157,7 +157,9 @@ def verify_drafts_by_batch(vllm_config, max_num_reqs: int) -> list[int]:
     num_speculative_tokens."""
     spec = vllm_config.speculative_config
     k = spec.num_speculative_tokens
-    adaptive = getattr(spec, "adaptive_k_config", None)
+    from vllm_sm80.spec_decode.adaptive_k import config_of
+
+    adaptive = config_of(vllm_config)
     if adaptive is not None:
         by_load = list(adaptive.by_load)
         return [0] + [

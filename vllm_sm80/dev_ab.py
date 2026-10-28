@@ -1382,7 +1382,9 @@ def _capture_unsupported(runner) -> str | None:
     if model_state.supports_mm_inputs and model_state.encoder_runner.has_cudagraph():
         return "encoder CUDA graphs are not keyed by arm"
     spec = runner.vllm_config.speculative_config
-    if getattr(spec, "adaptive_k_config", None) is not None:
+    from vllm_sm80.spec_decode.adaptive_k import config_of
+
+    if config_of(runner.vllm_config) is not None:
         return "acceptance/load-adaptive speculation is not covered"
     if getattr(runner, "adaptive_verification", None) is not None:
         return "adaptive verification profiles step costs during capture"
