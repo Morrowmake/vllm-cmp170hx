@@ -19,7 +19,10 @@ import pytest
 
 from tests.sm80 import gpu_lock_guard as guard
 
-HERE = Path(__file__).resolve().parent
+# Not resolved: where the test files are links into another tree (the plugin's
+# tests laid over an engine's), the child must run in this test tree, whose
+# tests/conftest.py installs the guard and registers the ``cuda`` marker.
+HERE = Path(__file__).absolute().parent
 REPO = HERE.parents[1]
 CASES = HERE / "gpu_lock_guard_cases.py"
 NOT_A_CARD = "GPU-00000000-0000-0000-0000-000000000000"
