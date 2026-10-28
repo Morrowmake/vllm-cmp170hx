@@ -188,6 +188,7 @@ def register() -> None:
     register_serial_trace_export()
     register_light_timing()
     register_fork_parsers()
+    register_mhc_decode_op()
 
 
 def register_fork_parsers() -> None:
@@ -196,6 +197,21 @@ def register_fork_parsers() -> None:
     from vllm_sm80.parsers import register_parsers
 
     register_parsers()
+
+
+# ---------------------------------------------------------------- layers: mHC
+def register_mhc_decode_op() -> None:
+    """Build ``MHCFusedPostPreOp`` as the fork's subclass, whose CUDA path
+    runs the sm_80 mHC decode kernel (``vllm_sm80/kernels/mhc/fused_op.py``),
+    while VLLM_AMPERE_DECODE_KERNELS and VLLM_GLM5_DECODE_MHC_V2 are set; with
+    either off the op stays upstream's. Idempotent."""
+    import vllm.envs as envs
+
+    if not (envs.VLLM_AMPERE_DECODE_KERNELS and envs.VLLM_GLM5_DECODE_MHC_V2):
+        return
+    from vllm_sm80.kernels.mhc import fused_op
+
+    fused_op.register()
 
 
 def register_execution_trace() -> None:

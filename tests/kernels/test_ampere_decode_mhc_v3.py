@@ -7,7 +7,9 @@ CPU (runs anywhere):
     CUDA_VISIBLE_DEVICES="" pytest -q tests/kernels/test_ampere_decode_mhc_v3.py
 the gate (off by default, needs the master flag, 1 <= M <= 32 and its bound,
 the hc == 4 / hidden % 1024 shapes, sm_80 only); the dispatch in
-`mhc_fused_post_pre_tilelang` reaches v3; warmup covers M <= 32; every kernel
+`vllm::sm80_mhc_fused_post_pre` (fused_op.py) reaches v3, and the plugin
+replaces MHCFusedPostPreOp only with both switches; warmup covers M <= 32;
+every kernel
 specialisation compiles for sm_80.
 GPU (sm_80, skipped otherwise): error against an FP64 recomputation no worse
 than TileLang's (summed mean <= 1.2x, max <= 1.25x on post_mix and comb_mix;
@@ -116,15 +118,35 @@ def _cpu_kw(M):
 
 def test_dispatch_reaches_v3(monkeypatch):
     """Host dispatch only: the v3 entry point is replaced by a spy."""
-    from vllm.model_executor.kernels.mhc import tilelang as tlmod
+    from vllm_sm80.kernels.mhc import fused_op
 
     seen = []
     monkeypatch.setattr(v3, "mhc_fused_post_pre",
                         lambda *a, **k: seen.append(a[1].shape[0]) or "v3")
     _on(monkeypatch)
     for M in (1, 4, 16, 32):
-        assert tlmod.mhc_fused_post_pre_tilelang(**_cpu_kw(M)) == "v3"
+        assert fused_op.sm80_mhc_fused_post_pre(**_cpu_kw(M)) == "v3"
     assert seen == [1, 4, 16, 32]
+
+
+@pytest.mark.parametrize(
+    ("decode", "mhc_v2", "replaced"),
+    [("1", "1", True), ("1", "0", False), ("0", "1", False)],
+)
+def test_plugin_replaces_the_op_only_with_both_switches(
+    monkeypatch, decode, mhc_v2, replaced
+):
+    from vllm.model_executor import custom_op
+    from vllm_sm80 import plugin
+    from vllm_sm80.kernels.mhc import fused_op
+
+    monkeypatch.setattr(custom_op, "op_registry_oot", {})
+    monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", decode)
+    monkeypatch.setenv("VLLM_GLM5_DECODE_MHC_V2", mhc_v2)
+    plugin.register_mhc_decode_op()
+    plugin.register_mhc_decode_op()  # idempotent
+    registered = custom_op.op_registry_oot.get("MHCFusedPostPreOp")
+    assert (registered is fused_op.Sm80MHCFusedPostPreOp) is replaced
 
 
 def test_warmup_covers_the_bound(monkeypatch):
@@ -328,7 +350,7 @@ def test_gpu_accuracy_vs_tilelang_no_floor(monkeypatch):
 
 @gpu
 def test_gpu_dispatch_reaches_v3(monkeypatch):
-    from vllm.model_executor.kernels.mhc import tilelang as tlmod
+    from vllm_sm80.kernels.mhc import fused_op
 
     fn = _fn(7)
     v3.warmup((4, 16, 32))
@@ -342,7 +364,7 @@ def test_gpu_dispatch_reaches_v3(monkeypatch):
     _on(monkeypatch)
     for M in (4, 16, 32, 33):
         kw = _kw(_case(M, fn, 70 + M))
-        out = tlmod.mhc_fused_post_pre_tilelang(**kw)
+        out = fused_op.sm80_mhc_fused_post_pre(**kw)
         if M <= 32:
             assert seen[-1] == M
             want = real(**kw)
@@ -353,7 +375,7 @@ def test_gpu_dispatch_reaches_v3(monkeypatch):
 
 @gpu
 def test_gpu_closed_gate_never_reaches_v3(monkeypatch):
-    from vllm.model_executor.kernels.mhc import tilelang as tlmod
+    from vllm_sm80.kernels.mhc import fused_op
 
     def boom(*a, **k):
         raise AssertionError("v3 called with VLLM_GLM5_DECODE_MHC_V2 off")
@@ -362,7 +384,7 @@ def test_gpu_closed_gate_never_reaches_v3(monkeypatch):
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "1")
     monkeypatch.setenv("VLLM_GLM5_DECODE_MHC_V2", "0")
     for M in (4, 16):
-        tlmod.mhc_fused_post_pre_tilelang(**_kw(_inputs(M, seed=5)))
+        fused_op.sm80_mhc_fused_post_pre(**_kw(_inputs(M, seed=5)))
     torch.cuda.synchronize()
 
 

@@ -135,3 +135,26 @@ def ampere_prenorm_offsets_fit(x: torch.Tensor, fn: torch.Tensor) -> bool:
         "TileLang kernel instead."
     )
     return False
+
+
+def try_prenorm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_tokens: int,
+) -> bool:
+    """The branch of ``_hc_prenorm_gemm_outputs``
+    (``vllm/model_executor/kernels/mhc/tilelang.py``) after DeepGEMM: write
+    ``out`` and ``sqrsum`` with the sm_80 pre-norm GEMM and return True where
+    :func:`use_ampere_prefill_prenorm` and :func:`ampere_prenorm_offsets_fit`
+    admit it, else return False with nothing done (TileLang runs)."""
+    if not (use_ampere_prefill_prenorm(num_tokens) and ampere_prenorm_offsets_fit(x, fn)):
+        return False
+    from vllm_sm80.kernels.mhc.prenorm import hc_prenorm_gemm
+
+    # `fn` differs for all 90 (layer, attn|ffn) calls per prefill chunk.
+    # The leased pack is overwritten every call, not memoized weights;
+    # eager streams are ordered and captures use their allocator pool.
+    hc_prenorm_gemm(x, fn, out=out, sqrsum=sqrsum)
+    return True
