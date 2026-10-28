@@ -21,7 +21,9 @@ HOME = "${home}"
 host = "0.0.0.0"
 models_dir = "/models"
 venv = "/opt/venv"
-tree = "/opt/vllm-src"
+# The assembly image's engine; its plugin is /opt/assembly/plugin
+# (${plugin}), beside /opt/assembly/assembly.json.
+tree = "/opt/assembly/engine"
 cuda_home = "/usr/local/cuda"
 policy = "merge"
 checkpoint_verify = "boot"

@@ -219,6 +219,15 @@ def test_image_env_is_declared_and_classified():
     assert {n: table.classify(n) for n in IMAGE_ENV if table.classify(n) == "unclassified"} == {}
 
 
+def test_container_defaults_name_the_assembly_layout():
+    """The image of an assembled engine (tools imagebuild ``build.py
+    assembly``) holds the engine at /opt/assembly/engine, the plugin beside
+    it and the venv at /opt/venv."""
+    container = _defaults()["runtime"]["container"]
+    assert container["tree"] == "/opt/assembly/engine"
+    assert container["venv"] == "/opt/venv"
+
+
 def test_container_with_exactly_the_image_env_adds_no_reason(w):
     base = in_image(w, environ=w.env(VIRTUAL_ENV=w.venv))
     d = in_image(w)
