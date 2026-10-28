@@ -6,19 +6,21 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import os
 
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm_sm80.fla.pinned_autotune import pinned_autotune
 
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
 
 
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
     ],
@@ -47,7 +49,7 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BT": BT}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8, 16]
