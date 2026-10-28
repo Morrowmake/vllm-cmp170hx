@@ -130,6 +130,22 @@ def test_state_hash_covers_the_plugin(aw):
     assert tree_state(aw.tree).state_sha256() != before
 
 
+def test_required_extensions_resolve_in_the_plugin(aw):
+    """Settings shared with single-tree arms name the extensions by their
+    single-tree paths; in an assembled engine they match the plugin's files
+    under the same keys."""
+    model = open(os.path.join(aw.settings, "model.toml")).read()
+    write(os.path.join(aw.settings, "model.toml"), model.replace(
+        "[args]\n", '[requires]\nfiles = ["vllm/_exl3_C*.so", "vllm/_ampere_marlin_C*.so", '
+        '"vllm_sm80/envs.py"]\n\n[args]\n', 1))
+    d = aw.resolve()
+    assert d["requires"] == {
+        "vllm/_exl3_C.abi3.so": sha256_file(os.path.join(aw.plugin, NATIVES[0])),
+        "vllm/_ampere_marlin_C.abi3.so": sha256_file(os.path.join(aw.plugin, NATIVES[1])),
+        "vllm_sm80/envs.py": sha256_file(os.path.join(aw.plugin, "vllm_sm80", "envs.py")),
+    }
+
+
 def test_legacy_tree_keeps_its_key(tmp_path):
     w = World(tmp_path)
     assert w.verify() == 0

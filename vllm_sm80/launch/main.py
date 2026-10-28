@@ -29,7 +29,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import checkpoint  # noqa: E402
-from assembly import PACKAGE, plugin_dir  # noqa: E402
+from assembly import plugin_dir, plugin_pattern  # noqa: E402
 from checkpoint import StopFlag  # noqa: E402
 from canon import HashCache, atomic_write, canonical_sha256, sha256_file  # noqa: E402
 from envclass import ClassTable  # noqa: E402
@@ -113,23 +113,30 @@ def _launcher_impl() -> dict:
 
 def _requires(ms, tree: str, capability: str, cache: HashCache) -> dict[str, str]:
     """Hashes of the required files. Patterns are tree-relative (checked at
-    load); in an assembled engine a pattern under vllm_sm80/ is relative to
-    the plugin directory, with the same key. A match may be a link (linked
-    trees link their artefacts), whose ownership and content the tree state
-    checks; a dangling one is refused."""
+    load); in an assembled engine a pattern of a plugin file (under
+    vllm_sm80/, or a compiled extension by its single-tree path
+    vllm/_exl3_C* or vllm/_ampere_marlin_C*) matches in the plugin directory
+    and keeps the pattern's own path in the key, so the same settings give
+    the same keys on both layouts. A match may be a link (linked trees link
+    their artefacts), whose ownership and content the tree state checks; a
+    dangling one is refused."""
     out: dict[str, str] = {}
     plugin = plugin_dir(tree)
     for ent in ms.requires:
         if capability == "plain-upstream" and ent.get("fork_only"):
             continue
-        base = plugin if plugin and ent["path"].startswith(PACKAGE + "/") else tree
-        hits = sorted(glob.glob(os.path.join(base, ent["path"])))
+        pattern = ent["path"]
+        in_plugin = plugin_pattern(pattern) if plugin else None
+        base = plugin if in_plugin else tree
+        hits = sorted(glob.glob(os.path.join(base, in_plugin or pattern)))
         if not hits:
-            raise Refusal(f"required file {ent['path']} is missing in {base}")
+            raise Refusal(f"required file {pattern} is missing in {base}")
         for h in hits:
             rel = os.path.relpath(h, base)
             if rel.startswith(".."):
                 raise Refusal(f"required file {h} is outside the engine tree")
+            if in_plugin:
+                rel = os.path.join(os.path.dirname(pattern), os.path.basename(h))
             try:
                 out[rel] = cache.sha256(h)
             except OSError as exc:

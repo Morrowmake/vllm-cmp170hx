@@ -58,6 +58,24 @@ def code_path(tree: str) -> str:
     return f"{tree}:{plugin}" if plugin else tree
 
 
+# Single-tree paths of the compiled extensions, which live in the plugin's
+# package directory in an assembled engine.
+_LEGACY_NATIVES = ("vllm/_exl3_C", "vllm/_ampere_marlin_C")
+
+
+def plugin_pattern(pattern: str) -> str | None:
+    """The plugin-relative form of a tree-relative path pattern that names a
+    plugin file in an assembled engine (``vllm_sm80/...``, or an extension
+    by its single-tree path ``vllm/_exl3_C*``, ``vllm/_ampere_marlin_C*``);
+    None for an engine file."""
+    if pattern.startswith(PACKAGE + "/"):
+        return pattern
+    if pattern.startswith(_LEGACY_NATIVES):
+        return PACKAGE + "/" + pattern[len("vllm/"):]
+    return None
+
+
+
 def sm80_package_dir(tree: str) -> str | None:
     """Directory of the sm80 package that serves ``tree``, or None."""
     plugin = plugin_dir(tree)
