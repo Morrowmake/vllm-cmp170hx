@@ -21,6 +21,7 @@ import re
 from collections import defaultdict
 
 import pytest
+import torch
 
 from tests.models.deepseek_v41.sm80 import construct
 from tests.models.deepseek_v41.sm80 import exl3_fixture as fixture
@@ -127,3 +128,39 @@ def test_every_checkpoint_tensor_has_one_owner(
         per_rank[ranks_[0]] += 1
     assert sorted(per_rank) == list(range(tp))
     assert len(set(per_rank.values())) == 1
+
+
+def test_drafter_stages_write_their_own_context_kv(
+    monkeypatch,
+    meta_platform,  # noqa: F811
+    checkpoint,
+):
+    """Each sm_80 draft stage writes its context KV from its own ``wkv``, so
+    the drafter keeps no stacked context-KV projection (which would load the
+    stage ``wkv`` matrices a second time) and loads no checkpoint copy into
+    one."""
+    from vllm_sm80 import plugin
+
+    plugin._register_exl3()
+    construct.set_groups(monkeypatch, 1, 0)
+    construct.stub_engram_tables(monkeypatch, 1)
+    _, draft_config = construct.vllm_configs(str(checkpoint), 1)
+    draft = construct.build_model(draft_config)
+    model = draft.model
+    assert not hasattr(model, "context_wkv_proj")
+    assert draft._remap_dspark_name("context_wkv_proj.weight") is None
+
+    stores = []
+    for layer in model.layers:
+        monkeypatch.setattr(
+            layer.attn,
+            "sm80_store_context_kv",
+            lambda x, p, s, attn=layer.attn: stores.append((attn, s)),
+        )
+    main_x = torch.empty(4, model.config.hidden_size, device="meta")
+    positions = torch.empty(4, dtype=torch.int64, device="meta")
+    slots = [torch.empty(4, dtype=torch.int64, device="meta") for _ in model.layers]
+    model.precompute_and_store_context_kv(main_x, positions, slots)
+    assert len(stores) == len(model.layers)
+    for (attn, slot), layer, expected in zip(stores, model.layers, slots):
+        assert attn is layer.attn and slot is expected

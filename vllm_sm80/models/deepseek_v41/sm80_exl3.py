@@ -15,7 +15,12 @@ constituents: ``fused_wqa_wkv`` = ``wq_a`` | ``wkv`` (replicated),
 ``gate_up_proj`` = ``w1`` | ``w3`` and ``down_proj`` = ``w2``. Routed expert
 roles gate/up/down are ``w1``/``w3``/``w2``. ``attn.wo_a`` is stored as one
 matrix per output group (``wo_a.slice.<g>``), so it becomes a grouped EXL3
-projection whose TP ranks own whole groups.
+projection whose TP ranks own whole groups. The DSpark drafter's stacked
+``context_wkv_proj`` (model level) is every draft stage's ``attn.wkv``, one
+output per stage: ``mtp.<j>.attn.wkv``. It resolves so the projection gets
+its stages' method when the drafter is built; the sm_80 drafter then drops
+it (its stages write the context KV from their own ``wkv``), so the stage
+matrices load once.
 
 Shared experts (intermediate 2304 = 18 H128 blocks) do not split into four
 equal block-aligned shards, so they shard unevenly: ranks 0-1 hold 5 blocks,
@@ -61,6 +66,8 @@ class DeepseekV41Exl3Layout(Exl3Layout):
         return re.sub(r"\.shared_experts\.down_proj$", ".shared_experts.w2", name)
 
     def members(self, config, leaf, source, outputs):
+        if source == "context_wkv_proj":
+            return [f"mtp.{j}.attn.wkv" for j in range(outputs)]
         members = _FUSED_MEMBERS.get(leaf)
         if members is None:
             return None

@@ -25,7 +25,9 @@ What changes on sm_80:
   the reference routing (``sm80_moe.adopt_moe``);
 - the drafter holds no embedding or LM head of its own (the DSpark loader
   aliases the target's), and keeps its confidence head across the EXL3
-  loader's one-tensor-at-a-time ``load_weights`` calls;
+  loader's one-tensor-at-a-time ``load_weights`` calls; its sm_80 stages
+  write their context KV from their own ``wkv``, so it drops upstream's
+  stacked context-KV projection and that projection's checkpoint copies;
 - the logits, the DSpark Markov bias and the drafts' logits are FP32, as the
   reference computes them: the plugin defaults ``head_dtype`` to float32
   (``vllm_sm80.plugin.HF_CONFIG_DEFAULTS``), the EXL3 head stores its FP32
@@ -455,6 +457,15 @@ class DeepseekV41ForCausalLM(
         Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
 
 
+def sm80_writes_context_kv(model: upstream_dspark.DSparkDeepseekV4Model) -> bool:
+    """Whether the DSpark drafter ``model``'s stages are sm_80 layers, which
+    write their context window rows themselves, each from its own ``wkv``
+    (:meth:`DSparkDeepseekV4Model.precompute_and_store_context_kv`). Every
+    stage takes its class from the same selector, so the first one decides."""
+    layers = list(model.layers)
+    return bool(layers) and isinstance(layers[0].attn, DeepseekV41Sm80Attention)
+
+
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
     """DSpark stages whose mHC runs ``ops/sm80_mhc.py`` and whose sm_80 draft
     layers write their context window rows themselves."""
@@ -471,6 +482,12 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
         _adopt_layers(model.layers, model.config)
         # Aliased from the target by the DSpark loader (load_dspark_model).
         model.embed_tokens = PPMissingLayer()
+        if sm80_writes_context_kv(model) and hasattr(model, "context_wkv_proj"):
+            # The sm_80 stages write their context KV from their own wkv
+            # (precompute_and_store_context_kv), so the stacked context
+            # projection never runs: drop it, and its checkpoint copies at load
+            # (DSparkDeepseekV4ForCausalLM._remap_dspark_name).
+            del model.context_wkv_proj
 
     def forward(
         self,
@@ -508,12 +525,11 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
         """sm_80 draft layers store their context KV through
         :meth:`DeepseekV41Sm80Attention.sm80_store_context_kv` (the target's
         rounding); other layers take upstream's insertion."""
-        layers = list(self.layers)
-        if not layers or not isinstance(layers[0].attn, DeepseekV41Sm80Attention):
+        if not sm80_writes_context_kv(self):
             return super().precompute_and_store_context_kv(
                 main_x, context_positions, context_slot_mappings
             )
-        for i, layer in enumerate(layers):
+        for i, layer in enumerate(self.layers):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
@@ -540,6 +556,16 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
         return self.logits_processor(
             self.lm_head, self.model.norm(hidden_states), skip_gather=True
         )
+
+    def _remap_dspark_name(self, name: str) -> str | None:
+        """Upstream's mapping; the stacked context-WKV copies of the stage
+        ``wkv`` weights load nowhere once the drafter has dropped that
+        projection (:meth:`DSparkDeepseekV4Model.adopt`)."""
+        if name.startswith("context_wkv_proj.") and not hasattr(
+            self.model, "context_wkv_proj"
+        ):
+            return None
+        return super()._remap_dspark_name(name)
 
     def load_weights(self, weights) -> set[str]:
         """Upstream ``load_weights``, without dropping the confidence head
