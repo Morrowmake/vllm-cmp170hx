@@ -452,12 +452,12 @@ def adopt_moe(ffn: nn.Module, config) -> None:
                 reason,
             )
     if (
-        envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
+        envs.VLLM_SM80_ALLREDUCE_ROUND_ONCE
         or envs.VLLM_SM80_PREFILL_REDUCE_OVERLAP
         or envs.VLLM_SM80_ALLREDUCE
     ):
         _adopt_layer_all_reduce(
-            ffn, round_once=envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
+            ffn, round_once=envs.VLLM_SM80_ALLREDUCE_ROUND_ONCE
         )
 
 
@@ -477,7 +477,7 @@ class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
     :meth:`forward_partial`, so a caller may run the two apart (the prefill
     split reduction, ``sm80_split_reduce.py``)."""
 
-    # VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: :func:`moe_all_reduce`;
+    # VLLM_SM80_ALLREDUCE_ROUND_ONCE: :func:`moe_all_reduce`;
     # otherwise the runner's own all-reduce.
     _round_once: bool = False
 
@@ -512,7 +512,7 @@ class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
 
 def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:
     """The layer, not the runner, all-reduces the MoE output, where the runner
-    would: rounded once with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
+    would: rounded once with VLLM_SM80_ALLREDUCE_ROUND_ONCE
     (``round_once``), else through the runner's all-reduce
     (VLLM_SM80_PREFILL_REDUCE_OVERLAP or VLLM_SM80_ALLREDUCE alone)."""
     if type(ffn) is not upstream_model.DeepseekV4MoE:
@@ -531,7 +531,7 @@ def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:
             "whole are all-reduced with one rounding per element on eager steps, "
             "over the copy-engine ring's owner sum (VLLM_SM80_ALLREDUCE=1) or "
             "else the custom all-reduce in pieces "
-            "(VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
+            "(VLLM_SM80_ALLREDUCE_ROUND_ONCE=1; set 0 for the "
             "runner's all-reduce)",
             scope="global",
         )

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks that the attention ``wo_b`` sum under
-VLLM_SM80_ALLREDUCE_ROUND_ONCE and the MoE output sum under
-VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE are the same once-rounded function
+VLLM_SM80_ALLREDUCE_ROUND_ONCE and the MoE output sum under the same switch
+are the same once-rounded function
 of the ranks' BF16 partials wherever both round once, and where they differ.
 
 Four ranks' partials are reduced through the layers' own entry points
@@ -240,8 +240,8 @@ def test_where_no_round_once_transport_takes_the_message(monkeypatch) -> None:
     """A backend dispatched before the custom all-reduce (or CUDA graph
     capture of a message too large for it whole): the wo_b sum is the FP32
     message rounded once; the MoE output keeps the runner's BF16 all-reduce,
-    which rounds every hop. Merging the MoE switch into the wo_b one changes
-    the MoE output only here, to the once-rounded sum."""
+    which rounds every hop, so the two sums differ only where no round-once
+    transport takes the message."""
     parts = _partials(ROWS)
     group = _Group(parts, ca_max=1 << 20, preempt=True)
     wo_b, moe, wo_b_paths, moe_paths = _both_consumers(group, monkeypatch)

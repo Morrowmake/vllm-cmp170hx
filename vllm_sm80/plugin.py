@@ -191,6 +191,7 @@ def register() -> None:
     install_host_width()
     register_execution_trace()
     register_serial_trace_export()
+    register_light_timing()
 
 
 def register_execution_trace() -> None:
@@ -207,6 +208,14 @@ def register_serial_trace_export() -> None:
     from vllm_sm80.worker import trace_export
 
     trace_export.install()
+
+
+def register_light_timing() -> None:
+    """GPU timing of CUDA-graph forwards, with VLLM_SM80_LIGHT_TIMING
+    (:mod:`vllm_sm80.worker.light_timing`)."""
+    from vllm_sm80.worker import light_timing
+
+    light_timing.install()
 
 
 def is_registered() -> bool:

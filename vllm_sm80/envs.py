@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_STATE_INDEX_CHECK: bool = False
     VLLM_SM80_EXECUTION_TRACE: bool = False
     VLLM_SM80_SERIAL_TRACE_EXPORT: bool = False
+    VLLM_SM80_LIGHT_TIMING: str = ""
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
@@ -80,7 +81,6 @@ if TYPE_CHECKING:
     VLLM_EXL3_OVERRIDE: str = ""
     VLLM_EXL3_OVERRIDE_SHA256: str = ""
     VLLM_EXL3_HYBRID: bool = False
-    VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
     VLLM_SM80_ALLREDUCE_ROUND_ONCE: bool = False
     VLLM_SM80_PREFILL_REDUCE_OVERLAP: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
@@ -311,6 +311,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_SM80_SERIAL_TRACE_EXPORT": lambda: bool(
         int(os.getenv("VLLM_SM80_SERIAL_TRACE_EXPORT", "0"))
     ),
+    # A JSON object (vllm_sm80.worker.light_timing): every forward of the
+    # named root modules captured into a CUDA graph stamps the GPU timer at
+    # each decoder layer and named scope into a device ring, dumped to files
+    # on request, with no host work per step. Diagnostic; empty: off.
+    "VLLM_SM80_LIGHT_TIMING": lambda: os.getenv("VLLM_SM80_LIGHT_TIMING", ""),
     # Opt in to the sm_80 decode kernels (mHC and MoE routing in
     # vllm_sm80/kernels/, the KDA decode step in vllm/models/glm5next/nvidia/ops/;
     # GA100-class parts only; measured on CMP 170HX, 70 SMs). Default OFF: with
@@ -746,24 +751,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # selected by its index. Unset: such a config is refused; EXL3
     # checkpoints without those keys load as before either way.
     "VLLM_EXL3_HYBRID": lambda: bool(int(os.getenv("VLLM_EXL3_HYBRID", "0"))),
-    # DeepSeek-V4.1 on sm_80: all-reduce the MoE output partial (routed experts
-    # plus the shared-expert shard, BF16) that is too large for the custom
-    # all-reduce to take whole (prefill and mixed steps) rounded once, on the
-    # copy-engine ring's owner sum (VLLM_SM80_ALLREDUCE) or else the custom
-    # all-reduce in pieces, instead of NCCL's BF16 ring. Precision: NCCL's ring
-    # stores every hop's sum in BF16, so a TP4 element is rounded three times
-    # (CPU emulation: about a third of the elements differ from one rounding of
-    # the FP32 sum); round-once paths sum each element in FP32 in a fixed order
-    # and round once, as the custom all-reduce already does for the
-    # decode-sized messages it takes whole and as the reference all-reduces its
-    # MoE output in FP32. The layer does the reduction the runner would do
-    # (skip_final_all_reduce); every other message takes the communicator's
-    # usual path. Eager steps only. Default OFF: unset, the runner all-reduces
-    # the MoE output as today. Read in
-    # vllm_sm80/models/deepseek_v41/sm80_moe.py.
-    "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE", "0"))
-    ),
     # Sum the BF16 partials of the TP ranks that a layer all-reduces itself
     # (DeepSeek-V4.1's attention wo_b) with one rounding per element: each
     # element accumulated in FP32 in a fixed order and rounded once to BF16,
@@ -780,8 +767,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # the last BF16 bit where a transport sums in another order than the FP32
     # path's (the ring's owner sum, the pieces). The function
     # (sm80_attention.round_once_all_reduce) takes any consumer's partial.
-    # Default OFF: unset, wo_b partials are all-reduced in FP32 and rounded
-    # once. Read in vllm_sm80/models/deepseek_v41/sm80_attention.py.
+    # DeepSeek-V4.1's MoE output partial (routed experts plus the shared-expert
+    # shard) is also summed by the layer (skip_final_all_reduce): on eager
+    # steps a message too large for the custom all-reduce whole goes over the
+    # copy-engine ring's owner sum (VLLM_SM80_ALLREDUCE) or the custom
+    # all-reduce in pieces, rounded once, instead of NCCL's BF16 ring (a TP4
+    # element rounded three times); every other MoE message takes the
+    # communicator's usual path. Default OFF: unset, wo_b partials are
+    # all-reduced in FP32 and rounded once and the runner all-reduces the MoE
+    # output. Read in vllm_sm80/models/deepseek_v41/sm80_attention.py and
+    # sm80_moe.py.
     "VLLM_SM80_ALLREDUCE_ROUND_ONCE": lambda: bool(
         int(os.getenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", "0"))
     ),
@@ -1332,6 +1327,9 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": (
         "merged into VLLM_SM80_ALLREDUCE_ROUND_ONCE (wo_b partials summed with "
         "one rounding, in BF16 where the transport rounds once)"
+    ),
+    "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE": (
+        "merged into VLLM_SM80_ALLREDUCE_ROUND_ONCE"
     ),
     "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": (
         "renamed to VLLM_DFLASH2_SELECTOR_SHARD (read by the shared DFlash2 "

@@ -1220,7 +1220,7 @@ seams:
 - id: dsv41-moe-forward
   kind: method
   target: vllm.models.deepseek_v4.nvidia.model:DeepseekV4MoE.forward
-  why: with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE sm80_moe.Sm80DeepseekV41MoE calls it with (hidden_states, input_ids, mega_gate_metadata) and all-reduces the [tokens, hidden] output it returns, which on the modular (non-MegaMoE) path is the runner's output with the final all-reduce skipped
+  why: with VLLM_SM80_ALLREDUCE_ROUND_ONCE sm80_moe.Sm80DeepseekV41MoE calls it with (hidden_states, input_ids, mega_gate_metadata) and all-reduces the [tokens, hidden] output it returns, which on the modular (non-MegaMoE) path is the runner's output with the final all-reduce skipped
   sha256: 39a1fcc1c943f891ff7dc83db25d0a1702f29229912327fbcb55e12fcff9452a
   signature: '(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> torch.Tensor'
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU checks of VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: the adopted MoE
+"""CPU checks of VLLM_SM80_ALLREDUCE_ROUND_ONCE on the MoE output: the adopted MoE
 all-reduces its own output where the runner would, through the custom
 all-reduce in pieces when the message is too large for it whole.
 
@@ -82,7 +82,7 @@ def test_layer_all_reduce_moves_the_final_all_reduce_into_the_layer(
     monkeypatch, round_once
 ) -> None:
     """The adopted MoE's forward is its reduce of its forward_partial: the
-    round-once all-reduce with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE,
+    round-once all-reduce with VLLM_SM80_ALLREDUCE_ROUND_ONCE,
     else the runner's own all-reduce (VLLM_SM80_PREFILL_REDUCE_OVERLAP or
     VLLM_SM80_ALLREDUCE alone)."""
     ffn = _bare_moe()
@@ -131,11 +131,16 @@ def test_layer_all_reduce_refuses_other_moe_classes() -> None:
         sm80_moe._adopt_layer_all_reduce(ffn, round_once=False)
 
 
-def test_moe_round_once_allreduce_default_off(monkeypatch) -> None:
-    import vllm.envs as envs
+@pytest.mark.parametrize("on", [False, True])
+def test_round_once_switch_rounds_the_moe_output_once(monkeypatch, on) -> None:
+    """VLLM_SM80_ALLREDUCE_ROUND_ONCE adopts the layer-reduced MoE with the
+    round-once all-reduce; unset, the MoE keeps the runner's all-reduce."""
+    from .test_sm80_ce_allreduce_dispatch import _adopt_moe_round_once
 
-    name = "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE"
-    monkeypatch.delenv(name, raising=False)
-    assert getattr(envs, name) is False
-    monkeypatch.setenv(name, "1")
-    assert getattr(envs, name) is True
+    for name in ("VLLM_SM80_ALLREDUCE", "VLLM_SM80_PREFILL_REDUCE_OVERLAP"):
+        monkeypatch.delenv(name, raising=False)
+    if on:
+        monkeypatch.setenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", "1")
+    else:
+        monkeypatch.delenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", raising=False)
+    assert _adopt_moe_round_once(monkeypatch) == ([True] if on else [])

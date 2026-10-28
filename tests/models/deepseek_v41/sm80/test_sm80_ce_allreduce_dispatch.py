@@ -93,16 +93,15 @@ def test_wo_b_fp32_path_goes_through_prefill_all_reduce(monkeypatch) -> None:
     assert torch.equal(got, (partial.float() * 3).to(BF16))
 
 
-def test_switch_adopts_the_layer_reduced_moe(monkeypatch) -> None:
+def _adopt_moe_round_once(monkeypatch) -> list[bool]:
+    """adopt_moe on a stub DSv4.1 MoE under the current environment; the
+    round_once argument of each layer all-reduce adoption it makes."""
     from vllm_sm80.models.deepseek_v41 import sm80_moe
 
     calls = []
     monkeypatch.setattr(sm80_moe, "_adopt_layer_all_reduce",
                         lambda ffn, round_once: calls.append(round_once))
-    for name in ("VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE",
-                 "VLLM_SM80_PREFILL_REDUCE_OVERLAP", "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_SM80_ALLREDUCE", "1")
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", raising=False)
     ffn = SimpleNamespace(use_native_mega_moe=False,
                           gate=SimpleNamespace(tid2eid=None, e_score_correction_bias=object()),
                           scoring_func="sqrtsoftplus")
@@ -111,7 +110,14 @@ def test_switch_adopts_the_layer_reduced_moe(monkeypatch) -> None:
     router.num_fused_shared_experts = 0
     ffn.experts = SimpleNamespace(router=router)
     sm80_moe.adopt_moe(ffn, SimpleNamespace())
-    assert calls == [False]
+    return calls
+
+
+def test_switch_adopts_the_layer_reduced_moe(monkeypatch) -> None:
+    for name in ("VLLM_SM80_ALLREDUCE_ROUND_ONCE", "VLLM_SM80_PREFILL_REDUCE_OVERLAP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE", "1")
+    assert _adopt_moe_round_once(monkeypatch) == [False]
 
 
 def test_allreduce_default_off(monkeypatch) -> None:
