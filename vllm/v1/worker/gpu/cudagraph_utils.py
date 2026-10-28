@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import gc
 import itertools
 from collections import defaultdict
@@ -53,6 +54,7 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
+from vllm_sm80.worker import adaptive_k_graphs as sm80_ak
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -277,6 +279,7 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
+        decode_max_reqs: dict[int, int] = {}
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
@@ -299,6 +302,8 @@ class CudaGraphManager:
                     for num_spec in dense_schedule[1:]
                 }
             )
+        elif ak := sm80_ak.decode_query_lens(self):
+            decode_query_lens, decode_max_reqs = ak
         else:
             decode_query_lens = [self.decode_query_len]
 
@@ -330,6 +335,8 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                        or rounded_num_reqs
+                        > decode_max_reqs.get(decode_query_len, self.max_num_reqs)
                     ):
                         continue
 
@@ -386,15 +393,40 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
-                for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    for i in range(current_range_start, num_tokens + 1):
-                        key = (i, num_active_loras)
-                        self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
+                # A descriptor only serves its own uniform_token_count, so each
+                # query length gets its own ladder. With several decode query
+                # lengths (dynamic or acceptance/load-adaptive speculative
+                # decoding), one shared ladder can map a token count to a size
+                # that holds only other lengths' graphs, hiding a larger FULL
+                # graph that fits. Each count lists candidates in ascending
+                # num_tokens order (ties in capture order), so the smallest
+                # compatible graph still wins, and every batch the shared
+                # ladder already served keeps the same descriptor.
+                by_token_count: defaultdict[
+                    int | None, list[BatchExecutionDescriptor]
+                ] = defaultdict(list)
+                for desc in lora_descs:
+                    by_token_count[desc.uniform_token_count].append(desc)
+                position = {desc: idx for idx, desc in enumerate(lora_descs)}
+                mode_candidates: defaultdict[int, list[BatchExecutionDescriptor]] = (
+                    defaultdict(list)
+                )
+                for token_count_descs in by_token_count.values():
+                    current_range_start = 0
+                    # Dynamic speculative decoding can produce multiple graphs
+                    # with the same num_tokens. Group them so each graph covers
+                    # the same candidate range.
+                    for num_tokens, group in groupby(
+                        token_count_descs, lambda d: d.num_tokens
+                    ):
+                        matching = list(group)
+                        for i in range(current_range_start, num_tokens + 1):
+                            mode_candidates[i].extend(matching)
+                        current_range_start = num_tokens + 1
+                for i, candidates in mode_candidates.items():
+                    candidates.sort(key=position.__getitem__)
+                    key = (i, num_active_loras)
+                    self._candidates.setdefault(key, []).extend(candidates)
 
     @property
     def dp_size(self) -> int:
