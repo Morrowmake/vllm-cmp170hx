@@ -8,10 +8,12 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 
 import torch
 
+from vllm_sm80.fla.pinned_autotune import pinned_autotune
 from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
@@ -201,7 +203,7 @@ def fused_recurrent_kda(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64]
@@ -305,7 +307,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@pinned_autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["BK", "BT"],
 )
@@ -478,7 +480,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
@@ -627,7 +629,7 @@ def recompute_w_u_fwd(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64]
@@ -766,7 +768,7 @@ def chunk_gla_fwd_o_gk(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BD": BD}, num_warps=num_warps)
         for BD in [32, 64]
@@ -1133,7 +1135,7 @@ def chunk_kda_with_fused_gate(
     return o, final_state
 
 
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
         for bt in BT_LIST_AUTOTUNE
