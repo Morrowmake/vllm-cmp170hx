@@ -36,8 +36,20 @@ NAMES = Path(__file__).parent / "fixtures" / "exl3_names.json"
 NUM_LAYERS = 48
 EXPERTS = (0, 1, 511)
 EXPERT_ROLES = ("gate_proj", "up_proj", "down_proj")
+# Upstream vLLM listed the QSA indexer projection in the target's packed
+# qkv_proj until it left it out (the attention layer now fuses it into qkv_proj
+# itself, only when it is quantized like q/k/v). The EXL3 config then makes
+# the target's choices exactly as the draft's, whose mapping never listed it;
+# the plugin serves both upstream layouts.
+INDEXER_IN_QKV = "indexer.index_qk_proj" in (
+    Qwen4ExpForConditionalGeneration.packed_modules_mapping["qkv_proj"]
+)
 EXPECTED = {
-    "target": "1982c1d215a99b255902e155a9e89602b4daab3f8a5feeedc5ad7bf47b7599de",
+    "target": (
+        "1982c1d215a99b255902e155a9e89602b4daab3f8a5feeedc5ad7bf47b7599de"
+        if INDEXER_IN_QKV
+        else "55d594722bb8699443d21ad5a29c6bb1b9caf291ad393669ee0e38f6feb373eb"
+    ),
     "draft": "55d594722bb8699443d21ad5a29c6bb1b9caf291ad393669ee0e38f6feb373eb",
     "owners": "85a4ee2a9097ae9a24635e0e3ec4e39aba4f831a525ab3c0ea84857f5dbdb9e1",
     "hooks": "3a35e7093b992c1356ca4c7adc308fb9e99f7f8d7369c7032a2138f4f2b416a8",
