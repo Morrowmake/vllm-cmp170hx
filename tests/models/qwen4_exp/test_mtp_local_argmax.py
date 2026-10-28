@@ -24,7 +24,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     pad_vocab_size,
 )
-from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP
+from vllm_sm80.models.qwen4_exp.sm80_model import Qwen4ExpMTP
 
 _LP = "vllm.model_executor.layers.logits_processor"
 _EMBEDDING = "vllm.model_executor.layers.vocab_parallel_embedding"

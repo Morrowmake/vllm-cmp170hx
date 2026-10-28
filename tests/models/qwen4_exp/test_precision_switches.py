@@ -140,6 +140,8 @@ def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, drafter
         torch.set_default_dtype(torch.bfloat16)
         try:
             block = model_module.Qwen4ExpSparseMoeBlock(cfg, "model.layers.0.mlp")
+            # The fork model classes set the dtype on the upstream-built blocks.
+            precision_module.adopt_router_precision(cfg, block)
         finally:
             torch.set_default_dtype(old_dtype)
     assert block.gate is block.experts.gate
@@ -208,7 +210,10 @@ def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, 
     monkeypatch.setattr(mtp_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
     banners = []
     monkeypatch.setattr(precision_module, "logger", SimpleNamespace(info_once=lambda *args: banners.append(args)))
-    predictor = mtp_module.Qwen4ExpMultiTokenPredictor(vllm_config=cfg).to(dtype)
+    predictor = mtp_module.Qwen4ExpMultiTokenPredictor(vllm_config=cfg)
+    # The fork Qwen4ExpMTP swaps the norm in on the upstream-built predictor.
+    precision_module.adopt_mtp_hidden_norm(cfg, predictor)
+    predictor = predictor.to(dtype)
     # Different stream scales distinguish one stack RMS from four stream RMSs.
     x = torch.linspace(-1.0, 1.0, 2560).repeat(2, 4, 1)
     x = (x * torch.tensor([0.125, 1.0, 4.0, 16.0])[None, :, None]).to(dtype)

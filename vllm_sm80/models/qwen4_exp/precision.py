@@ -15,7 +15,8 @@ not set; set them with ``--hf-overrides``, e.g.
 
 Both are read from the target config, also for the MTP drafter: its layers are
 built from the draft model config, which dict ``--hf-overrides`` do not reach.
-Both are read once, when the owning module is constructed.
+Both are applied once, by the fork model classes (``sm80_model.py``) right
+after the upstream model is built and before its weights load.
 """
 
 import torch
@@ -25,6 +26,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
+from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpSparseMoeBlock
 
 logger = init_logger(__name__)
 
@@ -50,6 +52,14 @@ def apply_router_precision(vllm_config: VllmConfig, gate: nn.Module) -> None:
         "FP32" if router_dtype is not None else "model dtype",
         getattr(config, "moe_router_dtype", None),
     )
+
+
+def adopt_router_precision(vllm_config: VllmConfig, model: nn.Module) -> None:
+    """:func:`apply_router_precision` on every Qwen4Exp sparse MoE block of an
+    upstream-built ``model``, in construction order."""
+    for module in model.modules():
+        if isinstance(module, Qwen4ExpSparseMoeBlock):
+            apply_router_precision(vllm_config, module.gate)
 
 
 def mtp_hidden_norm_mode(vllm_config: VllmConfig) -> str:
@@ -80,14 +90,18 @@ class PerStreamGemmaRMSNorm(GemmaRMSNorm):
         return (streams * (1.0 + weight)).to(x.dtype).flatten(-2)
 
 
-def mtp_hidden_norm(
-    vllm_config: VllmConfig, hidden_size: int, hc_count: int, eps: float
-) -> GemmaRMSNorm:
-    """Pre-FC norm of the MTP hidden input ``[T, hc_count * hidden]``: the flat
-    GemmaRMSNorm, or the per-stream one under ``mtp_hidden_norm="per_stream"``.
+def adopt_mtp_hidden_norm(vllm_config: VllmConfig, predictor: nn.Module) -> None:
+    """Pre-FC norm of the MTP hidden input ``[T, hc_count * hidden]`` of an
+    upstream-built ``Qwen4ExpMultiTokenPredictor``: upstream's flat
+    GemmaRMSNorm, replaced by the per-stream one under
+    ``mtp_hidden_norm="per_stream"`` (same parameter, so it loads unchanged).
     """
     mode = mtp_hidden_norm_mode(vllm_config)
     logger.info_once("Qwen4Exp MTP hidden norm: %s (mtp_hidden_norm)", mode)
     if mode == "per_stream":
-        return PerStreamGemmaRMSNorm(hidden_size, hc_count, eps)
-    return GemmaRMSNorm(hidden_size * hc_count, eps=eps)
+        predictor.pre_fc_norm_hidden = None
+        predictor.pre_fc_norm_hidden = PerStreamGemmaRMSNorm(
+            predictor.hidden_size,
+            predictor.hc_count,
+            eps=predictor.config.rms_norm_eps,
+        )
