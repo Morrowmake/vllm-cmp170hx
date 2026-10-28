@@ -55,3 +55,19 @@ def test_seam_pinned(row: dict) -> None:
             _drift_message(row, "changed upstream:\n" + "\n".join(drift)),
             pytrace=False,
         )
+
+
+def test_signature_pin_has_no_object_address() -> None:
+    """A default argument's repr carries its address, which differs per
+    process; the pinned signature must not."""
+
+    class Registry:
+        pass
+
+    def build(registry: Registry = Registry(), n: int = 0) -> None:
+        pass
+
+    assert " at 0x" in repr(Registry())
+    text = seams.signature_text(build)
+    assert " at 0x" not in text
+    assert text.endswith("Registry object>, n: int = 0) -> None")

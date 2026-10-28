@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import importlib
 import inspect
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -25,6 +26,11 @@ from typing import Any
 import yaml
 
 SEAMS_PATH = Path(__file__).with_name("seams.yaml")
+
+# The repr of an object without its own __repr__ (a default-argument instance,
+# e.g. a registry singleton) carries its memory address, which differs per
+# process.
+_OBJECT_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+>")
 
 CODE_KINDS = ("function", "method")
 ATTR_KINDS = ("module_attr", "class_attr")
@@ -46,7 +52,7 @@ HEADER = """\
 #   target     'module:qualname'
 #   why        what the fork code depends on
 #   sha256     sha256 of textwrap.dedent(inspect.getsource(obj)) (code kinds)
-#   signature  str(inspect.signature(obj)) (code kinds)
+#   signature  str(inspect.signature(obj)), object addresses removed (code kinds)
 #   type       type name of the value (attr kinds and dict_contract)
 #   value      exact value, for constants only (attr kinds, optional)
 #   dict_contract rows also require every value to be a zero-arg callable.
@@ -81,6 +87,12 @@ def source_sha256(obj: Any) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+def signature_text(obj: Any) -> str:
+    """str(inspect.signature(obj)) without the per-process object addresses
+    of default-argument reprs ('<... object at 0x7f...>' -> '<... object>')."""
+    return _OBJECT_ADDRESS.sub(">", str(inspect.signature(obj)))
+
+
 def zero_arg_callable(value: Any) -> bool:
     if not callable(value):
         return False
@@ -104,7 +116,7 @@ def measure(row: dict[str, Any]) -> dict[str, Any]:
     if kind in CODE_KINDS:
         return {
             "sha256": source_sha256(obj),
-            "signature": str(inspect.signature(obj)),
+            "signature": signature_text(obj),
         }
     measured: dict[str, Any] = {"type": type(obj).__name__}
     if kind in ATTR_KINDS:
