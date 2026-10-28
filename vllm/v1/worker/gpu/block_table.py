@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 from collections.abc import Iterable
 
 import torch
@@ -12,6 +13,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+from vllm_sm80.worker import state_index_check as sic
 
 
 class BlockTables:
@@ -193,6 +195,7 @@ class BlockTables:
         else:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
+        sic.gather(idx_mapping, self.max_num_reqs)
         # Also clear rows left by a larger batch in the shared buffer.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
             idx_mapping,
@@ -295,14 +298,15 @@ def _gather_block_tables_kernel(
     dst_block_table_ptr = _load_ptr(dst_block_table_ptrs + group_id, tl.int32)
     dst_row_ptr = dst_block_table_ptr + batch_idx * stride
 
-    if batch_idx >= num_reqs:
-        # Zero out padded rows.
+    req_idx = tl.load(batch_idx_to_req_idx + batch_idx, mask=batch_idx < num_reqs, other=-1)
+    if req_idx < 0:
+        # Padded rows, and rows whose request slot is masked (-1): no source row
+        # to read (row -1 lies before the table), so they get the null block.
         for i in tl.range(0, max_num_blocks, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
         return
 
-    req_idx = tl.load(batch_idx_to_req_idx + batch_idx)
     group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
     num_blocks = tl.load(group_num_blocks_ptr + req_idx)
 
