@@ -1,0 +1,161 @@
+schema = "launch-defaults/1"
+
+# Runtime defaults: the lowest settings layer. ${home} is the launching
+# user's home (native) and /cache in a container; ${venv} and ${tree} are
+# the resolved venv and engine tree; ${plugin} is the plugin directory of an
+# assembled engine (<tree>/../plugin), else the tree.
+
+[runtime.native]
+host = "127.0.0.1"
+models_dir = "${home}/models"
+venv = ""                       # required on the command line natively
+cuda_home = "/usr/local/cuda"   # a hardware file may name the box's CUDA
+policy = "strict"
+checkpoint_verify = "stamp"
+stamp_dir = "${home}/.cache/sm80-launch"
+
+[runtime.native.location]
+HOME = "${home}"
+
+[runtime.container]
+host = "0.0.0.0"
+models_dir = "/models"
+venv = "/opt/venv"
+tree = "/opt/vllm-src"
+cuda_home = "/usr/local/cuda"
+policy = "merge"
+checkpoint_verify = "boot"
+stamp_dir = "/cache/sm80-launch"
+hub_dirs = ["/cache/huggingface/hub", "/hf-hub"]
+
+[runtime.container.location]
+HOME = "/cache"
+HF_HOME = "/cache/huggingface"
+XDG_CACHE_HOME = "/cache/.cache"
+TRITON_CACHE_DIR = "/cache/.triton/cache"
+TORCHINDUCTOR_CACHE_DIR = "/cache/torchinductor"
+VLLM_CACHE_ROOT = "/cache/.cache/vllm"
+FLASHINFER_WORKSPACE_BASE = "/cache"
+TMPDIR = "/cache/tmp"
+TORCH_EXTENSIONS_DIR = "/cache/.cache/torch_extensions"
+TILELANG_CACHE_DIR = "/cache/.tilelang/cache"
+TILELANG_TMP_DIR = "/cache/.tilelang/cache/tmp"
+CUDA_CACHE_PATH = "/cache/.nv/ComputeCache"
+
+# The model image's ENV: its complete config Env, which the image build sets
+# to exactly this table. In a container the code-loading names except PATH
+# are built from it, the functional and inert names reach the server with
+# these values (unless the settings declare the name), and an ambient value
+# that differs is a change: refused under strict, NOT VALIDATED under merge.
+# NVIDIA_VISIBLE_DEVICES, NVIDIA_DRIVER_CAPABILITIES and NVIDIA_REQUIRE_* are
+# the container runtime's: passed, not compared.
+[runtime.container.image_env]
+CUDA_HOME = "/usr/local/cuda"
+CUDA_VERSION = "13.3.1"
+LD_LIBRARY_PATH = "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+LIBRARY_PATH = "/usr/local/cuda/lib64/stubs"
+NCCL_VERSION = "2.30.7-1"
+NVARCH = "x86_64"
+NVIDIA_DRIVER_CAPABILITIES = "compute,utility"
+NVIDIA_PRODUCT_NAME = "CUDA"
+NVIDIA_REQUIRE_CUDA = "cuda>=13.0"
+NVIDIA_VISIBLE_DEVICES = "all"
+NV_CUDA_CUDART_DEV_VERSION = "13.3.29-1"
+NV_CUDA_CUDART_VERSION = "13.3.29-1"
+NV_CUDA_LIB_VERSION = "13.3.1-1"
+NV_CUDA_NSIGHT_COMPUTE_DEV_PACKAGE = "cuda-nsight-compute-13-3=13.3.1-1"
+NV_CUDA_NSIGHT_COMPUTE_VERSION = "13.3.1-1"
+NV_LIBCUBLAS_DEV_PACKAGE = "libcublas-dev-13-3=13.6.0.2-1"
+NV_LIBCUBLAS_DEV_PACKAGE_NAME = "libcublas-dev-13-3"
+NV_LIBCUBLAS_DEV_VERSION = "13.6.0.2-1"
+NV_LIBCUBLAS_PACKAGE = "libcublas-13-3=13.6.0.2-1"
+NV_LIBCUBLAS_PACKAGE_NAME = "libcublas-13-3"
+NV_LIBCUBLAS_VERSION = "13.6.0.2-1"
+NV_LIBCUSPARSE_DEV_VERSION = "12.8.2.51-1"
+NV_LIBCUSPARSE_VERSION = "12.8.2.51-1"
+NV_LIBNCCL_DEV_PACKAGE = "libnccl-dev=2.30.7-1+cuda13.3"
+NV_LIBNCCL_DEV_PACKAGE_NAME = "libnccl-dev"
+NV_LIBNCCL_DEV_PACKAGE_VERSION = "2.30.7-1"
+NV_LIBNCCL_PACKAGE = "libnccl2=2.30.7-1+cuda13.3"
+NV_LIBNCCL_PACKAGE_NAME = "libnccl2"
+NV_LIBNCCL_PACKAGE_VERSION = "2.30.7-1"
+NV_LIBNPP_DEV_PACKAGE = "libnpp-dev-13-3=13.1.2.81-1"
+NV_LIBNPP_DEV_VERSION = "13.1.2.81-1"
+NV_LIBNPP_PACKAGE = "libnpp-13-3=13.1.2.81-1"
+NV_LIBNPP_VERSION = "13.1.2.81-1"
+NV_NVML_DEV_VERSION = "13.3.29-1"
+NV_NVTX_VERSION = "13.3.29-1"
+PATH = "/opt/venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PYTHONDONTWRITEBYTECODE = "1"
+VIRTUAL_ENV = "/opt/venv"
+
+# Arguments that only instrument a run; reported, excluded from the
+# functional hash. This list is closed: an overlay cannot extend it.
+[harness]
+args = ["enable-prompt-tokens-details", "profiler-config"]
+
+# Environment classes. The first row whose names, prefixes or patterns
+# match wins; a name no row matches is unclassified and never reaches the
+# server. "patterns" are fnmatch patterns, case-sensitive.
+[[classes]]
+class = "secret"
+names = ["HF_TOKEN", "VLLM_API_KEY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+         "http_proxy", "https_proxy", "no_proxy"]
+
+[[classes]]
+class = "ownership"
+names = ["SESSION_JOB"]
+prefixes = ["GPU_LOCK_", "GPU_QUEUE_", "GPU_RAM_", "RAM_"]
+
+[[classes]]
+class = "code-loading"
+names = ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+         "PYTHONNOUSERSITE", "VIRTUAL_ENV", "PATH", "CUDA_HOME",
+         "TRITON_PTXAS_PATH", "TRITON_LIBCUDA_PATH", "LIBRARY_PATH"]
+prefixes = ["LD_"]
+
+[[classes]]
+class = "location"
+names = ["HOME", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE",
+         "TRANSFORMERS_CACHE", "XDG_CACHE_HOME", "TRITON_CACHE_DIR",
+         "TORCHINDUCTOR_CACHE_DIR", "VLLM_CACHE_ROOT",
+         "FLASHINFER_WORKSPACE_BASE", "CUDA_CACHE_PATH", "TORCH_EXTENSIONS_DIR",
+         "TMPDIR", "TILELANG_CACHE_DIR", "TILELANG_TMP_DIR",
+         "CUDA_VISIBLE_DEVICES"]
+
+[[classes]]
+class = "container-runtime"
+names = ["NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES"]
+prefixes = ["NVIDIA_REQUIRE_"]
+
+[[classes]]
+class = "functional"
+names = ["NVIDIA_TF32_OVERRIDE", "GLIBC_TUNABLES", "MASTER_ADDR",
+         "MASTER_PORT", "WORLD_SIZE", "RANK", "LOCAL_RANK", "CC", "CXX",
+         "MAX_JOBS"]
+prefixes = ["VLLM_", "NCCL_", "PYTORCH_", "TORCH_", "TRITON_", "CUDA_",
+            "CUBLAS_", "CUBLASLT_", "CUDNN_", "FLASHINFER_", "PYTHON",
+            "MALLOC_", "OMP_", "KMP_", "GOMP_", "MKL_", "OPENBLAS_",
+            "TORCHINDUCTOR_", "TORCHDYNAMO_", "HF_", "HUGGINGFACE_",
+            "TRANSFORMERS_", "TOKENIZERS_", "RAY_", "GLOO_", "UCX_"]
+model_prefixes = true           # plus the model's env_prefixes
+
+[[classes]]
+class = "inert"
+names = ["LANG", "TERM", "TZ", "USER", "LOGNAME", "SHELL", "PWD",
+         "DBUS_SESSION_BUS_ADDRESS", "SHLVL", "OLDPWD", "_", "HOSTNAME",
+         "MAIL", "MOTD_SHOWN", "LS_COLORS", "COLORTERM", "INVOCATION_ID",
+         "JOURNAL_STREAM", "SYSTEMD_EXEC_PID",
+         # base-image package metadata of the image above (by name: any
+         # other NV_* name stays unclassified); the engine does not read it
+         "NVARCH", "NVIDIA_PRODUCT_NAME",
+         "NV_CUDA_CUDART_DEV_VERSION", "NV_CUDA_CUDART_VERSION", "NV_CUDA_LIB_VERSION",
+         "NV_CUDA_NSIGHT_COMPUTE_DEV_PACKAGE", "NV_CUDA_NSIGHT_COMPUTE_VERSION",
+         "NV_LIBCUBLAS_DEV_PACKAGE", "NV_LIBCUBLAS_DEV_PACKAGE_NAME", "NV_LIBCUBLAS_DEV_VERSION",
+         "NV_LIBCUBLAS_PACKAGE", "NV_LIBCUBLAS_PACKAGE_NAME", "NV_LIBCUBLAS_VERSION",
+         "NV_LIBCUSPARSE_DEV_VERSION", "NV_LIBCUSPARSE_VERSION",
+         "NV_LIBNCCL_DEV_PACKAGE", "NV_LIBNCCL_DEV_PACKAGE_NAME", "NV_LIBNCCL_DEV_PACKAGE_VERSION",
+         "NV_LIBNCCL_PACKAGE", "NV_LIBNCCL_PACKAGE_NAME", "NV_LIBNCCL_PACKAGE_VERSION",
+         "NV_LIBNPP_DEV_PACKAGE", "NV_LIBNPP_DEV_VERSION", "NV_LIBNPP_PACKAGE",
+         "NV_LIBNPP_VERSION", "NV_NVML_DEV_VERSION", "NV_NVTX_VERSION"]
+prefixes = ["LC_", "SSH_", "XDG_"]

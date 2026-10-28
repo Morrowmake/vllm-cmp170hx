@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it."
+title: "vllm-cmp170hx: vLLM for NVIDIA CMP 170HX"
+authors:
+  - name: Morrowmake
+repository-code: "https://github.com/Morrowmake/vllm-cmp170hx"
+license: Apache-2.0

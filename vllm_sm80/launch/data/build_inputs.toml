@@ -1,0 +1,48 @@
+schema = "build-inputs/4"
+# Paths whose change makes artefacts built at another commit stale: the
+# wheel-equality set, the native builder's own inputs and the build driver
+# modules the wheel build loads (setup.py: tools/build_rust.py).
+patterns = [
+  "csrc/**",
+  "cmake/**",
+  "CMakeLists.txt",
+  "setup.py",
+  "pyproject.toml",
+  "rust/**",
+  "requirements/build*.txt",
+  "requirements/build/**",
+  "vllm/vllm_flash_attn/**",
+  "tools/build_rust.py",
+]
+
+# The environment modules the wheel build loads (setup.py) hold the build
+# variables beside many runtime ones, and setup.py imports them. A change to
+# one of these files counts unless it touches only what runtime variables
+# defer: each side is reduced, then compared as ast.dump() (positions and
+# comments ignored). (1) In every top-level assignment to a name in `tables`
+# whose value is a dict literal, an entry keyed by a string constant not in
+# `names` is dropped when its value is a literal (ast.literal_eval accepts
+# it) or a lambda without default values; a lambda with default values
+# keeps its arguments (defaults run at import) and only its body becomes
+# the constant None; any other value stays as it is. (2) From the body of
+# every top-level `if TYPE_CHECKING:`, the annotated assignments to a plain
+# name not in `names` are dropped. Everything else (helpers, lookup and
+# registration code, imports, build entries, eager initializers) counts. A
+# missing file reduces from ""; a file that does not parse counts as changed.
+[env_modules]
+paths = ["vllm/envs.py", "vllm_sm80/envs.py"]
+tables = ["environment_variables", "FORK_ENV_VARS", "RETIRED_ENV_VARS"]
+names = [
+  "CMAKE_BUILD_TYPE",
+  "MAX_JOBS",
+  "NVCC_THREADS",
+  "VERBOSE",
+  "VLLM_AMPERE_MARLIN_BUILD",
+  "VLLM_DOCKER_BUILD_CONTEXT",
+  "VLLM_MAIN_CUDA_VERSION",
+  "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX",
+  "VLLM_SKIP_VERSION_SUFFIX",
+  "VLLM_TARGET_DEVICE",
+  "VLLM_USE_PRECOMPILED",
+  "VLLM_USE_PRECOMPILED_RUST",
+]

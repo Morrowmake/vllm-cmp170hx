@@ -1,0 +1,33 @@
+EXL3 format components
+
+Source: ExLlamaV3, https://github.com/turboderp-org/exllamav3
+Revision: d3739fd393337b1ff4d6c2a342b12f0c87a9592f
+Copyright (c) 2025 Turboderp. Licensed under the MIT License; see LICENSE.
+
+Matrix trellis packing, procedural codebooks, tensor-core lane ordering and
+Hadamard conventions are adapted from quant/pack.cu, quant/frac.cu,
+quant/codebook.cuh, quant/exl3_dq.cuh, quant/hadamard_inner.cuh and
+modules/quant/exl3_lib/quantize.py. Modifications provide per-lane ring
+window decoding into row-blocked FP32 GEMM tiles, the scalar generic ring
+decoder as a test-only reference, BF16 operator input/output, FP32 transforms
+and accumulation, expert-grouped whole-expert routing, caller-owned scratch
+and vLLM native registration.
+
+Compressed n-gram ring mapping and mul1 constants are adapted from
+modules/quant/exl3_lib/ngram_codec.py. Modifications provide allocation-free
+selected-row decoding, integer-bit layouts, global-row/head ownership masks
+and BF16 output after separately rounded FP32 scale multiplication and bias
+addition.
+
+The original runtime is not a dependency. No external vLLM integration is
+included. Original grants and modification notices are also retained in the
+adapted source headers.
+
+Tensor-core MoE operator, hidden-5120 shape
+
+Source: DeepSeekv41-Flash-EXL3-TC-MoE, https://github.com/CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE
+Revision: 88eb6e1
+Copyright Curtis White. Licensed under the Apache License, Version 2.0.
+
+csrc/exl3/moe_v2.cu adapts that port's hidden-5120 lane shape: two H128 blocks
+per gate/up input warp, column groups of four n16 tiles, and lane kernels

@@ -1,0 +1,12 @@
+schema = "link-written/1"
+
+# What the link step itself writes into a linked tree, beside the links to
+# the source tree. A leading / anchors at the tree root.
+patterns = [
+  "plugins/sm80/build/**",
+  "plugins/sm80/*.egg-info/**",
+  "/*.dist-info/**",
+  "vllm/_version.py",
+  "vllm_sm80/_ampere_marlin_C*.so",
+  "vllm_sm80/_exl3_C*.so",
+]

@@ -1,0 +1,331 @@
+# Size cut-offs of the sm_80 kernels on this card (vllm_sm80/tuning.py).
+# The first rows are the values each served model ran with before the table
+# existed (the former environment defaults or its launcher settings), so
+# serving is unchanged; tuning replaces them row by row with measured values.
+schema = "sm80-tuning/1"
+card = "NVIDIA CMP 170HX"
+
+# dense_gemm/thin_max_rows: largest M the sm_80 thin-M BF16 GEMM takes, per
+# weight [gemm_n, gemm_k].
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 128, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 160, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 288, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 1024, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 1536, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 2048, gemm_k = 128}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 2048, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 2560, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 512}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 1024}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 1536}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 2048}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 3072}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 4096, gemm_k = 20480}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 6144, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 6416, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 8192, gemm_k = 512}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 38720, gemm_k = 4096}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; GLM-5.3-Flash TP4 shape inventory"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 1, gemm_k = 2560}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 48, gemm_k = 2560}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 320, gemm_k = 10240}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 336, gemm_k = 10240}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 512, gemm_k = 2560}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 10240, gemm_k = 320}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+[[row]]
+op = "dense_gemm"
+param = "thin_max_rows"
+key = {gemm_n = 12800, gemm_k = 2560}
+value = 32
+evidence = "seed: VLLM_THIN_GEMM_MAX_TOKENS default 32; Qwen3.8-Flash-Next Gluon thin GEMM shapes"
+
+# mhc/decode_v2_max_rows: largest M of the sm_80 mHC decode kernel.
+[[row]]
+op = "mhc"
+param = "decode_v2_max_rows"
+key = {hidden = 4096, hc_mult = 4}
+value = 32
+evidence = "seed: VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS default 32; GLM-5.3-Flash"
+
+# mhc/prefill_min_rows: smallest M of the sm_80 mHC pre-norm GEMM. Its gate sees
+# no shape, so the row has an empty key.
+[[row]]
+op = "mhc"
+param = "prefill_min_rows"
+key = {}
+value = 384
+evidence = "seed: VLLM_GLM5_PREFILL_MIN_TOKENS=384, GLM-5.3-Flash settings (the only model with VLLM_GLM5_PREFILL_KERNELS)"
+
+# moe_router/route_v2_max_rows: largest M of the fused router GEMV + top-k +
+# alignment (at most 64).
+[[row]]
+op = "moe_router"
+param = "route_v2_max_rows"
+key = {n_experts = 288, top_k = 8, hidden = 4096}
+value = 32
+evidence = "seed: VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS default 32; GLM-5.3-Flash"
+
+# moe_router/fused_route_max_rows: largest M of the fused decode routing; batches
+# up to it are left unmasked by the MoE padding mask.
+[[row]]
+op = "moe_router"
+param = "fused_route_max_rows"
+key = {top_k = 8}
+value = 8
+evidence = "seed: VLLM_MOE_MASK_PADDING_MAX_TOKENS default 8; GLM-5.3-Flash"
+
+# attention_prefill/sparse_mla_min_rows: smallest M of the sm_80 sparse-MLA prefill.
+[[row]]
+op = "attention_prefill"
+param = "sparse_mla_min_rows"
+key = {head_dim = 512}
+value = 384
+evidence = "seed: VLLM_GLM5_PREFILL_MIN_TOKENS=384, GLM-5.3-Flash settings"
+
+# attention_prefill/sparse_mla_min_ctx: smallest cache length of the sm_80
+# sparse-MLA prefill (default twice the index width).
+[[row]]
+op = "attention_prefill"
+param = "sparse_mla_min_ctx"
+key = {head_dim = 512, index_width = 2176}
+value = 4352
+evidence = "seed: VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT default 2.0 x 2176 index slots; GLM-5.3-Flash"
+
+# moe_prefill/marlin_min_rows: smallest M of the split-list Marlin MoE prefill,
+# per expert width per rank.
+[[row]]
+op = "moe_prefill"
+param = "marlin_min_rows"
+key = {gemm_n = 2048}
+value = 384
+evidence = "seed: VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS default 384; GLM-5.3-Flash PP4"
+
+[[row]]
+op = "moe_prefill"
+param = "marlin_min_rows"
+key = {gemm_n = 512}
+value = 384
+evidence = "seed: VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS default 384; GLM-5.3-Flash TP4"
+
+# moe_routed_gemm/marlin_multi_max_rows: largest M (from 9) of the whole-expert
+# compiled Marlin decode for multi-request batches.
+[[row]]
+op = "moe_routed_gemm"
+param = "marlin_multi_max_rows"
+key = {gemm_n = 2048}
+value = 64
+evidence = "seed: VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS=9-64, GLM-5.3-Flash PP4 settings"
+
+# moe_routed_gemm/exl3_chunk_rows: most rows of one EXL3 moe_out launch (0: whole
+# calls).
+[[row]]
+op = "moe_routed_gemm"
+param = "exl3_chunk_rows"
+key = {hidden = 5120}
+value = 2048
+evidence = "seed: VLLM_EXL3_MOE_CHUNK_ROWS=2048, DeepSeek-V4.1-Flash settings"
+
+[[row]]
+op = "moe_routed_gemm"
+param = "exl3_chunk_rows"
+key = {hidden = 2560}
+value = 0
+evidence = "seed: VLLM_EXL3_MOE_CHUNK_ROWS default 0; Qwen3.8-Flash-Next"
+
+# topk_select/split_rows: most rows of the split tie fix + sort (0: off), per
+# selected width and calling indexer (kpool: GLM; qsa: Qwen, never measured
+# split, so no row).
+[[row]]
+op = "topk_select"
+param = "split_rows"
+key = {top_k = 512, indexer = "kpool"}
+value = 8
+evidence = "seed: VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS=8, GLM-5.3-Flash settings"
+
+# allreduce/flags_max_bytes: largest message of the flags-in-data all-reduce.
+[[row]]
+op = "allreduce"
+param = "flags_max_bytes"
+key = {world_size = 4, hidden = 4096}
+value = 262144
+evidence = "seed: VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES default 262144; GLM-5.3-Flash TP4"
+
+[[row]]
+op = "allreduce"
+param = "flags_max_bytes"
+key = {world_size = 4, hidden = 5120}
+value = 524288
+evidence = "seed: VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES=524288, DeepSeek-V4.1-Flash settings"
+
+[[row]]
+op = "allreduce"
+param = "flags_max_bytes"
+key = {world_size = 2, hidden = 2560}
+value = 262144
+evidence = "seed: VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES default 262144; Qwen3.8-Flash-Next TP2"
+
+# allreduce/host_max_bytes: largest message of the host-staged all-reduce.
+[[row]]
+op = "allreduce"
+param = "host_max_bytes"
+key = {world_size = 4, hidden = 4096}
+value = 524288
+evidence = "seed: VLLM_HOST_ALLREDUCE_MAX_SIZE default 524288; GLM-5.3-Flash TP4"
+
+[[row]]
+op = "allreduce"
+param = "host_max_bytes"
+key = {world_size = 4, hidden = 5120}
+value = 524288
+evidence = "seed: VLLM_HOST_ALLREDUCE_MAX_SIZE default 524288; DeepSeek-V4.1-Flash"

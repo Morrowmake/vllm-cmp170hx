@@ -1,0 +1,46 @@
+# The CMP 170HX (sm_80) plugin for vLLM: the vllm_sm80 package, its launcher
+# and its compiled extensions (vllm_sm80/_exl3_C.abi3.so and
+# vllm_sm80/_ampere_marlin_C.abi3.so, built from csrc/ by
+# csrc/*/build_standalone.py). vLLM calls vllm_sm80.plugin:register at
+# startup and selects the plugin's CUDA platform through
+# vllm_sm80.plugin:platform_plugin; vllm_sm80/guard.py stops vLLM at startup
+# when the plugin is missing.
+#
+# This is the project file at the root of the plugin's source tree, where it
+# packages vllm_sm80. In an engine source tree that carries the plugin next to
+# vLLM, the same file sits in plugins/sm80/ and installs the entry points only
+# (no package is found there):
+#   pip install --no-deps plugins/sm80
+# For a source tree used through PYTHONPATH, install the metadata into a
+# directory and add that directory to PYTHONPATH:
+#   pip install --no-deps --target <dir> plugins/sm80
+#
+# licenses/exl3/ holds LICENSE and NOTICE (MIT grant of the adapted ExLlamaV3
+# code), so every install of the plugin carries them in its dist-info. License
+# files must sit inside the project directory;
+# tests/sm80/test_plugin_distribution.py checks the copies.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-sm80"
+version = "0.1.0"
+description = "vLLM plugin for the CMP 170HX and other sm_80 GPUs"
+license = "Apache-2.0 AND MIT"
+license-files = ["licenses/exl3/LICENSE", "licenses/exl3/NOTICE"]
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+sm80 = "vllm_sm80.plugin:register"
+
+[project.entry-points."vllm.platform_plugins"]
+sm80 = "vllm_sm80.plugin:platform_plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_sm80*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.toml", "*.json", "*.so"]

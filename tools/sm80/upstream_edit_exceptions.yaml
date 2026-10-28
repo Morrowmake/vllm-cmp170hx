@@ -1,0 +1,221 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Fork code outside the fork's own packages.
+#
+# Fork Python code lives in vllm_sm80/ (shared) and in new files under
+# vllm/models/<model>/nvidia/; fork native code in
+# csrc/ampere_marlin/ and csrc/exl3/. An upstream-owned
+# file carries at most registered ops and one call into those packages.
+#
+# Each entry is a known exception: a fork-owned file placed in upstream's tree
+# (no `hunks`), or edits of an upstream-owned file that are more than such a
+# call (`hunks`: fingerprints of its zero-context hunks, the first 12 hex digits
+# of the sha256 of the hunk's -/+ lines). Every entry says why no extension
+# point serves it, who removes it and how:
+#
+# - file: <path>
+#   hunks: [<fingerprint>, ...]
+#   reason: <why no extension point serves it>
+#   owner: <who removes it>
+#   removal: <how it is removed>
+#
+# Remove an entry in the change that removes its code.
+exceptions:
+- file: vllm/v1/worker/gpu/async_utils.py
+  hunks: [659159ed35de, 2bd7c3af5842, b20fe5341bf9]
+  reason: >-
+    (659159ed35de) Bug fix inside the existing failed-inputs hunk of AsyncOutput: the GPU mask of failed tokens stays referenced until its host copy has run, so its memory cannot be reused before the copy reads it. vLLM has no hook for extra host copies in AsyncOutput, so the fix sits where the copy is. (2bd7c3af5842) The Apache-2.0 modification notice after the SPDX header, a comment line that every patched upstream file carries (tests/sm80/test_modification_notices.py). It belongs in the file it describes; no extension point can hold it.
+    (b20fe5341bf9) Output-type registration wraps the existing copy event once after both output classes exist. The older failed-request-id hook runs per output after synchronization and cannot install producer-stream copies before that same event. Registration does not add a synchronization or a reply.
+  owner: >-
+    (659159ed35de) Qwen4Exp EXL3 support; (2bd7c3af5842) fork licence compliance
+    (b20fe5341bf9) sm_80 distributed output checks
+  removal: >-
+    (659159ed35de) Remove when the failed-mask copy of AsyncOutput moves into vllm_sm80 behind a hook: an AsyncOutput extra-copy hook in vLLM (an upstream candidate), or a runner subclass that wraps AsyncOutput and owns the copy. (2bd7c3af5842) Delete the notice line in the change that removes the last fork edit of this file, so that it no longer differs from upstream.
+    (b20fe5341bf9) Remove when upstream output classes provide copy-stream and pre-publication error hooks on the same existing event; retain nonreply-rank dispatch and default-neutral copy-event regressions.
+
+- file: vllm/model_executor/models/qwen3_next.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/models/qwen4_exp/common/ngram_embedding.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/models/qwen4_exp/nvidia/model.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/models/qwen4_exp/nvidia/mtp.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/v1/outputs.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+
+- file: vllm/v1/core/sched/scheduler.py
+  hunks: [856437ee3c56, a8d54cb7d7ef, 22f90a26368e, 8ceddf09f07e, 7759e06de501, 2ba978c6ce4e]
+  reason: >-
+    Upstream bug fix taken ahead of upstream (vllm-project/vllm#54076, first
+    part): the align-mode prefill split stops on the Mamba group's own block
+    size instead of cache_config.block_size, which a smaller drafter group
+    pulls below it (GLM-5.3-Flash at PP4). The split is a private scheduler
+    method with no extension point.
+    The additional budget hunks prevent a long hybrid prompt from waiting for
+    decodes to finish when their recurring token and draft-slot charges leave
+    less than one state block. Both admission and running-chunk paths pass
+    the achievable prefill limit into the existing aligned splitter; other
+    prefills' temporary charges are restored. The accounting comment changes
+    because these counters now determine progress as well as statistics.
+    No extension point exposes both token budgets and prefill charges, and
+    this correctness fix must apply to every hybrid model without a flag.
+    The existing AdaptiveKPolicy constructor must run once per scheduler,
+    before requests can be admitted. Upstream has no scheduler-local draft
+    policy factory. Its constructor cannot share the failed-input hook,
+    which runs on worker-output delivery after admission. Scope this
+    exception only to that constructor/logging hunk; failed-input handling
+    remains the file's single unexcepted fork hook.
+  owner: hybrid scheduling and adaptive speculative decoding
+  removal: >-
+    When the upstream base carries #54076 or another fix that splits on the
+    Mamba state block: delete the mamba_state_block_size block in __init__ and
+    restore the single upstream block_size line in _mamba_block_aligned_split;
+    tests/sm80/test_glm_pp4_mamba_split.py must still pass.
+    Remove the two achievable-prefill-limit calculations when upstream's
+    splitter guarantees progress under persistent decode occupancy while
+    preserving block boundaries and temporary-fragment deferral;
+    tests/v1/core/test_mamba_decode_progress.py must still pass.
+    Remove the AdaptiveKPolicy constructor exception when upstream supplies
+    a per-scheduler speculative-policy factory or equivalent adaptive-depth
+    lifecycle, migrating initialization to that extension point without
+    changing its per-request acceptance history.
+
+- file: vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+  hunks: [21689b6f8e90, 501bbcf1c181]
+  reason: >-
+    Bug fix inside the fork's existing draft-width hunks of DFlashSpeculator
+    (set_width and the per-width drafter graphs): the block length follows
+    the anchor offset each drafter sets at construction (0 for DSpark, 1 for
+    DFlash and DFlash2) instead of a fixed 1 + width, which gave DSpark an
+    untrained block of N + 1 rows whose rows overlapped between requests.
+    The width code already sits in this upstream class (propose and
+    init_cudagraph_manager call set_width); no extension point holds it.
+  owner: DeepSeek-V4.1-Flash DSpark serving
+  removal: >-
+    Remove with the draft-width code when it moves into vllm_sm80 behind one
+    call (a DFlash subclass or a width hook); DSpark and DFlash must still
+    pass tests/v1/spec_decode/test_dspark_zero_draft.py.
+
+- file: vllm/models/deepseek_v41/common/engram.py
+  hunks: [41489bc78107]
+  reason: >-
+    The existing embedding-factory decorator selects storage before any lookup. The new projection hook runs after lookup and cannot replace that constructor-time selection. Both lifetimes belong to the upstream Engram class; no common factory registers both.
+  owner: sm_80 Engram storage
+  removal: >-
+    Remove this exact decorator exception when upstream provides one Engram implementation factory covering storage construction and projection; retain storage, ordinary-projection and early-gather tests.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [ff7a814b29b9, 9b96f0854408, 183d60859f35, a35c6ff88a1c, 276b0ee249b6, 20c6cc21da36, ba753e35fcca, 75b463763419, 645d5ea70245]
+  reason: >-
+    (ff7a814b29b9) The existing pipeline draft-tail controller must be constructed and attached after speculative configuration and PP ranks exist, before model loading. A graph-capture decorator cannot supply this constructor lifetime.
+    (9b96f0854408) The existing folded drafter projection configures the loaded target and PP handler before the drafter loads. It needs local target weights and cannot run at graph capture or output publication.
+    (183d60859f35) The existing folded-projection marker runs only after the speculator loads, unlike the preceding target-weight configuration. Its timing prevents applying the input projection twice.
+    (a35c6ff88a1c) The existing optional memory inventory reads the completed target/drafter load and its measured allocator delta. Constructor, capture and request callbacks do not expose that same completed-load boundary.
+    (276b0ee249b6) The existing optional KV-allocation observer brackets actual temporary profiling or serving KV construction. It must remain around this allocation scope, not around the later graph-capture method.
+    (20c6cc21da36) The existing optional profiling stage recorder is constructed at the memory-profile boundary and used by its nested stages. It cannot be initialized at model construction without changing its measured interval.
+    (ba753e35fcca) The existing failed-input delivery consumes per-step model failure tokens with the actual request query offsets when constructing asynchronous output. Capture-time registration cannot supply those per-request values.
+    (75b463763419) The DSpark row mask's live lengths must be written after the step's batch and draft counts are final and before the target forward or its graph replay reads them; no runner hook sits between input preparation and the forward. The call returns at once with VLLM_DSPARK_ADAPTIVE_DEPTH unset.
+    (645d5ea70245) The row mask's drafts past each live length must join the rejection sampler's invalid drafts after the target forward (whose inputs keep the real drafts) and before rejection; no sampler hook exists there. The call returns its argument at once with VLLM_DSPARK_ADAPTIVE_DEPTH unset.
+  owner: >-
+    (ff7a814b29b9) pipeline draft-tail lifecycle
+    (9b96f0854408) pipeline folded draft projection
+    (183d60859f35) pipeline folded draft projection
+    (a35c6ff88a1c) sm_80 memory attribution
+    (276b0ee249b6) sm_80 memory attribution
+    (20c6cc21da36) sm_80 memory attribution
+    (ba753e35fcca) sm_80 failed-input delivery
+    (75b463763419) DeepSeek-V4.1-Flash DSpark row mask
+    (645d5ea70245) DeepSeek-V4.1-Flash DSpark row mask
+  removal: >-
+    (ff7a814b29b9) Move controller construction behind an upstream runner-component factory when available, preserving PP draft-tail ownership and load ordering.
+    (9b96f0854408) Remove when an upstream target-loaded callback owns projection configuration; retain folded-versus-unfolded arithmetic and PP handoff tests.
+    (183d60859f35) Remove when an upstream speculator-loaded callback owns the marker and draft-tail loading without changing the load order.
+    (a35c6ff88a1c) Move the inventory behind an upstream completed-model-load observer that supplies the same measured allocation interval.
+    (276b0ee249b6) Remove when upstream exposes one KV-allocation context observer retaining the profiling-versus-serving distinction.
+    (20c6cc21da36) Move the recorder to an upstream memory-profiler observer with the same stage boundaries and allocation accounting.
+    (ba753e35fcca) Remove when upstream exposes per-output failed-token metadata through the runner output constructor without adding another per-step lookup.
+    (75b463763419) Remove when upstream exposes a pre-forward runner hook with the step's input batch (or when the row mask moves into upstream adaptive verification); retain the row-mask kernel and live-row identity tests.
+    (645d5ea70245) Remove when upstream exposes a pre-rejection hook over invalid drafts, or the cap moves into upstream adaptive verification; retain the greedy truncation and num_rejected tests.
+
+- file: vllm/envs.py
+  hunks: [61396cef5c73]
+  reason: >-
+    The registration call of the fork's variables runs only when the file is
+    imported as vllm.envs. setup.py loads it by path in an isolated build,
+    where no vllm package is importable; the guard keeps setup.py upstream's
+    (it previously had to load vllm_sm80/envs.py first). vLLM has no hook
+    for extra variables in its environment table, so the call sits at the
+    end of the table's module.
+  owner: sm_80 fork environment variables
+  removal: >-
+    Remove when vLLM accepts variables from plugins (a registration hook its
+    environment table calls), or when the fork's variables move to a plugin
+    entry point that registers them before vllm.envs is read.

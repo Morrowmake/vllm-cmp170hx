@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Load the optional, prebuilt Marlin extension. Never compile at runtime.
+
+Importing this module does not import or load the optional library. Workers
+call ``require_extension`` before model loading only when
+VLLM_AMPERE_MARLIN_DECODE_CUDA is set; it fails if the library is missing or
+incompatible. The compiled PP prefill tiles load it through
+``prefill_tile_op`` and the second-revision decode GEMM
+(VLLM_AMPERE_MARLIN_DECODE_V2) through ``decode_v2_op``; neither raises:
+without a usable library or op the released or original kernels run. The
+same binary serves tensor- and pipeline-parallel expert layouts.
+"""
+
+import importlib
+
+import torch
+
+_OPS = None
+_ABI_VERSION = 1
+# Only the operators called here are validated: a library that also exports
+# operators this tree no longer calls is accepted. prefill_tile_gemm (explicit
+# prefill tiles, below) and decode_gemm_v2 are optional: a library built
+# without them still serves decode.
+_SCHEMA_ARGUMENTS = {
+    "decode_gemm_orig": (
+        "a w s sorted eids ntpp topk_w topk n_slots K N w13 rows cfg ctr out",
+        "Tensor Tensor Tensor Tensor Tensor Tensor Tensor int int int int bool int int Tensor Tensor",
+        "int",
+    ),
+    "decode_act_orig": (
+        "part ids ksplit n_slots Nh limit h",
+        "Tensor Tensor int int int float Tensor",
+        "",
+    ),
+}
+_PREFILL_TILE_SCHEMA = (
+    "a c_or_none b_q_weight b_bias_or_none b_scales a_scales global_scale "
+    "b_zeros_or_none workspace sorted_token_ids expert_ids num_tokens_past_padded "
+    "topk_weights moe_block_size top_k mul_topk_weights b_type_id size_m size_n "
+    "size_k use_atomic_add use_fp32_reduce is_zp_float thread_k thread_n "
+    "blocks_per_sm c_tmp redo"
+)
+# build_info's prefill_schedule_version: 2 = stream-K CTA indices in start order
+# (no wait on a CTA that has not started). An older library still serves decode,
+# but its prefill tiles assume the whole grid is resident, so they are not used.
+_PREFILL_SCHEDULE_VERSION = 2
+_PREFILL_TILE = None
+_DECODE_V2 = None
+
+
+def _runtime_build_info() -> dict:
+    cuda = torch.version.cuda
+    major, minor = (int(v) for v in cuda.split(".")[:2]) if cuda else (0, 0)
+    return {
+        "abi_version": _ABI_VERSION,
+        "torch_version": torch.__version__.split("+")[0],
+        "cuda_version": major * 1000 + minor * 10,
+        "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI),
+    }
+
+
+def _validate_extension(module) -> None:
+    built = module.build_info()
+    for key, expected in _runtime_build_info().items():
+        actual = built.get(key)
+        # CUDA minor toolkits within one major share the runtime ABI.
+        if key == "cuda_version" and isinstance(actual, int):
+            actual, expected = actual // 1000, expected // 1000
+        if actual != expected:
+            raise ValueError(
+                f"{key} mismatch: extension {built.get(key)!r}, runtime {expected!r}"
+            )
+    for name, (names, types, returns) in _SCHEMA_ARGUMENTS.items():
+        qualified = f"_ampere_marlin_C::{name}"
+        schema = torch._C._dispatch_find_schema_or_throw(qualified, "").schema()
+        actual = (
+            " ".join(a.name for a in schema.arguments),
+            " ".join(str(a.type) for a in schema.arguments),
+            " ".join(str(a.type) for a in schema.returns),
+        )
+        if actual != (names, types, returns):
+            raise ValueError(f"incompatible operator schema: {qualified}")
+        if not torch._C._dispatch_has_kernel_for_dispatch_key(qualified, "CUDA"):
+            raise ValueError(f"missing CUDA implementation: {qualified}")
+
+
+def prefill_tile_op():
+    """(op, None) for torch.ops._ampere_marlin_C.prefill_tile_gemm, or
+    (None, reason) when the library or the op is missing or incompatible.
+    Never raises and never compiles; the result is cached."""
+    global _PREFILL_TILE
+    if _PREFILL_TILE is not None:
+        return _PREFILL_TILE
+    try:
+        module = importlib.import_module("vllm_sm80._ampere_marlin_C")
+        _validate_extension(module)
+        schedule = module.build_info().get("prefill_schedule_version")
+        if schedule != _PREFILL_SCHEDULE_VERSION:
+            raise ValueError(
+                f"prefill schedule version {schedule!r} needs every CTA "
+                "resident at once; rebuild the optional library "
+                "(VLLM_AMPERE_MARLIN_BUILD=1)")
+        qualified = "_ampere_marlin_C::prefill_tile_gemm"
+        schema = torch._C._dispatch_find_schema_or_throw(qualified, "").schema()
+        names = " ".join(a.name for a in schema.arguments)
+        if names != _PREFILL_TILE_SCHEMA:
+            raise ValueError(f"incompatible operator schema: {qualified}")
+        if not torch._C._dispatch_has_kernel_for_dispatch_key(qualified, "CUDA"):
+            raise ValueError(f"missing CUDA implementation: {qualified}")
+        _PREFILL_TILE = (torch.ops._ampere_marlin_C.prefill_tile_gemm, None)
+    except (ImportError, OSError, AttributeError, RuntimeError, ValueError,
+            TypeError) as exc:
+        _PREFILL_TILE = (None, f"vllm_sm80._ampere_marlin_C prefill_tile_gemm unavailable: {exc}")
+    return _PREFILL_TILE
+
+
+def decode_v2_op():
+    """(op, None) for torch.ops._ampere_marlin_C.decode_gemm_v2 (the same
+    signature as decode_gemm_orig), or (None, reason) when the library or the
+    op is missing or incompatible. Never raises and never compiles; the
+    result is cached."""
+    global _DECODE_V2
+    if _DECODE_V2 is not None:
+        return _DECODE_V2
+    try:
+        module = importlib.import_module("vllm_sm80._ampere_marlin_C")
+        _validate_extension(module)
+        qualified = "_ampere_marlin_C::decode_gemm_v2"
+        schema = torch._C._dispatch_find_schema_or_throw(qualified, "").schema()
+        actual = (
+            " ".join(a.name for a in schema.arguments),
+            " ".join(str(a.type) for a in schema.arguments),
+            " ".join(str(a.type) for a in schema.returns),
+        )
+        if actual != _SCHEMA_ARGUMENTS["decode_gemm_orig"]:
+            raise ValueError(f"incompatible operator schema: {qualified}")
+        if not torch._C._dispatch_has_kernel_for_dispatch_key(qualified, "CUDA"):
+            raise ValueError(f"missing CUDA implementation: {qualified}")
+        _DECODE_V2 = (torch.ops._ampere_marlin_C.decode_gemm_v2, None)
+    except (ImportError, OSError, AttributeError, RuntimeError, ValueError,
+            TypeError) as exc:
+        _DECODE_V2 = (None, f"vllm_sm80._ampere_marlin_C decode_gemm_v2 unavailable: {exc}")
+    return _DECODE_V2
+
+
+def require_extension():
+    """Return validated operators, or fail with installation instructions.
+
+    This explicit API also allows launchers to check an opt-in installation
+    without allocating CUDA memory. Success is cached; failures are not.
+    """
+    global _OPS
+    if _OPS is not None:
+        return _OPS
+    try:
+        module = importlib.import_module("vllm_sm80._ampere_marlin_C")
+        _validate_extension(module)
+    except (ImportError, OSError, AttributeError, RuntimeError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            "Optional compiled Marlin was requested, but vllm_sm80._ampere_marlin_C "
+            "is missing or incompatible. Install a matching prebuilt package or "
+            "build it with its standalone builder (build_standalone.py beside "
+            "its sources, VLLM_AMPERE_MARLIN_BUILD=1) in the current "
+            "PyTorch/CUDA environment. To use the released "
+            "kernels instead, set VLLM_AMPERE_MARLIN_DECODE_CUDA=0 before "
+            f"restarting. Detail: {exc}"
+        ) from exc
+    _OPS = torch.ops._ampere_marlin_C
+    return _OPS

@@ -1,0 +1,1124 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Guards on the version file, the full provenance rules shared with the
+build verifier, secret knob targets, argument spellings that reach a
+protected argument, cancellation through the last step before exec, and
+knob names of every classified kind."""
+
+from __future__ import annotations
+
+import ast
+import io
+import json
+import os
+import signal
+import subprocess
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+
+import pytest
+
+from canon import sha256_file
+from helpers import (ARGPARSE, MODEL_TOML, PAIRED_ARGPARSE, UPSTREAM_VARS, VERSION_TEXT, World, add_build,
+                     envs_py, git, head, promote, write, write_stamp)
+from test_launch_guards2 import linked
+from treestate import MANIFEST, STAMP, VERSION_FILE, build_owned_sha256
+
+
+@pytest.fixture
+def w(tmp_path):
+    w = World(tmp_path)
+    assert w.verify() == 0
+    promote(w, ["tp2"])
+    assert w.resolve()["validated"]["state"] == "VALIDATED"
+    return w
+
+
+def reasons(d):
+    return d["validated"]["reasons"]
+
+
+def metadata(w):
+    return " | ".join(w.resolve()["engine_target"]["dirty_paths"].get("metadata_invalid", []))
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def rewrite_manifest(tree, man, *, stamp=False):
+    man["build_owned_sha256"] = build_owned_sha256(man["files"])
+    write(os.path.join(tree, MANIFEST), json.dumps(man))
+    if stamp:
+        write_stamp(tree, man)
+
+
+def model_text(w):
+    with open(os.path.join(w.settings, "model.toml"), encoding="utf-8") as f:
+        return f.read()
+
+
+# -- the version file holds version metadata only ---------------------------------------------
+
+def linked_with_version(tmp_path):
+    w, _src, man, _ = linked(tmp_path)
+    write(os.path.join(w.tree, VERSION_FILE), VERSION_TEXT)
+    man["files"][VERSION_FILE] = sha256_file(os.path.join(w.tree, VERSION_FILE))
+    rewrite_manifest(w.tree, man, stamp=True)
+    promote(w, ["tp2"])
+    assert w.resolve()["validated"]["state"] == "VALIDATED"
+    return w
+
+
+# Version files whose declared source codec hides code in what UTF-8 reads
+# as comments: the importer decodes +AAo- (utf-7) and \\n (unicode-escape)
+# to newlines, so the import and the assignment run.
+UTF7_PAYLOAD = (b"# coding: utf-7\n# +AAo-import os+AAo-os.environ['VLLM_KERNEL_X'] = '1'\n"
+                b"__version__ = '0.1.0'\n")
+ESCAPE_PAYLOAD = (b"# coding: unicode-escape\n# \\nimport os\\nos.environ['VLLM_KERNEL_X'] = '1'\n"
+                  b"__version__ = '0.1.0'\n")
+APPENDED_CODE = VERSION_TEXT.encode() + b"import os\nos.environ['VLLM_KERNEL_X'] = '1'\n"
+# Physical lines ended by a bare CR: a reader splitting at LF sees one line
+# and no declaration; the importer sees the utf-7 declaration on line 2.
+CR_PAYLOAD = (b"\r# coding: utf-7\r# +AAo-import os+AAo-os.environ['VLLM_KERNEL_X'] = '1'\r"
+              b"__version__ = '0.1.0'\r")
+
+
+def test_cr_payload_runs_code_when_imported(tmp_path):
+    """The real importer, in a child interpreter, runs the CR payload."""
+    pkg = tmp_path / "probepkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_bytes(b"")
+    (pkg / "_version.py").write_bytes(CR_PAYLOAD)
+    env = {k: v for k, v in os.environ.items() if k != "VLLM_KERNEL_X"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", "import os, sys; sys.path.insert(0, sys.argv[1]); "
+         "import probepkg._version as v; print(v.__version__, os.environ.get('VLLM_KERNEL_X'))",
+         str(tmp_path)], capture_output=True, text=True, env=env, check=True)
+    assert out.stdout.split() == ["0.1.0", "1"]
+    from treestate import version_file_problem
+    assert "carriage return" in (version_file_problem(str(pkg / "_version.py")) or "")
+
+
+def test_codec_payloads_run_code_when_imported():
+    """The payloads do what the controls below assume, under the importer's decoding."""
+    for raw in (UTF7_PAYLOAD, ESCAPE_PAYLOAD):
+        assert [type(s).__name__ for s in ast.parse(raw).body][0] == "Import"
+        assert [type(s).__name__ for s in ast.parse(raw.decode("utf-8")).body] == ["Assign"]
+
+
+@pytest.mark.parametrize("payload", [APPENDED_CODE, UTF7_PAYLOAD, ESCAPE_PAYLOAD, CR_PAYLOAD],
+                         ids=["appended", "utf-7", "unicode-escape", "cr-lines"])
+@pytest.mark.parametrize("kind", ["built", "linked"])
+def test_version_file_code_breaks_validation(tmp_path, kind, payload):
+    if kind == "built":
+        w = World(tmp_path)
+        assert w.verify() == 0
+        promote(w, ["tp2"])
+    else:
+        w = linked_with_version(tmp_path)
+    before = w.resolve()
+    assert before["validated"]["state"] == "VALIDATED"
+    vf = os.path.join(w.tree, VERSION_FILE)
+    with open(vf, "wb") as f:
+        f.write(payload)
+    man = load(os.path.join(w.tree, MANIFEST))
+    man["files"][VERSION_FILE] = sha256_file(vf)
+    if kind == "built":
+        # the retained build record (outside the tree, not receipt-bound)
+        # rewritten in step with the map
+        rec = man["build_record"]["path"]
+        write(rec, json.dumps({"schema": "build-record/1", "files": man["files"]}))
+        man["build_record"]["sha256"] = sha256_file(rec)
+    rewrite_manifest(w.tree, man)
+    assert "build record" not in metadata(w)
+    d = w.resolve()
+    # the receipt-bound identity does not move ...
+    assert d["engine_target"]["build_owned"]["build_owned_sha256"] == \
+        before["engine_target"]["build_owned"]["build_owned_sha256"]
+    # ... so the file itself is checked
+    assert "not version metadata" in metadata(w)
+    assert d["validated"]["state"] != "VALIDATED" and "dirty tree" in reasons(d)
+
+
+def test_version_metadata_change_stays_validated(tmp_path):
+    """A re-link that rewrites the version text (another checkout) keeps the identity."""
+    w = linked_with_version(tmp_path)
+    vf = os.path.join(w.tree, VERSION_FILE)
+    write(vf, VERSION_TEXT.replace("g0123456", "g7654321"))
+    man = load(os.path.join(w.tree, MANIFEST))
+    man["files"][VERSION_FILE] = sha256_file(vf)
+    rewrite_manifest(w.tree, man)
+    assert w.resolve()["validated"]["state"] == "VALIDATED"
+
+
+GENERATED = '''\
+# file generated by vcs-versioning
+# don't change, don't track in version control
+from __future__ import annotations
+__all__ = [
+    "__version__",
+    "__version_tuple__",
+    "version",
+    "version_tuple",
+    "__commit_id__",
+    "commit_id",
+]
+version: str
+__version__: str
+__version_tuple__: tuple[int | str, ...]
+version_tuple: tuple[int | str, ...]
+commit_id: str | None
+__commit_id__: str | None
+__version__ = version = '0.32.0rc1.dev90+g8d463e6ab'
+__version_tuple__ = version_tuple = (0, 32, 0, 'rc1', 'dev90', 'g8d463e6ab')
+__commit_id__ = commit_id = 'g8d463e6ab'
+'''
+LOCAL = '''\
+# file generated for a local checkout
+# Local checkout identity; binary artifacts from another build
+__all__ = ["__version__", "__version_tuple__", "version", "version_tuple", "__commit_id__", "commit_id"]
+__version__ = version = "0.30.1rc1.dev282+g9cdecd00a.precompiled"
+__version_tuple__ = version_tuple = (0, 30, 1, "rc1", "dev282", "g9cdecd00a.precompiled")
+__commit_id__ = commit_id = "g9cdecd00a"
+'''
+SHORT = '''\
+__version__ = version = '0.30.1rc1.dev721+g7032b21f69'
+__version_tuple__ = version_tuple = (0, 30, 1, "rc1", "dev721", "g7032b21f69")
+__commit_id__ = commit_id = '7032b21f69012064ba2eb04c1cff30ac7e11834a'
+'''
+
+
+@pytest.mark.parametrize("text", [GENERATED, LOCAL, SHORT, VERSION_TEXT, '"""doc"""\n__version__ = None\n',
+                                  "# -*- coding: utf-8 -*-\n" + SHORT, "# coding: utf8\n" + SHORT,
+                                  "#!/usr/bin/env python3\n# vim: set fileencoding=UTF-8 :\n" + SHORT,
+                                  "# generated\n# by a tool\n# coding: utf-7 is only honoured on lines 1-2\n" + SHORT])
+def test_version_file_formats_accepted(tmp_path, text):
+    from treestate import version_file_problem
+    p = write(str(tmp_path / "_version.py"), text)
+    assert version_file_problem(p) is None
+
+
+@pytest.mark.parametrize("raw", [
+    b"import os\n",
+    b"__version__ = '1'\n__import__('os')\n",
+    b"__version__ = str(1)\n",
+    b"__version__ = f'{1}'\n",
+    b"__version__ = version = True\n",
+    b"__version__ = 1.5\n",
+    b"helper = '1'\n",
+    b"__version__: print() = '1'\n",
+    b"TYPE_CHECKING = False\nif TYPE_CHECKING:\n    pass\n",
+    b"from __future__ import annotations as a\n",
+    b"from os import path\n",
+    b"def __getattr__(name):\n    return name\n",
+    b"__version__ = '1\n",
+    b"\xff\xfe = 1\n",
+    UTF7_PAYLOAD,
+    ESCAPE_PAYLOAD,
+    b"# coding: latin-1\n__version__ = '1'\n",
+    b"#!/x\n# coding: utf-7\n__version__ = '1'\n",
+    b"# coding: no-such-codec\n__version__ = '1'\n",
+    b"\xef\xbb\xbf__version__ = '1'\n",          # BOM: refused by policy
+    CR_PAYLOAD,
+    SHORT.replace("\n", "\r\n").encode(),          # CRLF: refused (no carriage return at all)
+    b"__version__ = '1'\r",
+    b"#\r# coding: latin-1\n__version__ = '1'\n",
+])
+def test_version_file_code_refused(tmp_path, raw):
+    from treestate import version_file_problem
+    p = tmp_path / "_version.py"
+    p.write_bytes(raw)
+    assert "not version metadata" in (version_file_problem(str(p)) or "")
+
+
+# -- the provenance rules of the build verifier ---------------------------------------------------
+
+def test_missing_stamp_not_validated(w):
+    os.unlink(os.path.join(w.tree, STAMP))
+    d = w.resolve()
+    assert ".sm80-build.json: missing" in metadata(w)
+    assert d["validated"]["state"] != "VALIDATED"
+
+
+def test_missing_manifest_is_invalid(tmp_path):
+    w = World(tmp_path, build=False)
+    assert ".sm80-build-owned.json: missing" in metadata(w)
+
+
+def test_linked_source_native_path_invalid(tmp_path):
+    w, src, _, src_man = linked(tmp_path)
+    assert "metadata_invalid" not in w.resolve()["engine_target"]["dirty_paths"]
+    src_man["native_manifest_path"] = str(tmp_path / "gone.json")
+    write(os.path.join(src, MANIFEST), json.dumps(src_man))
+    text = metadata(w)
+    assert "linked_from: source tree" in text and "native manifest" in text
+
+
+def test_linked_commit_differs_from_link(tmp_path):
+    w, _, man, _ = linked(tmp_path)
+    man["commit"] = "1" * 40
+    rewrite_manifest(w.tree, man)
+    assert "is not linked_from.commit" in metadata(w)
+
+
+def test_linked_native_identity_differs_from_source(tmp_path):
+    w, _, man, _ = linked(tmp_path)
+    other = write(str(tmp_path / "other-native.json"), "{}")
+    man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(other), other
+    rewrite_manifest(w.tree, man, stamp=True)
+    assert "differs from the source tree's" in metadata(w)
+
+
+def test_linked_written_natives_match_native_manifest(tmp_path):
+    w, _, man, _ = linked(tmp_path)
+    rel = "vllm_sm80/_ampere_marlin_C.abi3.so"
+    write(os.path.join(w.tree, rel), "marlin")
+    sha = sha256_file(os.path.join(w.tree, rel))
+    man["files"][rel] = sha
+    nm = str(tmp_path / "native-build" / "manifest.json")
+
+    def native(artefacts, *, source=True):
+        data = {"artefacts": artefacts}
+        if source:
+            data["source"] = {"inputs": {"csrc": git(w.tree, "rev-parse", "HEAD:csrc").strip()}}
+        write(nm, json.dumps(data))
+        man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
+        rewrite_manifest(w.tree, man, stamp=True)
+    native({rel: {"sha256": sha}})
+    et = w.resolve()["engine_target"]
+    assert not et["dirty"], et["dirty_paths"]
+    native({rel: {"sha256": sha}}, source=False)
+    assert "no source.inputs" in metadata(w)
+    native({rel: {"sha256": "0" * 64}})
+    assert "artefacts differ" in metadata(w)
+    native({rel: {"sha256": sha}, "vllm_sm80/_exl3_C.abi3.so": {"sha256": "1" * 64}})
+    assert "artefacts differ" in metadata(w)
+    man.pop("native_manifest_path")
+    man["native_manifest_sha256"] = None
+    rewrite_manifest(w.tree, man, stamp=True)
+    assert "link-written natives without a native manifest" in metadata(w)
+
+
+@pytest.mark.parametrize("image", [False, True], ids=["native", "image"])
+def test_built_natives_match_native_manifest(tmp_path, image):
+    """A built_in_place map's fork natives are exactly the artefacts of the
+    native manifest it names, with the same hashes (the linked rule), in a
+    Git checkout and in a Git-free image tree."""
+    from helpers import BUILD
+    from test_launch_guards import image_tree
+    from treestate import tree_state
+    rel = "vllm_sm80/_ampere_marlin_C.abi3.so"
+    w = World(tmp_path / "w", build=False)
+    man = add_build(w.tree, dict(BUILD, **{rel: "marlin"}))
+    sha, nm = man["files"][rel], man["native_manifest_path"]
+    runs = iter(range(10))
+
+    def problems(artefacts, *, source=True):
+        if artefacts is None:
+            man["native_manifest_sha256"] = None
+            man.pop("native_manifest_path", None)
+        else:
+            if source:
+                artefacts = dict(artefacts, source={"inputs": {
+                    "csrc": git(w.tree, "rev-parse", "HEAD:csrc").strip()}})
+            write(nm, json.dumps(artefacts))
+            man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
+        rewrite_manifest(w.tree, man, stamp=True)
+        tree = image_tree(w, tmp_path / f"image{next(runs)}") if image else w.tree
+        st = tree_state(tree, image=image)
+        assert set(st.dirty_paths) <= {"metadata_invalid"}, st.dirty_paths
+        return " | ".join(st.dirty_paths.get("metadata_invalid", []))
+
+    assert problems({"artefacts": {rel: {"sha256": sha}}}) == ""
+    if not image:
+        assert "no source.inputs" in problems({"artefacts": {rel: {"sha256": sha}}}, source=False)
+    assert "artefacts differ from the built natives at " + rel in problems({"artefacts": {rel: {"sha256": "0" * 64}}})
+    extra = "vllm_sm80/_exl3_C.abi3.so"
+    assert "artefacts differ from the built natives at " + extra in problems(
+        {"artefacts": {rel: {"sha256": sha}, extra: {"sha256": "1" * 64}}})
+    assert "artefacts differ" in problems({"artefacts": {}})
+    assert "no artefacts table" in problems({"natives": "natives-1"})
+    assert "built natives without a native manifest" in problems(None)
+
+
+@pytest.mark.parametrize("image", [False, True], ids=["native", "image"])
+def test_built_tree_without_natives_names_no_artefact(tmp_path, image):
+    """No fork natives in a built_in_place map: a native manifest it names
+    lists no artefact (an empty set is clean, naming none is clean)."""
+    from test_launch_guards import image_tree
+    from treestate import tree_state
+    w = World(tmp_path / "w")
+    man = load(os.path.join(w.tree, MANIFEST))
+    nm = man["native_manifest_path"]
+    runs = iter(range(10))
+
+    def problems(content):
+        if content is None:
+            man["native_manifest_sha256"] = None
+            man.pop("native_manifest_path", None)
+        else:
+            write(nm, json.dumps(content))
+            man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
+        rewrite_manifest(w.tree, man, stamp=True)
+        tree = image_tree(w, tmp_path / f"image{next(runs)}") if image else w.tree
+        st = tree_state(tree, image=image)
+        assert set(st.dirty_paths) <= {"metadata_invalid"}, st.dirty_paths
+        return " | ".join(st.dirty_paths.get("metadata_invalid", []))
+
+    assert problems({"artefacts": {}}) == ""
+    extra = "vllm_sm80/_exl3_C.abi3.so"
+    assert "artefacts differ from the built natives at " + extra in problems(
+        {"artefacts": {extra: {"sha256": "1" * 64}}})
+    assert "no artefacts table" in problems({"natives": "natives-1"})
+    assert problems(None) == ""
+
+
+def _no_hex_commit(m):
+    m["commit"] = "abc"
+
+
+def _linked_from_on_built(m):
+    m["linked_from"] = {"tree": "/x", "commit": "0" * 40, "build_owned_sha256": "0" * 64}
+
+
+def _tracked_natively(m):
+    m["tracked"] = {"vllm/envs.py": "0" * 64}
+
+
+def _native_path_without_digest(m):
+    m["native_manifest_sha256"] = None
+
+
+def _hash_not_a_sha(m):
+    m["native_manifest_sha256"] = "x"
+
+
+@pytest.mark.parametrize("damage, expect", [
+    (_no_hex_commit, "40-hex"),
+    (_linked_from_on_built, "linked_from on a non-linked"),
+    (_tracked_natively, "tracked inventory present"),
+    (_native_path_without_digest, "native_manifest_path without"),
+    (_hash_not_a_sha, "is not a sha256"),
+])
+def test_manifest_structure(w, damage, expect):
+    man = load(os.path.join(w.tree, MANIFEST))
+    damage(man)
+    rewrite_manifest(w.tree, man)
+    assert expect in metadata(w)
+
+
+def test_adopted_needs_its_block(tmp_path):
+    w = World(tmp_path, build=False)
+    man = add_build(w.tree, source="adopted")
+    assert "metadata_invalid" not in w.resolve()["engine_target"]["dirty_paths"]
+    man.pop("adopted")
+    rewrite_manifest(w.tree, man)
+    assert "adopted without its adopted block" in metadata(w)
+
+
+@pytest.mark.parametrize("entry, cross", [("VLLM_PORT", False), ("VLLM_TARGET_DEVICE", True)])
+def test_environment_module_build_entries(tmp_path, entry, cross):
+    """Artefacts built one commit earlier: a changed vllm/envs.py makes them
+    stale only when an entry of a build variable changed."""
+    w = World(tmp_path)
+    man = load(os.path.join(w.tree, MANIFEST))
+    names = UPSTREAM_VARS + ([entry] if entry not in UPSTREAM_VARS else [])
+    write(os.path.join(w.tree, "vllm", "envs.py"), envs_py(names, {entry: "changed"}))
+    git(w.tree, "commit", "-q", "-am", "envs")
+    write_stamp(w.tree, man)
+    et = w.resolve()["engine_target"]
+    assert man["commit"] != head(w.tree)
+    assert not et["dirty"], et["dirty_paths"]
+    assert et["cross_commit_artifacts"] is cross
+    if cross:
+        assert et["dirty_paths"]["cross_commit_artifacts"] == ["vllm/envs.py"]
+
+
+@pytest.mark.parametrize("rel", ["csrc/kernel.cu", "requirements/build/cuda.txt", "requirements/build.txt"])
+def test_built_tree_cross_commit_input(tmp_path, rel):
+    w = World(tmp_path, build=False, extra_files={rel: "v1\n"})
+    git(w.tree, "add", "-f", rel)           # the fixture ignores build/ directories
+    git(w.tree, "commit", "-q", "--allow-empty", "-m", "tracked input")
+    man = add_build(w.tree)
+    write(os.path.join(w.tree, rel), "v2\n")
+    git(w.tree, "commit", "-q", "-am", "input")
+    write_stamp(w.tree, man)
+    et = w.resolve()["engine_target"]
+    assert et["cross_commit_artifacts"] and not et["dirty"]
+    assert et["dirty_paths"]["cross_commit_artifacts"] == [rel]
+
+
+# -- secret knobs set environment names only -------------------------------------------------------
+
+@pytest.mark.parametrize("decl", [
+    'target = "args.api-key"\nsecret = true',
+    'target = ["env.MY_TOKEN", "args.api-key"]\nsecret = true',
+    'target = "extra_args"\nsecret = true',
+    'target = "card_ids"\nsecret = true',
+    'variant = "mm-cap"\nsecret = true',
+    'target = "env.MY_TOKEN"\nsecret = "yes"',
+])
+def test_secret_knob_targets_environment_only(w, decl):
+    write(os.path.join(w.settings, "model.toml"), model_text(w) + f"\n[user.CREDENTIAL]\n{decl}\n")
+    text = w.refused("--set", "CREDENTIAL=tok-4711")
+    assert "secret" in text and "tok-4711" not in text
+
+
+def test_secret_environment_knob_still_masked(w):
+    write(os.path.join(w.settings, "model.toml"),
+          model_text(w) + '\n[user.CREDENTIAL]\ntarget = "env.MY_TOKEN"\nsecret = true\n')
+    d = w.resolve("--set", "CREDENTIAL=tok-4711")
+    assert "tok-4711" not in json.dumps(d)
+    assert d["child_env"]["MY_TOKEN"] == {"value": "***", "class": "secret"}
+
+
+# -- every spelling of a protected argument is that argument ----------------------------------------
+
+ARG_UTILS = '''\
+import argparse
+
+
+class AsyncEngineArgs:
+    @staticmethod
+    def add_cli_args(parser):
+        parser.add_argument("--max-model-len", type=int)
+        parser.add_argument("--max-num-seqs", type=int)
+        parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
+        parser.add_argument("--enable-lora", action=argparse.BooleanOptionalAction)
+        parser.add_argument("--enable-log-requests", action="store_true")
+        parser.add_argument("--compilation-config", type=str)
+'''
+
+
+def lora_world(tmp_path, extra_files: dict[str, str] | None = None) -> World:
+    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS, **(extra_files or {})})
+    text = model_text(w).replace(
+        'fixed = ["args.max-model-len",',
+        'fixed = ["args.enable-lora", "args.compilation-config", "args.max-model-len",').replace(
+        "trust-remote-code = true\n",
+        "trust-remote-code = true\nenable-lora = true\ncompilation-config = { mode = 3 }\n")
+    assert text != MODEL_TOML
+    write(os.path.join(w.settings, "model.toml"), text)
+    d = w.resolve()
+    assert "--enable-lora" in d["argv_functional"]
+    return w
+
+
+@pytest.fixture
+def aw(tmp_path):
+    return lora_world(tmp_path)
+
+
+RAW = [["--no-enable-lora"], ["--no_enable_lora"], ["--no-enable-l"],
+       ["--compilation-config.mode=0"], ["--compilation-config.mode", "0"],
+       ["--compilation_config.mode", "0"], ["--compilation-conf.mode", "0"],
+       ["--device-memory-utilization", "0.5"], ["--gpu-memory-util", "0.5"],
+       ["--max-model=1024"], ["--max-model"], ["--max-model-len.x=1"]]
+
+
+@pytest.mark.parametrize("tokens", RAW)
+def test_protected_spellings_on_raw_channels(aw, tmp_path, tokens):
+    aw.refused("--", *tokens)
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=" + " ".join(tokens) + "\n")
+    aw.refused("--env-file", env)
+    aw.resolve("--experiment", "e", "--", *tokens)
+
+
+SETS = ["args.no-enable-lora=true", "args.no_enable_lora=true", "args.device-memory-utilization=0.5",
+        "args.gpu-memory-util=0.5", "args.compilation-config.mode=0"]
+
+
+@pytest.mark.parametrize("item", SETS)
+def test_protected_spellings_on_set(aw, item):
+    aw.refused("--set", item)
+    aw.resolve("--experiment", "e", "--set", item)
+
+
+@pytest.mark.parametrize("body", ['no-enable-lora = true\n', '"compilation-config.mode" = 0\n',
+                                  'device-memory-utilization = 0.5\n'])
+def test_protected_spellings_in_overlay(aw, tmp_path, body):
+    ov = write(str(tmp_path / "ov.toml"), 'schema = "launch-overlay/1"\n[args]\n' + body)
+    aw.refused("--overlay", ov)
+
+
+@pytest.mark.parametrize("tokens", [["--disable-lora"], ["--disable_lora"], ["--disable-lo"],
+                                    ["--no-enable-lora"]])
+def test_paired_negative_forms_reach_the_flag(tmp_path, tokens):
+    """A tree whose parser pairs --enable-X with --disable-X: the inverse
+    spelling (full, underscored or abbreviated) sets the protected flag,
+    on every channel."""
+    pw = lora_world(tmp_path / "w", {ARGPARSE: PAIRED_ARGPARSE})
+    pw.refused("--", *tokens)
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=" + " ".join(tokens) + "\n")
+    pw.refused("--env-file", env)
+    pw.refused("--set", f"args.{tokens[0][2:]}=true")
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[args]\n"{tokens[0][2:]}" = true\n')
+    pw.refused("--overlay", ov)
+    pw.resolve("--experiment", "e", "--", *tokens)
+
+
+@pytest.mark.parametrize("args", [("--", "--config", "x.yaml"), ("--", "--config=x.yaml"),
+                                  ("--set", 'args.config="x.yaml"'),
+                                  ("--", "--tensor-parallel", "1"), ("--", "--mod", "/x")])
+def test_launcher_arguments_never_from_outside(aw, args):
+    assert "set by the launcher" in aw.refused(*args)
+    assert "set by the launcher" in aw.refused("--experiment", "e", *args)
+
+
+@pytest.fixture
+def alias_w(tmp_path):
+    """The protected arguments declared under their alias spellings."""
+    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS})
+    text = model_text(w).replace(
+        'fixed = ["args.max-model-len", "args.gpu-memory-utilization",',
+        'fixed = ["args.max-model-len", "args.device-memory-utilization",').replace(
+        'gpu-memory-utilization = { value = 0.9,', 'device-memory-utilization = { value = 0.9,').replace(
+        'controlled_args = ["max-model-len", "max-num-seqs"]',
+        'controlled_args = ["max-model-len", "max-num-seqs", "device-memory-utilization"]')
+    assert "device-memory-utilization = { value = 0.9" in text and "args.device-memory-utilization" in text
+    write(os.path.join(w.settings, "model.toml"), text)
+    assert w.verify() == 0
+    promote(w, ["tp2"])
+    d = w.resolve()
+    assert d["validated"]["state"] == "VALIDATED" and "--device-memory-utilization" in d["argv_functional"]
+    return w
+
+
+ALIAS_FORMS = ["gpu-memory-utilization", "device-memory-utilization", "gpu-memory-util", "device-mem"]
+
+
+@pytest.mark.parametrize("form", ALIAS_FORMS)
+def test_alias_declared_protection(alias_w, tmp_path, form):
+    alias_w.refused("--", f"--{form}", "0.5")
+    env = write(str(tmp_path / "u.env"), f"EXTRA_ARGS=--{form}=0.5\n")
+    alias_w.refused("--env-file", env)
+    alias_w.refused("--set", f"args.{form}=0.5")
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[args]\n{form} = 0.5\n')
+    alias_w.refused("--overlay", ov)
+    d = alias_w.resolve("--experiment", "e", "--", f"--{form}", "0.5")
+    assert d["argv"][-2:] == [f"--{form}", "0.5"]
+
+
+@pytest.mark.parametrize("decl", [
+    ('"args.gpu-memory-utilization", "tp"', '"args.gpu-memory-util", "tp"'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]',
+     'controlled_args = ["max-model-len", "max-num-seqs", "gpu-memory-util"]'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]', 'controlled_args = ["max-model", "max-num-seqs"]'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]',
+     'controlled_args = ["max-model-len", "max-num-seqs", "no-enable-lora"]'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]',
+     'controlled_args = ["max-model-len", "max-num-seqs", "not-an-option"]'),
+])
+def test_protected_declarations_full_names_only(aw, tmp_path, decl):
+    """An abbreviated, negative or unknown protected declaration is refused
+    at settings load, whatever the channel the launch would use."""
+    text = model_text(aw)
+    assert text.count(decl[0]) == 1
+    write(os.path.join(aw.settings, "model.toml"), text.replace(*decl))
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=--gpu-memory-utilization=0.5\n")
+    ov = write(str(tmp_path / "ov.toml"), 'schema = "launch-overlay/1"\n[args]\ngpu-memory-utilization = 0.5\n')
+    for args in [(), ("--", "--gpu-memory-utilization", "0.5"), ("--env-file", env),
+                 ("--set", "args.gpu-memory-utilization=0.5"), ("--overlay", ov),
+                 ("--experiment", "e", "--", "--gpu-memory-utilization", "0.5")]:
+        assert "must be full option names" in aw.refused(*args)
+
+
+def test_protected_full_name_declarations(aw, tmp_path):
+    """The full-name baseline resolves; overriding needs --experiment."""
+    text = model_text(aw).replace('controlled_args = ["max-model-len", "max-num-seqs"]',
+                                  'controlled_args = ["max-model-len", "max-num-seqs", "gpu-memory-utilization"]')
+    write(os.path.join(aw.settings, "model.toml"), text)
+    aw.resolve()
+    aw.refused("--", "--gpu-memory-util", "0.5")
+    d = aw.resolve("--experiment", "e", "--", "--gpu-memory-util", "0.5")
+    assert d["argv"][-2:] == ["--gpu-memory-util", "0.5"]
+
+
+# The frontend registration pattern of the engine: option names generated
+# at run time from the dataclass fields of the installed frontend class.
+FRONTEND_ARGS = '''\
+from dataclasses import dataclass
+from typing import ClassVar
+
+from vllm.engine.arg_utils import AsyncEngineArgs
+
+
+@dataclass
+class BaseFrontendArgs:
+    chat_template: str | None = None
+    trust_request_chat_template: bool = False
+    registry: ClassVar[dict] = {}
+
+    @classmethod
+    def add_cli_args(cls, parser):
+        from vllm.engine.arg_utils import get_kwargs
+        group = parser.add_argument_group(title="Frontend")
+        for key, value in get_kwargs(cls).items():
+            extra_flags = value.pop("flags", [])
+            group.add_argument(*extra_flags, f"--{key.replace('_', '-')}", **value)
+        return parser
+
+
+@dataclass
+class FrontendArgs(BaseFrontendArgs):
+    response_role: str = "assistant"
+
+
+@dataclass
+class UnusedArgs(BaseFrontendArgs):
+    never_installed: int = 0
+
+
+def make_arg_parser(parser):
+    parser.add_argument("--headless", action="store_true")
+    parser = FrontendArgs.add_cli_args(parser)
+    parser = AsyncEngineArgs.add_cli_args(parser)
+    return parser
+'''
+
+
+@pytest.fixture
+def fw(tmp_path):
+    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS,
+                                     "vllm/entrypoints/launchers/cli_args.py": FRONTEND_ARGS})
+    assert w.verify() == 0
+    return w
+
+
+def test_generated_frontend_options_read(fw):
+    from registry import read_arg_options
+    opts = read_arg_options(fw.tree)
+    assert {"chat-template", "trust-request-chat-template", "response-role", "headless", "help"} <= opts.options
+    assert "registry" not in opts.options and "never-installed" not in opts.options
+
+
+@pytest.mark.parametrize("decl, key, value, override", [
+    ('fixed = ["args.trust-request-chat-template", ', "trust-request-chat-template", "false",
+     ("--trust-request-chat-template",)),
+    ('controlled_args = ["chat-template", ', "chat-template", '"t.jinja"',
+     ("--chat-template", "other.jinja")),
+])
+def test_generated_names_protected(fw, tmp_path, decl, key, value, override):
+    """A protected argument whose option the engine generates from a dataclass
+    field: the baseline resolves and is VALIDATED, overrides through every
+    channel are refused, --experiment unlocks them."""
+    text = model_text(fw)
+    anchor = 'fixed = [' if decl.startswith("fixed") else 'controlled_args = ['
+    text = text.replace(anchor, decl, 1).replace("trust-remote-code = true\n",
+                                                 f"trust-remote-code = true\n{key} = {value}\n")
+    write(os.path.join(fw.settings, "model.toml"), text)
+    promote(fw, ["tp2"])
+    d = fw.resolve()
+    assert d["validated"]["state"] == "VALIDATED" and f"args.{key}" in d["resolved"]
+    assert "fixed by the settings" in fw.refused("--", *override)
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=" + " ".join(override) + "\n")
+    fw.refused("--env-file", env)
+    fw.refused("--set", f"args.{key}=" + ("true" if key.startswith("trust") else '"other.jinja"'))
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[args]\n{key} = "x"\n')
+    fw.refused("--overlay", ov)
+    d = fw.resolve("--experiment", "e", "--", *override)
+    assert d["argv"][-len(override):] == list(override) and d["validated"]["state"] != "VALIDATED"
+
+
+@pytest.mark.parametrize("name", ["never-installed", "registry", "chat-templ"])
+def test_generated_inventory_still_fails_closed(fw, name):
+    text = model_text(fw).replace('controlled_args = [', f'controlled_args = ["{name}", ', 1)
+    write(os.path.join(fw.settings, "model.toml"), text)
+    assert "must be full option names" in fw.refused()
+
+
+def frontend_world(tmp_path, source: str) -> World:
+    return World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS,
+                                        "vllm/entrypoints/launchers/cli_args.py": source})
+
+
+SHADOWED = {
+    "ClassVar": "    trust_request_chat_templ: ClassVar[bool] = False\n",
+    "InitVar": "    trust_request_chat_templ: InitVar[bool] = False\n",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(SHADOWED))
+def test_pseudo_field_override_removes_inherited_option(tmp_path, kind):
+    """A subclass ClassVar/InitVar declaration removes the inherited field of
+    the same name, as dataclasses.fields does: the short name is no option,
+    is refused as a declaration, and on incoming channels is still the
+    abbreviation argparse expands to the protected full option."""
+    source = FRONTEND_ARGS.replace("from typing import ClassVar", "from dataclasses import InitVar\nfrom typing import ClassVar") \
+        .replace("    trust_request_chat_template: bool = False\n",
+                 "    trust_request_chat_template: bool = False\n    trust_request_chat_templ: bool = False\n") \
+        .replace('    response_role: str = "assistant"\n', '    response_role: str = "assistant"\n' + SHADOWED[kind])
+    w = frontend_world(tmp_path, source)
+    from registry import read_arg_options
+    opts = read_arg_options(w.tree)
+    assert "trust-request-chat-templ" not in opts.options and "trust-request-chat-template" in opts.options
+    text = model_text(w).replace('fixed = [', 'fixed = ["args.trust-request-chat-template", ', 1) \
+        .replace("trust-remote-code = true\n", "trust-remote-code = true\ntrust-request-chat-template = false\n")
+    write(os.path.join(w.settings, "model.toml"), text)
+    w.resolve()
+    assert "fixed by the settings" in w.refused("--", "--trust-request-chat-templ")
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=--trust-request-chat-templ\n")
+    w.refused("--env-file", env)
+    w.refused("--set", "args.trust-request-chat-templ=true")
+    w.resolve("--experiment", "e", "--", "--trust-request-chat-templ")
+    write(os.path.join(w.settings, "model.toml"),
+          text.replace('controlled_args = [', 'controlled_args = ["trust-request-chat-templ", ', 1))
+    assert "must be full option names" in w.refused()
+
+
+def test_kw_only_sentinel_keeps_inherited_option(tmp_path):
+    """A KW_ONLY sentinel annotation is no field: a subclass annotating an
+    inherited field's name with it neither removes nor redeclares that field
+    (dataclasses.fields keeps it), so its option stays."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Base:
+        trust_request_chat_templ: bool = False
+
+    @dataclasses.dataclass
+    class Sub(Base):
+        trust_request_chat_templ: dataclasses.KW_ONLY
+        response_role: str = "assistant"
+
+    assert [f.name for f in dataclasses.fields(Sub)] == ["trust_request_chat_templ", "response_role"]
+    for annotation in ("KW_ONLY", "dataclasses.KW_ONLY"):
+        source = FRONTEND_ARGS.replace("from typing import ClassVar",
+                                       "import dataclasses\nfrom dataclasses import KW_ONLY\nfrom typing import ClassVar") \
+            .replace("    trust_request_chat_template: bool = False\n",
+                     "    trust_request_chat_template: bool = False\n    trust_request_chat_templ: bool = False\n") \
+            .replace('    response_role: str = "assistant"\n',
+                     f'    trust_request_chat_templ: {annotation}\n    response_role: str = "assistant"\n')
+        from registry import read_arg_options
+        opts = read_arg_options(frontend_world(tmp_path / annotation, source).tree).options
+        assert {"trust-request-chat-templ", "trust-request-chat-template", "response-role"} <= opts
+
+
+def test_field_redeclared_below_a_pseudo_field_is_an_option(tmp_path):
+    source = FRONTEND_ARGS.replace("    trust_request_chat_template: bool = False\n",
+                                   "    trust_request_chat_template: ClassVar[bool] = False\n") \
+        .replace('    response_role: str = "assistant"\n',
+                 '    response_role: str = "assistant"\n    trust_request_chat_template: bool = False\n')
+    from registry import read_arg_options
+    assert "trust-request-chat-template" in read_arg_options(frontend_world(tmp_path, source).tree).options
+
+
+@pytest.mark.parametrize("change", [
+    ("class FrontendArgs(BaseFrontendArgs):", "class FrontendArgs(ImportedArgs):"),
+    ("class FrontendArgs(BaseFrontendArgs):", "class FrontendArgs(BaseFrontendArgs, UnusedArgs):"),
+    ("@dataclass\nclass FrontendArgs(", "class FrontendArgs("),
+    ('    response_role: str = "assistant"\n', '    response_role: "str" = "assistant"\n'),
+])
+def test_unreadable_argument_class_refused(tmp_path, change):
+    """A shape the reader cannot follow exactly refuses the inventory."""
+    source = FRONTEND_ARGS.replace(*change)
+    assert source != FRONTEND_ARGS
+    w = frontend_world(tmp_path, source)
+    assert "argument class" in w.refused()
+
+
+def test_unprotected_spellings_allowed_with_aliases(alias_w):
+    d = alias_w.resolve("--", "--enable-log-requests")
+    assert d["argv"][-1] == "--enable-log-requests"
+
+
+def test_unprotected_spellings_allowed(aw):
+    d = aw.resolve("--", "--enable-log-requests", "--max-num-batched-tokens", "8192")
+    assert d["argv"][-3:] == ["--enable-log-requests", "--max-num-batched-tokens", "8192"]
+
+
+# -- cancellation lasts until exec ---------------------------------------------------------------------
+
+class Boom(Exception):
+    pass
+
+
+@pytest.fixture
+def signals():
+    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    yield
+    for s, h in old.items():
+        signal.signal(s, h)
+
+
+SIGNALS = [signal.SIGTERM, signal.SIGINT]
+
+
+def run_main(args, environ):
+    import main
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = main.main(args, environ)
+    return code, out.getvalue(), err.getvalue()
+
+
+@pytest.mark.parametrize("sig", SIGNALS)
+def test_stop_while_verify_command_loads(tmp_path, monkeypatch, signals, sig):
+    import checkpoint as ck
+    import main
+    w = World(tmp_path)
+    stamp = ck.stamp_path(w.stamps, w.cp)
+    real = main._context
+
+    def context(*a, **k):
+        os.kill(os.getpid(), sig)
+        return real(*a, **k)
+    monkeypatch.setattr(main, "_context", context)
+    code, _, err = run_main(w.base_args("--verify-checkpoints"), w.env())
+    assert code == 3 and "no stamp written" in err
+    assert not os.path.exists(stamp)
+    monkeypatch.undo()
+    assert run_main(w.base_args("--verify-checkpoints"), w.env())[0] == 0
+    assert os.path.exists(stamp)
+
+
+def no_exec(monkeypatch):
+    import main
+    calls = []
+    monkeypatch.setattr(main.os, "execve", lambda *a: calls.append(a))
+    return calls
+
+
+@pytest.mark.parametrize("sig", SIGNALS)
+def test_stop_after_last_check_never_execs(w, monkeypatch, signals, sig):
+    import main
+    calls = no_exec(monkeypatch)
+    real = main.preflight_checkpoints
+
+    def preflight(*a, **k):
+        real(*a, **k)
+        os.kill(os.getpid(), sig)
+    monkeypatch.setattr(main, "preflight_checkpoints", preflight)
+    code, _, err = run_main(w.base_args(), w.env())
+    assert code == 3 and "stopped before start" in err and not calls
+
+
+@pytest.mark.parametrize("sig", SIGNALS)
+def test_signal_during_banner_is_not_swallowed(w, monkeypatch, signals, sig):
+    import main
+    calls = no_exec(monkeypatch)
+
+    def boom(_sig, _frm):
+        raise Boom()
+    signal.signal(sig, boom)
+    real = main.banner
+
+    def banner(doc):
+        os.kill(os.getpid(), sig)
+        return real(doc)
+    monkeypatch.setattr(main, "banner", banner)
+    with pytest.raises(Boom):
+        run_main(w.base_args(), w.env())
+    assert not calls
+
+
+def test_exec_after_checks_restores_signals(w, monkeypatch, signals):
+    calls = no_exec(monkeypatch)
+
+    def mine(_sig, _frm):
+        raise Boom()
+    signal.signal(signal.SIGTERM, mine)
+    code, _, err = run_main(w.base_args(), w.env())
+    assert code == 0 and len(calls) == 1 and err.startswith("VALIDATED")
+    assert signal.getsignal(signal.SIGTERM) is mine
+
+
+# -- knob names apart from every classified name ------------------------------------------------------
+
+@pytest.mark.parametrize("knob", ["TERM", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"])
+def test_inert_knob_names_refused(w, knob):
+    write(os.path.join(w.settings, "model.toml"),
+          model_text(w) + f'\n[user.{knob}]\ntarget = "env.VLLM_PLACEMENT"\n')
+    assert "name knobs apart" in w.refused()
+
+
+@pytest.mark.parametrize("name", ["CUDA_CACHE_PATH", "TORCH_EXTENSIONS_DIR", "TMPDIR",
+                                  "TILELANG_CACHE_DIR", "TILELANG_TMP_DIR"])
+def test_cache_directories_are_location(w, name):
+    import main
+    from envclass import ClassTable
+    from settings_dir import load_toml
+    defaults = load_toml(os.path.join(os.path.dirname(main.__file__), "defaults.toml"), "launch-defaults")
+    assert ClassTable(defaults["classes"], []).classify(name) == "location"
+    d = w.resolve(environ=w.env(**{name: "/elsewhere"}))
+    assert name in d["ignored"] and d["validated"]["state"] == "VALIDATED"
+
+
+# the cache locations of the published container recipes (docker/container.env)
+RECIPE_LOCATIONS = {
+    "HOME": "/cache", "HF_HOME": "/cache/huggingface", "XDG_CACHE_HOME": "/cache/.cache",
+    "TRITON_CACHE_DIR": "/cache/.triton/cache", "TORCHINDUCTOR_CACHE_DIR": "/cache/torchinductor",
+    "VLLM_CACHE_ROOT": "/cache/.cache/vllm", "FLASHINFER_WORKSPACE_BASE": "/cache",
+    "TMPDIR": "/cache/tmp", "TORCH_EXTENSIONS_DIR": "/cache/.cache/torch_extensions",
+    "TILELANG_CACHE_DIR": "/cache/.tilelang/cache", "TILELANG_TMP_DIR": "/cache/.tilelang/cache/tmp",
+    "CUDA_CACHE_PATH": "/cache/.nv/ComputeCache",
+}
+
+
+def test_container_locations_match_the_recipes(w):
+    d = w.resolve("--runtime", "container", "--tree", w.tree, "--venv", w.venv)
+    got = {k: v["value"] for k, v in d["child_env"].items() if v["class"] == "location"
+           and k != "CUDA_VISIBLE_DEVICES"}
+    assert got == RECIPE_LOCATIONS
+    # the same values in the environment of the container are equal, not a change
+    d = w.resolve("--runtime", "container", "--tree", w.tree, "--venv", w.venv,
+                  environ=w.env(**RECIPE_LOCATIONS))
+    assert set(RECIPE_LOCATIONS) <= set(d["ambient_equal"])
+
+
+# -- environment modules: only runtime-only variables may change -----------------------------------
+
+ENVS_BASE = '''\
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    VLLM_PORT: int | None = None
+    VLLM_TARGET_DEVICE: str = "cuda"
+
+
+def env_with_choices(name, default, choices):
+    return lambda: os.getenv(name, default)
+
+
+environment_variables: dict = {
+    "VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),
+    "VLLM_API_KEY": lambda: os.getenv("VLLM_API_KEY", ""),
+    "VLLM_USE_V2": lambda: os.getenv("VLLM_USE_V2", ""),
+    "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", ""),
+    "VLLM_TARGET_DEVICE": env_with_choices("VLLM_TARGET_DEVICE", "cuda", ["cuda", "cpu"]),
+}
+'''
+
+
+def env_module_change(tmp_path, after: str, before: str = ENVS_BASE) -> dict:
+    """Artefacts built at a commit whose vllm/envs.py is ``before``; HEAD's is ``after``."""
+    w = World(tmp_path, build=False, extra_files={"vllm/envs.py": before})
+    man = add_build(w.tree)
+    write(os.path.join(w.tree, "vllm", "envs.py"), after)
+    git(w.tree, "commit", "-q", "-am", "envs")
+    write_stamp(w.tree, man)
+    et = w.resolve()["engine_target"]
+    assert man["commit"] != head(w.tree) and not et["dirty"], et["dirty_paths"]
+    return et
+
+
+@pytest.mark.parametrize("after", [
+    # a helper the build variable's getter calls
+    ENVS_BASE.replace("return lambda: os.getenv(name, default)",
+                      "return lambda: os.getenv(name, default).lower()"),
+    # a new import or module-level code
+    ENVS_BASE.replace("import os\n", "import os\nimport sys\n"),
+    # the build entry itself
+    ENVS_BASE.replace('"cuda", ["cuda", "cpu"]', '"cpu", ["cuda", "cpu"]'),
+    # a build variable's annotation
+    ENVS_BASE.replace('VLLM_TARGET_DEVICE: str = "cuda"', 'VLLM_TARGET_DEVICE: str = "cpu"'),
+    # an eager initializer in a runtime entry runs at import
+    ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                      '"VLLM_PORT": (os.environ.setdefault("CMAKE_BUILD_TYPE", "Debug"), '
+                      'lambda: os.getenv("VLLM_PORT", ""))[1],'),
+    # a runtime lambda's default value runs at import
+    ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                      '"VLLM_PORT": lambda _=os.environ.setdefault("CMAKE_BUILD_TYPE", "Debug"): '
+                      'os.getenv("VLLM_PORT", ""),'),
+    # the same through os.environ.update, changing the build target the build reads
+    ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                      '"VLLM_PORT": lambda _=os.environ.update(VLLM_TARGET_DEVICE="cpu"): '
+                      'os.getenv("VLLM_PORT", ""),'),
+    # a source codec that turns a comment into code (+AAo- is a newline in utf-7)
+    "# coding: utf-7\n# +AAo-import os+AAo-os.environ.update(VLLM_TARGET_DEVICE=+ACI-cpu+ACI-)\n"
+    + ENVS_BASE,
+    # the same declaration behind bare-CR line ends
+    "\r# coding: utf-7\r# +AAo-import os+AAo-os.environ.update(VLLM_TARGET_DEVICE=+ACI-cpu+ACI-)\r"
+    + ENVS_BASE,
+    # CRLF line ends: any carriage return counts
+    ENVS_BASE.replace("\n", "\r\n"),
+])
+def test_environment_module_other_code_is_a_build_input(tmp_path, after):
+    et = env_module_change(tmp_path, after)
+    assert et["cross_commit_artifacts"] and et["dirty_paths"]["cross_commit_artifacts"] == ["vllm/envs.py"]
+
+
+@pytest.mark.parametrize("after", [
+    # a runtime variable's default
+    ENVS_BASE.replace('os.getenv("VLLM_PORT", "")', 'os.getenv("VLLM_PORT", "8000")'),
+    # a new runtime variable with its annotation
+    ENVS_BASE.replace('    VLLM_PORT: int | None = None\n',
+                      '    VLLM_PORT: int | None = None\n    VLLM_NEW: bool = False\n')
+             .replace('    "VLLM_PORT":', '    "VLLM_NEW": lambda: os.getenv("VLLM_NEW", ""),\n    "VLLM_PORT":'),
+    # comments and layout
+    "# runtime switches\n" + ENVS_BASE.replace("\n\n\ndef", "\n\n\n# helper\ndef"),
+    # a runtime lambda's body
+    ENVS_BASE.replace('os.getenv("VLLM_PORT", "")', 'int(os.getenv("VLLM_PORT", "0")) or None'),
+    # a literal runtime entry
+    ENVS_BASE.replace('    "VLLM_API_KEY":', '    "VLLM_NOTE": "text",\n    "VLLM_API_KEY":'),
+    # an explicit UTF-8 declaration
+    "# -*- coding: utf-8 -*-\n" + ENVS_BASE,
+    # a comment that looks like a declaration, on line 3
+    "# runtime\n# switches\n# coding: utf-7 (not a declaration here)\n" + ENVS_BASE,
+])
+def test_environment_module_runtime_only_change_is_compatible(tmp_path, after):
+    assert env_module_change(tmp_path, after)["cross_commit_artifacts"] is False
+
+
+@pytest.mark.parametrize("before", [ENVS_BASE + "def broken(:\n",
+                                    ENVS_BASE.replace("import os", "import os  # \udcff")])
+def test_environment_module_unreadable_side_fails_closed(tmp_path, before):
+    raw = before.encode("utf-8", errors="surrogateescape")
+    w = World(tmp_path, build=False)
+    with open(os.path.join(w.tree, "vllm", "envs.py"), "wb") as f:
+        f.write(raw)
+    git(w.tree, "commit", "-q", "-am", "unreadable")
+    man = add_build(w.tree)
+    write(os.path.join(w.tree, "vllm", "envs.py"), ENVS_BASE)
+    git(w.tree, "commit", "-q", "-am", "readable")
+    write_stamp(w.tree, man)
+    et = w.resolve()["engine_target"]
+    assert et["cross_commit_artifacts"] and et["dirty_paths"]["cross_commit_artifacts"] == ["vllm/envs.py"]
+
+
+@pytest.mark.parametrize("field, value", [("build_owned_sha256", "0" * 64), ("build_owned_sha256", None),
+                                          ("native_manifest_sha256", "0" * 64),
+                                          ("native_manifest_sha256", None)])
+def test_empty_map_stamp_hashes_checked(tmp_path, field, value):
+    w = World(tmp_path, build=False)
+    add_build(w.tree, {}, source="adopted")
+    assert "metadata_invalid" not in w.resolve()["engine_target"]["dirty_paths"]
+    stamp = load(os.path.join(w.tree, STAMP))
+    if value is None:
+        stamp.pop(field)
+    else:
+        stamp[field] = value
+    write(os.path.join(w.tree, STAMP), json.dumps(stamp))
+    text = metadata(w)
+    assert (f"no {field}" if value is None else f"{field} differs from the manifest") in text
+
+
+def test_stamp_names_a_null_native_identity(tmp_path):
+    """A manifest without native identity: the stamp still carries the key (null)."""
+    w = World(tmp_path)
+    man = load(os.path.join(w.tree, MANIFEST))
+    man["native_manifest_sha256"] = None
+    man.pop("native_manifest_path")
+    rewrite_manifest(w.tree, man, stamp=True)
+    assert "metadata_invalid" not in w.resolve()["engine_target"]["dirty_paths"]
+    stamp = load(os.path.join(w.tree, STAMP))
+    stamp.pop("native_manifest_sha256")
+    write(os.path.join(w.tree, STAMP), json.dumps(stamp))
+    assert "no native_manifest_sha256" in metadata(w)
+
+
+WITH_DEFAULT = ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                                 '"VLLM_PORT": lambda d="": os.getenv("VLLM_PORT", d),')
+
+
+@pytest.mark.parametrize("after, cross", [
+    (WITH_DEFAULT.replace('os.getenv("VLLM_PORT", d)', 'os.getenv("VLLM_PORT", d) or None'), False),
+    (WITH_DEFAULT.replace('lambda d=""', 'lambda d="8000"'), True),
+    (ENVS_BASE, True),
+])
+def test_runtime_lambda_defaults_compared_body_erased(tmp_path, after, cross):
+    assert env_module_change(tmp_path, after, before=WITH_DEFAULT)["cross_commit_artifacts"] is cross

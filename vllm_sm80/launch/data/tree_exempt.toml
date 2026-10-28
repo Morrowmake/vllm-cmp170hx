@@ -1,0 +1,16 @@
+schema = "tree-exempt/1"
+
+# Paths no runtime reads. Untracked files here are listed by path only and
+# never make a tree dirty. Add a path only with a control showing the server never opens it.
+patterns = [
+  ".git/**",
+  "**/__pycache__/**",
+  "*.bak-*",
+  "*.orig",
+  "*.rej",
+  "*.swp",
+  "*.log",
+  "docs/**",
+  "tests/**",
+  "benchmarks/**",
+]

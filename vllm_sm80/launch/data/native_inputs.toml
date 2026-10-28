@@ -1,0 +1,107 @@
+schema = "native-inputs/1"
+# The one native-input contract: the launcher reads [[extensions]] from this
+# file, and the native build checks read all of it from the pinned launcher
+# tree. These are NOT exemptions: ownership transfers only with the recorded
+# native manifest, exact installed bytes, pinned builder source and complete
+# matching Git source-input objects.
+
+# [[stale]] header attribution: an #include resolves from the including file's
+# directory, then these (every native build passes csrc as an include path).
+include_dirs = ["csrc"]
+
+# EXL3 and the compiled Marlin library are built only by their standalone
+# builders. CMakeLists.txt and setup.py add neither directory to a wheel
+# target (earlier commits had an opt-in Marlin target, off in every wheel and
+# native build: [[cmake_option]]); shared build-driver changes, and the
+# upstream csrc headers the sources include, still fail the wheel comparison.
+[[extensions]]
+artifact = "vllm_sm80/_exl3_C*.so"
+builder = "csrc/exl3/build_standalone.py"
+paths = ["csrc/exl3"]
+source_inputs = ["CMakeLists.txt", "cmake", "csrc"]
+
+[[extensions]]
+artifact = "vllm_sm80/_ampere_marlin_C*.so"
+builder = "csrc/ampere_marlin/build_standalone.py"
+paths = ["csrc/ampere_marlin"]
+source_inputs = ["CMakeLists.txt", "cmake", "csrc"]
+
+# The wheel's core library, rebuilt by native_build.py build --stable (its CMake
+# target, TORCH_CUDA_ARCH_LIST 8.0) when a commit changes an input it reads
+# ([[stale]] below). wheel = true: a linked tree holds the source tree's (the
+# wheel's) file unless its native manifest lists a build of it. No exclusive
+# input root (paths = []): CMakeLists.txt, cmake and csrc also build the other
+# wheel targets, so every input keeps the wheel comparison.
+[[extensions]]
+artifact = "vllm/_C_stable_libtorch*.so"
+builder = "CMakeLists.txt target _C_stable_libtorch"
+paths = []
+source_inputs = ["CMakeLists.txt", "cmake", "csrc"]
+wheel = true
+
+# The wheel's MoE library, rebuilt by native_build.py build --moe-stable (its
+# CMake target, in the same CMake tree as --stable) when a commit changes an
+# input it reads. wheel = true and paths = [], as _C_stable_libtorch.
+[[extensions]]
+artifact = "vllm/_moe_C_stable_libtorch*.so"
+builder = "CMakeLists.txt target _moe_C_stable_libtorch"
+paths = []
+source_inputs = ["CMakeLists.txt", "cmake", "csrc"]
+wheel = true
+
+# A changed CMake file (CMakeLists.txt, *.cmake) whose statements differ only in
+# comments and in statements of a fork build option (each if() block without
+# else/elseif whose condition names one of `tokens`, and each set/option/unset
+# whose first argument is one and that sets no true constant) changes no wheel
+# target: the option is off in the wheel's build and in native_build.py's CMake
+# builds (their environment never sets it). It makes stale the `native` of each
+# entry whose statements differ (none for a comment change); any other CMake
+# change goes by [[stale]] below.
+[[cmake_option]]
+tokens = ["VLLM_AMPERE_MARLIN_BUILD", "_AMPERE_MARLIN_DEFAULT"]
+native = "vllm_sm80/_ampere_marlin_C*.so"
+
+# Which natives a changed build input (the source_inputs above, differing
+# between a base commit and a candidate) makes stale. `native` is one artifact
+# glob or a list. A changed header (.h .cuh .hpp ...) makes stale every native
+# whose sources include it, directly or through other headers, at base or
+# candidate; a native's sources are the non-header files whose first matching
+# entry below is its, plus its `generated` files (headers the sources its build
+# generates include: the Marlin kernels generate_kernels.py writes). A header no
+# source includes, and every other file, goes to the first entry whose paths
+# match it; no match is refused (unattributed). native "wheel": an input of the
+# wheel natives native_build.py does not build (spinloop, fs_io_C,
+# cumem_allocator and the FetchContent extensions' registration files; the
+# CMake files beyond [[cmake_option]] configure every target): a change to one,
+# or to a header one of them includes, is refused, naming the files, never run
+# on the wheel's stale binary.
+[[stale]]
+paths = ["csrc/exl3/**"]
+native = "vllm_sm80/_exl3_C*.so"
+
+[[stale]]
+paths = ["csrc/ampere_marlin/**"]
+native = "vllm_sm80/_ampere_marlin_C*.so"
+
+[[stale]]
+paths = ["/CMakeLists.txt", "cmake/**", "csrc/spinloop.cpp", "csrc/fs_io.cpp", "csrc/cumem_allocator.cpp",
+         "csrc/flashkda_registration.cpp", "csrc/qutlass_registration.cpp"]
+native = "wheel"
+
+# The Marlin kernel generator writes the dense kernels (_C_stable_libtorch) and
+# the MoE kernels (_moe_C_stable_libtorch).
+[[stale]]
+paths = ["csrc/quantization/marlin/generate_kernels.py"]
+native = ["vllm/_C_stable_libtorch*.so", "vllm/_moe_C_stable_libtorch*.so"]
+
+[[stale]]
+paths = ["csrc/moe/**"]
+native = "vllm/_moe_C_stable_libtorch*.so"
+generated = ["csrc/moe/marlin_moe_wna16/kernel.h", "csrc/moe/marlin_moe_wna16/marlin_template.h"]
+
+# Every other csrc file: the sources of _C_stable_libtorch (and CPU/ROCm-only
+# files, which only cost a needless rebuild).
+[[stale]]
+paths = ["csrc/**"]
+native = "vllm/_C_stable_libtorch*.so"
+generated = ["csrc/quantization/marlin/kernel.h", "csrc/quantization/marlin/marlin_template.h"]

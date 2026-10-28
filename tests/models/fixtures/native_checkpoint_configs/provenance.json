@@ -1,0 +1,19 @@
+{
+  "captured_on": "2026-10-06",
+  "description": "Byte-exact config.json copies from deployed checkpoint directories; no weights, tokenizer files, or configuration fields have been synthesized or removed.",
+  "fixtures": {
+    "glm53_flash": {
+      "checkpoint": "GLM-5.3-Flash-W4A16-MTP",
+      "sha256": "d4e721c7f18a45f5d9e2083d423bd15d707c43f60d3669fd1c48e52562e2000a"
+    },
+    "qwen38_flash_next": {
+      "checkpoint": "qwen38-flash-next-exl3-5.05",
+      "sha256": "ac225cdd25209e3220f02e99041f31391fbac183c008f58e841b2e773e80efa8"
+    },
+    "glm53_dflash2": {
+      "checkpoint": "GLM-5.3-Flash-DFlash2",
+      "sha256": "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573",
+      "selection": "GLM-5.3-Flash serving profile's dflash2 speculative model"
+    }
+  }
+}
