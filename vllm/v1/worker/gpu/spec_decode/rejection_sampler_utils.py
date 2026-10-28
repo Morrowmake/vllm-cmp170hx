@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -266,7 +267,9 @@ def _compute_local_logits_stats_kernel(
             other=float("-inf"),
         ).to(tl.float32)
         value, idx = tl.max(target_logits, axis=0, return_indices=True)
-        token_id = block_idx * BLOCK_SIZE + idx
+        # Out-of-vocab tail lanes are loaded as -inf; an all--inf/NaN tile
+        # can settle the argmax on one of them. Clamp -- see gumbel.py.
+        token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
         tl.store(
             target_local_argmax_ptr
             + logit_idx * target_local_argmax_stride
@@ -1015,7 +1018,10 @@ def _resample_kernel(
             vocab_size,
             USE_FP64=USE_FP64,
         )
-    token_id = block_idx * BLOCK_SIZE + idx
+    # Out-of-vocab tail lanes are loaded as -inf; an all--inf/NaN tile can
+    # settle the argmax on one of them, and a residual tile is far more
+    # likely to be degenerate than a raw logits tile. Clamp -- see gumbel.py.
+    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
     tl.store(
         resampled_local_argmax_ptr
         + req_idx * resampled_local_argmax_stride
