@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Kimi-K3 RecoverSSM speculative verify and accepted-state recovery."""
 
 from collections.abc import Sequence
@@ -10,6 +11,7 @@ import torch
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.kimi_k3.nvidia.recoverssm.kernels import cute_recoverssm_commit
+from vllm_sm80.kernels.kda import commit_plan as sm80_commit_plan
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -944,7 +946,7 @@ class KDARecoverSSMCommitContext:
         conv_ref = self.conv_states[0]
         conv_dim = conv_ref.shape[1]
         block_history = triton.next_power_of_2(self.conv_history_len)
-        _prepare_commit_plan_kernel[(batch,)](
+        sm80_commit_plan._prepare_commit_plan_kernel[(batch,)](
             num_accepted_tokens,
             request_indices,
             state_indices,
