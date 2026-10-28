@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Importing the fork's modules does not initialise CUDA.
 
-Every module of ``vllm_sm80`` and every module the plugin registers is
-imported in a fresh interpreter that reports as having a card
-(``torch.cuda.is_available`` and ``device_count`` forced, device properties
-of an sm_80 card, no card visible), so code that would query the device at
-import reaches ``torch.cuda._lazy_init``; each call is recorded with its
-stack and the import goes on.
+Every module of ``vllm_sm80`` the engine process imports (all but the
+launcher's, ``vllm_sm80/launch/``, which runs in a process of its own) and
+every module the plugin registers is imported in a fresh interpreter that
+reports as having a card (``torch.cuda.is_available`` and ``device_count``
+forced, device properties of an sm_80 card, no card visible), so code that
+would query the device at import reaches ``torch.cuda._lazy_init``; each
+call is recorded with its stack and the import goes on.
 
 The model and drafter classes the plugin registers extend upstream modules
 whose import already initialises CUDA (the GLM model package through FLA's
@@ -77,12 +78,14 @@ def _module(qualified: str) -> str:
 def _sm80_modules() -> list[str]:
     """Modules of vllm_sm80 outside its model packages (vllm_sm80/models/,
     which extend upstream model packages; the registered ones are checked
-    against their upstream module)."""
+    against their upstream module) and its launcher (vllm_sm80/launch/, a
+    stdlib-only script run by path in a process of its own, whose modules
+    import each other as top-level modules)."""
     root = pathlib.Path(plugin.__file__).parent
     names = set()
     for path in root.rglob("*.py"):
         relative = path.relative_to(root)
-        if relative.parts[0] == "models":
+        if relative.parts[0] in ("models", "launch"):
             continue
         parts = ("vllm_sm80", *relative.with_suffix("").parts)
         names.add(".".join(parts[:-1] if parts[-1] == "__init__" else parts))
