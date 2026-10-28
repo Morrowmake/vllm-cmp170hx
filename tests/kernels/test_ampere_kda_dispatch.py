@@ -13,7 +13,8 @@ o_norm) elsewhere. Served shapes: up to 8 sequences of 1..8 tokens (draft depth
 up to 7), pure verify and mixed steps.
 
 CPU part: the dispatch table (64 heads take every measured shape under
-VLLM_AMPERE_DECODE_KERNELS), the wide-schedule choice.
+VLLM_AMPERE_DECODE_KERNELS), the wide-schedule choice, the q|k|v conv weight
+in both upstream layouts (fused conv1d, or three convs merged).
 GPU part (skipped without CUDA), driven through the real forward()/_forward():
 for every served shape, the step's normed output o, its consumer y = o @ Wo^T
 (FP64 consumer on the kernel's bf16 output) and the per-token recurrent states
@@ -152,6 +153,31 @@ def test_wide_schedule():
             assert not wide_schedule(nseq, T, 16)
 
 
+def test_conv_weights_take_either_upstream_layout():
+    """The layer reads upstream's q|k|v short-conv weight as one (3P, K)
+    matrix in both upstream layouts: a view of the fused conv1d parameter
+    (3P, 1, K), or the three (P, 1, K) convs merged once and kept."""
+    from vllm_sm80.models.glm5next.sm80_kda import Glm5NextLinearAttention as K
+
+    P = 6
+    w = torch.randn(3 * P, CONV_K)
+    bias = torch.randn(3 * P)
+    conv1d = types.SimpleNamespace(weight=w.reshape(3 * P, 1, CONV_K).clone(),
+                                   bias=bias)
+    fused = types.SimpleNamespace(conv1d=conv1d)
+    weights, b = K._sm80_conv_weights(fused)
+    assert weights.shape == (3 * P, CONV_K) and torch.equal(weights, w)
+    assert weights.data_ptr() == conv1d.weight.data_ptr() and b is bias
+
+    q, k, v = (types.SimpleNamespace(weight=part.reshape(P, 1, CONV_K).clone(),
+                                     bias=None) for part in w.split(P))
+    split = types.SimpleNamespace(q_conv1d=q, k_conv1d=k, v_conv1d=v,
+                                  _merged_conv_weight=None)
+    weights, b = K._sm80_conv_weights(split)
+    assert torch.equal(weights, w) and b is None
+    assert K._sm80_conv_weights(split)[0] is weights
+
+
 def test_import_does_not_initialise_cuda():
     import importlib
 
@@ -258,8 +284,17 @@ def build_layer(H, w, *, kernels, nslot, recover=False, window=WINDOW,
     L.kv_cache = (conv, rec)
     L.kda_safe_gate, L.kda_lower_bound = True, float(w["lower_bound"])
     L._conv_state_dim_first = False
-    L._merged_conv_weight = w["conv_w"].to(dev).float().reshape(3 * P, CONV_K).contiguous()
-    L.q_conv1d = types.SimpleNamespace(bias=None)
+    conv_w = w["conv_w"].to(dev).float().reshape(3 * P, CONV_K).contiguous()
+    from vllm.models.glm5next.common import kda as upstream_kda
+
+    if hasattr(upstream_kda, "_fused_qkv_conv1d"):
+        # Upstream keeps the q|k|v convs as one fused conv1d (3P, 1, K).
+        L.conv1d = types.SimpleNamespace(weight=conv_w.view(3 * P, 1, CONV_K),
+                                         bias=None)
+    else:
+        # Upstream merges its three convs once into _merged_conv_weight.
+        L._merged_conv_weight = conv_w
+        L.q_conv1d = types.SimpleNamespace(bias=None)
     L.A_log = w["a_log"].to(dev).float().reshape(1, 1, H, 1).contiguous()
     L.dt_bias = w["dt_bias"].to(dev).float().reshape(-1).contiguous()
     L._kda_v2 = bool(kernels)
@@ -276,7 +311,7 @@ def build_layer(H, w, *, kernels, nslot, recover=False, window=WINDOW,
     L._kda_mixed = None
     for name in ("forward", "sm80_forward_tail", "_forward", "_forward_core",
                  "_kda_deferred_step", "_kda_mixed_spec_rows", "sm80_chunk_kda",
-                 "_fill_deferred_g2"):
+                 "_fill_deferred_g2", "_sm80_conv_weights"):
         setattr(L, name, types.MethodType(getattr(K, name), L))
     return L
 

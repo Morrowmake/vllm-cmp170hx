@@ -235,6 +235,26 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
             self.g_b_proj(g_a)[0].reshape(-1, self.local_num_heads, self.head_dim)
         )
 
+    def _sm80_conv_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Upstream's q|k|v short-conv weight as one (3P, K) matrix, and its
+        bias. Where upstream keeps the three convs as one fused ``conv1d``
+        parameter (3P, 1, K), a view of it; otherwise the three convs merged
+        once (upstream's ``_forward`` then finds the merge built)."""
+        conv1d = getattr(self, "conv1d", None)
+        if conv1d is not None:
+            weight = conv1d.weight
+            return weight.view(weight.size(0), weight.size(-1)), conv1d.bias
+        if self._merged_conv_weight is None:
+
+            def _w(m):
+                return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+            self._merged_conv_weight = torch.cat(
+                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                dim=0,
+            ).contiguous()
+        return self._merged_conv_weight, self.q_conv1d.bias
+
     def sm80_forward_tail(
         self,
         hidden_states: torch.Tensor,
@@ -416,19 +436,7 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
         (conv_state, recurrent_state) = self.kv_cache
         if not self._conv_state_dim_first:
             conv_state = conv_state.transpose(-1, -2)
-        # Upstream's merged q|k|v short-conv weight, built once (upstream's
-        # _forward finds it built).
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
-        conv_weights = self._merged_conv_weight
-        conv_bias = self.q_conv1d.bias
+        conv_weights, conv_bias = self._sm80_conv_weights()
 
         pure_verify = (
             use_spec
