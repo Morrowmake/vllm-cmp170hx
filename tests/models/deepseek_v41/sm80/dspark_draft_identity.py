@@ -44,7 +44,9 @@ def assert_identity(records, world, modes):
 
 
 def _fixture(rank, world, device, case, requests, steps, small, gather):
-    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    from vllm_sm80.spec_decode.dspark_width import (
+        Sm80DSparkSpeculator as DSparkSpeculator,
+    )
 
     width = 25 if small else 32320
     vocab = width * world - (3 if small else 0)

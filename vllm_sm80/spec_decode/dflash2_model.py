@@ -193,9 +193,7 @@ def _dynamic_grouped_conv(
 def _load_following_width(vllm_config: VllmConfig) -> bool:
     """Whether the drafter drafts per-step widths
     (adaptive_k.draft_by_load), so the conv's block length varies."""
-    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
-        load_following_draft_widths,
-    )
+    from vllm_sm80.spec_decode.dflash2_speculator import load_following_draft_widths
 
     return bool(load_following_draft_widths(vllm_config))
 

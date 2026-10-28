@@ -176,7 +176,9 @@ def _rank_main(rank: int, tp: int, init_file: str, result_file: str) -> None:
     import torch.distributed as dist
 
     from vllm_sm80.spec_decode import shard_argmax as sa
-    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    from vllm_sm80.spec_decode.dspark_width import (
+        Sm80DSparkSpeculator as DSparkSpeculator,
+    )
 
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank,
                             world_size=tp)

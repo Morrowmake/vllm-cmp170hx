@@ -28,8 +28,17 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_module
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator as _UpstreamDFlashSpeculator,
+)
+from vllm_sm80.spec_decode.dflash_width import DraftWidthMixin
+from vllm_sm80.spec_decode.dspark_width import (
+    Sm80DSparkSpeculator as DSparkSpeculator,
+)
+
+
+class DFlashSpeculator(DraftWidthMixin, _UpstreamDFlashSpeculator):
+    """vLLM's DFlash speculator with the plugin's draft widths."""
 
 pytestmark = pytest.mark.cpu_test
 

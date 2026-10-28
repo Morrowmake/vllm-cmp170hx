@@ -78,7 +78,7 @@ def test_default_off_is_original_class(monkeypatch):
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
     result = width_module.create_dspark_speculator(_config(), torch.device("cpu"))
-    assert type(result) is upstream.DSparkSpeculator
+    assert type(result) is width_module.Sm80DSparkSpeculator
     result.set_width(3)
     assert result.width == 5
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", True)
@@ -90,16 +90,21 @@ def test_default_off_is_original_class(monkeypatch):
 def test_non_anchor_mode_is_refused_before_base_initialization(monkeypatch):
     config = _config()
     config.speculative_config.draft_model_config.hf_config.sample_from_anchor = False
-    base_init = MagicMock(return_value=None)
+    calls = []
+
+    def base_init(self, config, device):
+        calls.append(config)
+        _init_cpu(self, config, device)
+
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", base_init)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", True)
     with pytest.raises(ValueError, match="requires sample_from_anchor=True"):
         width_module.create_dspark_speculator(config, torch.device("cpu"))
-    base_init.assert_not_called()
+    assert calls == []
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
     result = width_module.create_dspark_speculator(config, torch.device("cpu"))
-    assert type(result) is upstream.DSparkSpeculator
-    base_init.assert_called_once()
+    assert type(result) is width_module.Sm80DSparkSpeculator
+    assert calls == [config]
 
 
 @pytest.mark.parametrize("schedule,expected", [

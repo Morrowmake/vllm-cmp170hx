@@ -35,6 +35,9 @@ def _init_cpu(self, config, device):
     self.device = device
     self.max_num_reqs = 8
     self.max_width = self.width = self.num_speculative_steps = 5
+    self.num_query_per_req = 5
+    self.draft_tokens = torch.zeros(8, 5, dtype=torch.int64)
+    self.sample_col = torch.arange(5, dtype=torch.int32).repeat(8)
     self.draft_token_confidence_probs = torch.full((8, 5), -1.0)
     self.use_confidence_head = False
 
@@ -73,7 +76,7 @@ def test_flag_defaults_off_and_keeps_the_original_class(monkeypatch):
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
     result = width_module.create_dspark_speculator(_config(), torch.device("cpu"))
-    assert type(result) is upstream.DSparkSpeculator
+    assert type(result) is width_module.Sm80DSparkSpeculator
 
 
 def test_flag_wraps_the_plain_and_the_per_width_drafter(make, monkeypatch):

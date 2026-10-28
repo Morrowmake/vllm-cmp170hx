@@ -13,6 +13,7 @@ from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm_sm80.worker import pp_draft_tail as dt
 from vllm.v1.worker.gpu.spec_decode.dflash2 import speculator as sm
+from vllm_sm80.spec_decode import dflash2_speculator as plugin
 
 BY_LOAD_WIDTH = {"by_load": [5, 4, 3], "draft_by_load": True}
 MAX_REQS, TOP_K, H, VOCAB = 8, 4, 16, 97
@@ -44,7 +45,7 @@ def test_drafter_gate(sample, adaptive, dp, expect):
             draft_sample_method=sample, enable_adaptive_verification=adaptive),
         parallel_config=SimpleNamespace(data_parallel_size=dp),
         additional_config={"sm80": {"adaptive_k": BY_LOAD_WIDTH}})
-    assert sm.load_following_draft_widths(cfg) == expect
+    assert plugin.load_following_draft_widths(cfg) == expect
 
 
 # ------------------------------------------------------------- the scheduler
@@ -143,11 +144,11 @@ class _WalkStub:
 
 
 def _drafter(max_width, widths, width, num_reqs, pad, split, seed=0):
-    """A DFlash2Speculator (CPU, stand-in model) whose block is ``max_width``,
+    """A plugin DFlash2 speculator (CPU, stand-in model) whose block is ``max_width``,
     drafting at ``width``. The inputs depend only on (width, rows, seed), so
     two drafters drafting the same width see the same step."""
     k = max_width
-    s = object.__new__(sm.DFlash2Speculator)
+    s = object.__new__(plugin.Sm80DFlash2Speculator)
     s.device = torch.device("cpu")
     s.dtype = torch.float32
     s.hidden_size = H
@@ -325,7 +326,7 @@ def test_drafter_banner_logs_on_a_non_first_rank(monkeypatch, caplog_vllm):
     # The premise: a *_once line is dropped on this rank ...
     init_logger("vllm.test_draft_width").info_once("once-only line %s", "x")
     # ... while the drafter's banner still prints.
-    sm.log_draft_width_banner((3, 4, 5))
+    plugin.log_draft_width_banner((3, 4, 5))
     messages = [r.getMessage() for r in caplog_vllm.records]
     assert not any("once-only line" in m for m in messages)
     assert any(
@@ -342,9 +343,9 @@ def test_drafter_gate_warning_logs_on_a_non_first_rank(monkeypatch, caplog_vllm)
             draft_sample_method="probabilistic", enable_adaptive_verification=False),
         parallel_config=SimpleNamespace(data_parallel_size=1),
         additional_config={"sm80": {"adaptive_k": BY_LOAD_WIDTH}})
-    assert sm.load_following_draft_widths(cfg) == ()
+    assert plugin.load_following_draft_widths(cfg) == ()
     assert not any("keeps its full block" in r.getMessage() for r in caplog_vllm.records)
-    assert sm.load_following_draft_widths(cfg, log=True) == ()
+    assert plugin.load_following_draft_widths(cfg, log=True) == ()
     assert any("keeps its full block: needs greedy draft sampling" in r.getMessage()
                for r in caplog_vllm.records)
 

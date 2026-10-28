@@ -53,6 +53,9 @@ def _init_cpu(self, config, device):
     self.max_num_reqs = MAX_REQS
     self.max_num_tokens = MAX_TOKENS
     self.max_width = self.width = self.num_speculative_steps = MAX_DRAFT
+    self.num_query_per_req = MAX_DRAFT
+    self.draft_tokens = torch.zeros(MAX_REQS, MAX_DRAFT, dtype=torch.int64)
+    self.sample_col = torch.arange(MAX_DRAFT, dtype=torch.int32).repeat(MAX_REQS)
     self.draft_token_confidence_probs = torch.full((MAX_REQS, MAX_DRAFT), -1.0)
     self.use_confidence_head = False
     self.dp_size = 1
@@ -127,7 +130,7 @@ def test_switch_off_keeps_the_class_and_creates_no_state(monkeypatch):
         raising=False,
     )
     drafter = width_module.create_dspark_speculator(_config(), torch.device("cpu"))
-    assert type(drafter) is upstream.DSparkSpeculator
+    assert type(drafter) is width_module.Sm80DSparkSpeculator
     drafter.load_draft_model(None, set())
     assert drafter.use_confidence_head is False
     assert state_module.get_row_mask_state() is None
@@ -358,7 +361,7 @@ def kernel_cases() -> dict:
         if self._row_stats is not None:
             self._row_stats[:num_reqs, :, :width] = self.next_stats[:num_reqs, :, :width]
 
-    upstream.DSparkSpeculator._sample_sequential = sample
+    width_module.Sm80DSparkSpeculator._sample_sequential = sample
 
     def drafter(base):
         cls = conf_module.row_mask_class(base)
@@ -397,7 +400,7 @@ def kernel_cases() -> dict:
             "want_drafts": d.next_tokens[:padded, :width].tolist(),
         }
 
-    plain = drafter(upstream.DSparkSpeculator)
+    plain = drafter(width_module.Sm80DSparkSpeculator)
     plain._row_mask.conf_by_slot[4] = 0.25  # a slot outside the batch
     out["plain"] = step(plain, [6, 1, 3], MAX_DRAFT, padded=4)
 

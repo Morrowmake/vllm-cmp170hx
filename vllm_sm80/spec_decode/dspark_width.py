@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSpark query blocks at the scheduler's requested speculative width."""
+"""vLLM's DSpark speculator as the plugin builds it (the speculator factory,
+``vllm_sm80.spec_decode.speculators``): draft widths (:class:`DraftWidthMixin`,
+one width unless ``VLLM_DSPARK_PER_K_WIDTH``), the shard argmax of the greedy
+drafts (``VLLM_SM80_SHARD_ARGMAX``) and the DSpark switches."""
 
 import torch
 
@@ -9,6 +12,8 @@ from vllm.config import VllmConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm_sm80.spec_decode.adaptive_k import config_of
+from vllm_sm80.spec_decode.dflash_width import DraftWidthMixin
+from vllm_sm80.spec_decode.shard_argmax import shard_argmax_sampling
 
 
 def draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
@@ -37,7 +42,7 @@ def create_dspark_speculator(
             "VLLM_DSPARK_ADAPTIVE_DEPTH and VLLM_DSPARK_CONFIDENCE_DUMP cannot be "
             "set together: the dump would label drafts the mask cut as rejected."
         )
-    cls = DSparkSpeculator
+    cls = Sm80DSparkSpeculator
     if envs.VLLM_DSPARK_PER_K_WIDTH:
         cls = PerKDSparkSpeculator
     if envs.VLLM_DSPARK_CONFIDENCE_DUMP:
@@ -51,7 +56,13 @@ def create_dspark_speculator(
     return cls(vllm_config, device)
 
 
-class PerKDSparkSpeculator(DSparkSpeculator):
+class Sm80DSparkSpeculator(DraftWidthMixin, DSparkSpeculator):
+    """vLLM's DSpark speculator with draft widths and the shard argmax."""
+
+    _sample_sequential = shard_argmax_sampling(DSparkSpeculator._sample_sequential)
+
+
+class PerKDSparkSpeculator(Sm80DSparkSpeculator):
     """Reuse DFlash's per-width graphs/views with DSpark's anchor layout.
 
     The maximum-width logits cache retains its request/column strides: the

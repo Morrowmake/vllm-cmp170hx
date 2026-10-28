@@ -25,7 +25,13 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm_sm80.spec_decode.dflash_width import DraftWidthMixin
+from vllm_sm80.spec_decode.dspark_width import Sm80DSparkSpeculator
+
+
+class _WidthDFlashSpeculator(DraftWidthMixin, DFlashSpeculator):
+    pass
+
 
 pytestmark = pytest.mark.cpu_test
 
@@ -72,7 +78,9 @@ def test_direct_and_dictionary_slots_share_pool_and_cleanup():
     assert untouched.manager.pool == GLOBAL_POOL
 
 
-@pytest.mark.parametrize("speculator_cls", [DFlashSpeculator, DSparkSpeculator])
+@pytest.mark.parametrize(
+    "speculator_cls", [_WidthDFlashSpeculator, Sm80DSparkSpeculator]
+)
 @pytest.mark.parametrize("outcome", ["capture", "capture_error", "no_graphs"])
 def test_real_width_managers_retire_and_reinitialize(monkeypatch, speculator_cls, outcome):
     _patch_module(monkeypatch)
