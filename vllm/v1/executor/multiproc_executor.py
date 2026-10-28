@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import multiprocessing
 import os
 import pickle
@@ -44,6 +45,7 @@ from vllm.distributed.parallel_state import (
 from vllm.envs import enable_envs_cache
 from vllm.logger import configure_logging, init_logger
 from vllm.platforms import current_platform
+from vllm_sm80.distributed.step_errors import dispatch_worker_output
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
 from vllm.utils.network_utils import (
@@ -1180,8 +1182,7 @@ class WorkerProc:
             # is serialized/enqueued in handle_output().
             watchdog.feed()
 
-            if output_rank is None or self.rank == output_rank:
-                self.handle_output(output)
+            dispatch_worker_output(self, output, output_rank)
         except Exception as e:
             # Notes have been introduced in python 3.11
             if hasattr(e, "add_note"):
