@@ -9,6 +9,17 @@ the row's `why`, run this script to record the new fingerprints:
 
     python tests/sm80/update_seams.py            # rewrite every row
     python tests/sm80/update_seams.py ID [ID..]  # rewrite only these rows
+    python tests/sm80/update_seams.py --new-base # start the pins of a new
+                                                 # upstream base (below)
+
+The plugin runs on more than one upstream vLLM base, and a seam's
+fingerprint is the object as one base has it. seams.yaml pins the base named
+in FORK.md; seams.<base12>.yaml (the first 12 hex digits of the commit) is
+the reviewed re-pin for another base. A tree is checked, and rewritten, by
+the file of its upstream base when there is one, else by seams.yaml. The
+base is that of the vLLM the tests import: the `upstream_commit` of the
+assembly.json beside an assembled engine (<dir>/engine/vllm next to
+<dir>/assembly.json), else the `Upstream base:` line of FORK.md.
 
 Run it with the repository root importable (for example PYTHONPATH=.).
 """
@@ -16,7 +27,9 @@ Run it with the repository root importable (for example PYTHONPATH=.).
 import argparse
 import hashlib
 import importlib
+import importlib.util
 import inspect
+import json
 import re
 import sys
 import textwrap
@@ -26,6 +39,8 @@ from typing import Any
 import yaml
 
 SEAMS_PATH = Path(__file__).with_name("seams.yaml")
+REPO = Path(__file__).absolute().parents[2]
+FORK_BASE = re.compile(r"^Upstream base: ([0-9a-f]{40})$", re.M)
 
 # The repr of an object without its own __repr__ (a default-argument instance,
 # e.g. a registry singleton) carries its memory address, which differs per
@@ -42,7 +57,9 @@ HEADER = """\
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Upstream seams the sm80 fork code relies on without editing them.
+# Upstream seams the sm80 fork code relies on without editing them, pinned as
+# one upstream base has them (seams.yaml: the base in FORK.md;
+# seams.<base12>.yaml: the re-pin for another base).
 # Checked by tests/sm80/test_seams.py. After checking an upstream change to
 # a seam, rewrite the pins with: python tests/sm80/update_seams.py [ID ...]
 #
@@ -57,6 +74,35 @@ HEADER = """\
 #   value      exact value, for constants only (attr kinds, optional)
 #   dict_contract rows also require every value to be a zero-arg callable.
 """
+
+
+def upstream_base() -> str | None:
+    """The upstream base of the vLLM the tests import: an assembled engine's
+    assembly.json `upstream_commit`, else FORK.md's `Upstream base:`, else
+    None."""
+    spec = importlib.util.find_spec("vllm")
+    if spec is not None and spec.origin is not None:
+        engine = Path(spec.origin).resolve().parents[1]
+        assembly = engine.parent / "assembly.json"
+        if engine.name == "engine" and assembly.is_file():
+            return json.loads(assembly.read_text())["upstream_commit"]
+    fork_map = REPO / "FORK.md"
+    found = FORK_BASE.search(fork_map.read_text()) if fork_map.is_file() else None
+    return found.group(1) if found else None
+
+
+def base_seams_path(base: str) -> Path:
+    """The reviewed re-pin for upstream `base` (it may not exist)."""
+    return SEAMS_PATH.with_name(f"seams.{base[:12]}.yaml")
+
+
+def seams_path(base: str | None) -> Path:
+    """The pins a tree on upstream `base` is checked by: its base's re-pin
+    when there is one, else seams.yaml."""
+    if base is not None and base_seams_path(base).is_file():
+        return base_seams_path(base)
+    return SEAMS_PATH
+
 
 
 def load_rows(path: Path = SEAMS_PATH) -> list[dict[str, Any]]:
@@ -148,10 +194,31 @@ def dump_rows(rows: list[dict[str, Any]], path: Path = SEAMS_PATH) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("ids", nargs="*", help="seam ids to rewrite (default: all)")
-    parser.add_argument("--file", type=Path, default=SEAMS_PATH)
+    parser.add_argument(
+        "--file",
+        type=Path,
+        help="the pins to rewrite (default: those the tree is checked by)",
+    )
+    parser.add_argument(
+        "--new-base",
+        action="store_true",
+        help="write seams.<base12>.yaml for the tree's upstream base, "
+        "started from seams.yaml when it does not exist yet",
+    )
     args = parser.parse_args(argv)
 
-    rows = load_rows(args.file)
+    if args.file is not None:
+        source = target = args.file
+    elif args.new_base:
+        base = upstream_base()
+        if base is None:
+            parser.error("--new-base: the tree's upstream base is unknown")
+        target = base_seams_path(base)
+        source = target if target.is_file() else SEAMS_PATH
+    else:
+        source = target = seams_path(upstream_base())
+    print(f"pins: {target}")
+    rows = load_rows(source)
     known_ids = {row["id"] for row in rows}
     unknown = sorted(set(args.ids) - known_ids)
     if unknown:
@@ -177,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{failed} seam(s) could not be measured; file left unchanged",
               file=sys.stderr)
         return 1
-    dump_rows(rows, args.file)
+    dump_rows(rows, target)
     return 0
 
 

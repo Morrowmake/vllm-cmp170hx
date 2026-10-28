@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Upstream seams the sm80 fork code relies on without editing them.
+# Upstream seams the sm80 fork code relies on without editing them, pinned as
+# one upstream base has them (seams.yaml: the base in FORK.md;
+# seams.<base12>.yaml: the re-pin for another base).
 # Checked by tests/sm80/test_seams.py. After checking an upstream change to
 # a seam, rewrite the pins with: python tests/sm80/update_seams.py [ID ...]
 #

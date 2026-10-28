@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check that the upstream seams pinned in seams.yaml are unchanged.
+"""Check that the upstream seams pinned for this tree's upstream base are
+unchanged: seams.<base12>.yaml when the base has its own pins, else
+seams.yaml (update_seams.py says how the base is found).
 
 One test per seam row. A failure means upstream changed (or removed) an
 object the sm80 fork code relies on; check the change against the row's
 `why`, adapt the fork code if needed, then refresh the pin with
-tests/sm80/update_seams.py.
+tests/sm80/update_seams.py (--new-base on an upstream base the plugin has no
+pins for yet).
 
 Set SM80_SEAMS_FILE to check a different pin file.
 """
@@ -23,7 +26,9 @@ _spec = importlib.util.spec_from_file_location(
 seams = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(seams)
 
-SEAMS_FILE = Path(os.environ.get("SM80_SEAMS_FILE", seams.SEAMS_PATH))
+SEAMS_FILE = Path(
+    os.environ.get("SM80_SEAMS_FILE") or seams.seams_path(seams.upstream_base())
+)
 ROWS = seams.load_rows(SEAMS_FILE)
 
 
