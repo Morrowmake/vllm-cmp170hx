@@ -722,10 +722,11 @@ class _WalkStub:
 
 def _speculator(num_reqs, pad, split, seed=0):
     from vllm.v1.worker.gpu.spec_decode.dflash2 import speculator as sm
+    from vllm_sm80.spec_decode.dflash2_speculator import Sm80DFlash2Speculator
 
     k, top_k, h, nq, max_reqs, vocab = K, 4, 16, K + 1, 8, 97
     g = torch.Generator().manual_seed(seed)
-    s = object.__new__(sm.DFlash2Speculator)
+    s = object.__new__(Sm80DFlash2Speculator)
     s.device = torch.device("cpu")
     s.dtype = torch.float32
     s.hidden_size = h
@@ -741,6 +742,10 @@ def _speculator(num_reqs, pad, split, seed=0):
     s.use_fp64_gumbel = False
     s.enable_adaptive_verification = False
     s.split_tail = False
+    s.max_width = s.width = k
+    s.widths = (k,)
+    s._tail_layouts, s._tail_row_ids_by_width, s._anchor_indices_by_width = {}, {}, {}
+    s.draft_tail_controller = None
     s.input_buffers = SimpleNamespace(
         input_ids=torch.randint(0, vocab, (max_reqs * nq,), generator=g,
                                 dtype=torch.int32))
@@ -926,7 +931,7 @@ def test_finalized_pipeline_decodes_on_every_stage(monkeypatch):
                         lambda *a: contextlib.nullcontext())
     monkeypatch.setattr(sm, "_selector_walk_kernel", _WalkStub())
 
-    spec, rows = _speculator(3, 1, split=False)
+    spec, rows = _speculator(3, 1, split=True)
     cfg = _config()
     cfg.model_config = SimpleNamespace(use_fp64_gumbel=False)
     cfg.scheduler_config = SimpleNamespace(max_num_seqs=MAX_REQS)

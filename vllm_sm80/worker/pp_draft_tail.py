@@ -314,6 +314,19 @@ def run_draft_tail(
 
 
 @dataclass
+class DraftTailStep:
+    """This step's moved draft tail, on a non-last stage.
+
+    On the tail stage ``compute`` turns the received payload into the step's
+    draft tokens (written into its second argument); elsewhere it is None and
+    the stage only needs to know that the drafts are rooted at the tail stage.
+    """
+
+    payload_nbytes: int
+    compute: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+
+
+@dataclass
 class RemoteDrafts:
     step: int
     event: Any
@@ -486,6 +499,38 @@ def _find_lm_head_prefix(model: torch.nn.Module) -> str:
     return "lm_head"
 
 
+def _draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    """The config the drafter is built under on the last stage (its modules,
+    compile tags): the ``replace`` of vLLM's ``load_dflash_model``
+    (``vllm/v1/worker/gpu/spec_decode/dflash/utils.py``; seam
+    ``worker-dflash-draft-config``)."""
+    from vllm.config import replace
+    from vllm.model_executor.model_loader.utils import get_draft_load_config
+    from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+    from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
+
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    draft_model_config = speculative_config.draft_model_config
+    return replace(
+        vllm_config,
+        attention_config=replace(
+            vllm_config.attention_config,
+            use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
+            backend=speculative_config.attention_backend,
+        ),
+        cache_config=(
+            replace(
+                vllm_config.cache_config,
+                cache_dtype=speculative_config.kv_cache_dtype,
+            )
+            if speculative_config.kv_cache_dtype is not None
+            else vllm_config.cache_config
+        ),
+        load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
+    )
+
+
 class DraftTailModule(torch.nn.Module):
     """lm_head, the candidate logits processor and the candidate selector,
     built the way the last stage builds them (same classes, same arguments,
@@ -501,16 +546,13 @@ class DraftTailModule(torch.nn.Module):
             ParallelLMHead,
         )
         from vllm_sm80.spec_decode.dflash2_model import build_candidate_selector
-        from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
-            dflash_draft_vllm_config,
-        )
 
         spec = vllm_config.speculative_config
         assert spec is not None
         draft_hf = spec.draft_model_config.hf_config
         draft_cfg = draft_hf.dflash_config
         target_hf = vllm_config.model_config.hf_text_config
-        draft_vllm_config = dflash_draft_vllm_config(vllm_config)
+        draft_vllm_config = _draft_vllm_config(vllm_config)
         self.lm_head_prefix = _find_lm_head_prefix(target_model)
         with set_current_vllm_config(vllm_config):
             self.lm_head = ParallelLMHead(
@@ -651,7 +693,7 @@ class DraftTailController:
         self.rows_table: dict[int, dict[int, int]] | None = None
         self.layout: TailPayloadLayout | None = None  # the widest
         self.layouts: dict[int, TailPayloadLayout] = {}
-        from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+        from vllm_sm80.spec_decode.dflash2_speculator import (
             load_following_draft_widths,
         )
 
@@ -693,13 +735,10 @@ class DraftTailController:
         self.handler = handler
 
     def attach_speculator(self, speculator) -> None:
-        """Last stage: capture the drafter without its tail from now on."""
-        from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
-            DFlash2Speculator,
-        )
-
-        if self.is_last and isinstance(speculator, DFlash2Speculator):
-            speculator.enable_split_tail()
+        """Last stage: the drafter that captures its graphs without the tail
+        (the plugin DFlash2 speculator splits it at construction)."""
+        if self.is_last and getattr(speculator, "split_tail", False):
+            speculator.draft_tail_controller = self
             self.speculator = speculator
             self.layouts = {w: speculator.tail_layout_for(w) for w in self.widths}
             self.layout = self.layouts[max(self.widths)]
@@ -767,8 +806,6 @@ class DraftTailController:
         """Non-last stages: this step's DraftTailStep, or None (tail local).
         ``width`` is the block this step drafts (every stage has it from the
         scheduler output)."""
-        from vllm.v1.worker.gpu.pp_utils import DraftTailStep
-
         if not self.remote_step(input_batch):
             return None
         if not self.is_tail:
