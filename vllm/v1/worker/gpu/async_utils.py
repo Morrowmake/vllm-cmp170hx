@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm_sm80.distributed.step_errors import install_output_checks
+from vllm_sm80 import failed_inputs
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -123,6 +126,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        failed_tokens: torch.Tensor | None = None,
+        query_start_loc_np: np.ndarray | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -166,6 +171,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
                     num_sampled=self.num_sampled_tokens_np,
                     num_rejected=async_copy_to_np(sampler_output.num_rejected),
                 )
+            failed_inputs.attach(self, failed_tokens, query_start_loc_np)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -206,6 +212,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.aux_output_connector_output = (
                 self.pending_aux_output.process_output()
             )
+
+        failed_inputs.apply(self)
 
         if self._has_fault is not None and self._has_fault.item():
             mask = get_ep_all2all_manager().query_active_mask()
@@ -284,3 +292,6 @@ def stream(to_stream: torch.cuda.Stream, from_stream: torch.cuda.Stream):
         yield
     finally:
         torch.cuda.set_stream(from_stream)
+
+
+install_output_checks(AsyncOutput, AsyncPoolingOutput)
