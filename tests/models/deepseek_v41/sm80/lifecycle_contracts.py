@@ -92,11 +92,23 @@ from vllm.models.deepseek_v41 import compressor as compressor_mod  # noqa: E402
 from vllm_sm80.models.deepseek_v41 import sm80_engram  # noqa: E402
 from vllm_sm80.models.deepseek_v41.ops import sm80_attn_core as core  # noqa: E402
 from vllm_sm80.models.deepseek_v41.ops import sm80_engram_dequant  # noqa: E402
+from vllm_sm80.plugin import register_fork_env_vars  # noqa: E402
 from vllm.triton_utils import triton  # noqa: E402
 from vllm.v1.attention.backends.mla import sparse_swa  # noqa: E402
 
+# The Engram host fetch reads the plugin's variables (VLLM_SM80_CAPTURE) from
+# vllm.envs, where a served process has them from the plugin's entry points.
+register_fork_env_vars()
+
 BF16 = torch.bfloat16
 ROOT = Path(__file__).resolve().parents[4]
+# Where a CODE_FILES path lives: upstream's package in the engine tree, the
+# plugin package in the plugin tree, else beside these tests (tests/, csrc/).
+# All three are ROOT in a single tree; an assembled engine splits them.
+PACKAGE_ROOTS = {
+    "vllm/": Path(compressor_mod.__file__).resolve().parents[3],
+    "vllm_sm80/": Path(sm80_engram.__file__).resolve().parents[3],
+}
 WINDOW = 128
 SWA_BLOCK = 8  # tokens per window block
 COMP_BLOCK_TOKENS = 16  # tokens per compressed / index-key block
@@ -285,7 +297,9 @@ def identity(group: str) -> dict:
     """The code under test: its files' digest, the shapes of the history."""
     h = hashlib.sha256()
     for rel in CODE_FILES:
-        h.update(rel.encode() + b"\0" + (ROOT / rel).read_bytes())
+        root = next((r for p, r in PACKAGE_ROOTS.items() if rel.startswith(p)),
+                    ROOT)
+        h.update(rel.encode() + b"\0" + (root / rel).read_bytes())
     ident = {
         "producer": CODE_FILES[0],
         "code_sha256": h.hexdigest(),

@@ -41,7 +41,10 @@ def run_producer(tmp_path: Path, group: str, seed: int, mutation=None):
         module, old, new = mutation
         argv = [sys.executable, "-c", MUTATED.format(module=module, old=old, new=new)]
     argv += ["--group", group, "--seed", str(seed), "--out", str(out)]
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(ROOT))
+    # ROOT for the producer's own package, then every import root of this
+    # process: in an assembled engine vllm and vllm_sm80 are not under ROOT.
+    path = os.pathsep.join([str(ROOT), *sys.path])
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=path)
     proc = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert out.is_file(), proc.stdout + proc.stderr
     return proc.returncode, json.loads(out.read_text())
