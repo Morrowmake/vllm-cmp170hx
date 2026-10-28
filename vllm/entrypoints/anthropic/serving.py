@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/chat_completion/serving.py
 
@@ -270,11 +271,18 @@ class AnthropicServingMessages(OpenAIServingChat):
         """Probe the chat templates the renderer applies, not the CLI override.
 
         Both the tool and non-tool templates are checked since they may differ.
+        A renderer with its own prompt encoder and no ``--chat-template``
+        skips the merge only when its tokenizer declares that the encoder
+        renders inline system messages in place
+        (``renders_inline_system_messages``, e.g. DeepSeek-V4.1's).
         """
         renderer = online_renderer.renderer
         tool_variants: tuple[list[dict[str, Any]] | None, ...] = (None, [])
         if not isinstance(renderer, HfRenderer) or renderer.tokenizer is None:
-            merge = cls._detect_merge_inline_system(online_renderer.chat_template)
+            merge = not (
+                online_renderer.chat_template is None
+                and getattr(renderer.tokenizer, "renders_inline_system_messages", False)
+            ) and cls._detect_merge_inline_system(online_renderer.chat_template)
         else:
             merge = any(
                 cls._detect_merge_inline_system(
