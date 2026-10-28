@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -72,6 +73,7 @@ from vllm.renderers.inputs.preprocess import (
 )
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.utils.mistral import mt as _mt
+from vllm_sm80.parsers import adjust_on_tool_choice_none
 
 logger = init_logger(__name__)
 
@@ -852,6 +854,7 @@ class OnlineRenderer:
                 or parser.reasoning_parser_cls is not None
                 or tool_choice != "none"
                 or is_mistral_grammar_eligible
+                or adjust_on_tool_choice_none(parser)
             )
             if should_adjust_request:
                 if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
