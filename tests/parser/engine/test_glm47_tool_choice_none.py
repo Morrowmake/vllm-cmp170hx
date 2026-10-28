@@ -9,13 +9,20 @@ import pytest
 import torch
 
 from tests.parser.engine.conftest import make_mock_tokenizer
+from tests.parser.engine.sm80_parsers import fork_parsers  # noqa: F401
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.inputs.engine import tokens_input
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.parser.engine.parser_engine import ParserEngine
-from vllm.parser.glm47_moe import TOOL_CALL_START, Glm47MoeParser
+from vllm.parser.glm47_moe import TOOL_CALL_START
+from vllm_sm80.parsers import (
+    adjust_on_tool_choice_none,
+    wants_tool_choice_none_mask,
+)
+from vllm_sm80.parsers import glm47 as sm80_glm47
+from vllm_sm80.parsers.glm47 import Sm80Glm47MoeParser as Glm47MoeParser
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.renderers.params import ChatParams
 from vllm.v1.sample.ops.bad_words import apply_bad_words, apply_bad_words_with_drafts
@@ -180,31 +187,19 @@ def test_renderer_off_calls_adjust_only_where_upstream_does(api, flag, monkeypat
 @pytest.mark.parametrize("enabled", ["0", "1"])
 def test_startup_banner(enabled, monkeypatch):
     monkeypatch.setenv("VLLM_TOOL_CHOICE_NONE_MASK", enabled)
-    monkeypatch.setattr(
-        "vllm.renderers.online_renderer.ParserManager.get_parser",
-        lambda **kwargs: Glm47MoeParser,
-    )
     banner = MagicMock()
-    monkeypatch.setattr("vllm.renderers.online_renderer.logger.info_once", banner)
-    OnlineRenderer(
-        SimpleNamespace(hf_config=SimpleNamespace(model_type="glm5next"), model="glm"),
-        MagicMock(),
-        request_logger=None,
-        chat_template=None,
-        chat_template_content_format="string",
-    )
+    monkeypatch.setattr(sm80_glm47.logger, "info_once", banner)
+    sm80_glm47.log_mask_state()
     assert banner.call_args.args[1] == ("enabled" if enabled == "1" else "disabled")
 
 
 @pytest.mark.parametrize("api", ["chat", "responses"])
 @pytest.mark.parametrize("configuration", ["tool", "reasoning", "both"])
 @pytest.mark.parametrize("enabled", ["0", "1"])
-def test_managed_parser_and_startup_banner(api, configuration, enabled, monkeypatch):
+def test_managed_parser(api, configuration, enabled, monkeypatch):
     monkeypatch.setenv("VLLM_TOOL_CHOICE_NONE_MASK", enabled)
     tool = "glm47" if configuration in ("tool", "both") else None
     reasoning = "glm47" if configuration in ("reasoning", "both") else None
-    banner = MagicMock()
-    monkeypatch.setattr("vllm.renderers.online_renderer.logger.info_once", banner)
     tokenizer = _parser().model_tokenizer
     renderer = OnlineRenderer(
         SimpleNamespace(hf_config=SimpleNamespace(model_type="glm5next"), model="glm"),
@@ -216,8 +211,8 @@ def test_managed_parser_and_startup_banner(api, configuration, enabled, monkeypa
         reasoning_parser=reasoning,
         enable_auto_tools=True,
     )
-    assert renderer.parser.adjust_request_when_tool_choice_none
-    assert banner.call_args.args[1] == ("enabled" if enabled == "1" else "disabled")
+    assert wants_tool_choice_none_mask(renderer.parser)
+    assert adjust_on_tool_choice_none(renderer.parser) is (enabled == "1")
     renderer.model_config.multimodal_config = None
     renderer.model_config.enable_prompt_embeds = False
     renderer.model_config.is_encoder_decoder = False
@@ -246,29 +241,20 @@ def test_non_glm_managed_parser_retains_none_opt_out():
     parser_cls = ParserManager.get_parser(
         tool_parser_name="qwen3_xml", enable_auto_tools=True
     )
-    assert not parser_cls.adjust_request_when_tool_choice_none
+    assert not wants_tool_choice_none_mask(parser_cls)
 
 
-def test_real_logger_emits_managed_startup_banner(monkeypatch, caplog):
+def test_real_logger_emits_startup_banner(monkeypatch, caplog):
     import logging
 
     from vllm.logger import _print_info_once
-    from vllm.renderers.online_renderer import logger
 
+    logger = sm80_glm47.logger
     _print_info_once.cache_clear()
     monkeypatch.setenv("VLLM_TOOL_CHOICE_NONE_MASK", "1")
     monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
     caplog.set_level(logging.INFO, logger=logger.name)
-    OnlineRenderer(
-        SimpleNamespace(hf_config=SimpleNamespace(model_type="glm5next"), model="glm"),
-        MagicMock(),
-        request_logger=None,
-        chat_template=None,
-        chat_template_content_format="string",
-        tool_parser="glm47",
-        reasoning_parser="glm47",
-        enable_auto_tools=True,
-    )
+    sm80_glm47.log_mask_state()
     assert any(
         record.getMessage() == "GLM tool_choice=none decode mask: enabled "
         "(VLLM_TOOL_CHOICE_NONE_MASK)"

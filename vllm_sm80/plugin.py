@@ -187,6 +187,15 @@ def register() -> None:
     register_execution_trace()
     register_serial_trace_export()
     register_light_timing()
+    register_fork_parsers()
+
+
+def register_fork_parsers() -> None:
+    """The GLM-4.7 and DeepSeek V4.1 reasoning and tool parsers under their
+    upstream names (``vllm_sm80/parsers``)."""
+    from vllm_sm80.parsers import register_parsers
+
+    register_parsers()
 
 
 def register_execution_trace() -> None:

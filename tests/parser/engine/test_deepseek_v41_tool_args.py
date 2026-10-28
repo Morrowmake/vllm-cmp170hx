@@ -14,7 +14,8 @@ import json
 
 import pytest
 
-from tests.parser.engine.test_deepseek_v41 import (
+from tests.parser.engine.sm80_parsers import fork_parsers  # noqa: F401
+from tests.parser.engine.test_sm80_deepseek_v41_recovery import (
     _stream_calls,
     parser_for,
     tokenizer_for,
