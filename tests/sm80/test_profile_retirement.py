@@ -20,7 +20,6 @@ from tests.v1.worker.test_gpu_model_runner_v2_cudagraph_profiling import (
 )
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
 from vllm_sm80 import capture
-from vllm_sm80.worker.cudagraph_mem import profiling_speculator_graphs
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
@@ -40,12 +39,6 @@ class _Graph:
     pass
 
 
-def _bare_manager(pool=GLOBAL_POOL):
-    manager = cgu.CudaGraphManager.__new__(cgu.CudaGraphManager)
-    manager.pool = pool
-    return manager
-
-
 def test_gpu_regression_has_reimportable_spawn_identity():
     module = importlib.import_module(
         "tests.v1.worker.test_sm80_profile_retirement_gpu")
@@ -57,25 +50,6 @@ def test_gpu_regression_has_reimportable_spawn_identity():
     for name in test.__qualname__.split("."):
         target = getattr(target, name)
     assert target is test
-
-
-def test_direct_and_dictionary_slots_share_pool_and_cleanup():
-    direct = _bare_manager()
-    registry = {3: _bare_manager(), 5: direct, "metadata": "keep"}
-    untouched = SimpleNamespace(manager=_bare_manager())
-    speculator = SimpleNamespace(
-        query=direct, managers=registry, alias=registry, other=untouched,
-    )
-    with profiling_speculator_graphs(speculator, THROWAWAY_POOL):
-        assert speculator.query.pool == THROWAWAY_POOL
-        assert all(registry[k].pool == THROWAWAY_POOL for k in (3, 5))
-        assert untouched.manager.pool == GLOBAL_POOL
-        # A lazily constructed manager uses the already-swapped global pool.
-        registry[7] = _bare_manager(THROWAWAY_POOL)
-    assert speculator.query is None
-    assert speculator.managers is speculator.alias is registry
-    assert registry == {"metadata": "keep"}
-    assert untouched.manager.pool == GLOBAL_POOL
 
 
 @pytest.mark.parametrize(
@@ -140,17 +114,26 @@ def test_real_width_managers_retire_and_reinitialize(monkeypatch, speculator_cls
     original_capture = runner.capture_model
 
     def capture_model(*, profile_only=False):
+        # As the fork runner's capture_model: the per-width managers are
+        # dropped once the profiling capture returns or fails.
         assert profile_only
-        speculator.capture()
-        assert not capture._pending
-        if outcome == "capture_error":
-            raise RuntimeError("capture failed")
-        return original_capture(profile_only=profile_only)
+        try:
+            speculator.capture()
+            assert not capture._pending
+            if outcome == "capture_error":
+                raise RuntimeError("capture failed")
+            return original_capture(profile_only=profile_only)
+        finally:
+            speculator.retire_width_managers()
 
     def teardown(r):
         r.events.append("teardown")
         gc.collect()
         assert speculator.query_cudagraph_manager is None
+        if outcome == "no_graphs":
+            # Nothing was captured, so nothing holds the profiling pool; the
+            # real initialization replaces the managers.
+            return
         assert speculator._cg_managers == {}
         assert all(ref() is None for ref in profile_refs)
 

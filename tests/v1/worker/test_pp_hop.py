@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm_sm80.worker import worker_hooks
 from vllm_sm80.worker.pp_hop import HopLayout, PackedHop
 
 T, N, H = 7, 4, 16
@@ -159,23 +159,23 @@ def test_pp_hop_rows_only_when_every_stage_runs_the_scheduled_count():
     runner = SimpleNamespace(
         adaptive_verification=None, pcp_manager=None, ubatch_runner=None
     )
-    assert GPUModelRunner.pp_hop_rows(runner, sched) == 37
+    assert worker_hooks._hop_rows(runner, sched) == 37
     for attr in ("adaptive_verification", "pcp_manager", "ubatch_runner"):
         r = SimpleNamespace(**{**vars(runner), attr: object()})
-        assert GPUModelRunner.pp_hop_rows(r, sched) is None
+        assert worker_hooks._hop_rows(r, sched) is None
 
 
 def _worker(monkeypatch, *, flag, no_meta=False, v2=True, pp=4, tp=1):
-    import vllm.v1.worker.gpu_worker as gw
+    import vllm.distributed as dist
 
     monkeypatch.setenv("VLLM_PP_PACKED_HOP", "1" if flag else "0")
     monkeypatch.setenv("VLLM_PP_HOP_NO_METADATA", "1" if no_meta else "0")
     monkeypatch.setattr(
-        gw, "get_pp_group", lambda: SimpleNamespace(world_size=pp, rank_in_group=0)
+        dist, "get_pp_group", lambda: SimpleNamespace(world_size=pp, rank_in_group=0)
     )
-    monkeypatch.setattr(gw, "get_tp_group", lambda: SimpleNamespace(world_size=tp))
+    monkeypatch.setattr(dist, "get_tp_group", lambda: SimpleNamespace(world_size=tp))
     w = SimpleNamespace(use_v2_model_runner=v2, _pp_hop=None, _pp_hop_resolved=False)
-    return gw._resolve_pp_hop(w)
+    return worker_hooks._pp_hop(w)
 
 
 def test_worker_hop_gate(monkeypatch):

@@ -16,6 +16,7 @@ from vllm_sm80.sched.scheduler import Sm80AsyncScheduler, Sm80Scheduler
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm_sm80.worker import adaptive_k_graphs
 from vllm_sm80.worker import pp_draft_tail as dt
 
 BY_LOAD = {"by_load": [5, 4, 3]}
@@ -236,12 +237,12 @@ def _graph_manager(
     spec.num_speculative_tokens_per_batch_size = None
     spec.num_speculative_tokens = num_speculative_tokens
     vllm_config.speculative_config = spec
-    return gpu_cudagraph_utils.CudaGraphManager(
+    # The target model's manager: the only one adaptive-k widens.
+    return gpu_cudagraph_utils.ModelCudaGraphManager(
         vllm_config=vllm_config,
         device=torch.device("cpu"),
         cudagraph_mode=cudagraph_mode,
         decode_query_len=num_speculative_tokens + 1,
-        adaptive_k_capture=True,
     )
 
 
@@ -387,7 +388,7 @@ def test_decode_graph_miss_is_any_mode_below_the_decode_mode(
     desc = gpu_cudagraph_utils.BatchExecutionDescriptor(
         cg_mode=dispatched, num_tokens=12, num_reqs=3
     )
-    assert manager.is_decode_graph_miss(desc) is missed
+    assert adaptive_k_graphs.is_decode_graph_miss(manager, desc) is missed
 
 
 def test_set_cudagraph_sizes_load_tiers(monkeypatch):

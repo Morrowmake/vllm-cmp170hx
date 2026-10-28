@@ -230,8 +230,8 @@ def test_select_worker(monkeypatch, flag):
     monkeypatch.delenv("VLLM_SM80_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
     cudagraph_mem.select_worker(parallel)
-    expected = cudagraph_mem.WORKER if flag != "0" else cudagraph_mem.UPSTREAM_WORKER
-    assert parallel.worker_cls == expected
+    # The fork worker carries every runner feature, each off with its switch.
+    assert parallel.worker_cls == cudagraph_mem.WORKER
     # The qualname resolves to the fork worker.
     assert (
         f"{graph_mem_worker.GraphMemWorker.__module__}."

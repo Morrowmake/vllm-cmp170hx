@@ -124,3 +124,26 @@ def test_prepare_inputs_preserves_base_padding_and_routes(
     assert mr.mask_padding_topk_ids(ids) is ids
     assert torch.equal(ids, expected_ids)
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_generic_padding_flag_controls_padding_fill(monkeypatch, skip):
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", str(int(skip)))
+    monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
+    buffers = InputBuffers(max_num_reqs=2, max_num_tokens=8, device=torch.device("cpu"))
+    buffers.is_padding.fill_(True)  # stale previous-step padding
+
+    class StopAfterMask:
+        num_tokens = 4
+
+        @property
+        def req_ids(self):
+            raise RuntimeError("stop after preparing padding")
+
+    runner = SimpleNamespace(input_buffers=buffers)
+    with pytest.raises(RuntimeError, match="stop after preparing padding"):
+        GPUModelRunner.prepare_inputs(
+            runner, None, StopAfterMask(), SimpleNamespace(num_tokens=8), 0
+        )
+    expected = [False] * 4 + [True] * 4 if skip else [True] * 8
+    assert buffers.is_padding.tolist() == expected

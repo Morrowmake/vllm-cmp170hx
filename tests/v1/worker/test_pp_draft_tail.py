@@ -25,7 +25,7 @@ import torch
 
 import vllm.v1.worker.gpu.pp_utils as pp_utils
 from vllm_sm80.worker import pp_draft_tail as dt
-from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm_sm80.worker.pp_handler import Sm80PPHandler
 
 FLAG = "VLLM_PP_DRAFT_TAIL_STAGE"
 
@@ -482,14 +482,22 @@ def test_tail_copy_is_allocated_inside_the_model_memory_profile():
     assert len(profiled) == 1
 
     def is_tail_load(n):
+        # The runner's hook that loads the tail (runner_hooks.after_drafter_load).
         return (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "load"
-                and isinstance(n.func.value, ast.Attribute)
-                and n.func.value.attr == "draft_tail")
+                and n.func.attr == "after_drafter_load")
 
     inside = [n for n in ast.walk(profiled[0]) if is_tail_load(n)]
     everywhere = [n for n in ast.walk(load_model) if is_tail_load(n)]
     assert len(inside) == 1 and len(everywhere) == 1
+
+    from vllm_sm80.worker import runner_hooks
+
+    loads = []
+    runner = SimpleNamespace(
+        model="target", dtype=torch.bfloat16, speculator=None,
+        draft_tail=SimpleNamespace(load=lambda *a: loads.append(a)))
+    runner_hooks.after_drafter_load(runner)
+    assert loads == [("target", torch.bfloat16)]
 
 
 class _Fp64Peak(torch.utils._python_dispatch.TorchDispatchMode):
@@ -872,7 +880,7 @@ class _Stream:
 
 
 def _make_handler(rank, remote_on):
-    h = PPHandler.__new__(PPHandler)
+    h = Sm80PPHandler.__new__(Sm80PPHandler)
     h.is_last_rank = rank == PP - 1
     h.last_rank = PP - 1
     h.max_sample_len = K + 1
@@ -891,7 +899,19 @@ def _make_handler(rank, remote_on):
     h.tail_group = "tail" if remote_on else None
     h.remote_drafts = (dt.RemoteDraftQueue(max_age=PP + 2)
                        if remote_on and h.is_last_rank else None)
+    h.early_event = None
+    h.draft_tail = None
+    h.next_width = None
+    h.draft_tail_step = None
+    h.tail_payload = None
     return h
+
+
+def _receive(h, batch, step):
+    """``receive`` with this step's DraftTailStep (which the stage's
+    controller decides in the runner)."""
+    h.draft_tail = SimpleNamespace(step=lambda input_batch, width: step)
+    return h.receive(batch)
 
 
 @contextlib.contextmanager
@@ -975,7 +995,7 @@ def test_finalized_pipeline_decodes_on_every_stage(monkeypatch):
             handlers[-1].send_draft_tail(last.payload(batch.num_reqs), batch)
         for rank in [0, 1, TAIL]:
             with _as_rank(comm, rank):
-                assert handlers[rank].receive(batch, controllers[rank].step(batch))
+                assert _receive(handlers[rank], batch, controllers[rank].step(batch))
         for h in handlers[:-1]:
             assert torch.equal(h.queue[-1].draft_tokens, check)
 
@@ -1098,7 +1118,7 @@ def _run_pipeline(seed, remote_on, monkeypatch):
             if step_obj is not None and step_obj.compute is not None:
                 step_obj.compute = tail_compute(rows, batch.num_reqs)
             with _as_rank(comm, r):
-                handlers[r].receive(batch, step_obj)
+                _receive(handlers[r], batch, step_obj)
         need = pp_utils.compute_need_sampled_mask(batch)
         sampled_last[batch.idx_mapping_np] = (
             need if need is not None else np.zeros(batch.num_reqs, dtype=bool)

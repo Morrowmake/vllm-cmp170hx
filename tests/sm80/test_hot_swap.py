@@ -692,10 +692,10 @@ def test_hot_argmax_selects_the_fork_worker(monkeypatch, listed):
 
     monkeypatch.setenv("VLLM_SM80_SHARD_ARGMAX", "0")
     monkeypatch.setenv("VLLM_CUDAGRAPH_ESTIMATE_SPLIT", "0")
-    config = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
-    listed()
-    cudagraph_mem.select_worker(config)
-    assert config.worker_cls == cudagraph_mem.UPSTREAM_WORKER
     listed("shard_argmax")
+    config = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
     cudagraph_mem.select_worker(config)
     assert config.worker_cls == cudagraph_mem.WORKER
+    # Another worker cannot serve the hot pair.
+    with pytest.raises(ValueError, match="fork GPU worker"):
+        cudagraph_mem.select_worker(SimpleNamespace(worker_cls="my.Worker"))

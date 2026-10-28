@@ -14,8 +14,9 @@ import torch
 
 import vllm.v1.worker.gpu.model_runner as mr
 import vllm.v1.worker.gpu.pp_utils as pp_utils
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm.v1.worker.gpu.pp_utils import PendingRecv, PPHandler
+from vllm.v1.worker.gpu.pp_utils import PendingRecv
+from vllm_sm80.worker import runner_hooks
+from vllm_sm80.worker.pp_handler import Sm80PPHandler
 
 
 class _Stream:
@@ -30,7 +31,7 @@ def _handler(monkeypatch, split=True):
     monkeypatch.setattr(
         pp_utils, "async_tensor_h2d", lambda data, device: torch.as_tensor(data)
     )
-    h = PPHandler.__new__(PPHandler)
+    h = Sm80PPHandler.__new__(Sm80PPHandler)
     h.device = torch.device("cpu")
     h.main_stream = _Stream()
     h.req_idx_gen_np = np.zeros(8, dtype=np.int32)
@@ -42,7 +43,7 @@ def _handler(monkeypatch, split=True):
 
 def _slot(idx, drafts, split=True):
     n = len(idx)
-    return PendingRecv(
+    slot = PendingRecv(
         event="counts",
         sampled_tokens=torch.zeros(n, 4, dtype=torch.int64),
         num_sampled=torch.ones(n, dtype=torch.int32),
@@ -52,8 +53,11 @@ def _slot(idx, drafts, split=True):
         need_sampled_mask=np.ones(n, dtype=bool),
         gen_at_receive_np=np.zeros(n, dtype=np.int32),
         draft_tokens=torch.tensor(drafts, dtype=torch.int64),
-        draft_event="drafts" if split else None,
     )
+    # Sm80PPHandler.receive moves the drafts' event here with the split on.
+    if split:
+        slot.draft_event = "drafts"
+    return slot
 
 
 def test_consume_waits_counts_only_and_defers_drafts(monkeypatch):
@@ -110,18 +114,21 @@ def test_runner_rebuilds_input_ids_after_the_late_scatter(monkeypatch):
         mr, "combine_sampled_and_draft_tokens", lambda *a: calls.append(a)
     )
     applied = []
-    handler = SimpleNamespace(
-        has_pending_drafts=lambda: not applied,
-        apply_pending_drafts=lambda state: applied.append(state),
-    )
+    handler = SimpleNamespace(pending_drafts=object())
+
+    def apply_pending_drafts(state):
+        applied.append(state)
+        handler.pending_drafts = None
+
+    handler.apply_pending_drafts = apply_pending_drafts
     runner = SimpleNamespace(
         pp_handler=handler,
         req_states=SimpleNamespace(draft_tokens="state"),
         _late_combine_args=("args",),
     )
-    GPUModelRunner.apply_late_drafts(runner)
+    runner_hooks.apply_late_drafts(runner, dummy_run=False)
     assert applied == ["state"]
     assert calls == [("args",)]
     assert runner._late_combine_args is None
-    GPUModelRunner.apply_late_drafts(runner)  # nothing pending: no-op
+    runner_hooks.apply_late_drafts(runner, dummy_run=False)  # nothing pending
     assert calls == [("args",)]
