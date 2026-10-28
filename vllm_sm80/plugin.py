@@ -172,6 +172,7 @@ def register_glm_layers() -> None:
 
 def register() -> None:
     """Entry point named in ``plugins/sm80/pyproject.toml``."""
+    register_fork_env_vars()
     register_models()
     register_drafter_models()
     register_hf_config_defaults()
@@ -284,6 +285,7 @@ def platform_plugin() -> str | None:
     single activated out-of-tree platform plugin over the builtin one
     (``vllm.platforms.resolve_current_platform_cls_qualname``).
     """
+    register_fork_env_vars()
     from vllm.platforms import cuda_platform_plugin
 
     if cuda_platform_plugin() is None:
@@ -357,3 +359,27 @@ def register_moe_layers() -> None:
         layer_cls = resolve_obj_by_qualname(qualname)
         if op_registry_oot.get(name) is not layer_cls:
             PluggableLayer.register_oot(layer_cls, name=name)
+
+
+# ---------------------------------------------------------------------------
+# Environment variables
+# ---------------------------------------------------------------------------
+
+_env_vars_registered = False
+
+
+def register_fork_env_vars() -> None:
+    """Add the fork's variables (``vllm_sm80/envs.py``) to vLLM's table
+    ``vllm.envs.environment_variables``, which ``vllm.envs.__getattr__`` reads
+    lazily. Both entry points call it first: the platform plugin, which vLLM
+    resolves before any fork platform code runs, and the general plugin,
+    which vLLM loads in every process before engine and model code
+    (``validate_environ`` runs after it). Once per process."""
+    global _env_vars_registered
+    if _env_vars_registered:
+        return
+    import vllm.envs as envs
+    from vllm_sm80.envs import register_env_vars
+
+    register_env_vars(envs.environment_variables)
+    _env_vars_registered = True

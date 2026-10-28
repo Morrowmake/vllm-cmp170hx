@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Environment variables of the CMP 170HX (sm_80) fork.
 
-``vllm/envs.py`` calls :func:`register_env_vars` at the end of its import, so
-every name below is an ordinary vLLM environment variable in every process:
-``envs.X``, ``envs.is_set``, ``envs.compile_factors`` and the unknown-variable
-check in ``Platform.validate_environ`` all see it. The table lives here so the
-upstream file carries two lines instead of the declarations.
+The plugin's entry points call :func:`register_env_vars` first
+(``vllm_sm80.plugin.register_fork_env_vars``), so every name below is an
+ordinary vLLM environment variable in every process that loaded the plugin:
+``envs.X``, ``envs.is_set``, ``envs.compile_factors`` and the
+unknown-variable check in ``Platform.validate_environ`` all see it.
 """
 
 import logging

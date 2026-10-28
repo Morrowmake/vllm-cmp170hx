@@ -25,8 +25,8 @@ can reach.
   parser engine, held until validated; ``deepseek_v41_recovery`` recovers
   the damaged DeepSeek V4.1 tool calls with it (vllm/parser/deepseek_v41.py
   wraps its parser class).
-- ``envs``: the fork's environment variables; ``vllm/envs.py`` registers
-  them at the end of its own import.
+- ``envs``: the fork's environment variables; the plugin's entry points
+  register them (``plugin.register_fork_env_vars``).
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point
   (distribution in ``plugins/sm80``), which registers ``kernels.exl3``, and
   the startup check that it loaded.
