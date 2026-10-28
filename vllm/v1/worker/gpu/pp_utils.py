@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
@@ -14,6 +15,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm_sm80.worker import pp_hooks as sm80_pp
 
 
 @dataclass
@@ -127,6 +129,12 @@ class PPHandler:
     ) -> dict[str, torch.Tensor] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
+
+        Besides the postprocess_sampled arguments, the dict carries
+        ``step_idx_mapping``: that step's unfiltered batch -> request mapping,
+        from which the caller can rebuild the step's batch-order block tables
+        (batch-indexed consumers such as the mamba align postprocess must not
+        read the rows of a later step's batch).
         """
         if not self.queue:
             return None
@@ -150,6 +158,7 @@ class PPHandler:
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
+        sm80_pp.defer_drafts(self, slot, exclude_mask, draft_tokens_to_update)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
             draft_idx_mapping = slot.idx_mapping
@@ -167,6 +176,7 @@ class PPHandler:
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
+            step_idx_mapping=slot.idx_mapping,
         )
 
     def broadcast_drafts(
@@ -221,7 +231,9 @@ class PPHandler:
                     device=self.device,
                 )
                 torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+                    draft_tokens,
+                    src=sm80_pp.drafts_src(self, draft_tokens),
+                    group=self.broadcast_group,
                 )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
