@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from __future__ import annotations
 
@@ -1134,8 +1135,13 @@ class MambaSpec(KVCacheSpec):
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":
+            from vllm_sm80.kv_planning import inflight_state_blocks
+
             return self.page_size_bytes * (
-                2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+                2
+                + self.num_speculative_blocks
+                + self.num_prefill_checkpoint_blocks
+                + inflight_state_blocks(self, vllm_config)
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
