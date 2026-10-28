@@ -75,6 +75,37 @@ def failed_request_ids(
     return {req_ids[i] for i in np.unique(owners).tolist()}
 
 
+def attach(
+    output, failed_tokens: torch.Tensor | None, query_start_loc_np: np.ndarray | None
+) -> None:
+    """``AsyncOutput.__init__`` (V2 runner), on the output's copy stream after
+    its other copies: start the failed-token mask's copy to the host."""
+    from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+
+    output.query_start_loc_np = query_start_loc_np
+    output.failed_tokens = None
+    if failed_tokens is not None:
+        # The runner drops its reference at once; the copy may still wait
+        # behind the copies before it.
+        output.failed_tokens_gpu = failed_tokens
+        output.failed_tokens = async_copy_to_np(failed_tokens)
+
+
+def apply(output) -> None:
+    """``AsyncOutput.get_output``, after the copy event: the requests whose
+    inputs failed go into ``ModelRunnerOutput.failed_req_ids``."""
+    if output.failed_tokens is None:
+        return
+    assert output.query_start_loc_np is not None
+    failed = failed_request_ids(
+        output.failed_tokens,
+        output.query_start_loc_np,
+        output.model_runner_output.req_ids,
+    )
+    if failed:
+        output.model_runner_output.failed_req_ids = failed
+
+
 def evict_blocks_from(
     kv_cache_manager: "KVCacheManager", request_id: str, num_tokens: int
 ) -> tuple[set[int], ...]:
