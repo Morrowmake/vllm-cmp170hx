@@ -6,6 +6,7 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 # ruff: noqa: E501
 
@@ -16,6 +17,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+from vllm_sm80.fla.pinned_autotune import pinned_autotune
 from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -28,7 +30,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BKV_LIST
