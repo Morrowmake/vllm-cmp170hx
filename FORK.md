@@ -486,7 +486,7 @@ Grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/hybrid_consumer_cases.py` | 289 |
 | `tests/models/deepseek_v41/sm80/hybrid_fixture.py` | 189 |
 | `tests/models/deepseek_v41/sm80/hybrid_linear_cases.py` | 224 |
-| `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,508 |
+| `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,522 |
 | `tests/models/deepseek_v41/sm80/mhc_consumer_cases.py` | 148 |
 | `tests/models/deepseek_v41/sm80/swa_meta_batch_cases.py` | 519 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
@@ -507,7 +507,7 @@ Grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_hybrid_capture.py` | 349 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_capture_gpu.py` | 78 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_checkpoint.py` | 495 |
-| `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 126 |
+| `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_mhc_consumer_cases.py` | 115 |
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_official_reference.py` | 1,402 |
@@ -620,7 +620,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_gpu_lock_guard.py` | 74 |
 | `tests/sm80/test_hot_swap.py` | 701 |
 | `tests/sm80/test_hot_swap_gpu.py` | 124 |
-| `tests/sm80/test_import_cuda_init.py` | 165 |
+| `tests/sm80/test_import_cuda_init.py` | 168 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
 | `tests/sm80/test_jit_extension_cache.py` | 160 |
 | `tests/sm80/test_jit_extension_std.py` | 68 |
@@ -689,7 +689,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **302 files** | **126,160** |
+| **302 files** | **126,180** |
 
 #### `tools/`
 
