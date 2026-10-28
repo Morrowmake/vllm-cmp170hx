@@ -11,12 +11,16 @@ down from the production ones (2048 batched tokens / a 512-token cap); the
 ratios are what the assertions are about.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from vllm.config import SchedulerConfig
+from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm_sm80.sched import check_fair_prefill
 
 from .sm80_utils import create_requests, create_scheduler
 
@@ -91,8 +95,9 @@ def test_options_off_keeps_the_upstream_schedule():
     """Default config: a long prompt takes the whole remaining budget on every
     step and the decode streams get one token each, so a decode step only
     happens as often as a full-size prefill chunk completes."""
-    assert SchedulerConfig.prefill_chunk_with_decodes == 0
-    assert SchedulerConfig.max_num_partial_prefills == 0
+    args = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args([])
+    assert args.prefill_chunk_with_decodes == 0
+    assert args.max_num_partial_prefills == 0
 
     scheduler = create_scheduler(
         max_num_batched_tokens=256, max_num_seqs=8, max_model_len=MAX_LEN
@@ -518,25 +523,66 @@ def test_mamba_alignment_still_advances_under_a_sub_block_cap():
     assert long_req.num_computed_tokens > 0
 
 
+def _config(enable_chunked_prefill=True, **settings):
+    return SimpleNamespace(
+        additional_config={"sm80": settings},
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=enable_chunked_prefill),
+    )
+
+
 def test_config_rejects_a_cap_smaller_than_the_split():
     with pytest.raises(ValueError, match="prefill_chunk_with_decodes"):
-        SchedulerConfig.default_factory(
-            max_num_batched_tokens=2048,
-            prefill_chunk_with_decodes=2,
-            max_num_partial_prefills=4,
+        check_fair_prefill(
+            _config(prefill_chunk_with_decodes=2, max_num_partial_prefills=4)
         )
 
 
+@pytest.mark.parametrize("value", [-1, 1.5, "512", True])
+def test_config_rejects_a_knob_that_is_not_a_count(value):
+    with pytest.raises(ValueError, match="max_num_partial_prefills"):
+        check_fair_prefill(_config(max_num_partial_prefills=value))
+
+
 def test_config_ignores_the_knobs_without_chunked_prefill():
-    config = SchedulerConfig.default_factory(
-        max_num_batched_tokens=8192,
-        max_model_len=8192,
+    check_fair_prefill(
+        _config(
+            enable_chunked_prefill=False,
+            prefill_chunk_with_decodes=2,
+            max_num_partial_prefills=4,
+        )
+    )
+    scheduler = create_scheduler(
+        max_num_batched_tokens=MAX_LEN,
+        max_num_seqs=8,
+        max_model_len=MAX_LEN,
         enable_chunked_prefill=False,
         prefill_chunk_with_decodes=512,
         max_num_partial_prefills=2,
     )
-    assert config.prefill_chunk_with_decodes == 0
-    assert config.max_num_partial_prefills == 0
+    assert not scheduler.fair_prefill
+
+
+def test_served_flags_reach_the_fork_settings():
+    """`--prefill-chunk-with-decodes` / `--max-num-partial-prefills` keep
+    working as served flags and land in additional_config["sm80"]."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--prefill-chunk-with-decodes", "384", "--max-num-partial-prefills", "2"]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.additional_config == {
+        "sm80": {"prefill_chunk_with_decodes": 384, "max_num_partial_prefills": 2}
+    }
+    args = parser.parse_args(
+        [
+            "--prefill-chunk-with-decodes",
+            "384",
+            "--additional-config",
+            '{"sm80": {"prefill_chunk_with_decodes": 512}}',
+        ]
+    )
+    with pytest.raises(ValueError, match="set twice"):
+        EngineArgs.from_cli_args(args)
 
 
 # --------------------------------------------------------------------------

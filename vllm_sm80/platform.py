@@ -122,11 +122,11 @@ class _Sm80CudaPlatformMixin:
         super().check_and_update_config(vllm_config)  # type: ignore[misc]
         from vllm_sm80.worker.cudagraph_mem import select_worker
         from vllm_sm80.dev_ab import configure
-        from vllm_sm80.sched import select_scheduler
+        from vllm_sm80.sched import configure_scheduler
 
         select_worker(vllm_config.parallel_config)
         configure(vllm_config)
-        select_scheduler(vllm_config)
+        configure_scheduler(vllm_config)
 
 
 class Sm80NvmlCudaPlatform(_Sm80CudaPlatformMixin, NvmlCudaPlatform):

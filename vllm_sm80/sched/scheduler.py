@@ -32,6 +32,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import PauseState, Scheduler
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import Request
+from vllm_sm80.config import fair_prefill
 from vllm_sm80.sched.step import Sm80Step
 from vllm_sm80.spec_decode import dspark_depth_hint, dspark_host_width
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKPolicy
@@ -94,10 +95,9 @@ class Sm80SchedulerMixin:
         # Fair chunked prefill (opt-in). Both knobs at 0 -> `fair_prefill` is
         # False and every fair-prefill path is bypassed, so the schedule is
         # identical to upstream.
-        self.prefill_chunk_with_decodes = (
-            self.scheduler_config.prefill_chunk_with_decodes
+        self.prefill_chunk_with_decodes, self.max_num_partial_prefills = (
+            fair_prefill(vllm_config)
         )
-        self.max_num_partial_prefills = self.scheduler_config.max_num_partial_prefills
         self.fair_prefill = self.scheduler_config.enable_chunked_prefill and bool(
             self.prefill_chunk_with_decodes or self.max_num_partial_prefills
         )
