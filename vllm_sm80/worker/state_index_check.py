@@ -297,3 +297,56 @@ def postcopy_plan(num_accepted_slots, state_idx_slots, num_computed_slots, idx_m
             continue
         src[row], dst[row], bias[row], needs[row] = s, d, b, True
     return src, dst, bias, needs
+
+
+# ---- the calls from vLLM's V2 runner (block_table.py, mamba_hybrid.py) ----
+
+
+def gather(idx_mapping: torch.Tensor, max_num_reqs: int) -> None:
+    """``BlockTables.gather_block_tables``, before the gather kernel."""
+    from vllm import envs
+
+    if envs.VLLM_STATE_INDEX_CHECK:
+        check_gather_mapping(idx_mapping, max_num_reqs)
+
+
+def capture_tables(state, block_tables, kv_cache_config, mamba_group_ids) -> None:
+    """``MambaHybridModelState.initialize_kv_cache`` (align mode): the
+    per-request-slot tables the state copies use, for the copy checks."""
+    if not enabled():
+        return
+    _, mamba_spec = state._get_mamba_group_info(kv_cache_config)
+    state._sic_tables = [block_tables.block_tables[gid].gpu for gid in mamba_group_ids]
+    state._sic_num_blocks = kv_cache_config.num_blocks
+    state._sic_block_size = mamba_spec.block_size
+
+
+def pre_copy(state, input_batch, num_reqs: int) -> None:
+    """``MambaHybridModelState.preprocess_state``, between the align kernel
+    and the fused pre-copy."""
+    if not enabled():
+        return
+    idx = input_batch.idx_mapping[:num_reqs]
+    check_align_copies(
+        "pre-copy", state._sic_tables, state._sic_num_blocks, idx,
+        *precopy_plan(state._mamba_src_col_gpu, state._mamba_state_idx_gpu,
+                      state._mamba_src_off_gpu, idx),
+    )
+
+
+def attn_metadata(state, attn_metadata: dict, for_capture: bool) -> None:
+    """``MambaHybridModelState.prepare_attn``, on its result (not for capture)."""
+    if not for_capture and enabled():
+        check_attn_metadata(attn_metadata, state.vllm_config)
+
+
+def post_copy(state, idx_mapping: torch.Tensor, num_computed_tokens) -> None:
+    """``MambaHybridModelState.postprocess_state`` (align mode), before the
+    fused post-copy."""
+    if not enabled():
+        return
+    check_align_copies(
+        "post-copy", state._sic_tables, state._sic_num_blocks, idx_mapping,
+        *postcopy_plan(state.num_accepted_tokens_gpu, state._mamba_state_idx_gpu,
+                       num_computed_tokens, idx_mapping, state._sic_block_size),
+    )
