@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
 from dataclasses import replace
@@ -474,6 +475,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
+        if (tail := getattr(self, "sm80_forward_tail", None)) is not None:
+            return tail(hidden_states, qkv, beta, f_a, g_a)
         g1 = self.f_b_proj(f_a)[0]
         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
@@ -599,7 +602,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
 
         # --- causal conv1d: spec (draft-verify) path ---
-        if use_spec:
+        if use_spec and getattr(self, "_kda_mixed", None) is None:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
@@ -663,7 +666,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
             else None
         )
-        if use_spec:
+        if (mixed := getattr(self, "_kda_mixed", None)) is not None:
+            core_attn_out_spec = mixed(qkv_spec, beta_spec)
+        elif use_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None
@@ -725,7 +730,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
+                ) = getattr(self, "sm80_chunk_kda", chunk_kda_with_fused_gate)(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
                     v=_rearr(v_ns),
