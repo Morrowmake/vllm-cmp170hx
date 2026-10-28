@@ -69,9 +69,9 @@ def test_flag_off_is_unchanged(monkeypatch):
     for mcb, budget, block in (TP4, PP4):
         vc = _vllm_config(mcb, budget)
         spec = _mamba_spec(block)
-        assert spec.inflight_state_blocks(vc) == 0
+        assert kv_planning.inflight_state_blocks(spec, vc) == 0
         assert _pages(spec, spec.max_memory_usage_bytes(vc)) == 2 + SPEC
-        assert _pages(spec, spec.speculative_scratch_bytes(vc)) == SPEC
+        assert _pages(spec, kv_planning.speculative_scratch_bytes(spec, vc)) == SPEC
 
 
 @pytest.mark.parametrize(
@@ -88,10 +88,10 @@ def test_in_flight_state_blocks(monkeypatch, mcb, budget, block, extra):
     monkeypatch.setenv(FLAG, "1")
     vc = _vllm_config(mcb, budget)
     spec = _mamba_spec(block)
-    assert spec.inflight_state_blocks(vc) == extra
+    assert kv_planning.inflight_state_blocks(spec, vc) == extra
     assert _pages(spec, spec.max_memory_usage_bytes(vc)) == 2 + SPEC + extra
     # Held only while chunks are in flight: running-only, like the spec pages.
-    assert _pages(spec, spec.speculative_scratch_bytes(vc)) == SPEC + extra
+    assert _pages(spec, kv_planning.speculative_scratch_bytes(spec, vc)) == SPEC + extra
     ck = _mamba_spec(block, ckpt=1)
     assert _pages(ck, ck.max_memory_usage_bytes(vc)) == 3 + SPEC + extra
 
@@ -101,7 +101,7 @@ def test_other_cache_modes_unchanged(monkeypatch, mode):
     monkeypatch.setenv(FLAG, "1")
     vc = _vllm_config(*TP4[:2], mamba_cache_mode=mode)
     spec = _mamba_spec(TP4[2], mode=mode)
-    assert spec.inflight_state_blocks(vc) == 0
+    assert kv_planning.inflight_state_blocks(spec, vc) == 0
 
 
 def test_kv_connector_charges_per_slot(monkeypatch):
@@ -109,7 +109,7 @@ def test_kv_connector_charges_per_slot(monkeypatch):
     vc = _vllm_config(*PP4[:2], kv_transfer_config=object())
     spec = _mamba_spec(PP4[2])
     assert _pages(spec, spec.max_memory_usage_bytes(vc)) == 2 + SPEC + 2
-    assert _pages(spec, spec.speculative_scratch_bytes(vc)) == SPEC
+    assert _pages(spec, kv_planning.speculative_scratch_bytes(spec, vc)) == SPEC
 
 
 def _config(num_blocks, block, num_mamba, num_swa):

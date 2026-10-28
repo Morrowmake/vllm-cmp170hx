@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache planning rules of the CMP 170HX (sm_80) fork.
 
-Upstream files call in from two places:
+Upstream files call in from three places:
 
 - ``kv_cache_planning._get_packed_kv_cache_groups`` passes its groups through
   :func:`fit_packed_kv_cache_groups`, which refits the groups of an MLA +
@@ -12,8 +12,10 @@ Upstream files call in from two places:
   share of a group widens the block.
 - ``kv_cache_utils.get_max_concurrency_for_kv_cache_config`` returns
   :func:`max_concurrency_for_kv_cache_config`, which charges a spec's
-  speculative scratch (``KVCacheSpec.speculative_scratch_bytes``) once per
-  running request instead of once per resident request.
+  speculative scratch (:func:`speculative_scratch_bytes`) once per running
+  request instead of once per resident request.
+- ``MambaSpec.max_memory_usage_bytes`` adds the align-mode in-flight states
+  (:func:`inflight_state_blocks`).
 """
 
 import math
@@ -436,6 +438,68 @@ def _fit_state_groups(
 # --------------------------------------------------------------------------
 
 
+def inflight_state_blocks(spec: MambaSpec, vllm_config: VllmConfig) -> int:
+    """Align-mode state blocks a Mamba spec holds only while prefill chunks
+    are in flight.
+
+    A chunk writes its end state into the block holding its last token, and
+    the block that seeded the oldest in-flight chunk is freed only once the
+    processed-token count passes it. With synchronous scheduling that is the
+    two blocks already reserved (seed + new state). With
+    `max_concurrent_batches` > 1 a prefilling request can have one chunk in
+    each in-flight batch, so it holds one state per distinct block its
+    in-flight chunk ends fall in, plus the seed: at most
+    1 + min(max_concurrent_batches, cdiv(max_in_flight_tokens, block))
+    states. This returns the part beyond the two already reserved, when
+    VLLM_KV_MAMBA_INFLIGHT_STATES is set (0 otherwise).
+    """
+    if (
+        not envs.VLLM_KV_MAMBA_INFLIGHT_STATES
+        or spec.mamba_cache_mode != "align"
+        or vllm_config.cache_config.mamba_cache_mode != "align"
+        or spec.block_size <= 0
+    ):
+        return 0
+    in_flight_ends = min(
+        vllm_config.max_concurrent_batches,
+        cdiv(vllm_config.max_in_flight_tokens, spec.block_size),
+    )
+    return max(0, in_flight_ends - 1)
+
+
+def speculative_scratch_bytes(spec: KVCacheSpec, vllm_config: VllmConfig) -> int:
+    """The part of `spec.max_memory_usage_bytes` that is scratch space only a
+    *running* (i.e. currently speculating) request holds, rather than a
+    per-request working set that every resident request keeps (0 for specs
+    without such scratch).
+
+    Such scratch is bounded by `max_num_seqs`, not by the number of requests
+    the KV cache pool could hold, so capacity planning reserves it once for
+    the whole engine instead of once per concurrency slot.
+    """
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        max_scratch_pages = max(
+            cdiv(speculative_scratch_bytes(s, vllm_config), s.page_size_bytes)
+            for s in spec.kv_cache_specs.values()
+        )
+        return max_scratch_pages * spec.page_size_bytes
+    if not isinstance(spec, MambaSpec):
+        return 0
+    # `num_speculative_blocks` extra state pages are allocated by
+    # `MambaManager` when a request first gets blocks and are then relocated
+    # in place for the rest of its life (never re-allocated), so at most
+    # `max_num_seqs` requests hold them at the same time. The in-flight states
+    # (`inflight_state_blocks`) are likewise held only by a running request
+    # with chunks in flight; waiting and preempted requests hold no blocks.
+    # With a KV connector (async loads, delayed frees) they stay charged per
+    # concurrency slot.
+    scratch = spec.num_speculative_blocks
+    if vllm_config.kv_transfer_config is None:
+        scratch += inflight_state_blocks(spec, vllm_config)
+    return spec.page_size_bytes * scratch
+
+
+
 def max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -445,7 +509,7 @@ def max_concurrency_for_kv_cache_config(
     out of its pool (device groups share one pool, host groups another); the
     smaller pool limit applies.
 
-    Speculative scratch (`KVCacheSpec.speculative_scratch_bytes`: the extra
+    Speculative scratch (`speculative_scratch_bytes`: the extra
     Mamba state pages a linear-attention model needs while drafting, and Mamba
     in-flight states) is part of that per-request footprint, but only a
     *running* request holds it, so the engine never needs more than
@@ -461,7 +525,7 @@ def max_concurrency_for_kv_cache_config(
         spec = group.kv_cache_spec
         required = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
         scratch = cdiv(
-            spec.speculative_scratch_bytes(vllm_config), spec.page_size_bytes
+            speculative_scratch_bytes(spec, vllm_config), spec.page_size_bytes
         )
         # The scratch is a subset of the per-request footprint; never let a
         # spec claim more scratch than it claims memory.
@@ -484,7 +548,10 @@ def max_concurrency_for_kv_cache_config(
         else:
             num_blocks_per_request += required
             scratch_blocks_per_request += scratch
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    # Only the scratch split reads max_num_seqs; without scratch the limit is
+    # the plain num_blocks / blocks_per_request.
+    has_scratch = scratch_blocks_per_request or host_scratch_blocks_per_request
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs if has_scratch else 0
     if envs.VLLM_KV_MAMBA_INFLIGHT_STATES:
         _log_mamba_inflight_states(vllm_config, kv_cache_config)
     limits = [
@@ -513,7 +580,7 @@ def max_concurrency_for_kv_cache_config(
             kv_cache_config.num_blocks,
             num_blocks_per_request,
             scratch_blocks_per_request,
-            max_num_seqs,
+            vllm_config.scheduler_config.max_num_seqs,
             concurrency,
             "; ".join(plan),
         )
@@ -530,7 +597,7 @@ def _log_mamba_inflight_states(
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.first_spec
         if isinstance(spec, MambaSpec):
-            per_group.append(spec.inflight_state_blocks(vllm_config))
+            per_group.append(inflight_state_blocks(spec, vllm_config))
     if not any(per_group):
         logger.info_once(
             "VLLM_KV_MAMBA_INFLIGHT_STATES is set but no align-mode Mamba "
