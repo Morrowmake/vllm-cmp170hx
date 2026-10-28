@@ -56,7 +56,9 @@ def adopt_text_model(
     """The sm_80 changes to an upstream-built ``Qwen4ExpForCausalLM`` whose
     prefix is ``prefix``."""
     adopt_router_precision(vllm_config, lm)
-    if lm.quant_config is None:
+    # A pipeline stage without the head (upstream builds a PPMissingLayer
+    # there) keeps it.
+    if lm.quant_config is None or isinstance(lm.lm_head, PPMissingLayer):
         return
     config = lm.config
     # Free the unquantized head before building the quantized one in its place.

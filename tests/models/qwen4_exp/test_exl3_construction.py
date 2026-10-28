@@ -271,3 +271,17 @@ def test_every_packed_matrix_has_one_owner_and_ranks_tile_it(built, role):
                 for index in range(start, stop):
                     counts[index] += 1
         assert len(set(counts)) == 1 and counts[0] in (1, TP), (prefix, split)
+
+
+def test_text_model_keeps_a_pipeline_stage_without_the_head():
+    """A pipeline stage upstream builds without the LM head (a PPMissingLayer)
+    keeps it: the quantized head replaces only a head upstream built."""
+    from vllm.model_executor.models.utils import PPMissingLayer
+    from vllm_sm80.models.qwen4_exp.sm80_model import adopt_text_model
+
+    lm = torch.nn.Module()
+    lm.quant_config = object()
+    lm.config = None
+    lm.lm_head = missing = PPMissingLayer()
+    adopt_text_model(lm, None, "language_model")
+    assert lm.lm_head is missing
