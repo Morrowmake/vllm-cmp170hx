@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import copy
 import getpass
@@ -1509,6 +1510,10 @@ class VllmConfig:
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
+        # Fail at startup if vLLM loaded its general plugins without the fork's.
+        from vllm_sm80.guard import check_plugin_loaded
+
+        check_plugin_loaded()
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
@@ -2537,6 +2542,10 @@ class VllmConfig:
                             ):
                                 widest_batch[num_spec + 1] = batch_size
                             decode_tiers = list(widest_batch.items())
+                    from vllm_sm80.spec_decode.adaptive_k import adaptive_k_decode_tiers
+
+                    if tiers := adaptive_k_decode_tiers(self, default_max_graph_size):
+                        max_cudagraph_capture_size, decode_tiers = tiers
 
                     uniform_decode_sizes = sorted(
                         {
