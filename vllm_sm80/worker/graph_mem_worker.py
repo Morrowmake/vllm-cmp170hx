@@ -65,10 +65,11 @@ def runner_cls() -> type:
     from vllm_sm80.dev_ab import with_ab_capture
     from vllm_sm80.worker import adaptive_k_graphs, mem_attribution
 
+    def upstream_capture(runner, *, profile_only: bool = False) -> int:
+        return GPUModelRunnerV2.capture_model(runner, profile_only=profile_only)
+
     # vLLM's capture_model behind the A/B capture, as one inference-mode call.
-    ab_capture = torch.inference_mode()(
-        with_ab_capture(GPUModelRunnerV2.capture_model)
-    )
+    ab_capture = torch.inference_mode()(with_ab_capture(upstream_capture))
 
     class GraphMemModelRunner(GPUModelRunnerV2):
         # target_argmax.refusal: sample() runs in target_argmax.step.
@@ -85,13 +86,14 @@ def runner_cls() -> type:
 
         def load_model(self, *args, **kwargs) -> None:
             super().load_model(*args, **kwargs)
-            mem_attribution.log_load_inventory(
-                [
-                    ("target", self.model),
-                    ("drafter", getattr(self.speculator, "model", None)),
-                ],
-                self.model_memory_usage,
-            )
+            if mem_attribution.enabled():
+                mem_attribution.log_load_inventory(
+                    [
+                        ("target", self.model),
+                        ("drafter", getattr(self.speculator, "model", None)),
+                    ],
+                    self.model_memory_usage,
+                )
             target_argmax.load(self)
 
         def profile_cudagraph_memory(self) -> int:
@@ -102,23 +104,25 @@ def runner_cls() -> type:
             )
 
         def capture_model(self, *, profile_only: bool = False) -> int:
-            if not cudagraph_mem.enabled():
-                size = ab_capture(self, profile_only=profile_only)
-            else:
+            try:
+                if not cudagraph_mem.enabled():
+                    size = ab_capture(self, profile_only=profile_only)
+                else:
+                    if profile_only:
+                        cudagraph_mem.measure_full_graphs(self.cudagraph_manager)
+                    size = cudagraph_mem.capture(
+                        functools.partial(ab_capture, self), profile_only
+                    )
+            finally:
                 if profile_only:
-                    cudagraph_mem.measure_full_graphs(self.cudagraph_manager)
-                size = cudagraph_mem.capture(
-                    functools.partial(ab_capture, self), profile_only
-                )
-            if self.cudagraph_manager.needs_capture():
-                adaptive_k_graphs.warn_missing(self.cudagraph_manager)
-            if profile_only:
-                # vLLM's profiling retires the speculator's managers held as
-                # attributes; the per-width ones go here, before its teardown
-                # releases the profiling pool.
-                retire = getattr(self.speculator, "retire_width_managers", None)
-                if retire is not None:
-                    retire()
+                    # vLLM's profiling retires the speculator's managers held
+                    # as attributes; the per-width ones go here, before its
+                    # teardown releases the profiling pool.
+                    speculator = getattr(self, "speculator", None)
+                    retire = getattr(speculator, "retire_width_managers", None)
+                    if retire is not None:
+                        retire()
+            adaptive_k_graphs.warn_missing(getattr(self, "cudagraph_manager", None))
             return size
 
         def _dummy_sampler_run(self, hidden_states):

@@ -73,14 +73,15 @@ def decode_query_lens(manager: Any) -> tuple[list[int], dict[int, int]] | None:
 
 
 def warn_missing(manager: Any) -> None:
-    """Check every adaptive draft count has a single-request decode graph.
+    """After the decode graphs of the target manager are captured: check
+    every adaptive draft count has a single-request decode graph.
 
     ``dispatch`` returns CUDAGraphMode.NONE on a miss and the step quietly
     runs eager, which would read as a mysterious slowdown rather than a
     misconfiguration, so surface it once at startup.
     """
     counts = draft_counts(manager)
-    if not counts:
+    if not counts or not manager.needs_capture():
         return
     if not manager.cudagraph_mode or not manager.cudagraph_mode.decode_mode():
         return
