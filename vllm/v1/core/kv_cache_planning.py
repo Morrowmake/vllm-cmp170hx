@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """KV cache planning: grouping, sizing, and memory-fit logic."""
 
 import math
@@ -11,6 +12,7 @@ from typing import Any
 
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm_sm80.kv_planning import fit_packed_kv_cache_groups
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
@@ -1034,6 +1036,7 @@ def _get_packed_kv_cache_groups(
             assert group_spec is not None
             groups.append(KVCacheGroupSpec(group_layer_names, group_spec))
 
+    groups = fit_packed_kv_cache_groups(vllm_config, kv_cache_spec, groups)
     return groups
 
 
