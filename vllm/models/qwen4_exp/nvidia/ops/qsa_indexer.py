@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Triton kernels for Qwen4Exp QSA index selection."""
 
 import torch
@@ -9,6 +10,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
 )
 from vllm.platforms import current_platform
+from vllm_sm80.kernels.indexer.topk_tiefix_gate import canonical_topk_
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
@@ -503,6 +505,7 @@ def _topk(
         block_topk,
         logits.shape[1],
     )
+    canonical_topk_(logits, block_indices, indexer="qsa", row_ends=visible_blocks)
 
 
 def qsa_select_paged_decode(
