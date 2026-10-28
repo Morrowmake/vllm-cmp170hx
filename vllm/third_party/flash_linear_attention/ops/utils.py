@@ -7,6 +7,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import contextlib
 import functools
 import logging
@@ -29,6 +30,26 @@ SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
 # Default chunk size used across FLA triton kernels (kda, chunk, chunk_o, etc.)
 FLA_CHUNK_SIZE = 64
+
+
+def _tensor_snapshot(x: Any) -> tuple | None:
+    """What a cached result depends on besides the identity of a tensor
+    argument: storage address, view geometry and version counter (bumped by
+    every in-place write), so a buffer rewritten in place (e.g. a persistent
+    ``query_start_loc``) is recomputed. Inference tensors keep no version
+    counter; they get ``None`` there, and their address and geometry still
+    have to match."""
+    if not isinstance(x, torch.Tensor):
+        return None
+    try:
+        version = x._version
+    except RuntimeError:
+        version = None
+    try:
+        ptr = x.data_ptr()
+    except RuntimeError:
+        ptr = None
+    return (ptr, x.storage_offset(), tuple(x.shape), tuple(x.stride()), version)
 
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
@@ -54,7 +75,7 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entries, cache_size
         for i, entry in enumerate(cache_entries):
-            last_args, last_kwargs, last_result = entry
+            last_args, last_kwargs, last_snaps, last_kwsnaps, last_result = entry
             if (
                 len(args) == len(last_args)
                 and len(kwargs) == len(last_kwargs)
@@ -62,19 +83,22 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                 and all(
                     k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
                 )
-            ):
-                cache_entries = (
-                    cache_entries[:i]
-                    + cache_entries[i + 1 :]
-                    + [(args, kwargs, last_result)]
+                and all(_tensor_snapshot(a) == s for a, s in zip(args, last_snaps))
+                and all(
+                    _tensor_snapshot(v) == last_kwsnaps[k] for k, v in kwargs.items()
                 )
+            ):
+                cache_entries = cache_entries[:i] + cache_entries[i + 1 :] + [entry]
                 return last_result
 
         result = fn(*args, **kwargs)
 
+        # Snapshot after the call: the decorated functions only read their inputs.
+        snaps = tuple(_tensor_snapshot(a) for a in args)
+        kwsnaps = {k: _tensor_snapshot(v) for k, v in kwargs.items()}
         if len(cache_entries) >= cache_size:
             cache_entries = cache_entries[1:]
-        cache_entries.append((args, kwargs, result))
+        cache_entries.append((args, kwargs, snaps, kwsnaps, result))
         return result
 
     return wrapper
