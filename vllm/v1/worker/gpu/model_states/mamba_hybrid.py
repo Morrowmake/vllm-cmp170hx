@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,7 @@ from vllm.v1.worker.mamba_utils import (
     validate_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
+from vllm_sm80.worker import state_index_check as sic
 
 
 @dataclass
@@ -176,6 +178,7 @@ class MambaHybridModelState(DefaultModelState):
             [block_tables.block_tables[gid].gpu for gid in mamba_group_ids],
             [block_tables.input_block_tables[gid] for gid in mamba_group_ids],
         )
+        sic.capture_tables(self, block_tables, kv_cache_config, mamba_group_ids)
 
     def preprocess_state(
         self,
@@ -219,6 +222,7 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        sic.pre_copy(self, input_batch, num_reqs)
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -345,6 +349,7 @@ class MambaHybridModelState(DefaultModelState):
             self.recoverssm.record_step(
                 attn_metadata, attn_groups, for_capture=for_capture
             )
+        sic.attn_metadata(self, attn_metadata, for_capture)
         return attn_metadata
 
     def postprocess_state(
@@ -393,6 +398,7 @@ class MambaHybridModelState(DefaultModelState):
             and num_computed_tokens is not None
             and self._mamba_ctx is not None
         ):
+            sic.post_copy(self, idx_mapping, num_computed_tokens)
             self._mamba_ctx.run_fused_postprocess_align(
                 num_reqs,
                 self.num_accepted_tokens_gpu,
