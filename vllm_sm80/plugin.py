@@ -153,9 +153,18 @@ GLM_LAYER_OVERRIDES = {
     ),
 }
 
+# Upstream custom ops the fork's GLM classes replace (op class name ->
+# "<module>:<class>" of the replacement).
+GLM_OP_OVERRIDES = {
+    "SparseAttnIndexerKpool": (
+        "vllm_sm80.models.glm5next.sm80_indexer_op:SparseAttnIndexerKpool"
+    ),
+}
+
 
 def register_glm_layers() -> None:
-    """Register :data:`GLM_LAYER_OVERRIDES` as out-of-tree pluggable layers.
+    """Register :data:`GLM_LAYER_OVERRIDES` as out-of-tree pluggable layers
+    and :data:`GLM_OP_OVERRIDES` as out-of-tree custom ops.
 
     A layer override needs the replacement class itself, so this imports the
     GLM model code. It therefore runs when the fork GLM model module is
@@ -165,18 +174,32 @@ def register_glm_layers() -> None:
     """
     import importlib
 
-    from vllm.model_executor.custom_op import PluggableLayer, op_registry_oot
+    from vllm.model_executor.custom_op import (
+        CustomOp,
+        PluggableLayer,
+        op_registry_oot,
+    )
 
-    for name, qualified in GLM_LAYER_OVERRIDES.items():
-        module_name, _, class_name = qualified.partition(":")
-        layer_cls = getattr(importlib.import_module(module_name), class_name)
-        registered = op_registry_oot.get(name)
-        if registered is None:
-            PluggableLayer.register_oot(layer_cls, name=name)
-        elif registered is not layer_cls:
-            raise RuntimeError(
-                f"pluggable layer {name!r} is already replaced by {registered}"
-            )
+    for overrides, base in (
+        (GLM_LAYER_OVERRIDES, PluggableLayer),
+        (GLM_OP_OVERRIDES, CustomOp),
+    ):
+        for name, qualified in overrides.items():
+            module_name, _, class_name = qualified.partition(":")
+            layer_cls = getattr(importlib.import_module(module_name), class_name)
+            registered = op_registry_oot.get(name)
+            if registered is None and base is CustomOp:
+                # register_oot names the op by its table key; keep upstream's
+                # op name, which the custom_ops switch reads.
+                upstream_name = layer_cls.name
+                base.register_oot(layer_cls, name=name)
+                layer_cls.name = upstream_name
+            elif registered is None:
+                base.register_oot(layer_cls, name=name)
+            elif registered is not layer_cls:
+                raise RuntimeError(
+                    f"pluggable layer {name!r} is already replaced by {registered}"
+                )
 
 
 def register() -> None:

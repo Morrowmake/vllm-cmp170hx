@@ -7,9 +7,14 @@
 upstream layer of the same name (``vllm/models/glm5next/common/kda.py``), so
 every KDA layer the GLM decoder builds is this subclass. It adds:
 
-- the decode attributes the fused sm_80 KDA decode step and the KDA chunked
-  prefill read in the layer's forward (``VLLM_AMPERE_DECODE_KERNELS``,
-  ``VLLM_SM80_KDA_PREFILL``), and the deferred ``g_b_proj`` fill;
+- the fused sm_80 KDA decode step (``ops/kda_decode.py``,
+  ``VLLM_AMPERE_DECODE_KERNELS``) and the KDA chunked prefill
+  (``ops/kda_prefill.py``, ``VLLM_SM80_KDA_PREFILL``) in the layer's forward.
+  Upstream's ``forward`` and ``_forward`` call this class's
+  ``sm80_forward_tail``, ``_kda_mixed`` and ``sm80_chunk_kda`` where present
+  (one hook each); everything else in them is upstream's code. The output
+  norm runs inside the eager ``_forward`` break, where the step's path (and
+  with it whether a fused kernel already applied the norm) is known;
 - RecoverSSM (``vllm_sm80/kernels/kda/recover.py``): the per-layer record
   buffer, no draft-position state pages in the KV spec, and the builder's
   commit metadata;
@@ -20,11 +25,14 @@ every KDA layer the GLM decoder builds is this subclass. It adds:
   which must import without the GLM model package.
 """
 
+import functools
 from dataclasses import replace
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.glm5next.common import kda as glm_kda
 from vllm_sm80.kernels.kda.recover import Glm5NextGDNAttentionMetadata
@@ -177,6 +185,10 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
                 allowed_heads=enabled_heads(),
             )
 
+        # Set by _kda_deferred_step for one mixed RecoverSSM step and cleared
+        # after upstream's _forward has read it.
+        self._kda_mixed = None
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Glm5NextGDNAttentionBackend
 
@@ -222,3 +234,418 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
         g2.copy_(
             self.g_b_proj(g_a)[0].reshape(-1, self.local_num_heads, self.head_dim)
         )
+
+    def sm80_forward_tail(
+        self,
+        hidden_states: torch.Tensor,
+        qkv: torch.Tensor,
+        beta: torch.Tensor,
+        f_a: torch.Tensor,
+        g_a: torch.Tensor,
+    ) -> torch.Tensor:
+        """Upstream ``forward`` after the input projections, which calls it.
+
+        With the decode kernels on, f_b_proj / g_b_proj are deferred to
+        ``_forward``: the fused kernel reads f_a / g_a itself. g1 is only
+        consumed inside ``_forward``, so it is computed there when needed. g2
+        is also read by the o_norm at the end of ``_forward``, so it is a
+        buffer allocated here and filled in ``_forward`` on every path that
+        does not fuse the norm (the same static-buffer contract as
+        core_attn_out).
+        """
+        num_tokens = hidden_states.size(0)
+        if self._kda_v2:
+            g1 = None
+            g2 = torch.empty(
+                (num_tokens, self.local_num_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            f_a_in, g_a_in = f_a, g_a
+        else:
+            g1 = self.f_b_proj(f_a)[0]
+            g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+
+            g_proj_states = self.g_b_proj(g_a)[0]
+            # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
+            g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+            f_a_in = g_a_in = None
+
+        core_attn_out = torch.empty(
+            (1, num_tokens, self.local_num_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        # Call the decorated eager break directly so host-side prefill branches
+        # are not captured by PIECEWISE CUDA graphs. It leaves the normalised
+        # attention output in core_attn_out.
+        self._forward(
+            qkv_proj_states=qkv,
+            g1=g1,
+            beta=beta,
+            core_attn_out=core_attn_out,
+            g2=g2,
+            f_a=f_a_in,
+            g_a=g_a_in,
+        )
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
+        return self.o_proj(core_attn_out)[0]
+
+    @eager_break_during_capture
+    def _forward(
+        self,
+        qkv_proj_states: torch.Tensor,
+        g1: torch.Tensor | None,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        g2: torch.Tensor | None = None,
+        f_a: torch.Tensor | None = None,
+        g_a: torch.Tensor | None = None,
+    ) -> None:
+        """Core attention and o_norm, written into ``core_attn_out``.
+
+        The step's metadata picks the path here, and with it whether a fused
+        sm_80 kernel has already applied o_norm, so the norm is applied here
+        too: a host-side decision read after this eager break would be frozen
+        into a PIECEWISE graph by the batch it was captured with.
+        """
+        if self._forward_core(qkv_proj_states, g1, beta, core_attn_out, g2, f_a, g_a):
+            return
+        normed = self.o_norm(core_attn_out, g2)
+        # The CUDA gated norm runs in place; keep the static buffer either way.
+        if normed.data_ptr() != core_attn_out.data_ptr():
+            core_attn_out.copy_(normed)
+
+    def _forward_core(
+        self,
+        qkv_proj_states: torch.Tensor,
+        g1: torch.Tensor | None,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        g2: torch.Tensor | None,
+        f_a: torch.Tensor | None,
+        g_a: torch.Tensor | None,
+    ) -> bool:
+        """Core attention into ``core_attn_out``; True when a fused sm_80
+        kernel has already applied o_norm. f_a / g_a are passed only with the
+        decode kernels on (see :meth:`sm80_forward_tail`): g1 is then None and
+        g2 an unfilled buffer, resolved by :meth:`_kda_deferred_step`. The
+        rest is upstream's ``_forward`` (nested in this eager break, so it runs
+        inline)."""
+        if f_a is not None:
+            fused, g1 = self._kda_deferred_step(
+                qkv_proj_states, beta, core_attn_out, g2, f_a, g_a
+            )
+            if fused:
+                return True
+            if g1 is None:
+                # No metadata for this layer (profile / warmup dummy run).
+                return False
+        try:
+            # Explicit, not super(): tests/kernels/test_ampere_kda_dispatch.py
+            # binds these methods to a stand-in layer.
+            glm_kda.Glm5NextLinearAttention._forward(
+                self,
+                qkv_proj_states=qkv_proj_states,
+                g1=g1,
+                beta=beta,
+                core_attn_out=core_attn_out,
+            )
+        finally:
+            self._kda_mixed = None
+        return False
+
+    def _kda_deferred_step(
+        self,
+        qkv_proj_states: torch.Tensor,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        g2: torch.Tensor,
+        f_a: torch.Tensor,
+        g_a: torch.Tensor,
+    ) -> tuple[bool, torch.Tensor | None]:
+        """The decode-kernel part of ``_forward`` ahead of upstream's: the step
+        metadata and caches as upstream's ``_forward`` reads them, then
+
+        - the fused sm_80 KDA decode step (kda_decode.py): ONE kernel for
+          f_b_proj + g_b_proj + causal_conv1d_update + fused_recurrent_kda +
+          o_norm on a pure spec-verify step, within the shapes
+          use_ampere_kda_decode_v2 covers; RecoverSSM: a pure spec-verify step
+          runs the kernel in RECOVER mode whatever the shape gate says (there
+          are no draft-position state pages to write to). Returns (True, None);
+        - otherwise the deferred projections are materialised (g1 returned,
+          g2 filled) and the unfused chain runs upstream's ``_forward``; under
+          RecoverSSM the same kernel runs the spec rows of a mixed step
+          unnormalised (``_kda_mixed``, read by upstream's ``_forward``).
+
+        Without metadata only g2 is filled: (False, None).
+        """
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+        if attn_metadata_raw is None:
+            self._fill_deferred_g2(g_a, g2)
+            return False, None
+        assert isinstance(attn_metadata_raw, dict)
+        attn_metadata_narrowed = attn_metadata_raw.get(self.prefix)
+        if attn_metadata_narrowed is None:
+            # Profile/warmup dummy runs may omit mamba-family metadata.
+            self._fill_deferred_g2(g_a, g2)
+            return False, None
+        assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
+        non_spec_token_indx = attn_metadata_narrowed.non_spec_token_indx
+        num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
+        spec_sequence_masks = attn_metadata_narrowed.spec_sequence_masks
+        spec_query_start_loc = attn_metadata_narrowed.spec_query_start_loc
+        spec_state_indices_tensor = attn_metadata_narrowed.spec_state_indices_tensor
+        spec_token_indx = attn_metadata_narrowed.spec_token_indx
+        num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
+        num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
+        use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
+        # The fused kernel's token tile from the step's bound (None: the full
+        # num_spec + 1 window, without the fused step).
+        kda_tile = (
+            getattr(attn_metadata_narrowed, "spec_max_query_len", None)
+            if self._kda_step_tile
+            else None
+        )
+        lower_bound = self.kda_lower_bound
+
+        qkv_proj_states = qkv_proj_states[:num_actual_tokens]
+        beta = beta[:, :num_actual_tokens]
+
+        (conv_state, recurrent_state) = self.kv_cache
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+        # Upstream's merged q|k|v short-conv weight, built once (upstream's
+        # _forward finds it built).
+        if self._merged_conv_weight is None:
+
+            def _w(m):
+                return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+            self._merged_conv_weight = torch.cat(
+                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                dim=0,
+            ).contiguous()
+        conv_weights = self._merged_conv_weight
+        conv_bias = self.q_conv1d.bias
+
+        pure_verify = (
+            use_spec
+            and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)
+            and attn_metadata_narrowed.num_prefills == 0
+            and attn_metadata_narrowed.num_decodes == 0
+        )
+        if self._kda_recover and pure_verify:
+            from vllm_sm80.models.glm5next.ops.kda_decode import (
+                _kda_tile,
+                kda_decode_v2,
+            )
+
+            assert spec_state_indices_tensor is not None
+            assert num_accepted_tokens is not None and spec_query_start_loc is not None
+            kda_decode_v2(
+                qkv_proj_states,
+                beta,
+                f_a[:num_actual_tokens],
+                g_a[:num_actual_tokens],
+                self.f_b_proj.weight,
+                self.g_b_proj.weight,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                self.o_norm.weight,
+                recurrent_state,
+                spec_state_indices_tensor[:, 0][:num_spec_decodes],
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                spec_query_start_loc[: num_spec_decodes + 1],
+                _kda_tile(kda_tile, self.num_spec + 1, keep_same_rows=True),
+                self.A_log.view(-1),
+                self.dt_bias,
+                lower_bound=lower_bound,
+                eps=self.o_norm.eps,
+                out=core_attn_out[0, :num_actual_tokens].unsqueeze(0),
+                records=self._kda_recover_records,
+            )
+            return True, None
+
+        # Spec rows of a mixed step on the fused kernel: RecoverSSM only (the
+        # per-draft-slot step measured slower there than the unfused chain).
+        from vllm_sm80.models.glm5next.ops.kda_decode import (
+            use_ampere_kda_decode_v2,
+            wide_schedule,
+        )
+
+        w_f = getattr(self.f_b_proj, "weight", None)
+        w_g = getattr(self.g_b_proj, "weight", None)
+        v2_ready = (
+            use_spec
+            and w_f is not None
+            and w_g is not None
+            and spec_state_indices_tensor is not None
+            and num_accepted_tokens is not None
+            and spec_query_start_loc is not None
+            and recurrent_state.dtype == torch.float32
+        )
+        if (
+            v2_ready
+            and pure_verify
+            and use_ampere_kda_decode_v2(
+                num_spec_decodes,
+                num_actual_tokens,
+                self.local_num_heads,
+                self.head_dim,
+                w_f,
+                w_g,
+            )
+        ):
+            from vllm_sm80.models.glm5next.ops.kda_decode import (
+                _kda_tile,
+                kda_decode_v2,
+            )
+
+            kda_decode_v2(
+                qkv_proj_states,
+                beta,
+                f_a[:num_actual_tokens],
+                g_a[:num_actual_tokens],
+                w_f,
+                w_g,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                self.o_norm.weight,
+                recurrent_state,
+                spec_state_indices_tensor[:, 0][:num_spec_decodes],
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+                spec_query_start_loc[: num_spec_decodes + 1],
+                _kda_tile(kda_tile, spec_state_indices_tensor.size(-1)),
+                self.A_log.view(-1),
+                self.dt_bias,
+                lower_bound=lower_bound,
+                eps=self.o_norm.eps,
+                out=core_attn_out[0, :num_actual_tokens].unsqueeze(0),
+                wide=self._kda_wide
+                and wide_schedule(
+                    num_spec_decodes,
+                    num_actual_tokens // num_spec_decodes,
+                    self.local_num_heads,
+                ),
+            )
+            return True, None
+        mixed_v2 = (
+            v2_ready
+            and self._kda_recover
+            and not pure_verify
+            and spec_token_indx is not None
+        )
+        # Upstream's _forward cuts g1 to num_actual_tokens.
+        g1 = self.f_b_proj(f_a)[0]
+        g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+        self._fill_deferred_g2(g_a, g2)
+        if mixed_v2:
+            self._kda_mixed = functools.partial(
+                self._kda_mixed_spec_rows,
+                f_a=f_a[:num_actual_tokens],
+                g_a=g_a[:num_actual_tokens],
+                spec_token_indx=spec_token_indx,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                conv_bias=conv_bias,
+                recurrent_state=recurrent_state,
+                spec_state_indices_tensor=spec_state_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
+                spec_query_start_loc=spec_query_start_loc,
+                num_spec_decodes=num_spec_decodes,
+                kda_tile=kda_tile,
+                lower_bound=lower_bound,
+            )
+        return False, g1
+
+    def _kda_mixed_spec_rows(
+        self,
+        qkv_spec: torch.Tensor,
+        beta_spec: torch.Tensor,
+        *,
+        f_a: torch.Tensor,
+        g_a: torch.Tensor,
+        spec_token_indx: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        recurrent_state: torch.Tensor,
+        spec_state_indices_tensor: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_query_start_loc: torch.Tensor,
+        num_spec_decodes: int,
+        kda_tile: int | None,
+        lower_bound: float,
+    ) -> torch.Tensor:
+        """Mixed prefill + verify step (``_kda_mixed``, in place of upstream's
+        spec-row recurrence; upstream's spec-row conv is skipped): the spec
+        rows go through the recover verify (conv + recurrence, records, no
+        state writes) and stay unnormalised; ``_forward`` norms the whole
+        step."""
+        from vllm_sm80.models.glm5next.ops.kda_decode import (
+            _kda_tile,
+            kda_decode_v2,
+        )
+
+        core_attn_out_spec = torch.empty(
+            1,
+            qkv_spec.shape[0],
+            self.local_num_heads,
+            self.head_dim,
+            dtype=qkv_spec.dtype,
+            device=qkv_spec.device,
+        )
+        kda_decode_v2(
+            qkv_spec,
+            beta_spec.contiguous(),
+            f_a.index_select(0, spec_token_indx),
+            g_a.index_select(0, spec_token_indx),
+            self.f_b_proj.weight,
+            self.g_b_proj.weight,
+            conv_state,
+            conv_weights,
+            conv_bias,
+            self.o_norm.weight,
+            recurrent_state,
+            spec_state_indices_tensor[:, 0][:num_spec_decodes],
+            spec_state_indices_tensor,
+            num_accepted_tokens,
+            spec_query_start_loc[: num_spec_decodes + 1],
+            _kda_tile(kda_tile, self.num_spec + 1, keep_same_rows=True),
+            self.A_log.view(-1),
+            self.dt_bias,
+            lower_bound=lower_bound,
+            eps=self.o_norm.eps,
+            out=core_attn_out_spec,
+            records=self._kda_recover_records,
+            skip_norm=True,
+        )
+        return core_attn_out_spec
+
+    def sm80_chunk_kda(self, **kwargs):
+        """Upstream's ``chunk_kda_with_fused_gate`` call in ``_forward``, on
+        this module's chunked prefill (kda_prefill.py) when
+        VLLM_SM80_KDA_PREFILL covers the layer and the call."""
+        chunk_fn = glm_kda.chunk_kda_with_fused_gate
+        if self._pp_kda_prefill:
+            from vllm_sm80.models.glm5next.ops.kda_prefill import select_chunk_fn
+
+            q = kwargs["q"]
+            chunk_fn = select_chunk_fn(
+                chunk_fn,
+                q.shape[1],
+                kwargs["cu_seqlens"].shape[0] - 1,
+                q.dtype,
+                kwargs["raw_g"].dtype,
+                self.kv_cache[1].dtype,
+                self.A_log.dtype,
+                self.dt_bias.dtype,
+                num_heads=self.local_num_heads,
+            )
+        return chunk_fn(**kwargs)

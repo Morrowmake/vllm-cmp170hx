@@ -230,16 +230,16 @@ seams:
 - id: glm-kda-forward
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention.forward
-  why: reads _kda_v2, which the fork layer sets, to defer f_b_proj / g_b_proj to the fused decode step
-  sha256: c365deda35bdd0ee074959e66cd7bd42349a37564af7b8fd5a1128b5908cb481
+  why: hands the rest of the layer (f_b_proj / g_b_proj, core_attn_out, _forward, o_norm, o_proj) to the fork layer's sm80_forward_tail(hidden_states, qkv, beta, f_a, g_a) right after the input projections; sm80_forward_tail is this method's tail with the deferred projections and the norm inside _forward, so a change to the tail must be carried into it
+  sha256: 6eb07879a757bcb0b151ce3e336ec2e80fdd747d879008173c9a0273829169a4
   signature: '(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor'
 
-- id: glm-kda-forward-core
+- id: glm-kda-forward-body
   kind: method
-  target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention._forward_core
-  why: reads the fork layer's _kda_recover, _kda_recover_records, _kda_step_tile, _kda_wide, _pp_kda_prefill and _fill_deferred_g2, and the metadata's spec_max_query_len
-  sha256: eaac2672a965ba7ea61ee6ce86dee8e15c5c112aa4480fd2da82aa20a1a1643c
-  signature: '(self, qkv_proj_states: torch.Tensor, g1: torch.Tensor | None, beta: torch.Tensor, core_attn_out: torch.Tensor, g2: torch.Tensor | None = None, f_a: torch.Tensor | None = None, g_a: torch.Tensor | None = None) -> bool'
+  target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention._forward
+  why: the fork layer's _forward runs it nested in its own eager break after _kda_deferred_step, which mirrors its metadata, cache, conv-state layout and merged conv weight reads; it reads the fork layer's _kda_mixed (spec-row conv skipped, spec rows from that callable) and sm80_chunk_kda (the chunked prefill call)
+  sha256: 9f357032ed3099257e81e16df87ffec54f018b116cabd187875aafc4049b639d
+  signature: '(self, qkv_proj_states: torch.Tensor, g1: torch.Tensor, beta: torch.Tensor, core_attn_out: torch.Tensor) -> None'
 
 - id: glm-mamba-get-attn-backend
   kind: method
@@ -1963,6 +1963,48 @@ seams:
   why: DFlashDraftMixin returns the folded fc output (rounded to the fc weight dtype) when aux_fc_folded is set and calls this method otherwise; it must return hidden_states unchanged when the model takes no aux hidden states
   sha256: 8bbefec5535cc3b16c83572aabf66747528ee234330ef7c2262ac3755fd1a4d1
   signature: '(self, hidden_states: torch.Tensor) -> torch.Tensor'
+
+- id: glm-indexer-forward
+  kind: method
+  target: vllm.models.glm5next.common.attention:Indexer.forward
+  why: calls sm80_indexer.k_weights, quant_q and gate_score in place of its k / fp32 weights block, its Hadamard quant + weight scale and its gate projection; those functions keep upstream's code for the paths the fork switches leave unchanged, so a change to those blocks must be carried into them
+  sha256: 482b676ec1eb2ffd41a537072c9c70cf50562ff3d96d2d81bb0894ca33774a81
+  signature: '(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb) -> torch.Tensor'
+
+- id: glm-indexer-weight-scale
+  kind: function
+  target: vllm.models.glm5next.common.attention:_fused_indexer_weight_scale
+  why: sm80_indexer.quant_q calls it as Indexer.forward does, (weights, q_scale, softmax_scale * n_head**-0.5)
+  sha256: c6972b8ed87e5a1409b2bfefff7de3b4bf4929a2bb3eac87d32fedc166fe9395
+  signature: '(weights: torch.Tensor, q_scale: torch.Tensor, scale: float) -> torch.Tensor'
+
+- id: glm-sparse-indexer-kpool
+  kind: function
+  target: vllm.models.glm5next.nvidia.sparse_indexer:sparse_attn_indexer_kpool
+  why: calls the sm80_indexer hooks at the top-k fill, the prefill logits (Triton rows [ks, ke) instead of compressed rows) and both top-k selections, the decode positions, the paged decode logits function and the decode pool expansion; the Triton adapters rely on its argument order and on as_fp32_logits passing fp32 logits through
+  sha256: 6d0940a6e6066cb8920a9f246bd3131c6e5b8e32a61787ea5392f8603b265dff
+  signature: '(hidden_states: torch.Tensor, k_cache_prefix: vllm.utils.torch_utils.LayerName, kv_cache: torch.Tensor, q_quant: torch.Tensor, q_scale: torch.Tensor | None, k: torch.Tensor, weights: torch.Tensor, quant_block_size: int, scale_fmt: str | None, topk_tokens: int, head_dim: int, max_pool_len: int, total_seq_lens: int, topk_indices_buffer: torch.Tensor, skip_k_cache_insert: bool, use_fp4_cache: bool = False, gate_score: torch.Tensor | None = None, compress_ape: torch.Tensor | None = None, index_kpool: int = 1, positions: torch.Tensor | None = None, tail_kv_cache: torch.Tensor | None = None, tail_prefix: str | None = None, topk_backend: str = ''auto'', dcp_rank: int = 0, dcp_world_size: int = 1, cp_kv_cache_interleave_size: int = 1) -> torch.Tensor'
+
+- id: glm-sparse-indexer-op-init
+  kind: method
+  target: vllm.models.glm5next.nvidia.sparse_indexer:SparseAttnIndexerKpool.__init__
+  why: the fork op subclass runs it first; it must raise only when DeepGEMM is not installed (the vendored copy is) and set use_fp4_cache
+  sha256: 987e725dc854db88a1f15d3787fe0f275dde3255783ba1a8fcc421f22183e2d0
+  signature: '(self, k_cache, quant_block_size: int, scale_fmt: str, topk_tokens: int, head_dim: int, max_pool_len: int, max_total_seq_len: int, topk_indices_buffer: torch.Tensor, skip_k_cache_insert: bool = False, use_fp4_cache: bool = False, tail_cache=None)'
+
+- id: glm-custom-op-new
+  kind: method
+  target: vllm.model_executor.custom_op:CustomOp.__new__
+  why: building the upstream SparseAttnIndexerKpool looks up op_registry_oot by the class name and builds the registered fork op instead
+  sha256: 2090d4ec9b9a1d575566f432685fce8d9e8ceff1145c0335f9c3dec571d2bffc
+  signature: (cls, *args, **kwargs)
+
+- id: glm-custom-op-register-oot
+  kind: method
+  target: vllm.model_executor.custom_op:CustomOp.register_oot
+  why: register_glm_layers registers the fork op under 'SparseAttnIndexerKpool' and then restores upstream's op name, which register_oot overwrites with the table key
+  sha256: 177d332ffd744ee36f8be3585d0d569080d63ebfa839616761d878a3c15a443d
+  signature: '(_decorated_op_cls=None, name: str | None = None)'
 
 - id: dsv41-fused-topk-bias-router-compute-routing
   kind: method

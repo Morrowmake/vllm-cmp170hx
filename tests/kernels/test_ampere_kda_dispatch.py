@@ -273,8 +273,30 @@ def build_layer(H, w, *, kernels, nslot, recover=False, window=WINDOW,
         L._kda_recover_pool = torch.zeros(1, 3, 8, kr.WS_T, H, D, device=dev)
         L._kda_recover_records = kr.layer_records(L._kda_recover_pool, 0)
     L._pp_kda_prefill = False
-    for name in ("forward", "_forward", "_forward_core", "_fill_deferred_g2"):
+    L._kda_mixed = None
+    for name in ("forward", "sm80_forward_tail", "_forward", "_forward_core",
+                 "_kda_deferred_step", "_kda_mixed_spec_rows", "sm80_chunk_kda",
+                 "_fill_deferred_g2"):
         setattr(L, name, types.MethodType(getattr(K, name), L))
+    return L
+
+
+def _set_forward_context(fn):
+    """Point the forward-context lookups of upstream's KDA module and of the
+    fork layer's module at fn; returns what they were."""
+    import vllm.models.glm5next.common.kda as kmod
+    from vllm_sm80.models.glm5next import sm80_kda
+
+    saved = (kmod.get_forward_context, sm80_kda.get_forward_context)
+    kmod.get_forward_context = sm80_kda.get_forward_context = fn
+    return saved
+
+
+def _restore_forward_context(saved):
+    import vllm.models.glm5next.common.kda as kmod
+    from vllm_sm80.models.glm5next import sm80_kda
+
+    kmod.get_forward_context, sm80_kda.get_forward_context = saved
     return L
 
 
@@ -323,7 +345,6 @@ def run_layer(L, x, meta, conv0, rec0, calls=None):
     """forward() from a fixed state -> (normed o [M, P] bf16, conv, rec, records).
     `calls` (a list) collects the fused kernel's (wide, skip_norm, recover)
     per launch."""
-    import vllm.models.glm5next.common.kda as kmod
     from vllm_sm80.models.glm5next.ops import kda_decode as v2mod
 
     conv, rec = L.kv_cache
@@ -332,8 +353,8 @@ def run_layer(L, x, meta, conv0, rec0, calls=None):
     if L._kda_recover_records is not None:
         L._kda_recover_pool.zero_()
     L.o_norm.calls = 0
-    saved = kmod.get_forward_context
-    kmod.get_forward_context = lambda: types.SimpleNamespace(attn_metadata={L.prefix: meta})
+    saved = _set_forward_context(
+        lambda: types.SimpleNamespace(attn_metadata={L.prefix: meta}))
     fused = v2mod.kda_decode_v2
     if calls is not None:
         def counted(*a, **k):
@@ -346,7 +367,7 @@ def run_layer(L, x, meta, conv0, rec0, calls=None):
         y = L.forward(x.clone(), None)
         torch.cuda.synchronize()
     finally:
-        kmod.get_forward_context = saved
+        _restore_forward_context(saved)
         v2mod.kda_decode_v2 = fused
     recs = None if L._kda_recover_records is None else L._kda_recover_pool[0].clone()
     return y.clone(), conv.clone(), rec.clone(), recs
@@ -592,7 +613,6 @@ def gpu_test_mixed_step_spec_rows():
 
 def gpu_test_graph_replay_is_eager():
     """The 64-head wide shapes capture into a CUDA graph and replay bitwise."""
-    import vllm.models.glm5next.common.kda as kmod
     from vllm_sm80.models.glm5next.ops.kda_decode import wide_schedule
 
     e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1)
@@ -607,9 +627,8 @@ def gpu_test_graph_replay_is_eager():
             yb = run_layer(L, x, meta, conv0, rec0)
             assert all(torch.equal(a, b) for a, b in zip(ya[:3], yb[:3])), (nseq, T)
             conv, rec = L.kv_cache
-            saved = kmod.get_forward_context
-            kmod.get_forward_context = lambda: types.SimpleNamespace(
-                attn_metadata={L.prefix: meta})
+            saved = _set_forward_context(lambda: types.SimpleNamespace(
+                attn_metadata={L.prefix: meta}))
             try:
                 xg = x.clone()
                 side = torch.cuda.Stream()
@@ -622,7 +641,7 @@ def gpu_test_graph_replay_is_eager():
                 with torch.cuda.graph(gr):
                     yg = L.forward(xg, None)
             finally:
-                kmod.get_forward_context = saved
+                _restore_forward_context(saved)
             for _ in range(2):
                 conv.copy_(conv0)
                 rec.copy_(rec0)
@@ -644,15 +663,16 @@ def gpu_test_piecewise_replay_norms_by_replay_path():
     unfused chain norms after the kernels), and the reverse, at 16 heads
     (RecoverSSM) and 64 heads: each replay must be bitwise eager forward() of
     the replayed step."""
-    import vllm.models.glm5next.common.kda as kmod
+    from vllm_sm80.models.glm5next.sm80_kda import Glm5NextLinearAttention as K
     from vllm_sm80.models.glm5next.ops.kda_decode import wide_schedule
+    from vllm.forward_context import get_forward_context
     from vllm.compilation.breakable_cudagraph import (
         BreakableCUDAGraphCapture,
         eager_break_during_capture,
     )
 
     e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_USE_BREAKABLE_CUDAGRAPH=1)
-    saved = kmod.get_forward_context
+    saved = _set_forward_context(get_forward_context)
     try:
         nseq, T = 8, 4
         for H, recover in ((16, True), (64, False)):
@@ -674,13 +694,13 @@ def gpu_test_piecewise_replay_norms_by_replay_path():
             L.in_proj_qkvbfg_a = lambda t: (t.clone(),)
             L.o_proj = lambda t: (t.clone(),)
             # The class was decorated at import, when breaks may have been off.
-            fn = kmod.Glm5NextLinearAttention._forward
+            fn = K._forward
             L._forward = types.MethodType(
                 eager_break_during_capture(getattr(fn, "__wrapped__", fn)), L)
             conv, rec = L.kv_cache
             step = {}
-            kmod.get_forward_context = lambda: types.SimpleNamespace(
-                attn_metadata={L.prefix: step["meta"]})
+            _set_forward_context(lambda: types.SimpleNamespace(
+                attn_metadata={L.prefix: step["meta"]}))
             for captured, replayed, want, label in (
                 (spec, dec, want_dec, "verify capture, decode replay"),
                 (dec, spec, want_spec, "decode capture, verify replay"),
@@ -708,9 +728,9 @@ def gpu_test_piecewise_replay_norms_by_replay_path():
                 assert torch.equal(conv, want[1]) and torch.equal(rec, want[2]), (H, label)
                 print(f"  H={H} {label}: bitwise eager")
                 del cap
-            kmod.get_forward_context = saved
+            _restore_forward_context(saved)
     finally:
-        kmod.get_forward_context = saved
+        _restore_forward_context(saved)
         e.undo()
 
 
