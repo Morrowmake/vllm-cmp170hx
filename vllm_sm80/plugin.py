@@ -434,7 +434,10 @@ def register_fork_env_vars() -> None:
     lazily. Both entry points call it first: the platform plugin, which vLLM
     resolves before any fork platform code runs, and the general plugin,
     which vLLM loads in every process before engine and model code
-    (``validate_environ`` runs after it). Once per process."""
+    (``validate_environ`` runs after it). The fork modules that read a
+    variable when imported call it too: an upstream file can import them in a
+    process where neither entry point ran (``VLLM_PLUGINS`` without sm80).
+    Once per process."""
     global _env_vars_registered
     if _env_vars_registered:
         return

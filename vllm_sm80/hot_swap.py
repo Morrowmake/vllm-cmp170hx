@@ -75,6 +75,9 @@ from typing import Any
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm_sm80.plugin import register_fork_env_vars
+
+register_fork_env_vars()  # read at import below
 
 logger = init_logger(__name__)
 

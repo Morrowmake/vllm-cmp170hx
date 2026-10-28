@@ -14,6 +14,9 @@ from vllm_sm80 import capture
 from vllm_sm80.kernels.exl3 import dense_prefill_tc
 from vllm_sm80.kernels.exl3 import capture_points
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_sm80.plugin import register_fork_env_vars
+
+register_fork_env_vars()  # read at import below
 
 logger = init_logger(__name__)
 

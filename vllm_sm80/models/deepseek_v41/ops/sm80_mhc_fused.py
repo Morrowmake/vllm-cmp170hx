@@ -83,6 +83,9 @@ from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_side
 from vllm_sm80.models.deepseek_v41.ops.sm80_mhc import mhc_post
 from vllm_sm80.kernels.mhc.decode import HB_GLU, post_prenorm
 from vllm.triton_utils import tl, triton
+from vllm_sm80.plugin import register_fork_env_vars
+
+register_fork_env_vars()  # read at import below
 
 __all__ = ["mhc_fused_post_pre_delayed", "mhc_post", "mhc_pre_delayed", "supports"]
 

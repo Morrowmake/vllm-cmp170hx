@@ -66,6 +66,9 @@ import torch
 from vllm import envs
 from vllm.platforms import current_platform
 from vllm_sm80 import tuning
+from vllm_sm80.plugin import register_fork_env_vars
+
+register_fork_env_vars()  # read at import below
 
 # Below this K the weight is too small to amortise the launch and cuBLAS wins
 # outright; also keeps the split-K heuristic out of its degenerate corner.
