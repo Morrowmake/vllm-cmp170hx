@@ -334,15 +334,34 @@ def test_spec_decode_warmup_skips_other_speculators(monkeypatch, kind) -> None:
     _assert_skipped(monkeypatch, runner)
 
 
-def test_spec_decode_warmup_is_called_by_the_runner_warmup() -> None:
-    import inspect as _inspect
+@pytest.mark.parametrize(
+    ("profile_only", "jit_warmup", "runs"),
+    [(False, True, True), (True, True, False), (False, False, False)],
+)
+def test_spec_decode_warmup_runs_before_the_real_capture(
+    monkeypatch, profile_only, jit_warmup, runs
+) -> None:
+    from types import SimpleNamespace
 
-    from vllm.v1.worker.gpu import warmup as gpu_warmup
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm_sm80.worker import cudagraph_mem, graph_mem_worker
 
-    assert gpu_warmup.warmup_spec_decode is spec_warmup.warmup_spec_decode
-    assert "warmup_spec_decode(model_runner)" in _inspect.getsource(
-        gpu_warmup.warmup_kernels
+    events = []
+    monkeypatch.setattr(
+        spec_warmup, "warmup_spec_decode", lambda runner: events.append("warmup")
     )
+    monkeypatch.setattr(cudagraph_mem, "enabled", lambda: False)
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "capture_model",
+        lambda self, *, profile_only=False: events.append("capture") or 0,
+    )
+    runner = object.__new__(graph_mem_worker.runner_cls())
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(enable_jit_warmup=jit_warmup)
+    )
+    runner.capture_model(profile_only=profile_only)
+    assert events == (["warmup", "capture"] if runs else ["capture"])
 
 
 class _SpecRecorder(_Recorder):

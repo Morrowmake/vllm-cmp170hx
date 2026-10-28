@@ -161,7 +161,10 @@ def _setup(monkeypatch, dev: FakeDevice, cap: Capture) -> tuple[Any, dict]:
     runner.cudagraph_manager = _FakeManager(cap)
     # needs_cudagraph_capture: a text-only model, so no encoder graphs.
     runner.model_state = SimpleNamespace(supports_mm_inputs=False)
-    runner.vllm_config = SimpleNamespace()
+    # JIT warmup off: capture_model runs no speculative-decoding warmup.
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(enable_jit_warmup=False)
+    )
     state: dict[str, Any] = {}
 
     def init(_r) -> None:

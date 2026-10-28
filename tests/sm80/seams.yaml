@@ -1630,6 +1630,13 @@ seams:
   sha256: 3e56aa69835f93d1cb1d3f08e590fcc9928e74a9d9f81935c1f1cc35727dbe5f
   signature: '(path: str) -> bool'
 
+- id: layers-worker-warmup-then-capture
+  kind: method
+  target: vllm.v1.worker.gpu_worker:Worker._compile_or_warm_up_model
+  why: kernel_warmup, then (V2 runner, JIT warmup on) warmup_kernels, then capture_model with no step between; the fork runner's capture_model runs the speculative-decoding warmup first, where warmup_kernels used to end
+  sha256: 68118c19e62b16634e3e3960b4e3b55dc5a644fd3887ee476a9fca16743adb45
+  signature: (self) -> vllm.v1.worker.worker_base.CompilationTimes
+
 - id: worker-init-speculator
   kind: function
   target: vllm.v1.worker.gpu.spec_decode:init_speculator

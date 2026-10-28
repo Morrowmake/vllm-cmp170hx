@@ -21,9 +21,11 @@ dummy run reaches (model runner V2).
   the decode value compiles at boot; a prefill chunk needs a larger one.
   Warmed by preparing a one-request dummy batch for every reachable value.
 
-Called at the end of the runner's warmup steps (``warmup_kernels``, with
-JIT warmup on), before graph capture, and runs only on sm_80 with a DSpark
-speculator (DeepSeek-V4.1's; other models' drafters keep upstream's boot).
+Called by the fork runner's ``capture_model`` before the real capture
+(:func:`warmup_before_capture`, with JIT warmup on), which the worker runs
+right after the runner's warmup steps (``warmup_kernels``), and runs only on
+sm_80 with a DSpark speculator (DeepSeek-V4.1's; other models' drafters keep
+upstream's boot).
 It makes no collective call: the target logits are a local zero tensor of
 the shape and dtype ``compute_logits`` returns, so a rank that fails cannot
 leave the others waiting. A failure is logged and does not stop the engine:
@@ -60,6 +62,16 @@ def prepare_block_sizes(num_query_per_req: int, max_num_tokens: int) -> list[int
         out.append((block, q))
         block *= 2
     return out
+
+
+def warmup_before_capture(runner: "GPUModelRunner", profile_only: bool) -> None:
+    """:func:`warmup_spec_decode` from the fork runner's ``capture_model``
+    (``vllm_sm80/worker/graph_mem_worker.py``): the worker calls it right
+    after the runner's warmup steps, which run only with JIT warmup on.
+    Profiling captures (``profile_only``) skip it."""
+    if profile_only or not runner.vllm_config.kernel_config.enable_jit_warmup:
+        return
+    warmup_spec_decode(runner)
 
 
 def warmup_spec_decode(runner: "GPUModelRunner") -> None:

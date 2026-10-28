@@ -19,6 +19,8 @@ is a no-op with its switch off:
   rank; and the dummy sampler run at boot warms the slot kernels. The hot
   pair ``shard_argmax`` (``vllm_sm80.hot_swap``) needs the same runner and
   turns the target half on and off between steps (``set_enabled``);
+- the speculative-decoding kernel warmup (``vllm_sm80.spec_decode.warmup``):
+  ``capture_model`` first compiles the DSpark kernels no boot run reaches;
 - the A/B capture of ``VLLM_DEV_AB_SWITCH`` and the hot pairs
   (``dev_ab.with_ab_capture``) around vLLM's ``capture_model``;
 - adaptive-k (``adaptive_k_graphs``): the startup check that every draft
@@ -49,6 +51,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_worker import Worker
 from vllm_sm80 import hot_swap
+from vllm_sm80.spec_decode import warmup as spec_decode_warmup
 from vllm_sm80.worker import cudagraph_mem, target_argmax
 
 if TYPE_CHECKING:
@@ -104,6 +107,7 @@ def runner_cls() -> type:
             )
 
         def capture_model(self, *, profile_only: bool = False) -> int:
+            spec_decode_warmup.warmup_before_capture(self, profile_only)
             try:
                 if not cudagraph_mem.enabled():
                     size = ab_capture(self, profile_only=profile_only)
