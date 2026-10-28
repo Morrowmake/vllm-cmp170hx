@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -336,7 +337,14 @@ def _gumbel_sample_kernel(
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
     )
-    token_id = block_idx * BLOCK_SIZE + idx
+    # `idx` is the argmax over a BLOCK_SIZE-wide tile whose out-of-vocab tail
+    # lanes were loaded as -inf. If every in-vocab lane of the tile is also
+    # -inf (or NaN) the reduction can settle on a tail lane, giving a token id
+    # >= vocab_size; nothing downstream bounds a sampled token id, so it would
+    # index the detokenizer and the drafter tables out of range. In such a tile
+    # every index is equally arbitrary, so clamping changes no well-defined
+    # result. (vllm-project/vllm#50843)
+    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
