@@ -1630,6 +1630,13 @@ seams:
   sha256: 3e56aa69835f93d1cb1d3f08e590fcc9928e74a9d9f81935c1f1cc35727dbe5f
   signature: '(path: str) -> bool'
 
+- id: layers-moe-align-block-size
+  kind: function
+  target: vllm.model_executor.layers.fused_moe.moe_align_block_size:moe_align_block_size
+  why: vllm_sm80/kernels/moe/align.py maybe_align is called after the argument check and, for the deterministic kernel, repeats the buffer allocation (order, shapes, dtypes), the expert_map remap and the return tuple of this body; a change here must be carried over
+  sha256: 07fee1b7e35e7a1096a95250460032730ab36dc8a99c6584f56aaad6283ee419
+  signature: '(topk_ids: torch.Tensor, block_size: int, num_experts: int, expert_map: torch.Tensor | None = None, pad_sorted_ids: bool = False, ignore_invalid_experts: bool = False, return_scatter_idx: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]'
+
 - id: layers-worker-warmup-then-capture
   kind: method
   target: vllm.v1.worker.gpu_worker:Worker._compile_or_warm_up_model

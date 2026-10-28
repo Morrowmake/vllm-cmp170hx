@@ -271,6 +271,87 @@ def kernel_moe_align_block_size(
         )
 
 
+def maybe_align(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+    pad_sorted_ids: bool,
+    ignore_invalid_experts: bool,
+    return_scatter_idx: bool,
+) -> tuple[torch.Tensor, ...] | None:
+    """The sm_80 paths of ``moe_align_block_size`` (called at its top, after
+    the argument check), or None to run upstream's body.
+
+    1. With ``VLLM_AMPERE_DECODE_KERNELS``: the alignment that
+       ``fused_route_align`` (``vllm_sm80/kernels/moe/routing.py``) produced
+       in the same launch as the routing. The fusion is exact
+       (count_and_sort is phase 2 of moe_align_block_size and both consume
+       only topk_ids, which the routing kernel produced, and nothing reads
+       topk_ids in between). A miss falls through.
+    2. With ``VLLM_MOE_DETERMINISTIC_ALIGN=1``: upstream's body with
+       :func:`kernel_moe_align_block_size` in place of
+       ``ops.moe_align_block_size``; the buffers are allocated in the same
+       order, shapes and dtypes as upstream's.
+    """
+    from vllm import envs
+
+    if not return_scatter_idx and envs.VLLM_AMPERE_DECODE_KERNELS:
+        from vllm_sm80.kernels.moe import take_fused_align
+
+        fused = take_fused_align(
+            topk_ids, block_size, num_experts, expert_map, pad_sorted_ids
+        )
+        if fused is not None:
+            return fused
+    if deterministic_moe_align_mode() != 1:
+        return None
+
+    from vllm.utils.math_utils import round_up
+
+    scatter_idx = None
+    if return_scatter_idx:
+        scatter_idx = torch.empty(
+            (topk_ids.numel(), 1),
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = min(
+            topk_ids.numel() * block_size, max_num_tokens_padded
+        )
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    kernel_moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map if ignore_invalid_experts else None,
+        scatter_idx,
+    )
+
+    if expert_map is not None and not ignore_invalid_experts:
+        expert_ids = expert_map[expert_ids]
+
+    if scatter_idx is not None:
+        return sorted_ids, expert_ids, num_tokens_post_pad, scatter_idx
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+
 def warmup(device: torch.device | str, num_experts: int) -> None:
     """Allocate default scratch and compile all flag variants before capture.
 
