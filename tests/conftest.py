@@ -13,6 +13,12 @@ from tblib import pickling_support
 # This should be run before any custom exception subclasses are defined.
 pickling_support.install()
 
+# GPU tests run only under the GPU lock: outside it, hide the cards before
+# anything can initialise CUDA (tests/sm80/gpu_lock_guard.py).
+from tests.sm80.gpu_lock_guard import hide_cuda, pytest_configure, refuse_cuda_tests
+
+hide_cuda()
+
 import http.server
 import json
 import math
@@ -1615,7 +1621,10 @@ def pytest_addoption(parser):
     )
 
 
+# trylast: after `-m` deselection, so `-m 'not cuda'` deselects marked tests
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
+    refuse_cuda_tests(config, items)
     if config.getoption("--optional"):
         # --optional given in cli: do not skip optional tests
         return
