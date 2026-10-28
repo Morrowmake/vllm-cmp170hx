@@ -12,9 +12,15 @@ at a position the model really does sample.
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.worker.gpu.structured_outputs import grammar_invalid_drafts
+
+# grammar_invalid_drafts copies its row limits through pinned host memory.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="pinned host memory requires CUDA"
+)
 
 
 def _input_batch(req_ids, num_drafts, num_admitted=None):
