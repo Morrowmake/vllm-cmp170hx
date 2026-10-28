@@ -1630,6 +1630,13 @@ seams:
   sha256: 3e56aa69835f93d1cb1d3f08e590fcc9928e74a9d9f81935c1f1cc35727dbe5f
   signature: '(path: str) -> bool'
 
+- id: dsv41-dspark-precompute-context-kv
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model.precompute_and_store_context_kv
+  why: the fork DSpark model overrides it; sm_80 draft layers store their context window rows with sm80_store_context_kv (main_x, context_positions, the layer's slot mapping or None while profiling), any other layer calls this method through super()
+  sha256: ccba490e970e4da597bab2e55e078b5de98f4fb6d4c88a65a1d4b3d7e2f23a74
+  signature: '(self, main_x: torch.Tensor, context_positions: torch.Tensor, context_slot_mappings: list[torch.Tensor | None] | None = None) -> None'
+
 - id: layers-mhc-fused-post-pre-forward-cuda
   kind: method
   target: vllm.model_executor.layers.mhc:MHCFusedPostPreOp.forward_cuda
@@ -1869,23 +1876,93 @@ seams:
 - id: dsv41-attention-indexer-cls
   kind: method
   target: vllm.models.deepseek_v41.attention:DeepseekV4Attention._indexer_cls
-  why: DeepseekV41Sm80Attention overrides it to build the sm80 indexer; the upstream constructor must still obtain its indexer class through this method
+  why: overridden by DeepseekV41Sm80Attention to return DeepseekV41Sm80Indexer; the upstream constructor must still pick the indexer class with self._indexer_cls(index_k_cache)
   sha256: 7033b10773c1e6a10957bf84081372bdf9fad4ae9f2538341fa7eb28762d0f25
   signature: '(self, k_cache: ''DeepseekV4IndexerCache | None'') -> type[''DeepseekV4Indexer'']'
 
 - id: dsv41-attention-o-proj
   kind: method
   target: vllm.models.deepseek_v41.attention:DeepseekV4Attention._o_proj
-  why: DeepseekV41Sm80Attention overrides the output projection with the same arguments (attn_out, positions); upstream forward must still call it
+  why: overridden by DeepseekV41Sm80Attention (wo_a per group, wo_b partials summed in fp32); the attention forward must still end with self._o_proj(attn_out, positions)
   sha256: 61b178ce898ac23ba2bf40e60acc02dd1a78064f2210192fb7f24fb41c8dd6c7
   signature: '(self, attn_out: ''torch.Tensor | QuantizedActivation'', positions: torch.Tensor) -> torch.Tensor'
 
 - id: dsv41-model-collapse
   kind: method
   target: vllm.models.deepseek_v41.nvidia.model:DeepseekV4Model._collapse
-  why: the sm80 DeepseekV4Model overrides the hyper-connection collapse; upstream forward must still call it with the same arguments
+  why: overridden by the fork DeepseekV4Model (sm_80 mHC collapse); the upstream forward must still produce its output through self._collapse with the same arguments
   sha256: 4837d2776dd455f40886a53a1be9a1c8582e8649e914ebf76a59d0cc47a46283
   signature: '(self, hidden_states: torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.MoEOutput, residual: torch.Tensor, post_mix: torch.Tensor, res_mix: torch.Tensor, aux_hidden_by_layer: dict[int, torch.Tensor], full_num_tokens: int) -> torch.Tensor'
+
+- id: dsv41-topk-bias-router-compute-routing
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router:FusedTopKBiasRouter._compute_routing
+  why: overridden by Sm80DeepseekV41Router (routing on FP32 router logits); BaseRouter.select_experts must still reach routing through this method with the same arguments and return (topk_weights, topk_ids)
+  sha256: bcef69224e0cfe473a6bf64130151ce4e943453b32ec45bf33c0c11d529579bc
+  signature: '(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, indices_type: torch.dtype | None, *, input_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]'
+
+- id: exl3-logits-processor-apply-head
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor._apply_head
+  why: overridden by Exl3HeadLogitsProcessor to apply the packed EXL3 head; LogitsProcessor must still compute logits through this method with (lm_head, hidden_states, embedding_bias)
+  sha256: 3cb7fea48c08851aed74084630e965e5d78b1dabe10b2f94fceb28ea0dfd0486
+  signature: '(self, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None) -> torch.Tensor'
+
+- id: qwen4-moe-block-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpSparseMoeBlock.__init__
+  why: the fork Qwen4Exp classes set the router logits dtype on every block after the upstream model is built (gate.set_out_dtype, which refuses a dtype already set); the block must expose its GateLinear as self.gate with out_dtype unset, and nothing built after it may read the gate's out_dtype before then
+  sha256: 0ed594acdec2e097b1c703f9b944f7316965e2ee7001c2aeb4c741eb5dfb24d7
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''', reduce_results: bool = True) -> None'
+
+- id: qwen4-moe-router-dtype
+  kind: function
+  target: vllm.model_executor.models.deepseek_v2:_get_moe_router_dtype
+  why: precision.apply_router_precision takes the router logits dtype of the target text config from it (None keeps the model dtype)
+  sha256: c8ca0f6368f694bcc5a5c771e64bb32023741e789adce8e98fc5a99edafed5d7
+  signature: '(config: transformers.models.deepseek_v2.configuration_deepseek_v2.DeepseekV2Config | transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config) -> torch.dtype | None'
+
+- id: qwen4-causal-lm-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpForCausalLM.__init__
+  why: builds lm_head = ParallelLMHead(vocab_size, hidden_size, prefix lm_head) unquantized, with self.quant_config and self.config set; the fork replaces it in place by the same head built with the quantization config. The low-latency GEMM pass after it changes only unquantized heads on capabilities with plans (none for 8.x)
+  sha256: 1337459c6aa744fee3cb6304c2f49b27334a697d29adae5adcfaf84843a717a3
+  signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
+
+- id: qwen4-conditional-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpForConditionalGeneration.__init__
+  why: builds self.language_model = Qwen4ExpForCausalLM(prefix language_model) directly (not through the registry), so the fork wrapper adopts it after construction
+  sha256: e75ac841f2ecbc0772639ed2688fdd178943035b7419a44832ac3eaa209fafb6
+  signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = ''model'') -> None'
+
+- id: qwen4-mtp-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.mtp:Qwen4ExpMTP.__init__
+  why: builds self.model (the predictor) and lm_head (the tied embedding, a ParallelLMHead or a PPMissingLayer), with self.quant_config and self.config set; the fork drops both for PPMissingLayer when the quantization config's mtp_shares_target_embeddings says so
+  sha256: 19155e6eebd83beb3e3bd980c0dce698bd93cce53f7f16a64c8b19cdacf252e2
+  signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
+
+- id: qwen4-mtp-predictor-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.mtp:Qwen4ExpMultiTokenPredictor.__init__
+  why: builds embed_tokens and pre_fc_norm_hidden = GemmaRMSNorm(hidden_size * hc_count, eps=config.rms_norm_eps) with self.hidden_size, self.hc_count and self.config set; the fork swaps in the per-stream norm (same parameter) before weights load
+  sha256: 9674c0ca485e98c9e200d67636d68a9590371c798fc9d64e5fc8152d8b31cae6
+  signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
+
+- id: dflash-decoder-layer-init
+  kind: method
+  target: vllm.model_executor.models.qwen3_dflash:DFlashQwen3DecoderLayer.__init__
+  why: sizes the RoPE cache from config.max_position_embeddings, the only read of that field while a DFlash-family drafter is built; dflash_draft.fitted_rope_positions sets the fitted value on the draft config for the construction
+  sha256: 2366a0877c693df6e9d9c5e833b7f470ee2fab2e33c59f258c8356d20238cbcf
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, *, config: transformers.models.qwen3.configuration_qwen3.Qwen3Config, layer_idx: int, cache_config: vllm.config.cache.CacheConfig | None = None, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, prefix: str = '''') -> None'
+
+- id: dflash-combine-hidden-states
+  kind: method
+  target: vllm.model_executor.models.qwen3_dflash:DFlashQwen3ForCausalLM.combine_hidden_states
+  why: DFlashDraftMixin returns the folded fc output (rounded to the fc weight dtype) when aux_fc_folded is set and calls this method otherwise; it must return hidden_states unchanged when the model takes no aux hidden states
+  sha256: 8bbefec5535cc3b16c83572aabf66747528ee234330ef7c2262ac3755fd1a4d1
+  signature: '(self, hidden_states: torch.Tensor) -> torch.Tensor'
 
 - id: dsv41-fused-topk-bias-router-compute-routing
   kind: method

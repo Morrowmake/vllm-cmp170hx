@@ -36,8 +36,13 @@ MODEL_OVERRIDES = {
     "DSparkV41DraftModel": (
         "vllm_sm80.models.deepseek_v41.sm80_model:DSparkDeepseekV4ForCausalLM"
     ),
-    # Qwen4Exp's vision wrapper (its text model is built inside it) and its
-    # MTP drafter: compute_logits_local and the greedy target argmax.
+    # Qwen4Exp's text model, its vision wrapper (which builds the text model
+    # itself) and its MTP drafter: router precision, the quantized LM head,
+    # the MTP norm and shared embeddings, compute_logits_local and the greedy
+    # target argmax.
+    "Qwen4ExpForCausalLM": (
+        "vllm_sm80.models.qwen4_exp.sm80_model:Qwen4ExpForCausalLM"
+    ),
     "Qwen4ExpForConditionalGeneration": (
         "vllm_sm80.models.qwen4_exp.sm80_model:Qwen4ExpForConditionalGeneration"
     ),
@@ -94,10 +99,14 @@ def register_hf_config_defaults() -> None:
         MODELS_CONFIG_MAP[architecture] = with_hf_config_defaults(hook, defaults)
 
 
-# DFlash2 drafter code shared by the models (vllm_sm80/spec_decode/).
+# DFlash-family drafter code shared by the models (vllm_sm80/spec_decode/).
 # Architecture -> ("<module>:<class>" of the fork class, the upstream module
 # whose class it extends). Resolved lazily, like MODEL_OVERRIDES.
 DRAFTER_OVERRIDES = {
+    "DFlashDraftModel": (
+        "vllm_sm80.spec_decode.dflash_draft:DFlashQwen3ForCausalLM",
+        "vllm.model_executor.models.qwen3_dflash",
+    ),
     "DFlash2DraftModel": (
         "vllm_sm80.spec_decode.dflash2_model:DFlash2Qwen3ForCausalLM",
         "vllm.model_executor.models.qwen3_dflash2",
