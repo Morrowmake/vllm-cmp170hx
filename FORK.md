@@ -215,9 +215,10 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/model_registry.py` | 91 |
 | `vllm_sm80/models/__init__.py` | 2 |
 | `vllm_sm80/parser_recovery.py` | 321 |
-| `vllm_sm80/parsers/__init__.py` | 75 |
+| `vllm_sm80/parsers/__init__.py` | 82 |
 | `vllm_sm80/parsers/deepseek_v41.py` | 28 |
-| `vllm_sm80/parsers/glm47.py` | 63 |
+| `vllm_sm80/parsers/glm47.py` | 71 |
+| `vllm_sm80/parsers/ling3.py` | 27 |
 | `vllm_sm80/platform.py` | 171 |
 | `vllm_sm80/plugin.py` | 445 |
 | `vllm_sm80/sched/__init__.py` | 66 |
@@ -264,7 +265,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **85 files** | **23,874** |
+| **86 files** | **23,916** |
 
 ### `csrc/exl3/`
 
@@ -580,7 +581,7 @@ Grouped by top-level directory.
 | `tests/models/test_native_checkpoint_wrapper_meta.py` | 268 |
 | `tests/parser/engine/sm80_parsers.py` | 31 |
 | `tests/parser/engine/test_deepseek_v41_tool_args.py` | 341 |
-| `tests/parser/engine/test_glm47_tool_choice_none.py` | 262 |
+| `tests/parser/engine/test_glm47_tool_choice_none.py` | 264 |
 | `tests/parser/engine/test_sm80_deepseek_v41_recovery.py` | 912 |
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/gpu_lock_guard.py` | 86 |
@@ -688,7 +689,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **302 files** | **126,158** |
+| **302 files** | **126,160** |
 
 #### `tools/`
 
@@ -954,8 +955,8 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 
 | Measure | Value |
 |---|---:|
-| Plugin product files | 265 |
-| Plugin product lines | 85,798 |
+| Plugin product files | 266 |
+| Plugin product lines | 85,840 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |
