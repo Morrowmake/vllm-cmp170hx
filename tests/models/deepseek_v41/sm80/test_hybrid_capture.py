@@ -243,7 +243,7 @@ def test_hybrid_padded_scores_export_and_select(monkeypatch, tmp_path, n_cols, o
         inputs = {"scores": selected, "n_vis": n_vis, "k": 2}
         hybrid._record("select_topk", inputs, lambda: core.select_topk(**inputs))
 
-    path = Path(hybrid.__file__).resolve().parents[4] / "tools/sm80/export_hybrid_cases.py"
+    path = Path(__file__).resolve().parents[4] / "tools/sm80/export_hybrid_cases.py"
     spec = importlib.util.spec_from_file_location("hybrid_link_export", path)
     exporter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(exporter)
