@@ -161,7 +161,7 @@ The launcher: settings, checkpoints, receipts and the serve entry.
 | `vllm_sm80/launch/data/link_written.toml` | 12 |
 | `vllm_sm80/launch/data/native_inputs.toml` | 107 |
 | `vllm_sm80/launch/data/tree_exempt.toml` | 16 |
-| `vllm_sm80/launch/defaults.toml` | 161 |
+| `vllm_sm80/launch/defaults.toml` | 163 |
 | `vllm_sm80/launch/envclass.py` | 45 |
 | `vllm_sm80/launch/errors.py` | 20 |
 | `vllm_sm80/launch/main.py` | 590 |
@@ -171,7 +171,7 @@ The launcher: settings, checkpoints, receipts and the serve entry.
 | `vllm_sm80/launch/settings_dir.py` | 237 |
 | `vllm_sm80/launch/treestate.py` | 843 |
 | `vllm_sm80/launch/validated.py` | 350 |
-| **18 files** | **4,825** |
+| **18 files** | **4,827** |
 
 ### `vllm_sm80/`
 
@@ -587,7 +587,7 @@ Grouped by top-level directory.
 | `tests/sm80/gpu_lock_guard_cases.py` | 25 |
 | `tests/sm80/launch/conftest.py` | 10 |
 | `tests/sm80/launch/helpers.py` | 515 |
-| `tests/sm80/launch/test_launch_ambient.py` | 281 |
+| `tests/sm80/launch/test_launch_ambient.py` | 290 |
 | `tests/sm80/launch/test_launch_assembled.py` | 157 |
 | `tests/sm80/launch/test_launch_checkpoint.py` | 365 |
 | `tests/sm80/launch/test_launch_dependencies.py` | 154 |
@@ -688,7 +688,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **302 files** | **126,149** |
+| **302 files** | **126,158** |
 
 #### `tools/`
 
@@ -955,7 +955,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 265 |
-| Plugin product lines | 85,796 |
+| Plugin product lines | 85,798 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |
