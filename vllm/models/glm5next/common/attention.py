@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
+from vllm_sm80.models.glm5next import sm80_indexer
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -302,16 +304,7 @@ class Indexer(nn.Module):
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
-            )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        k, weights = sm80_indexer.k_weights(self, hidden_states)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -347,18 +340,12 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
-        )
+        q_fp8, weights = sm80_indexer.quant_q(self, q, weights)
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        gate_score = sm80_indexer.gate_score(self, hidden_states)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
