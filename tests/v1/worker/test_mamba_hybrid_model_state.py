@@ -424,6 +424,8 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
         ),
         block_size=8,
         block_table=torch.zeros((2, 4), dtype=torch.int32, device=GPU_DEVICE),
+        commit_lens=torch.tensor([3], dtype=torch.int32, device=GPU_DEVICE),
+        source_state_indices=torch.tensor([1], dtype=torch.int32, device=GPU_DEVICE),
     )
     num_sampled = torch.tensor([2, sampled], dtype=torch.int32, device=GPU_DEVICE)
     idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device=GPU_DEVICE)
