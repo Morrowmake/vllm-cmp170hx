@@ -224,11 +224,14 @@ def register() -> None:
 
 
 def register_fork_parsers() -> None:
-    """The GLM-4.7 and DeepSeek V4.1 reasoning and tool parsers under their
-    upstream names (``vllm_sm80/parsers``)."""
+    """The GLM-4.7 and DeepSeek V4.1 reasoning and tool parsers and the
+    DeepSeek V4.1 tokenizer under their upstream names (``vllm_sm80/parsers``,
+    ``vllm_sm80/tokenizers``)."""
     from vllm_sm80.parsers import register_parsers
+    from vllm_sm80.tokenizers import register_tokenizers
 
     register_parsers()
+    register_tokenizers()
 
 
 # ---------------------------------------------------------------- layers: mHC
