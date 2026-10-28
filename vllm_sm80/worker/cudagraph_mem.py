@@ -52,10 +52,8 @@ the limit are never split, so a small long-lived allocation made during a
 capture cannot keep a large free segment from being released.
 
 The worker and model runner subclasses that call in here are in
-``graph_mem_worker``; without the flag nothing here runs (the fork platform
-also selects that worker for the greedy target argmax, whose runner then
-keeps vLLM's estimate). The speculator-manager retirement scope also runs with
-the upstream estimate: all profiling graphs must release their throwaway pool.
+``graph_mem_worker``; the fork platform always selects that worker in place of
+vLLM's GPU worker, and without the flag nothing here runs.
 """
 
 from __future__ import annotations
@@ -81,55 +79,6 @@ UPSTREAM_WORKER = "vllm.v1.worker.gpu_worker.Worker"
 WORKER = "vllm_sm80.worker.graph_mem_worker.GraphMemWorker"
 
 
-def _speculator_manager_slots(speculator: Any) -> list[tuple[dict, Any, bool]]:
-    """Direct manager attributes and manager entries in their dictionaries.
-
-    This is the ownership layout used by single- and multi-width speculators.
-    Do not walk model objects, tensors, or arbitrary nested state.
-    """
-    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
-
-    if speculator is None:
-        return []
-    attributes = vars(speculator)
-    slots = []
-    seen = {id(attributes)}
-    for name, value in attributes.items():
-        if isinstance(value, CudaGraphManager):
-            slots.append((attributes, name, True))
-        elif isinstance(value, dict) and id(value) not in seen:
-            seen.add(id(value))
-            slots.extend(
-                (value, key, False)
-                for key, manager in value.items()
-                if isinstance(manager, CudaGraphManager)
-            )
-    return slots
-
-
-@contextmanager
-def profiling_speculator_graphs(speculator: Any, pool: Any) -> Iterator[None]:
-    """Bind every owned manager to profiling's pool, then discard its handles.
-
-    Real KV initialization rebuilds the managers. Clearing only the active
-    direct alias leaves width-indexed managers, their graphs and snapshots
-    alive and pins the shared throwaway pool. Dictionary entries are removed,
-    not replaced with None, so width selection cannot find a retired manager.
-    """
-    try:
-        for owner, key, _ in _speculator_manager_slots(speculator):
-            owner[key].pool = pool
-        yield
-    finally:
-        # Re-enumerate to include handles created lazily during capture; their
-        # constructors bind the globally swapped profiling pool.
-        for owner, key, attribute in _speculator_manager_slots(speculator):
-            if attribute:
-                owner[key] = None
-            else:
-                del owner[key]
-
-
 def enabled() -> bool:
     return envs.VLLM_CUDAGRAPH_ESTIMATE_SPLIT >= 1
 
@@ -139,22 +88,21 @@ def tracing() -> bool:
 
 
 def select_worker(parallel_config: Any) -> None:
-    """With this flag or the greedy target argmax
-    (``VLLM_SM80_SHARD_ARGMAX``, or its hot pair ``shard_argmax``), run the
-    fork worker in place of upstream's GPU worker (called by the fork
-    platform's ``check_and_update_config``). The argmax refuses another
-    worker; the estimate split only warns."""
-    argmax = bool(envs.VLLM_SM80_SHARD_ARGMAX) or hot_swap.listed("shard_argmax")
-    if not (enabled() or argmax):
-        return
+    """Run the fork worker (``graph_mem_worker``) in place of vLLM's GPU
+    worker (called by the fork platform's ``check_and_update_config``); its
+    runner features are no-ops with their switches off. Another worker is
+    kept: the greedy target argmax (``VLLM_SM80_SHARD_ARGMAX``, or its hot
+    pair ``shard_argmax``) refuses it, the estimate split only warns."""
     if parallel_config.worker_cls == UPSTREAM_WORKER:
         parallel_config.worker_cls = WORKER
-    elif parallel_config.worker_cls != WORKER:
-        if argmax:
-            raise ValueError(
-                "VLLM_SM80_SHARD_ARGMAX: the greedy target "
-                f"argmax needs the fork GPU worker, not {parallel_config.worker_cls}"
-            )
+    if parallel_config.worker_cls == WORKER:
+        return
+    if bool(envs.VLLM_SM80_SHARD_ARGMAX) or hot_swap.listed("shard_argmax"):
+        raise ValueError(
+            "VLLM_SM80_SHARD_ARGMAX: the greedy target "
+            f"argmax needs the fork GPU worker, not {parallel_config.worker_cls}"
+        )
+    if enabled():
         logger.warning(
             "VLLM_CUDAGRAPH_ESTIMATE_SPLIT=1 is set but the worker is %s, not "
             "vLLM's GPU worker; the CUDA-graph memory estimate stays vLLM's.",
