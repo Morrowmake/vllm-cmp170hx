@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from typing import Any
 
 import torch
 
+from vllm_sm80.kernels.kda import commit_plan as sm80_commit_plan
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.recoverssm_metadata import RecoverSSMMetadata
 from vllm.v1.worker.utils import AttentionGroup
@@ -55,15 +57,8 @@ class RecoverSSMState:
             assert state_indices is not None
             # RecoverSSM already restored the accepted state. Update its running
             # column and reset the next-step copy bias to the neutral value.
-            _postprocess_recoverssm_align_kernel[(postprocess_meta.num_spec_decodes,)](
-                idx_mapping,
-                num_sampled,
-                postprocess_meta.request_indices,
-                postprocess_meta.num_computed_tokens,
-                state_indices,
-                num_accepted_tokens,
-                MAMBA_BLOCK_SIZE=postprocess_meta.block_size,
-                BLOCK_TABLE_WIDTH=postprocess_meta.block_table.shape[1],
+            sm80_commit_plan.launch_align_postprocess(
+                postprocess_meta, idx_mapping, state_indices, num_accepted_tokens
             )
 
 
