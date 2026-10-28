@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """# MLA Common Components
 
 This file implements common components for MLA implementations.
@@ -773,11 +774,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     @property
     def chunked_prefill_workspace_size(self) -> int:
         if self._chunked_prefill_workspace_size is None:
-            self._chunked_prefill_workspace_size = (
-                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                    self._vllm_config
-                )
+            # The backend builder's size (sparse MLA caps it far below dense).
+            builder_cls = self.attn_backend.get_builder_cls()
+            determine = getattr(
+                builder_cls,
+                "determine_chunked_prefill_workspace_size",
+                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size,
             )
+            self._chunked_prefill_workspace_size = determine(self._vllm_config)
         return self._chunked_prefill_workspace_size
 
     def update_kv_cache(
