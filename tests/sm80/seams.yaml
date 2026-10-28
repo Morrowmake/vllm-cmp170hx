@@ -148,7 +148,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.prepare_attn
   why: records the RecoverSSM step through self.recoverssm when it is set and returns the attention metadata it built; Glm5NextModelState hands that dict to the KDA commit fold's step hook after it, with input_batch.idx_mapping
-  sha256: 28650c92d4942282b5d661e2feea240b23c7431a91daab3ea248ceb17691474b
+  sha256: 86fdc3f8321044cb316b504cac74d7a63e408a998616536fcdd99bab4d9e6a48
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, cudagraph_mode: vllm.config.compilation.CUDAGraphMode, block_tables: tuple[torch.Tensor, ...], slot_mappings: torch.Tensor, attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, for_capture: bool = False, ubatch_idx: int = 0, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None) -> dict[str, typing.Any]'
 
 - id: glm-mamba-state-add-request
@@ -169,7 +169,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.postprocess_state
   why: commits the RecoverSSM step through self.recoverssm when it is set
-  sha256: 748cb954377dbe837fd3bd2dbea45b7eb4c42989df5a1320e9f488fbd5377625
+  sha256: f008a3a37ac30d9715de035f286ce4b14159c06593e5caaa56de9abcfcb303ce
   signature: '(self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor | int, num_computed_tokens: torch.Tensor | None = None) -> None'
 
 - id: glm-recoverssm-state-init
@@ -1000,13 +1000,6 @@ seams:
   sha256: c785b3c0c4259e483b7c2a4adb3f0e032d3993bb07eb15a71b27b179994704fb
   signature: '(cls: type[~_T], dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]], mark_unbacked_dims: dict[str, int | list[int]] | None = None, enable_if: collections.abc.Callable[[vllm.config.vllm.VllmConfig], bool] | None = None, is_encoder: bool = False, use_aot_compile: bool = True) -> type[~_T]'
 
-- id: drafter-speculator-set-block-size
-  kind: method
-  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator._set_model_block_size
-  why: writes each width's block length into every module attribute named block_size_tensor (the fork conv's buffer) before the forward or graph capture of that width
-  sha256: 640f1064db2022126aa6056c463c07bf24faef91dd3bf94cc58d9a4faaee70a4
-  signature: '(self, block_size: int) -> None'
-
 - id: drafter-fc-fold-graph-forward
   kind: method
   target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator._prepare_graph_forward
@@ -1020,13 +1013,6 @@ seams:
   why: concatenates the aux hidden states into _aux_staging for the FULL graph's rows and combines the rest eagerly; with the drafter fc fold the aux list is the single fp32 fc output, so the reallocated staging buffer matches that width and dtype
   sha256: e92b662a604051cecce55e9843c527cc2f6b0604609b74918b4f2be129312e33
   signature: '(self, num_tokens: int, last_hidden_states: torch.Tensor, aux_hidden_states: list[torch.Tensor] | None, num_graph_tokens: int = 0) -> None'
-
-- id: drafter-load-following-widths
-  kind: function
-  target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:load_following_draft_widths
-  why: _load_following_width decides from it whether the drafter's convs get the runtime block length (adaptive_k.draft_by_load)
-  sha256: b9f493b44b56a7728fe2e21f924c0a7e0b794c6b5189aaabe5f6b1741d72c833
-  signature: '(vllm_config: vllm.config.vllm.VllmConfig, log: bool = False) -> tuple[int, ...]'
 
 - id: quant-register-quantization-config
   kind: function
@@ -1269,15 +1255,15 @@ seams:
 - id: graphmem-profile-cudagraph-memory
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
-  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; direct and dictionary-held speculator managers share one profiling-pool/retirement scope before allocator cleanup; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
-  sha256: c32120abc4b9255f38ad10e3ac287ff3d978086f5aa187cc841f9e2e63933f6c
+  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; it retires the speculator's managers held as direct attributes after the capture (the fork runner's capture_model drops the per-width ones before returning); it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
+  sha256: 1aeb08fbac35c92be0d7913ceab4fe4586cb3d093ef3fe3ef0acbd742bcedc47
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: graphmem-runner-capture-model
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model
   why: the estimate split runner overrides it (keyword-only profile_only, returns the free-memory drop in bytes); the worker calls it once for the real capture after the KV cache is sized
-  sha256: 9270818604a666706f9a5cb84ce3be12321e297f0a466668f993a106762e3457
+  sha256: d5b2efcf1b37e94f9123fb8116d0a97a66944b1a27b354154246858963fb1042
   signature: '(self, *, profile_only: bool = False) -> int'
 
 - id: graphmem-runner-profile-cudagraph-memory
@@ -1340,7 +1326,7 @@ seams:
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
   why: the graph-memory estimate comes from runner.capture_model(profile_only=True), so dev_ab's both-arm capture is what the KV cache is sized against
-  sha256: c32120abc4b9255f38ad10e3ac287ff3d978086f5aa187cc841f9e2e63933f6c
+  sha256: 1aeb08fbac35c92be0d7913ceab4fe4586cb3d093ef3fe3ef0acbd742bcedc47
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: dev-ab-request-state
@@ -1354,7 +1340,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._init_candidates
   why: the static K table selects compatible candidates by token count while preserving distinct request-count and uniform-query descriptors; dev_ab captures the existing union without respecializing it
-  sha256: 61d50da8e2460aa48a601683b6c8210092a9d5ff4e520f1a2591a4ea47a45992
+  sha256: 4ce10925c0550cc07c430b608c11ae44dc6533ac22d18fc5825fcc9fc65aaec3
   signature: (self) -> None
 
 - id: dev-ab-dynamic-compatible
@@ -1368,7 +1354,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential
   why: vllm_sm80/spec_decode/shard_argmax.py replaces its dense greedy path (base logits of every draft position once, then per step the anchor or last draft through markov_embed and markov_bias added to the base logits, the draft written to draft_tokens, the confidence head over the stacked Markov embeddings) and must draft the same tokens
-  sha256: 2b6b199d9cf62d7bfb8ac15718524f6521e528c7384764dcde2bc3945df90b80
+  sha256: 0b877e79b29a0cf61fc6da8eae01087bf08ffb89d5303cc84f02c9bde595c3df
   signature: '(self, num_reqs: int, head_hidden: torch.Tensor) -> None'
 
 - id: dsv41-dspark-sample-logits
@@ -1557,7 +1543,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample
   why: outside batch-sharded sampling it calls self.model.compute_logits once, on the step's logits rows, before the grammar bitmask, the sampler and the rejection sampler read the logits; the fork runner (vllm_sm80/worker/graph_mem_worker.py) runs it inside target_argmax.step, and the sm_80 DeepSeek-V4.1 target's compute_logits returns the argmax rows during a greedy-only step
-  sha256: 62c0bcc3433677ba37c10e65019a6cf5894f7a0d58f15643eec078961e391d9e
+  sha256: 13c12172969689a187bc82513a99f458fa9a3437b880c0538251356354a08c10
   signature: '(self, hidden_states: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> tuple[vllm.v1.worker.gpu.sample.output.SamplerOutput, torch.Tensor, torch.Tensor]'
 
 - id: dsv41-target-dummy-sampler-run
@@ -1585,7 +1571,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.propose
   why: dspark_confidence.py binds its arguments by name (num_sampled, num_rejected, dummy_run, is_profile) and, before the draft step overwrites draft_token_confidence_probs, pairs the previous draft step's confidences with this step's verification result
-  sha256: 16ac90c7bcd2178c9b3e97c73875956844ff14808451d28a3698696213d290fa
+  sha256: 00923ec00b91a8029c7bc3a2e24af06a84b5bbfb5df29a328e2848f771ce4831
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, attn_metadata: dict[str, typing.Any], slot_mappings: dict[str, torch.Tensor], last_hidden_states: torch.Tensor, aux_hidden_states: list[torch.Tensor] | None, num_sampled: torch.Tensor, num_rejected: torch.Tensor, last_sampled: torch.Tensor, next_prefill_tokens: torch.Tensor, temperature: torch.Tensor, seeds: torch.Tensor, dp_sync_state: vllm.v1.worker.gpu.dp_utils.DPSyncState | None = None, dummy_run: bool = False, skip_attn_for_dummy_run: bool = False, mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None, is_profile: bool = False, num_speculative_tokens: int | None = None) -> torch.Tensor'
 
 - id: dsv41-dspark-load-draft-model
@@ -1643,6 +1629,104 @@ seams:
   why: true for a remote trace directory (gs:// and the like); trace_export.py orders exports and moves temporary files only for a local directory
   sha256: 3e56aa69835f93d1cb1d3f08e590fcc9928e74a9d9f81935c1f1cc35727dbe5f
   signature: '(path: str) -> bool'
+
+- id: worker-init-speculator
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode:init_speculator
+  why: asks vllm_sm80.spec_decode.speculators.create_speculator first; the factory repeats its dflash precedence (XPress, then LiLiCorr, then the DFlash2 architectures) to pick only plain DFlash2 and DSpark
+  sha256: 3d4758cd416ec133c4d18befe047e9d8ecd1c8058f7c403855c56d0c5ae6ad6f
+  signature: '(vllm_config: vllm.config.vllm.VllmConfig, device: torch.device, req_states: ''RequestState'')'
+
+- id: worker-dflash-init
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.__init__
+  why: DraftWidthMixin runs after it and keeps per-width views of draft_tokens [max_num_reqs, num_speculative_steps] and sample_col
+  sha256: bda2c3b5752ed06f78dfc23efb04833ca3df434e0cf5642e265d888e0b7eb4ae
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
+
+- id: worker-dflash-init-cudagraph-manager
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.init_cudagraph_manager
+  why: builds query_cudagraph_manager for decode_query_len = self.num_query_per_req; the width mixin calls it once per width with num_query_per_req set to that width's length
+  sha256: 3746da0c71604b64da792ffc8f80de65c55ce5d88320cc30b208fcb2821de543
+  signature: '(self, cudagraph_mode: vllm.config.compilation.CUDAGraphMode) -> None'
+
+- id: worker-dflash-capture
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.capture
+  why: captures self.query_cudagraph_manager with the speculator's current host state; the width mixin calls it once per width after set_width
+  sha256: 562a3938ab4750947410384f967a77bff50959cbaf517449e9998398f06bac82
+  signature: (self) -> None
+
+- id: worker-dflash2-generate-draft
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:DFlash2Speculator._generate_draft
+  why: the split-tail override re-issues its _run_model call with the same arguments and packs the tail's inputs instead of the candidate pass that follows
+  sha256: 3f1f638eac3e48f85b4a7dae898611150bbbef21120b5a0306ad5c0c8e5c4ba6
+  signature: '(self, num_reqs: int, num_tokens_padded: int, attn_metadata: dict[str, typing.Any] | None, slot_mappings: dict[str, torch.Tensor] | None, num_tokens_across_dp: torch.Tensor | None, cudagraph_runtime_mode: vllm.config.compilation.CUDAGraphMode = <CUDAGraphMode.NONE: 0>) -> None'
+
+- id: worker-dflash2-selector-walk
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:_selector_walk_kernel.fn
+  why: the split tail (here and on the tail stage) launches this walk with the arguments CandidateSampler.sample uses, on the staged inputs
+  sha256: 1579afead466ddccba605fa4665c37b50caa2c60a8a6ba16df481daab1eb34a4
+  signature: '(scores_ptr, candidate_ptr, sample_pos_ptr, req_state_ptr, temperature_ptr, seeds_ptr, tokens_ptr, realized_scores_ptr, num_steps: triton.language.core.constexpr, top_k: triton.language.core.constexpr, BLOCK_K: triton.language.core.constexpr, SAMPLE_PROBABILISTIC: triton.language.core.constexpr, USE_FP64: triton.language.core.constexpr)'
+
+- id: worker-dflash-load-model
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.dflash.utils:load_dflash_model
+  why: pp_draft_tail._draft_vllm_config copies its replace() of the drafter's VllmConfig for the tail stage's lm_head and selector
+  sha256: 2ffb0333a9b17bcd0846e1c975b8c755b29e056f6c4b78e533f4dc27827340b6
+  signature: '(target_model: torch.nn.modules.module.Module, vllm_config: vllm.config.vllm.VllmConfig) -> torch.nn.modules.module.Module'
+
+- id: worker-runner-sample-tokens
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample_tokens
+  why: the fork runner reads execute_model_state.num_spec_tokens_to_schedule before it clears the state; a non-last stage then calls pp_handler.receive(input_batch), and the last stage broadcast_drafts after the drafter
+  sha256: 820961af906d82a190dc33ac8eb296bc5ae3542f6f7576f4539626ff76ce273c
+  signature: '(self, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> vllm.v1.worker.gpu.async_utils.AsyncOutput | vllm.v1.outputs.ModelRunnerOutput | None'
+
+- id: worker-runner-load-model
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model
+  why: sets model_memory_usage (the load window's consumed memory), which the fork runner logs after it
+  sha256: efbbb082a6934a10c718ab7b3b431fa9b47a092f856db07e6a1d6e0ca9336418
+  signature: '(self, load_dummy_weights: bool = False, *args, model: torch.nn.modules.module.Module | None = None, **kwargs) -> None'
+
+- id: worker-pp-handler-init
+  kind: method
+  target: vllm.v1.worker.gpu.pp_utils:PPHandler.__init__
+  why: Sm80PPHandler builds it with these keyword arguments, then adds its state and a second sibling device group for the draft tail
+  sha256: 49e1cc0ce0a2d8a94951d64626fa353f878371a9506d63195f95971a1f2953ed
+  signature: '(self, max_num_reqs: int, num_speculative_steps: int, device: torch.device)'
+
+- id: worker-pp-handler-receive
+  kind: method
+  target: vllm.v1.worker.gpu.pp_utils:PPHandler.receive
+  why: records the slot's event right after the drafts broadcast whose root pp_hooks.drafts_src picks; Sm80PPHandler moves that event to draft_event and puts the early event in the slot
+  sha256: 5897889d39957037c83acc7daf787e83ffee5b1d1d6d89609e57d8a3f292aa0d
+  signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch) -> bool'
+
+- id: worker-pp-handler-broadcast-drafts
+  kind: method
+  target: vllm.v1.worker.gpu.pp_utils:PPHandler.broadcast_drafts
+  why: Sm80PPHandler sends the tail payload in its place on a step whose draft tail runs on the tail stage
+  sha256: a3024d9ef0a6d59c9f51598d968b23ae18c04042ee2a2ba4811d883275ae1084
+  signature: '(self, draft_tokens: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch) -> None'
+
+- id: worker-mamba-group-info
+  kind: method
+  target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState._get_mamba_group_info
+  why: state_index_check.capture_tables reads the mamba spec's block_size from it (cached, no side effect after the first call)
+  sha256: 6066954fb666ae2572be7f0393daadccbebf9e8e2c38f5c3e5f4aa8c625f48a1
+  signature: '(self, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig) -> tuple[list[int], vllm.v1.kv_cache_interface.MambaSpec]'
+
+- id: worker-gpu-worker-init-device
+  kind: method
+  target: vllm.v1.worker.gpu_worker:Worker.init_device
+  why: the fork worker checks the Marlin MoE decode extension before it
+  sha256: f3b3a4ec2776c2ba5a9f2e6e6bc2323214539f315374ee549923befc03ad65eb
+  signature: (self)
 
 - id: kda-recoverssm-compact-conv-state-kernel
   kind: function
@@ -1795,6 +1879,7 @@ seams:
   why: sets the instance's _gemm_impl, which vllm_sm80/kernels/thin_gemm/concat.py checks and sm80_moe.py calls as _gemm_impl(layer, x, weight, None)
   sha256: e2fb974714067dbdd2df18e2fc685f7c92cfe1f54cda700fc4cf39c00903332d
   signature: (self) -> None
+
 - id: sched-scheduler-init
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler.__init__
