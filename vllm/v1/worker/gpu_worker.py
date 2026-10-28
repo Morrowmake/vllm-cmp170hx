@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """A GPU worker class."""
 
 import gc
@@ -110,6 +111,7 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
+from vllm_sm80.worker import worker_hooks as sm80
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
@@ -758,6 +760,7 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        sm80.kv_accounting(self, profile_result)
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
@@ -1348,7 +1351,8 @@ class Worker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
+                sm80.hop_recv(self, scheduler_output)
+                or get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
                 )
             )
@@ -1384,7 +1388,8 @@ class Worker(WorkerBase):
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
+        handles = sm80.hop_send(self, scheduler_output, output.tensors)
+        handles = handles or get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
         )
