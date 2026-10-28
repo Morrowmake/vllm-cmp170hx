@@ -1025,7 +1025,7 @@ seams:
   kind: function
   target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:load_following_draft_widths
   why: _load_following_width decides from it whether the drafter's convs get the runtime block length (adaptive_k.draft_by_load)
-  sha256: 9a777298b7bb3e6cb4731760d24e69bb67f61071070a7d82973d890bf4a7349f
+  sha256: b9f493b44b56a7728fe2e21f924c0a7e0b794c6b5189aaabe5f6b1741d72c833
   signature: '(vllm_config: vllm.config.vllm.VllmConfig, log: bool = False) -> tuple[int, ...]'
 
 - id: quant-register-quantization-config
@@ -1354,7 +1354,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._init_candidates
   why: the static K table selects compatible candidates by token count while preserving distinct request-count and uniform-query descriptors; dev_ab captures the existing union without respecializing it
-  sha256: 94c269cb0aad093f1b7875db56b8b962a47c53cf9250419d39254f12935ef6a0
+  sha256: 61d50da8e2460aa48a601683b6c8210092a9d5ff4e520f1a2591a4ea47a45992
   signature: (self) -> None
 
 - id: dev-ab-dynamic-compatible
