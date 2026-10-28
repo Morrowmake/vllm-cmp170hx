@@ -34,8 +34,16 @@ can reach.
   ``vllm.platform_plugins`` entry point of the same distribution; the guard
   also checks that it is the platform in use on CUDA.
 
-Kernels only one model calls live under ``vllm/models/<model>/nvidia/ops``.
-Importing this package does no work: the upstream files that use a module
-here import that module directly, and ``plugin`` imports the EXL3 modules it
-registers.
+Kernels only one model calls live under ``vllm_sm80/models/<model>/ops``.
+Importing this package does no work beyond placing its loggers: the
+upstream files that use a module here import that module directly, and
+``plugin`` imports the EXL3 modules it registers.
 """
+
+import logging as _logging
+
+# vLLM configures only the "vllm" logger (handler, format, level). The
+# package's loggers ("vllm_sm80.*", from vllm.logger.init_logger(__name__))
+# get it as their ancestor, so their records reach vLLM's handler at vLLM's
+# level, as they did when the package was vllm.sm80.
+_logging.getLogger(__name__).parent = _logging.getLogger("vllm")

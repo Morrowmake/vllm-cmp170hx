@@ -16,7 +16,10 @@ import vllm.plugins
 from vllm_sm80 import guard, plugin
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-PYPROJECT = REPO / "plugins" / "sm80" / "pyproject.toml"
+# The distribution's project file: at the root of the plugin's source tree,
+# or in plugins/sm80/ of an engine source tree that carries the plugin.
+PYPROJECT = next(p for p in (REPO / "plugins" / "sm80" / "pyproject.toml", REPO / "pyproject.toml")
+                 if p.exists())
 
 
 def _entry_point(group: str = vllm.plugins.DEFAULT_PLUGINS_GROUP) -> str:

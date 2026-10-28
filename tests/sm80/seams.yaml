@@ -148,7 +148,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.prepare_attn
   why: records the RecoverSSM step through self.recoverssm when it is set and returns the attention metadata it built; Glm5NextModelState hands that dict to the KDA commit fold's step hook after it, with input_batch.idx_mapping
-  sha256: 9593d783475eb87f44a29bcc70f329f44910a86ccf623b92d85f558bde4494f4
+  sha256: 28650c92d4942282b5d661e2feea240b23c7431a91daab3ea248ceb17691474b
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, cudagraph_mode: vllm.config.compilation.CUDAGraphMode, block_tables: tuple[torch.Tensor, ...], slot_mappings: torch.Tensor, attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, for_capture: bool = False, ubatch_idx: int = 0, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None) -> dict[str, typing.Any]'
 
 - id: glm-mamba-state-add-request
@@ -169,7 +169,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.postprocess_state
   why: commits the RecoverSSM step through self.recoverssm when it is set
-  sha256: b5ce81f79b711589a9027f71f17da20b72f60a1c9e937bce83a7f514864d5175
+  sha256: 748cb954377dbe837fd3bd2dbea45b7eb4c42989df5a1320e9f488fbd5377625
   signature: '(self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor | int, num_computed_tokens: torch.Tensor | None = None) -> None'
 
 - id: glm-recoverssm-state-init
@@ -238,7 +238,7 @@ seams:
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention._forward_core
   why: reads the fork layer's _kda_recover, _kda_recover_records, _kda_step_tile, _kda_wide, _pp_kda_prefill and _fill_deferred_g2, and the metadata's spec_max_query_len
-  sha256: cf017014837f8bf0921c4ced96248272a5ea5105a26cfc5fec0dd941b2edbdaf
+  sha256: eaac2672a965ba7ea61ee6ce86dee8e15c5c112aa4480fd2da82aa20a1a1643c
   signature: '(self, qkv_proj_states: torch.Tensor, g1: torch.Tensor | None, beta: torch.Tensor, core_attn_out: torch.Tensor, g2: torch.Tensor | None = None, f_a: torch.Tensor | None = None, g_a: torch.Tensor | None = None) -> bool'
 
 - id: glm-mamba-get-attn-backend
@@ -439,7 +439,7 @@ seams:
   kind: method
   target: vllm.config.vllm:VllmConfig.__post_init__
   why: calls the fork plugin guard, which checks that the fork plugin was loaded
-  sha256: 30ff80d2ff247c9abf7979e7c20c4b28a58b1a905d0081f5e9bf343df04c27ef
+  sha256: fe845e6c67eec63d6f7b06c23f3c12e1f9a68722b790228e757aef4a74d98be0
   signature: (self)
 
 - id: platform-plugins-group
@@ -1270,7 +1270,7 @@ seams:
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
   why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; direct and dictionary-held speculator managers share one profiling-pool/retirement scope before allocator cleanup; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
-  sha256: a67b75c2f12662a15e448363699632e5f0828cf33fce9d792805e22e7ee2223c
+  sha256: c32120abc4b9255f38ad10e3ac287ff3d978086f5aa187cc841f9e2e63933f6c
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: graphmem-runner-capture-model
@@ -1340,7 +1340,7 @@ seams:
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
   why: the graph-memory estimate comes from runner.capture_model(profile_only=True), so dev_ab's both-arm capture is what the KV cache is sized against
-  sha256: a67b75c2f12662a15e448363699632e5f0828cf33fce9d792805e22e7ee2223c
+  sha256: c32120abc4b9255f38ad10e3ac287ff3d978086f5aa187cc841f9e2e63933f6c
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: dev-ab-request-state
@@ -1648,6 +1648,8 @@ seams:
   kind: function
   target: vllm.models.kimi_k3.nvidia.ops.recoverssm:_compact_conv_state_kernel.fn
   why: vllm_sm80/kernels/kda/recover.py launches this upstream kernel itself (grid conv_dim/256 x batch x layers, the upstream argument list) to compact the conv state after recovery
+  sha256: 1bfb987d737b97956e876673360c13492c7c240ec8a19d192da2f0157af7cc2c
+  signature: '(conv_state_ref_ptr, conv_state_base_addrs_ptr, conv_state_block_strides_ptr, conv_state_dim_strides_ptr, conv_state_token_strides_ptr, state_indices_ptr, commit_lens_ptr, final_state_indices_ptr, boundary_state_indices_ptr, boundary_recovery_lens_ptr, null_block_id, conv_dim, conv_history_len, stride_state_indices, BLOCK_D: triton.language.core.constexpr, BLOCK_HISTORY: triton.language.core.constexpr, ALIGN_MODE: triton.language.core.constexpr)'
 
 - id: dsv41-sparse-swa-layer-type-swaonly
   kind: module_attr

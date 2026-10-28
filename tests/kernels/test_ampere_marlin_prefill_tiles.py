@@ -57,7 +57,7 @@ FLAG = pp.FLAG
 E, TOPK, K, N = pp.E, pp.TOPK, pp.K, pp.N
 gpu = pp.gpu
 ROOT = Path(__file__).resolve().parents[2]
-LIB = ROOT / "csrc" / "libtorch_stable" / "moe" / "ampere_marlin"
+LIB = ROOT / "csrc" / "ampere_marlin"
 WIDE = {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)}
 TILES_BANNER = f"Marlin MoE prefill compiled tiles active ({SWITCH}, N=2048)"
 FAST_BANNER = f"Marlin MoE prefill fast dequant active ({SWITCH}, N=2048)"
