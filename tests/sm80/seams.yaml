@@ -11,7 +11,7 @@
 #   target     'module:qualname'
 #   why        what the fork code depends on
 #   sha256     sha256 of textwrap.dedent(inspect.getsource(obj)) (code kinds)
-#   signature  str(inspect.signature(obj)) (code kinds)
+#   signature  str(inspect.signature(obj)), object addresses removed (code kinds)
 #   type       type name of the value (attr kinds and dict_contract)
 #   value      exact value, for constants only (attr kinds, optional)
 #   dict_contract rows also require every value to be a zero-arg callable.
@@ -1668,8 +1668,8 @@ seams:
 - id: layers-worker-warmup-then-capture
   kind: method
   target: vllm.v1.worker.gpu_worker:Worker._compile_or_warm_up_model
-  why: kernel_warmup, then (V2 runner, JIT warmup on) warmup_kernels, then capture_model with no step between; the fork runner's capture_model runs the speculative-decoding warmup first, where warmup_kernels used to end
-  sha256: 68118c19e62b16634e3e3960b4e3b55dc5a644fd3887ee476a9fca16743adb45
+  why: kernel_warmup, then (V2 runner, JIT warmup on) warmup_kernels, then capture_model with no step between; the fork runner's capture_model runs the speculative-decoding warmup first, where warmup_kernels used to end; GraphMemWorker._compile_or_warm_up_model overrides it, runs it whole and then finalizes the moved draft tail
+  sha256: c1b89fcda3c985fa24e5698e5b17be284721cf49beddd8e5a37498c36ba62509
   signature: (self) -> vllm.v1.worker.worker_base.CompilationTimes
 
 - id: worker-init-speculator
@@ -1706,13 +1706,6 @@ seams:
   why: the split-tail override re-issues its _run_model call with the same arguments and packs the tail's inputs instead of the candidate pass that follows
   sha256: 3f1f638eac3e48f85b4a7dae898611150bbbef21120b5a0306ad5c0c8e5c4ba6
   signature: '(self, num_reqs: int, num_tokens_padded: int, attn_metadata: dict[str, typing.Any] | None, slot_mappings: dict[str, torch.Tensor] | None, num_tokens_across_dp: torch.Tensor | None, cudagraph_runtime_mode: vllm.config.compilation.CUDAGraphMode = <CUDAGraphMode.NONE: 0>) -> None'
-
-- id: worker-dflash2-selector-walk
-  kind: function
-  target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:_selector_walk_kernel.fn
-  why: the split tail (here and on the tail stage) launches this walk with the arguments CandidateSampler.sample uses, on the staged inputs
-  sha256: 1579afead466ddccba605fa4665c37b50caa2c60a8a6ba16df481daab1eb34a4
-  signature: '(scores_ptr, candidate_ptr, sample_pos_ptr, req_state_ptr, temperature_ptr, seeds_ptr, tokens_ptr, realized_scores_ptr, num_steps: triton.language.core.constexpr, top_k: triton.language.core.constexpr, BLOCK_K: triton.language.core.constexpr, SAMPLE_PROBABILISTIC: triton.language.core.constexpr, USE_FP64: triton.language.core.constexpr)'
 
 - id: worker-dflash-load-model
   kind: function
@@ -1822,7 +1815,7 @@ seams:
 - id: qwen4exp-moe-router-dtype
   kind: function
   target: vllm.model_executor.models.deepseek_v2:_get_moe_router_dtype
-  why: vllm_sm80/models/qwen4_exp/precision.py reads the router logits dtype from the config the way upstream does for DeepSeek-V2
+  why: vllm_sm80/models/qwen4_exp/precision.py (apply_router_precision) takes the router logits dtype of the target text config from it the way upstream does for DeepSeek-V2 (None keeps the model dtype)
   sha256: c8ca0f6368f694bcc5a5c771e64bb32023741e789adce8e98fc5a99edafed5d7
   signature: '(config: transformers.models.deepseek_v2.configuration_deepseek_v2.DeepseekV2Config | transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config) -> torch.dtype | None'
 
@@ -1863,7 +1856,7 @@ seams:
 - id: pp-draft-tail-selector-walk-kernel
   kind: function
   target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:_selector_walk_kernel.fn
-  why: vllm_sm80/worker/pp_draft_tail.py launches this kernel with the speculator's argument list on the draft tail
+  why: vllm_sm80/worker/pp_draft_tail.py and the split tail of Sm80DFlash2Speculator (here and on the tail stage) launch this walk with the argument list CandidateSampler.sample uses, on the staged inputs
   sha256: 1579afead466ddccba605fa4665c37b50caa2c60a8a6ba16df481daab1eb34a4
   signature: '(scores_ptr, candidate_ptr, sample_pos_ptr, req_state_ptr, temperature_ptr, seeds_ptr, tokens_ptr, realized_scores_ptr, num_steps: triton.language.core.constexpr, top_k: triton.language.core.constexpr, BLOCK_K: triton.language.core.constexpr, SAMPLE_PROBABILISTIC: triton.language.core.constexpr, USE_FP64: triton.language.core.constexpr)'
 
@@ -1894,33 +1887,12 @@ seams:
   sha256: 4837d2776dd455f40886a53a1be9a1c8582e8649e914ebf76a59d0cc47a46283
   signature: '(self, hidden_states: torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.MoEOutput, residual: torch.Tensor, post_mix: torch.Tensor, res_mix: torch.Tensor, aux_hidden_by_layer: dict[int, torch.Tensor], full_num_tokens: int) -> torch.Tensor'
 
-- id: dsv41-topk-bias-router-compute-routing
-  kind: method
-  target: vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router:FusedTopKBiasRouter._compute_routing
-  why: overridden by Sm80DeepseekV41Router (routing on FP32 router logits); BaseRouter.select_experts must still reach routing through this method with the same arguments and return (topk_weights, topk_ids)
-  sha256: bcef69224e0cfe473a6bf64130151ce4e943453b32ec45bf33c0c11d529579bc
-  signature: '(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, indices_type: torch.dtype | None, *, input_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]'
-
-- id: exl3-logits-processor-apply-head
-  kind: method
-  target: vllm.model_executor.layers.logits_processor:LogitsProcessor._apply_head
-  why: overridden by Exl3HeadLogitsProcessor to apply the packed EXL3 head; LogitsProcessor must still compute logits through this method with (lm_head, hidden_states, embedding_bias)
-  sha256: 3cb7fea48c08851aed74084630e965e5d78b1dabe10b2f94fceb28ea0dfd0486
-  signature: '(self, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None) -> torch.Tensor'
-
 - id: qwen4-moe-block-init
   kind: method
   target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpSparseMoeBlock.__init__
   why: the fork Qwen4Exp classes set the router logits dtype on every block after the upstream model is built (gate.set_out_dtype, which refuses a dtype already set); the block must expose its GateLinear as self.gate with out_dtype unset, and nothing built after it may read the gate's out_dtype before then
   sha256: 0ed594acdec2e097b1c703f9b944f7316965e2ee7001c2aeb4c741eb5dfb24d7
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''', reduce_results: bool = True) -> None'
-
-- id: qwen4-moe-router-dtype
-  kind: function
-  target: vllm.model_executor.models.deepseek_v2:_get_moe_router_dtype
-  why: precision.apply_router_precision takes the router logits dtype of the target text config from it (None keeps the model dtype)
-  sha256: c8ca0f6368f694bcc5a5c771e64bb32023741e789adce8e98fc5a99edafed5d7
-  signature: '(config: transformers.models.deepseek_v2.configuration_deepseek_v2.DeepseekV2Config | transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config) -> torch.dtype | None'
 
 - id: qwen4-causal-lm-init
   kind: method
@@ -2009,14 +1981,14 @@ seams:
 - id: dsv41-fused-topk-bias-router-compute-routing
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router:FusedTopKBiasRouter._compute_routing
-  why: Sm80DeepseekV41Router overrides the routing computation; the upstream router must still route through this method with the same arguments
+  why: overridden by Sm80DeepseekV41Router (routing on FP32 router logits); BaseRouter.select_experts must still reach routing through this method with the same arguments and return (topk_weights, topk_ids)
   sha256: bcef69224e0cfe473a6bf64130151ce4e943453b32ec45bf33c0c11d529579bc
   signature: '(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, indices_type: torch.dtype | None, *, input_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]'
 
 - id: exl3-logits-apply-head
   kind: method
   target: vllm.model_executor.layers.logits_processor:LogitsProcessor._apply_head
-  why: Exl3HeadLogitsProcessor overrides the head projection for an EXL3 lm_head; upstream must still compute logits through this method
+  why: overridden by Exl3HeadLogitsProcessor to apply the packed EXL3 head; LogitsProcessor must still compute logits through this method with (lm_head, hidden_states, embedding_bias)
   sha256: 3cb7fea48c08851aed74084630e965e5d78b1dabe10b2f94fceb28ea0dfd0486
   signature: '(self, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None) -> torch.Tensor'
 
@@ -2039,7 +2011,7 @@ seams:
   target: vllm.v1.core.sched.scheduler:Scheduler.__init__
   why: Sm80SchedulerMixin.__init__ runs after it and reads vllm_config, scheduler_config, parallel_config, use_pp, num_spec_tokens and kv_cache_config; fair prefill reads running, waiting, kv_holding_waiting, max_num_active_reqs, num_waiting_for_streaming_input, _pause_state, num_prefill_lookahead, need_mamba_block_aligned_split and max_num_scheduled_tokens set here
   sha256: e2459991e9a5dcdab8be620a30db1e1f531ab150da020c32af2647a838f7aaa4
-  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, structured_output_manager: vllm.v1.structured_output.StructuredOutputManager, block_size: int, hash_block_size: int | None = None, mm_registry: vllm.multimodal.registry.MultiModalRegistry = <vllm.multimodal.registry.MultiModalRegistry object at 0x7e4b5d5c3e30>, include_finished_set: bool = False, log_stats: bool = False) -> None'
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, structured_output_manager: vllm.v1.structured_output.StructuredOutputManager, block_size: int, hash_block_size: int | None = None, mm_registry: vllm.multimodal.registry.MultiModalRegistry = <vllm.multimodal.registry.MultiModalRegistry object>, include_finished_set: bool = False, log_stats: bool = False) -> None'
 
 - id: sched-scheduler-schedule
   kind: method
@@ -2096,3 +2068,101 @@ seams:
   why: resolves the 'module.Class' string vllm_sm80.sched.select_scheduler puts in scheduler_cls (left None it would pick Scheduler / AsyncScheduler itself)
   sha256: d05279a5158f75c1ce508b68191551144e5b54ce3695e8568aab9e39033bf79a
   signature: (self) -> type['SchedulerInterface']
+
+- id: sched-async-scheduler-init
+  kind: method
+  target: vllm.v1.core.sched.async_scheduler:AsyncScheduler.__init__
+  why: Sm80AsyncScheduler's mixin __init__ and dev_ab_batch.OrderedAdmission run after it; it must still pass every argument on to Scheduler.__init__ (sched-scheduler-init)
+  sha256: dfdc4ab3827e748496ef73e3b2da9fe02e5442929e307e05d9d2beae93ce91df
+  signature: (self, *args, **kwargs) -> None
+
+- id: sched-tokenizer-dsv41-from-pretrained
+  kind: method
+  target: vllm.tokenizers.deepseek_v41:DeepseekV41Tokenizer.from_pretrained
+  why: Sm80DeepseekV41Tokenizer.from_pretrained repeats these two lines (TokenizersBackend.from_pretrained, then get_cached_tokenizer(get_deepseek_v41_tokenizer(...))) and sets renders_inline_system_messages on the HF tokenizer in between; an upstream change here must be carried into the plugin's copy
+  sha256: c14ef76652a1158f058b145c672b81a0c167680736d6c08692914adebb5b1870
+  signature: (*args, **kwargs) -> transformers.tokenization_python.PythonBackend | transformers.tokenization_utils_tokenizers.TokenizersBackend
+
+- id: sched-tokenizer-dsv41-wrapper
+  kind: function
+  target: vllm.tokenizers.deepseek_v41:get_deepseek_v41_tokenizer
+  why: wraps a copy of the HF tokenizer (instance attributes kept, so renders_inline_system_messages set by the plugin tokenizer reaches the wrapper) and rebuilds itself from that HF tokenizer on copy and pickle (__reduce__)
+  sha256: 8accb5fa2227af3d0a7b24c0fbb6e1629506ec8bd3031d2bd47b8b997f6e4ee3
+  signature: '(tokenizer: transformers.tokenization_python.PythonBackend | transformers.tokenization_utils_tokenizers.TokenizersBackend) -> transformers.tokenization_python.PythonBackend | transformers.tokenization_utils_tokenizers.TokenizersBackend'
+
+- id: sched-tokenizer-cached-wrapper
+  kind: function
+  target: vllm.tokenizers.hf:get_cached_tokenizer
+  why: caches a copy of the tokenizer it is given (instance attributes kept) and rebuilds itself from that tokenizer on copy and pickle (__reduce__), so the plugin tokenizer's renders_inline_system_messages survives both
+  sha256: 73ba1f406e5e5982cbdfc0c1ceebf15d69272b99218842667890f1cd63e65ae0
+  signature: '(tokenizer: transformers.tokenization_python.PythonBackend | transformers.tokenization_utils_tokenizers.TokenizersBackend) -> transformers.tokenization_python.PythonBackend | transformers.tokenization_utils_tokenizers.TokenizersBackend'
+
+- id: sched-tokenizer-registry-register
+  kind: method
+  target: vllm.tokenizers.registry:_TokenizerRegistry.register
+  why: vllm_sm80.tokenizers.register_tokenizers pops the deepseek_v41 mode from TokenizerRegistry.tokenizers and registers its (module, class) here, which must store it in that dict
+  sha256: f1285b60fac0be91f551b824377fa0e6500fa72bf22792d42885958309efab8d
+  signature: '(self, tokenizer_mode: str, module: str, class_name: str) -> None'
+
+- id: sched-tokenizer-registry-load-cls
+  kind: method
+  target: vllm.tokenizers.registry:_TokenizerRegistry.load_tokenizer_cls
+  why: a tokenizer mode resolves through TokenizerRegistry.tokenizers when the tokenizer is loaded, after the plugin registered the fork's deepseek_v41 class
+  sha256: 86a9b387eaecbfb8477c3c7b763810f7c660dea1bd0bf3235a8d1362efcf2466
+  signature: '(self, tokenizer_mode: str) -> type[vllm.tokenizers.protocol.TokenizerLike]'
+
+- id: worker-runner-init
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.__init__
+  why: GraphMemModelRunner.__init__ runs it first, then reads self.vllm_config to set adaptive_k_enabled and the decode graph-miss counter that runner_hooks reads each step
+  sha256: 3f002499fe4bd3060795c17e147465529c32532c7acb64f7f8dd4b03d9b6bb09
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
+
+- id: worker-dflash2-init
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:DFlash2Speculator.__init__
+  why: Sm80DFlash2Speculator runs it behind DraftWidthMixin.__init__ and then sets up the split tail; it must still chain to DFlashSpeculator.__init__ (worker-dflash-init), whose num_speculative_steps, draft_tokens, sample_col, max_num_reqs and device the mixin reads
+  sha256: 8350a60956cc17bfb1cf294ea3f3f63f85fe99764546ce3e48647e0095f61d78
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
+
+- id: worker-dspark-init
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.__init__
+  why: Sm80DSparkSpeculator and PerKDSparkSpeculator run it behind DraftWidthMixin.__init__; PerK then takes _anchor_idx and draft_token_confidence_probs set here as the full-width anchors and confidence buffer
+  sha256: 5248fda42619b9700ec6ded38847e226026417a2fdda74419132a66c101af4ca
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
+
+- id: exl3-experts-supports-current-device
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExperts._supports_current_device
+  why: Exl3Experts implements this support check; FusedMoEExperts.is_supported_config must still call it with no arguments
+  sha256: a10d464ad46643162e64a162be5e88bea2f0c1173a867472ff4c18e66227b5ce
+  signature: () -> bool
+
+- id: exl3-experts-supports-no-act-and-mul
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExperts._supports_no_act_and_mul
+  why: Exl3Experts implements this support check; FusedMoEExperts.is_supported_config must still call it with no arguments
+  sha256: 0f576c7d809337984e003b3a31ce7486bb790093b87ea2b6fa606ad064e1d72c
+  signature: () -> bool
+
+- id: exl3-experts-supports-quant-scheme
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExperts._supports_quant_scheme
+  why: Exl3Experts implements this support check; FusedMoEExperts.is_supported_config must still call it with (weight_key, activation_key)
+  sha256: ca1d85d5384f48ceb57a76c2fba091596780081d7f047ab7871e0b1440839a50
+  signature: '(weight_key: vllm.model_executor.layers.quantization.utils.quant_utils.QuantKey | None, activation_key: vllm.model_executor.layers.quantization.utils.quant_utils.QuantKey | None) -> bool'
+
+- id: exl3-experts-supports-activation
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExperts._supports_activation
+  why: Exl3Experts implements this support check; FusedMoEExperts.is_supported_config must still call it with the MoE activation
+  sha256: 97623f25616256d6b7530a401fb947afeb69666fbb40b8c8d08913eacd64368f
+  signature: '(activation: vllm.model_executor.layers.fused_moe.activation.MoEActivation) -> bool'
+
+- id: exl3-experts-supports-parallel-config
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.modular_kernel:FusedMoEExperts._supports_parallel_config
+  why: Exl3Experts implements this support check; FusedMoEExperts.is_supported_config must still call it with the MoE parallel config
+  sha256: 68f0bee185b609b1374f9e0f5e0d5225e4a110d6b468d128e6ecb4acde0e9736
+  signature: '(moe_parallel_config: vllm.model_executor.layers.fused_moe.config.FusedMoEParallelConfig) -> bool'
