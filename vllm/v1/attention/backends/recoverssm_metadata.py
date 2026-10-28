@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import abc
 from dataclasses import dataclass
@@ -16,6 +17,10 @@ class RecoverSSMPostprocessMetadata:
     block_table: torch.Tensor
     num_computed_tokens: torch.Tensor
     block_size: int
+    # Plan outputs are in spec-row order, not request/batch order. Reuse the
+    # actual clipped count rather than interpreting sampler counts twice.
+    commit_lens: torch.Tensor
+    source_state_indices: torch.Tensor
 
 
 class RecoverSSMMetadata(abc.ABC):
