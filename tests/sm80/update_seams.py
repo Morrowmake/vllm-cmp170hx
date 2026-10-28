@@ -76,16 +76,30 @@ HEADER = """\
 """
 
 
+def assembled_engine(vllm_origin: str | None = None) -> tuple[Path, str] | None:
+    """(engine directory, upstream_commit) of the assembled engine whose vLLM
+    the tests import (``vllm_origin``: that package's ``__init__.py``, default
+    the importable one): <dir>/engine/vllm next to <dir>/assembly.json. None
+    for a single tree."""
+    if vllm_origin is None:
+        spec = importlib.util.find_spec("vllm")
+        vllm_origin = spec.origin if spec is not None else None
+    if vllm_origin is None:
+        return None
+    engine = Path(vllm_origin).resolve().parents[1]
+    assembly = engine.parent / "assembly.json"
+    if engine.name != "engine" or not assembly.is_file():
+        return None
+    return engine, json.loads(assembly.read_text())["upstream_commit"]
+
+
 def upstream_base() -> str | None:
     """The upstream base of the vLLM the tests import: an assembled engine's
     assembly.json `upstream_commit`, else FORK.md's `Upstream base:`, else
     None."""
-    spec = importlib.util.find_spec("vllm")
-    if spec is not None and spec.origin is not None:
-        engine = Path(spec.origin).resolve().parents[1]
-        assembly = engine.parent / "assembly.json"
-        if engine.name == "engine" and assembly.is_file():
-            return json.loads(assembly.read_text())["upstream_commit"]
+    engine = assembled_engine()
+    if engine is not None:
+        return engine[1]
     fork_map = REPO / "FORK.md"
     found = FORK_BASE.search(fork_map.read_text()) if fork_map.is_file() else None
     return found.group(1) if found else None
