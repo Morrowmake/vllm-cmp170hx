@@ -15,8 +15,9 @@ values exactly.
 Selection is by the platform: :func:`sm80_select_attn_cls` wraps upstream's
 ``_select_dsv4_attn_cls`` and returns :class:`DeepseekV41Sm80Attention` on
 compute capability 8.x; the DSpark draft layers are built by the same
-selector. :func:`sm80_dspark_context_kv` wraps the drafter's context-KV
-insertion so its window rows go through the same rounding.
+selector. The fork DSpark model (``sm80_model.DSparkDeepseekV4Model``) sends
+the drafter's context-KV insertion through :meth:`sm80_store_context_kv`, so
+its window rows go through the same rounding.
 
 The attention region (KV writes, compressor, indexer, top-k, sparse attention,
 output RoPE and quantize-dequantize) runs eagerly under a piecewise CUDA-graph
@@ -1143,29 +1144,5 @@ def sm80_select_attn_cls(
         if _is_sm80():
             return DeepseekV41Sm80Attention
         return select(vllm_config)
-
-    return wrapper
-
-
-def sm80_dspark_context_kv(store: Callable[..., None]) -> Callable[..., None]:
-    """Decorates the DSpark drafter's ``precompute_and_store_context_kv``:
-    sm_80 draft layers write their context window rows themselves."""
-
-    @functools.wraps(store)
-    def wrapper(
-        self,
-        main_x: torch.Tensor,
-        context_positions: torch.Tensor,
-        context_slot_mappings: list[torch.Tensor | None] | None = None,
-    ) -> None:
-        layers = list(self.layers)
-        if not layers or not isinstance(layers[0].attn, DeepseekV41Sm80Attention):
-            return store(self, main_x, context_positions, context_slot_mappings)
-        for i, layer in enumerate(layers):
-            slot_mapping = (
-                None if context_slot_mappings is None else context_slot_mappings[i]
-            )
-            layer.attn.sm80_store_context_kv(main_x, context_positions, slot_mapping)
-        return None
 
     return wrapper

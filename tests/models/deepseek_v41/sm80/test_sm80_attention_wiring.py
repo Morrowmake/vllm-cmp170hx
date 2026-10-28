@@ -15,7 +15,8 @@ import torch.nn as nn
 
 from vllm.models.deepseek_v41.nvidia import model as dsv41_model
 from vllm_sm80.models.deepseek_v41 import sm80_attention as sm80
-from vllm.models.deepseek_v41.nvidia.dspark import DSparkDeepseekV4Model
+from vllm.models.deepseek_v41.nvidia import dspark as upstream_dspark
+from vllm_sm80.models.deepseek_v41.sm80_model import DSparkDeepseekV4Model
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm_sm80.models.deepseek_v41.ops import sm80_attn_core as core
 from vllm.platforms.interface import DeviceCapability
@@ -207,7 +208,7 @@ def test_o_proj_grouped_wo_a_and_fp32_reduce(monkeypatch) -> None:
     assert seen["shape"] == (T, G, D)
 
 
-def test_dspark_context_kv_hook_dispatch() -> None:
+def test_dspark_context_kv_dispatch(monkeypatch) -> None:
     calls = []
     sm80_attn = _bare_layer()
     object.__setattr__(
@@ -215,18 +216,23 @@ def test_dspark_context_kv_hook_dispatch() -> None:
         "sm80_store_context_kv",
         lambda x, p, s: calls.append(("sm80", s)),
     )
-    model = SimpleNamespace(layers=[SimpleNamespace(attn=sm80_attn)] * 2)
-    store = DSparkDeepseekV4Model.precompute_and_store_context_kv
+    model = object.__new__(DSparkDeepseekV4Model)
+    object.__setattr__(model, "layers", [SimpleNamespace(attn=sm80_attn)] * 2)
     x, pos = torch.zeros(2, 4), torch.arange(2)
-    store(model, x, pos, [torch.tensor([1]), None])
+    model.precompute_and_store_context_kv(x, pos, [torch.tensor([1]), None])
     assert [c[0] for c in calls] == ["sm80", "sm80"] and calls[1][1] is None
 
-    other = SimpleNamespace(layers=[])
-    upstream = store.__wrapped__
+    # Layers other than the sm_80 attention take upstream's insertion.
     hits = []
-    wrapped = sm80.sm80_dspark_context_kv(lambda *a: hits.append(a))
-    wrapped(other, x, pos, None)
-    assert len(hits) == 1 and upstream is not None
+    monkeypatch.setattr(
+        upstream_dspark.DSparkDeepseekV4Model,
+        "precompute_and_store_context_kv",
+        lambda self, *a: hits.append(a),
+    )
+    other = object.__new__(DSparkDeepseekV4Model)
+    object.__setattr__(other, "layers", [])
+    other.precompute_and_store_context_kv(x, pos, None)
+    assert len(hits) == 1 and hits[0][0] is x and hits[0][2] is None
 
 
 class _FakeComm:

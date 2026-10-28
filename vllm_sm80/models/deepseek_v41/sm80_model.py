@@ -58,6 +58,7 @@ from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_side
 from vllm_sm80 import capture
 from vllm_sm80.models.deepseek_v41.ops.sm80_mhc import mhc_post
 from vllm_sm80.models.deepseek_v41 import sm80_split_reduce
+from vllm_sm80.models.deepseek_v41.sm80_attention import DeepseekV41Sm80Attention
 from vllm_sm80.models.deepseek_v41.sm80_moe import adopt_moe, adopt_row_mask
 from vllm_sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
 from vllm_sm80.worker import target_argmax
@@ -455,7 +456,8 @@ class DeepseekV41ForCausalLM(
 
 
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
-    """DSpark stages whose mHC runs ``ops/sm80_mhc.py``."""
+    """DSpark stages whose mHC runs ``ops/sm80_mhc.py`` and whose sm_80 draft
+    layers write their context window rows themselves."""
 
     @classmethod
     def adopt(cls, model: upstream_dspark.DSparkDeepseekV4Model) -> None:
@@ -495,6 +497,28 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
         # (compute_logits applies the norm).
         assert pre_mix is not None
         return hc_collapse_triton(hidden_states, pre_mix)
+
+    @torch.inference_mode()
+    def precompute_and_store_context_kv(
+        self,
+        main_x: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mappings: list[torch.Tensor | None] | None = None,
+    ) -> None:
+        """sm_80 draft layers store their context KV through
+        :meth:`DeepseekV41Sm80Attention.sm80_store_context_kv` (the target's
+        rounding); other layers take upstream's insertion."""
+        layers = list(self.layers)
+        if not layers or not isinstance(layers[0].attn, DeepseekV41Sm80Attention):
+            return super().precompute_and_store_context_kv(
+                main_x, context_positions, context_slot_mappings
+            )
+        for i, layer in enumerate(layers):
+            slot_mapping = (
+                None if context_slot_mappings is None else context_slot_mappings[i]
+            )
+            layer.attn.sm80_store_context_kv(main_x, context_positions, slot_mapping)
+        return None
 
 
 class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
