@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Kimi-K3 specialization of GDN attention metadata.
 
 The request classification and cudagraph staging intentionally mirror
@@ -296,6 +297,8 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             block_table=align.block_table,
             num_computed_tokens=align.num_computed_tokens,
             block_size=align.block_size,
+            commit_lens=context.commit_lens[: self.num_spec_decodes],
+            source_state_indices=commit.state_indices[: self.num_spec_decodes, 0],
         )
 
 
