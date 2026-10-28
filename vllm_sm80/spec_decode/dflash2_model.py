@@ -25,6 +25,8 @@ upstream's):
   and rebuilds the looked-up rows with one all-reduce (exact: each row has one
   non-zero contributor). The PP draft tail builds its selector the same way
   (:func:`build_candidate_selector`).
+- the DFlash-family additions of ``dflash_draft.py`` (the fitted RoPE cache,
+  the folded aux fc input).
 """
 
 import torch
@@ -45,6 +47,7 @@ from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_sm80.spec_decode.dflash_draft import DFlashDraftMixin
 
 logger = init_logger(__name__)
 
@@ -419,5 +422,5 @@ class DFlash2Qwen3Model(qwen3_dflash2.DFlash2Qwen3Model):
             )
 
 
-class DFlash2Qwen3ForCausalLM(qwen3_dflash2.DFlash2Qwen3ForCausalLM):
+class DFlash2Qwen3ForCausalLM(DFlashDraftMixin, qwen3_dflash2.DFlash2Qwen3ForCausalLM):
     model_cls = DFlash2Qwen3Model

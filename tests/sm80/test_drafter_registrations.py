@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The fork plugin's drafter registrations (DFlash2 and LiLiCorr).
+"""The fork plugin's drafter registrations (DFlash, DFlash2 and LiLiCorr).
 
 After :func:`vllm_sm80.plugin.register_drafter_models` the model registry
 resolves each drafter architecture to the fork class, which describes itself
@@ -17,6 +17,7 @@ import torch
 from vllm.model_executor.models.registry import ModelRegistry, _ModelInfo
 from vllm_sm80 import plugin
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig
+from vllm_sm80.spec_decode.dflash_draft import DFlashDraftMixin
 
 
 def _load(qualified: str) -> type:
@@ -35,7 +36,8 @@ def test_drafter_resolves_to_the_fork_class(architecture):
     fork_cls = _load(qualified)
     assert ModelRegistry._try_load_model_cls(architecture) is fork_cls
     upstream_cls = getattr(importlib.import_module(upstream_module), fork_cls.__name__)
-    assert fork_cls.__bases__ == (upstream_cls,)
+    # The DFlash-family additions first, then the upstream class itself.
+    assert fork_cls.__bases__ == (DFlashDraftMixin, upstream_cls)
     assert _ModelInfo.from_model_cls(fork_cls) == _ModelInfo.from_model_cls(
         upstream_cls
     )

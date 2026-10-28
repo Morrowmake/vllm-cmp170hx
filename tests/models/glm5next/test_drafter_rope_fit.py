@@ -20,7 +20,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
-from vllm.model_executor.models.qwen3_dflash import dflash_rope_max_position
+from vllm_sm80.spec_decode import dflash_draft
+from vllm_sm80.spec_decode.dflash_draft import dflash_rope_max_position
 
 FLAG = "VLLM_GLM5_DRAFTER_ROPE_FIT"
 PLAIN_ROPE = {"rope_theta": 10000.0, "rope_type": "default"}
@@ -98,6 +99,19 @@ def test_fitted_length(flag_on, max_model_len, num_spec, expected):
 def test_never_grows_past_configured(flag_on):
     vllm_config, draft = _configs(4_096, 1_000_000, 3)
     assert dflash_rope_max_position(vllm_config, draft) == 4_096
+
+
+def test_drafter_is_built_with_the_fitted_length_only(flag_on, monkeypatch):
+    # The decoder layers read max_position_embeddings while the drafter is
+    # built; afterwards the draft config must read as configured again.
+    vllm_config, draft = _configs(1 << 20, 1_000, 3)
+    monkeypatch.setattr(dflash_draft, "get_current_vllm_config", lambda: vllm_config)
+    with dflash_draft.fitted_rope_positions(draft):
+        assert draft.max_position_embeddings == 1_024
+    assert draft.max_position_embeddings == 1 << 20
+    with pytest.raises(RuntimeError), dflash_draft.fitted_rope_positions(draft):
+        raise RuntimeError("drafter construction failed")
+    assert draft.max_position_embeddings == 1 << 20
 
 
 def test_uses_larger_of_draft_and_target_len(flag_on):

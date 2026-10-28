@@ -23,9 +23,9 @@ from tests.models.glm5next.test_aux_hidden_states_pp import (
     _build_stage,
     _set_pp,
 )
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm_sm80.spec_decode import aux_fc_fold
+from vllm_sm80.spec_decode.dflash_draft import DFlashQwen3ForCausalLM
 from vllm.v1.worker.gpu.spec_decode.eagle import eagle3_utils
 from vllm_sm80.spec_decode.aux_fc_fold import (
     AUX_FC_PARTIAL_KEY,
@@ -184,6 +184,13 @@ def test_drafter_takes_the_folded_fc_output():
 
 
 def test_mark_drafter(monkeypatch):
-    spec = SimpleNamespace(model=SimpleNamespace())
+    drafter = DFlashQwen3ForCausalLM.__new__(DFlashQwen3ForCausalLM)
+    nn.Module.__init__(drafter)
+    spec = SimpleNamespace(model=drafter)
     aux_fc_fold.mark_drafter_aux_fc_folded(spec)
     assert spec.model.aux_fc_folded
+    # A drafter without the fork combine would ignore the folded input.
+    with pytest.raises(RuntimeError, match="not a fork DFlash drafter"):
+        aux_fc_fold.mark_drafter_aux_fc_folded(
+            SimpleNamespace(model=SimpleNamespace())
+        )

@@ -166,14 +166,20 @@ def maybe_configure_aux_fc_fold(
 
 def mark_drafter_aux_fc_folded(speculator: Any) -> None:
     """Tell the last stage's drafter that its aux input is already the fc
-    output (see DFlashQwen3ForCausalLM.combine_hidden_states), and give the
-    speculator's FULL-graph staging buffer that input's shape: the graph
-    combines its context rows from this buffer, which upstream sizes for the
-    concatenated aux states. The fp32 rows are rounded once in the combine,
-    as on the eager path."""
+    output (see DFlashDraftMixin.combine_hidden_states in dflash_draft.py),
+    and give the speculator's FULL-graph staging buffer that input's shape:
+    the graph combines its context rows from this buffer, which upstream
+    sizes for the concatenated aux states. The fp32 rows are rounded once in
+    the combine, as on the eager path."""
     draft_model = getattr(speculator, "model", None)
     if draft_model is None:
         raise RuntimeError("fc fold: the speculator has no draft model")
+    from vllm_sm80.spec_decode.dflash_draft import DFlashDraftMixin
+
+    if not isinstance(draft_model, DFlashDraftMixin):
+        raise RuntimeError(
+            f"fc fold: {type(draft_model).__name__} is not a fork DFlash drafter"
+        )
     draft_model.aux_fc_folded = True
     staging = getattr(speculator, "_aux_staging", None)
     if staging is not None:
