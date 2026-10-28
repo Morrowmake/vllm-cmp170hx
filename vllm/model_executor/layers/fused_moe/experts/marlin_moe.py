@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Fused MoE utilities for GPTQ."""
 
 import math
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation_masked_supported,
     apply_moe_activation_supported,
 )
+from vllm_sm80.kernels.marlin_moe import experts as sm80_marlin
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
@@ -761,6 +763,11 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     return
                 self.moe_sum(input, output, topk_ids, expert_map)
 
+            if sm80_marlin.apply(
+                self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
+                global_num_experts, expert_map, apply_router_weight_on_input,
+                workspace13, workspace2):
+                return
             fused_marlin_moe(
                 hidden_states=hidden_states,
                 w1=w1,
@@ -911,6 +918,8 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
     ) -> None:
+        if sm80_marlin.moe_sum(self, input, output, expert_map):
+            return
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:
