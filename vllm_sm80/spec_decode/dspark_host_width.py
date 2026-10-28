@@ -35,11 +35,10 @@ No upstream file changes:
   copy stream copies it to the host before the output's copy event, and
   ``get_output`` sets the rows (``req_ids`` order) on the
   ``ModelRunnerOutput`` as :data:`P_HAT_ATTR`;
-* scheduler (:func:`install`, at plugin registration): wraps
-  ``Scheduler.schedule`` (each request's verify round: its scheduled drafts,
-  placeholder drafts excepted), ``Scheduler.update_from_output`` (the round's
-  ``p_i``), ``Scheduler._select_adaptive_k`` (the width) and
-  ``AdaptiveKPolicy.mark_padded`` / ``forget``.
+* scheduler: the fork scheduler (``vllm_sm80.sched.scheduler``) keeps each
+  request's verify rounds (:func:`rounds_of`: its scheduled drafts,
+  placeholder drafts excepted, and the round's ``p_i``) and refines its
+  adaptive width with :func:`select`.
 
 Pipeline parallelism is refused, and a forced calibration depth
 (``VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE``) is left as forced. It needs
@@ -307,7 +306,7 @@ class _Rounds:
             self.chosen.clear()
 
 
-def _rounds(policy, hw: HostWidth) -> _Rounds:
+def rounds_of(policy, hw: HostWidth) -> _Rounds:
     rounds = policy.__dict__.get("_dspark_host_rounds")
     if rounds is None:
         rounds = policy.__dict__["_dspark_host_rounds"] = _Rounds(hw)
@@ -346,82 +345,35 @@ def _check_captured(scheduler, hw: HostWidth) -> None:
             )
 
 
-def install() -> None:
-    """Wrap the scheduler when the policy has a host width (plugin
-    registration; idempotent)."""
-    hw = configured()
-    if hw is None:
-        return
-    from vllm_sm80.spec_decode.adaptive_k import AdaptiveKPolicy
-    from vllm.v1.core.sched.scheduler import Scheduler
+def forget(policy, hw: HostWidth, req_id: str) -> None:
+    rounds_of(policy, hw).by_req.pop(req_id, None)
 
-    select = Scheduler._select_adaptive_k
-    if getattr(select, "_dspark_host_width", False):
-        return
-    schedule, update = Scheduler.schedule, Scheduler.update_from_output
-    mark_padded, forget = AdaptiveKPolicy.mark_padded, AdaptiveKPolicy.forget
 
-    @functools.wraps(schedule)
-    def _schedule(self, *args, **kwargs):
-        if self.adaptive_k is None:
-            raise ValueError(
-                "VLLM_DSPARK_ADAPTIVE_DEPTH: a policy with host_width needs "
-                "speculative_config.adaptive_k"
-            )
-        rounds = _rounds(self.adaptive_k, hw)
-        rounds.padded.clear()
-        output = schedule(self, *args, **kwargs)
-        rounds.scheduled(output)
-        return output
-
-    @functools.wraps(update)
-    def _update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
-        if self.adaptive_k is not None:
-            _rounds(self.adaptive_k, hw).observed(scheduler_output, model_runner_output)
-        return update(self, scheduler_output, model_runner_output, *args, **kwargs)
-
-    @functools.wraps(select)
-    def _select_adaptive_k(self) -> tuple[int, int]:
-        k_verify, k_draft = select(self)
-        running = self.running
-        b = len(running)
-        if b not in hw.batch_sizes or any(r.is_prefill_chunk for r in running):
-            return k_verify, k_draft
-        if self._forced_depth() is not None:
-            # Step-cost calibration: the forced depth stands.
-            return k_verify, k_draft
-        rounds = _rounds(self.adaptive_k, hw)
-        if not rounds.checked:
-            _check_captured(self, hw)
-            rounds.checked = True
-        estimates = rounds.estimates(running)
-        if estimates is None:
-            k = min(hw.fallback_k, k_verify)
-        else:
-            k = choose_width(hw, b, estimates, cap=k_verify)
-        for request in running:
-            if len(request.spec_token_ids) > k:
-                # Rebind: AsyncScheduler shares one placeholder list.
-                request.spec_token_ids = request.spec_token_ids[:k]
-        rounds.record(0 if estimates is None else k)
-        return k, k_draft
-
-    @functools.wraps(mark_padded)
-    def _mark_padded(self, req_id: str) -> None:
-        _rounds(self, hw).padded.add(req_id)
-        return mark_padded(self, req_id)
-
-    @functools.wraps(forget)
-    def _forget(self, req_id: str) -> None:
-        _rounds(self, hw).by_req.pop(req_id, None)
-        return forget(self, req_id)
-
-    _select_adaptive_k._dspark_host_width = True  # type: ignore[attr-defined]
-    Scheduler.schedule = _schedule
-    Scheduler.update_from_output = _update_from_output
-    Scheduler._select_adaptive_k = _select_adaptive_k
-    AdaptiveKPolicy.mark_padded = _mark_padded
-    AdaptiveKPolicy.forget = _forget
+def select(scheduler, hw: HostWidth, k_verify: int, k_draft: int) -> tuple[int, int]:
+    """The step's (verify width, draft width) from the host width rule, given
+    the adaptive width ``(k_verify, k_draft)``."""
+    running = scheduler.running
+    b = len(running)
+    if b not in hw.batch_sizes or any(r.is_prefill_chunk for r in running):
+        return k_verify, k_draft
+    if scheduler._forced_depth() is not None:
+        # Step-cost calibration: the forced depth stands.
+        return k_verify, k_draft
+    rounds = rounds_of(scheduler.adaptive_k, hw)
+    if not rounds.checked:
+        _check_captured(scheduler, hw)
+        rounds.checked = True
+    estimates = rounds.estimates(running)
+    if estimates is None:
+        k = min(hw.fallback_k, k_verify)
+    else:
+        k = choose_width(hw, b, estimates, cap=k_verify)
+    for request in running:
+        if len(request.spec_token_ids) > k:
+            # Rebind: AsyncScheduler shares one placeholder list.
+            request.spec_token_ids = request.spec_token_ids[:k]
+    rounds.record(0 if estimates is None else k)
+    return k, k_draft
 
 
 # ------------------------------------------------------------------- worker

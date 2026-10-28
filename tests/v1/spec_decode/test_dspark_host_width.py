@@ -29,6 +29,7 @@ from types import SimpleNamespace as S
 import pytest
 import torch
 
+from vllm_sm80.sched.scheduler import Sm80SchedulerMixin
 from vllm_sm80.spec_decode import dspark_host_width as hw_module
 from vllm_sm80.spec_decode import dspark_row_mask
 from vllm_sm80.spec_decode import dspark_row_mask_kernel as rmk
@@ -184,69 +185,70 @@ def _req(rid, prefill=False, drafts=5):
     return S(request_id=rid, is_prefill_chunk=prefill, spec_token_ids=[-1] * drafts)
 
 
+class _UpstreamStandIn:
+    """Stand-in for the upstream scheduler under the fork mixin: its
+    ``schedule`` gives each running decode its drafts and each request the
+    waiting loop admits this step (``admitted``) placeholder drafts."""
+
+    def schedule(self):
+        out = S(scheduled_spec_decode_tokens={})
+        for r in self.running + self.admitted:
+            if not r.is_prefill_chunk:
+                out.scheduled_spec_decode_tokens[r.request_id] = list(r.spec_token_ids)
+        return out
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        return "updated"
+
+    def _free_request(self, request):
+        return None
+
+
+class _Scheduler(Sm80SchedulerMixin, _UpstreamStandIn):
+    def __init__(self, policy, hw, capture, pp):
+        self.running, self.admitted = [], []
+        self.waiting, self.kv_holding_waiting = [], []
+        self.num_spec_tokens = 7
+        self.adaptive_k = policy
+        self._depth_hint = False
+        self._host_width = hw
+        self.max_num_running_reqs = 8
+        self.vllm_config = S(
+            compilation_config=S(cudagraph_capture_sizes=capture),
+            parallel_config=S(pipeline_parallel_size=pp),
+        )
+
+    def _forced_depth(self):
+        return None
+
+
 class Engine:
-    """The wrapped scheduler on stand-ins: ``step(running)`` runs one
-    schedule (its width choice, then its output) and returns the width and
-    the step's output; ``done(output, p_hat)`` processes a step's output."""
+    """The fork scheduler on stand-ins: ``step(running)`` runs one schedule
+    (its width choice, then its output) and returns the width and the step's
+    output; ``done(output, p_hat)`` processes a step's output."""
 
     def __init__(self, monkeypatch, tmp_path, by_load=BY_LOAD, capture=CAPTURE, pp=1):
         from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
-        from vllm.v1.core.sched.scheduler import Scheduler
 
-        self.Scheduler = Scheduler
-        for cls, name in (
-            (Scheduler, "_select_adaptive_k"),
-            (Scheduler, "schedule"),
-            (Scheduler, "update_from_output"),
-            (AdaptiveKPolicy, "mark_padded"),
-            (AdaptiveKPolicy, "forget"),
-        ):
-            monkeypatch.setattr(cls, name, getattr(cls, name))
-
-        def schedule(sched):
-            # Stand-in for the real loop: the drafts each running request
-            # gets this step, placeholder drafts for the "padded" ones.
-            out = S(scheduled_spec_decode_tokens={})
-            for r in sched.running:
-                if not r.is_prefill_chunk:
-                    out.scheduled_spec_decode_tokens[r.request_id] = list(r.spec_token_ids)
-                    if r.request_id in sched.pad:
-                        sched.adaptive_k.mark_padded(r.request_id)
-            return out
-
-        monkeypatch.setattr(Scheduler, "schedule", schedule)
-        monkeypatch.setattr(Scheduler, "update_from_output", lambda sched, so, mro: "updated")
         monkeypatch.setattr(
             hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", str(_policy(tmp_path))
         )
         hw_module.configured.cache_clear()
-        hw_module.install()
-        hw_module.install()
-        assert Scheduler._select_adaptive_k._dspark_host_width
+        hw = hw_module.configured()
+        assert hw is not None
         monkeypatch.setattr(hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
         hw_module.configured.cache_clear()
         config = AdaptiveKConfig.from_dict({"by_load": by_load, "draft_by_load": True}, 7)
         self.policy = AdaptiveKPolicy(config)
-        self.sched = S(
-            running=[],
-            waiting=[],
-            kv_holding_waiting=[],
-            num_spec_tokens=7,
-            adaptive_k=self.policy,
-            _forced_depth=lambda: None,
-            max_num_running_reqs=8,
-            vllm_config=S(
-                compilation_config=S(cudagraph_capture_sizes=capture),
-                parallel_config=S(pipeline_parallel_size=pp),
-            ),
-            pad=set(),
-        )
+        self.sched = _Scheduler(self.policy, hw, capture, pp)
 
     def step(self, running, pad=()):
-        self.sched.running = running
-        self.sched.pad = set(pad)
-        choice = self.Scheduler._select_adaptive_k(self.sched)
-        output = self.Scheduler.schedule(self.sched)
+        """``pad``: requests of ``running`` the waiting loop admits this step
+        with placeholder drafts instead."""
+        self.sched.running = [r for r in running if r.request_id not in pad]
+        self.sched.admitted = [r for r in running if r.request_id in pad]
+        output = self.sched.schedule()
+        choice = (self.sched.cur_num_spec_tokens, self.sched.next_num_spec_tokens)
         return choice, output
 
     def done(self, output, p_hat=None, order=None):
@@ -254,7 +256,10 @@ class Engine:
         mro = S(req_ids=order, req_id_to_index={r: i for i, r in enumerate(order)})
         if p_hat is not None:
             setattr(mro, P_HAT_ATTR, [p_hat[r] for r in order])
-        assert self.Scheduler.update_from_output(self.sched, output, mro) == "updated"
+        assert self.sched.update_from_output(output, mro) == "updated"
+
+    def finish(self, req_id):
+        self.sched._free_request(S(request_id=req_id))
 
 
 def _running(n, **kw):
@@ -307,7 +312,7 @@ def test_fallbacks(monkeypatch, tmp_path):
     e.done(out, {r: LOW for r in "abc"})
     (k, _), _ = e.step(_running(3))
     assert k == 1
-    e.policy.forget("c")  # a finished request's rounds go
+    e.finish("c")  # a finished request's rounds go
     (k, _), _ = e.step(_running(3))
     assert k == 5
 
@@ -327,7 +332,7 @@ def test_other_steps_keep_their_width(monkeypatch, tmp_path):
     (k, _), _ = e.step(run)
     assert k == 1
     for r in "abc":
-        e.policy.forget(r)
+        e.finish(r)
     for _ in range(2):
         _, out = e.step(_running(3))
         e.done(out, {r: HIGH for r in "abc"})
@@ -365,18 +370,14 @@ def test_widths_without_graphs_refuse(monkeypatch, tmp_path, by_load, capture, m
         e.step(_running(3))
 
 
-def test_off_installs_nothing(monkeypatch, tmp_path):
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    monkeypatch.setattr(Scheduler, "_select_adaptive_k", Scheduler._select_adaptive_k)
+def test_policy_without_a_block_has_no_host_width(monkeypatch, tmp_path):
     monkeypatch.setattr(
         hw_module.envs,
         "VLLM_DSPARK_ADAPTIVE_DEPTH",
         str(_policy(tmp_path, with_block=False)),
     )
     hw_module.configured.cache_clear()
-    hw_module.install()
-    assert not getattr(Scheduler._select_adaptive_k, "_dspark_host_width", False)
+    assert hw_module.configured() is None
     hw_module.configured.cache_clear()
 
 

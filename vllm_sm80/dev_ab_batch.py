@@ -16,9 +16,9 @@ from dataclasses import asdict
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_sm80.sched import SCHEDULERS as SM80_SCHEDULERS
+from vllm_sm80.sched.scheduler import Sm80AsyncScheduler, Sm80Scheduler
 
 logger = init_logger(__name__)
 PROTOCOL = "dev-ab-batch/1"
@@ -138,11 +138,13 @@ class OrderedAdmission:
         return finished
 
 
-class OrderedScheduler(OrderedAdmission, Scheduler):
+# Over the fork scheduler, which the ordered classes replace as
+# SchedulerConfig.scheduler_cls.
+class OrderedScheduler(OrderedAdmission, Sm80Scheduler):
     pass
 
 
-class OrderedAsyncScheduler(OrderedAdmission, AsyncScheduler):
+class OrderedAsyncScheduler(OrderedAdmission, Sm80AsyncScheduler):
     pass
 
 
@@ -150,7 +152,7 @@ def configure(config):
     require_enabled()
     scheduler = config.scheduler_config
     chosen = SCHEDULERS[bool(scheduler.async_scheduling)]
-    if scheduler.scheduler_cls not in (None, *SCHEDULERS):
+    if scheduler.scheduler_cls not in (None, *SCHEDULERS, *SM80_SCHEDULERS):
         raise ValueError("ordered A/B batches cannot replace another scheduler extension")
     scheduler.scheduler_cls = chosen
 

@@ -17,10 +17,11 @@ keeps the step at ``base``. The step's width is capped by the adaptive_k load
 width; the drafter drafts that width, or a 5-wide block when the width is
 below 5, as the served table drafts 5 and verifies 3.
 
-The plugin (``install``) wraps ``AdaptiveKPolicy.observe``/``forget`` to keep
-each request's last round, and ``Scheduler._select_adaptive_k``: the wrapped
-method has already truncated every request's drafts to at most the load
-width, and this one truncates them further to its own width. It needs
+The fork scheduler (``vllm_sm80.sched.scheduler``) keeps each request's last
+round (:func:`observe`, :func:`forget`) and refines its adaptive width with
+:func:`select_step`: the adaptive-k pick has already truncated every
+request's drafts to at most the load width, and this one truncates them
+further to its own width. It needs
 ``speculative_config.adaptive_k`` with ``draft_by_load`` and a ``by_load`` at
 least as wide as ``full`` at each load that lists every width either list
 uses (adaptive_k captures CUDA graphs only for the ``by_load`` widths, and a
@@ -99,60 +100,45 @@ def select(
     return verify, max(verify, DRAFT_FLOOR)
 
 
-def install() -> None:
-    """Wrap the adaptive-k policy and Scheduler._select_adaptive_k when the
-    hint is set (plugin registration; idempotent)."""
-    if not enabled():
-        return
-    from vllm_sm80.spec_decode.adaptive_k import AdaptiveKPolicy
-    from vllm.v1.core.sched.scheduler import Scheduler
+def _full_rounds(policy) -> dict[str, bool]:
+    rounds = policy.__dict__.get("_dspark_full_rounds")
+    if rounds is None:
+        rounds = policy.__dict__["_dspark_full_rounds"] = {}
+    return rounds
 
-    original = Scheduler._select_adaptive_k
-    if getattr(original, "_dspark_depth_hint", False):
-        return
-    observe, forget = AdaptiveKPolicy.observe, AdaptiveKPolicy.forget
 
-    def _rounds(policy) -> dict[str, bool]:
-        rounds = policy.__dict__.get("_dspark_full_rounds")
-        if rounds is None:
-            rounds = policy.__dict__["_dspark_full_rounds"] = {}
-        return rounds
+def observe(policy, req_id: str, num_draft_tokens: int, num_accepted: int) -> None:
+    """Record whether the request's verified round accepted every draft;
+    called before ``policy.observe`` consumes a pending padded mark."""
+    # Placeholder drafts (pending padded) carry no acceptance.
+    if num_draft_tokens > 0 and not policy._pending_padded.get(req_id):
+        _full_rounds(policy)[req_id] = num_accepted >= num_draft_tokens
 
-    def _observe(self, req_id: str, num_draft_tokens: int, num_accepted: int):
-        # Placeholder drafts (pending padded) carry no acceptance.
-        if num_draft_tokens > 0 and not self._pending_padded.get(req_id):
-            _rounds(self)[req_id] = num_accepted >= num_draft_tokens
-        return observe(self, req_id, num_draft_tokens, num_accepted)
 
-    def _forget(self, req_id: str):
-        _rounds(self).pop(req_id, None)
-        return forget(self, req_id)
+def forget(policy, req_id: str) -> None:
+    _full_rounds(policy).pop(req_id, None)
 
-    def _select_adaptive_k(self) -> tuple[int, int]:
-        k_verify, k_draft = original(self)
-        _check_captured(self.adaptive_k)
-        running = self.running
-        if not running:
-            return k_verify, k_draft
-        num_reqs = len(running) + len(self.waiting) + len(self.kv_holding_waiting)
-        load_width = self.adaptive_k.config.k_for_load(num_reqs)
-        k_want, k_draft = select(
-            running, _rounds(self.adaptive_k), num_reqs, load_width
-        )
-        available = min(
-            (len(r.spec_token_ids) for r in running if r.spec_token_ids),
-            default=k_draft,
-        )
-        k_verify = k_want if available >= k_want else self.adaptive_k.snap(available)
-        for request in running:
-            if len(request.spec_token_ids) > k_verify:
-                request.spec_token_ids = request.spec_token_ids[:k_verify]
+
+def select_step(scheduler, k_verify: int, k_draft: int) -> tuple[int, int]:
+    """The step's (verify width, draft width) from the hint, given the
+    adaptive-k pick ``(k_verify, k_draft)``."""
+    policy = scheduler.adaptive_k
+    _check_captured(policy)
+    running = scheduler.running
+    if not running:
         return k_verify, k_draft
-
-    _select_adaptive_k._dspark_depth_hint = True  # type: ignore[attr-defined]
-    AdaptiveKPolicy.observe = _observe
-    AdaptiveKPolicy.forget = _forget
-    Scheduler._select_adaptive_k = _select_adaptive_k
+    num_reqs = len(running) + len(scheduler.waiting) + len(scheduler.kv_holding_waiting)
+    load_width = policy.config.k_for_load(num_reqs)
+    k_want, k_draft = select(running, _full_rounds(policy), num_reqs, load_width)
+    available = min(
+        (len(r.spec_token_ids) for r in running if r.spec_token_ids),
+        default=k_draft,
+    )
+    k_verify = k_want if available >= k_want else policy.snap(available)
+    for request in running:
+        if len(request.spec_token_ids) > k_verify:
+            request.spec_token_ids = request.spec_token_ids[:k_verify]
+    return k_verify, k_draft
 
 
 def _check_captured(policy) -> None:
@@ -172,4 +158,3 @@ def _check_captured(policy) -> None:
             "should serve them"
         )
     policy.__dict__["_dspark_hint_checked"] = True
-

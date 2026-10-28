@@ -31,7 +31,7 @@ from tests.v1.core.utils import create_requests
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_group_id
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_sm80.sched.scheduler import Sm80Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -56,7 +56,7 @@ PROMPT_LEN = 14000
 RETENTIONS = [None, 0, PP4_BLOCK, 2 * PP4_BLOCK]
 
 
-def _scheduler(kda_block: int, retention: int | None = None) -> Scheduler:
+def _scheduler(kda_block: int, retention: int | None = None) -> Sm80Scheduler:
     """A scheduler with GLM's group geometry: MLA and KDA at ``kda_block``, the
     drafter's sliding-window group at 1152 (the hit unit at both layouts)."""
     vllm_config = VllmConfig(
@@ -124,7 +124,7 @@ def _scheduler(kda_block: int, retention: int | None = None) -> Scheduler:
         ],
     )
     register_all_kvcache_specs(vllm_config)
-    return Scheduler(
+    return Sm80Scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
@@ -134,7 +134,7 @@ def _scheduler(kda_block: int, retention: int | None = None) -> Scheduler:
     )
 
 
-def _prefill(scheduler: Scheduler, request, first_chunk_limit: int | None):
+def _prefill(scheduler: Sm80Scheduler, request, first_chunk_limit: int | None):
     """Prefill ``request`` chunk by chunk through the scheduler's split and the
     KV cache manager, the first chunk narrowed as fair prefill narrows it when
     another prefill shares the step.
@@ -157,7 +157,7 @@ def _prefill(scheduler: Scheduler, request, first_chunk_limit: int | None):
         start = request.num_computed_tokens
         budget = min(request.num_tokens - start, limit or MAX_BATCHED)
         num_new = scheduler._mamba_block_aligned_split(
-            request, budget, max_prefill_tokens=limit
+            request, budget, prefill_limit=limit
         )
         limit = None
         assert num_new > 0, f"no progress at {start}"

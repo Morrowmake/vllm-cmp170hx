@@ -7,7 +7,7 @@ import random
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_sm80.sched.scheduler import Sm80Scheduler
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -129,7 +129,7 @@ def _make_scheduler(raw):
     spec = base.vllm_config.speculative_config
     spec.adaptive_k = raw
     spec.adaptive_k_config = AdaptiveKConfig.from_dict(raw, 5)
-    return Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
+    return Sm80Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
                      block_size=base.block_size, log_stats=True,
                      structured_output_manager=StructuredOutputManager(base.vllm_config))
 
@@ -291,7 +291,7 @@ def test_force_file_pins_the_depth(tmp_path, monkeypatch, depth):
     spec = base.vllm_config.speculative_config
     spec.adaptive_k = K7
     spec.adaptive_k_config = AdaptiveKConfig.from_dict(K7, 7)
-    scheduler = Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
+    scheduler = Sm80Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
                           block_size=base.block_size, log_stats=True,
                           structured_output_manager=StructuredOutputManager(base.vllm_config))
     [req] = create_requests(num_requests=1)
@@ -351,7 +351,7 @@ def test_scheduler_depth_sequence_is_repeatable_alone():
                             num_speculative_tokens=7)
     spec = base.vllm_config.speculative_config
     spec.adaptive_k, spec.adaptive_k_config = K7, AdaptiveKConfig.from_dict(K7, 7)
-    scheduler = Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
+    scheduler = Sm80Scheduler(vllm_config=base.vllm_config, kv_cache_config=base.kv_cache_config,
                           block_size=base.block_size, log_stats=True,
                           structured_output_manager=StructuredOutputManager(base.vllm_config))
     rng = random.Random(14)

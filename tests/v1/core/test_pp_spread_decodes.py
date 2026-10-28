@@ -14,7 +14,7 @@ only the scheduling arithmetic reads it.
 
 import pytest
 
-from .utils import create_requests, create_scheduler
+from .sm80_utils import create_requests, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
 

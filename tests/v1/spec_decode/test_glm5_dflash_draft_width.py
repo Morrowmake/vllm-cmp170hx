@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_sm80.sched.scheduler import Sm80Scheduler
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm_sm80.worker import pp_draft_tail as dt
@@ -55,7 +55,7 @@ def _make_scheduler(adaptive_k):
     spec = base.vllm_config.speculative_config
     spec.adaptive_k = adaptive_k
     spec.adaptive_k_config = AdaptiveKConfig.from_dict(adaptive_k, 5)
-    return Scheduler(vllm_config=base.vllm_config,
+    return Sm80Scheduler(vllm_config=base.vllm_config,
                      kv_cache_config=base.kv_cache_config,
                      block_size=base.block_size, log_stats=True,
                      structured_output_manager=StructuredOutputManager(

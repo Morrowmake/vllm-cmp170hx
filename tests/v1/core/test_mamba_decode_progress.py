@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from tests.v1.core.test_fair_prefill import _start_decode_streams, _step
-from tests.v1.core.utils import create_requests, create_scheduler
+from tests.v1.core.sm80_utils import create_requests, create_scheduler
 from vllm.config import SpeculativeConfig
 from vllm.v1.kv_cache_interface import MambaSpec
 

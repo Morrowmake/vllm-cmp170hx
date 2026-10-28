@@ -5,8 +5,7 @@
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_sm80.sched.scheduler import Sm80AsyncScheduler, Sm80Scheduler
 from vllm.v1.request import RequestStatus
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
 from vllm.v1.structured_output import StructuredOutputManager
@@ -100,7 +99,7 @@ def test_logging_histogram_resets_only_after_the_interval():
 
 
 def _make_scheduler(adaptive_k: dict | None, num_speculative_tokens: int = 3,
-                    cls=Scheduler):
+                    cls=Sm80Scheduler):
     base = create_scheduler(
         max_num_seqs=16,
         max_num_batched_tokens=8192,
@@ -171,7 +170,7 @@ def test_scheduler_never_verifies_more_drafts_than_the_batch_carries():
 def test_adaptive_k_does_not_corrupt_the_async_placeholder_list():
     # AsyncScheduler hands every request the *same* placeholder list object,
     # so trimming a request's drafts must rebind, never mutate in place.
-    scheduler = _make_scheduler({"by_load": [3, 1]}, cls=AsyncScheduler)
+    scheduler = _make_scheduler({"by_load": [3, 1]}, cls=Sm80AsyncScheduler)
     requests = create_requests(num_requests=2)
     for request in requests:
         scheduler.add_request(request)

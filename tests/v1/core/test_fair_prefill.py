@@ -18,7 +18,7 @@ from vllm.config import SchedulerConfig
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 
-from .utils import create_requests, create_scheduler
+from .sm80_utils import create_requests, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
 

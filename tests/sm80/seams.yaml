@@ -1795,3 +1795,65 @@ seams:
   why: sets the instance's _gemm_impl, which vllm_sm80/kernels/thin_gemm/concat.py checks and sm80_moe.py calls as _gemm_impl(layer, x, weight, None)
   sha256: e2fb974714067dbdd2df18e2fc685f7c92cfe1f54cda700fc4cf39c00903332d
   signature: (self) -> None
+- id: sched-scheduler-init
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler.__init__
+  why: Sm80SchedulerMixin.__init__ runs after it and reads vllm_config, scheduler_config, parallel_config, use_pp, num_spec_tokens and kv_cache_config; fair prefill reads running, waiting, kv_holding_waiting, max_num_active_reqs, num_waiting_for_streaming_input, _pause_state, num_prefill_lookahead, need_mamba_block_aligned_split and max_num_scheduled_tokens set here
+  sha256: e2459991e9a5dcdab8be620a30db1e1f531ab150da020c32af2647a838f7aaa4
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, structured_output_manager: vllm.v1.structured_output.StructuredOutputManager, block_size: int, hash_block_size: int | None = None, mm_registry: vllm.multimodal.registry.MultiModalRegistry = <vllm.multimodal.registry.MultiModalRegistry object at 0x7e4b5d5c3e30>, include_finished_set: bool = False, log_stats: bool = False) -> None'
+
+- id: sched-scheduler-schedule
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler.schedule
+  why: Sm80SchedulerMixin.schedule picks the step's draft widths and truncates drafts before calling it, so nothing ahead of the running loop may size a request; a request running at the start of a step never reaches the waiting loop (it runs only when nothing was preempted), and the waiting loop's only scheduled drafts are the uniform-decode placeholders, which the mixin marks as padded from the output
+  sha256: 14be1cae9993ca5e8978522d7d68f5aa01ee0d2a5002b58e06784b9aff51b3fd
+  signature: '(self, throttle_prefills: bool = False) -> vllm.v1.core.sched.output.SchedulerOutput'
+
+- id: sched-scheduler-update-from-output
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler.update_from_output
+  why: Sm80SchedulerMixin.update_from_output feeds the DSpark host-width rounds the step's output before calling it with the same arguments
+  sha256: 3ecd1fa58f8839d7ad5a42431545ba764913f609ffccf1522ad884a9e4defe8f
+  signature: '(self, scheduler_output: vllm.v1.core.sched.output.SchedulerOutput, model_runner_output: vllm.v1.outputs.ModelRunnerOutput) -> dict[int, vllm.v1.engine.EngineCoreOutputs]'
+
+- id: sched-scheduler-make-spec-decoding-stats
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler.make_spec_decoding_stats
+  why: update_from_output calls it once per request whose drafts were verified, with the step's draft count, accepted count, grammar-invalidated counts and request id; Sm80SchedulerMixin overrides it to feed the adaptive-k acceptance counts
+  sha256: 293e480c77e7ad856e9c27cf693d7cf119a224a150e41d858f6d20372e08e344
+  signature: '(self, spec_decoding_stats: vllm.v1.spec_decode.metrics.SpecDecodingStats | None, num_draft_tokens: int, num_accepted_tokens: int, num_invalid_spec_tokens: dict[str, int] | None, request_id: str) -> vllm.v1.spec_decode.metrics.SpecDecodingStats | None'
+
+- id: sched-scheduler-free-request
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler._free_request
+  why: called once per finished request; Sm80SchedulerMixin overrides it to drop the request's adaptive-k state first
+  sha256: 024636560a9c7436ccaf9fc5f7bca4de3829e5ba7fd878af5595dcd9cc6391a9
+  signature: '(self, request: vllm.v1.request.Request, delay_free_blocks: bool = False) -> tuple[dict[str, typing.Any] | None, dict[str, typing.Any] | None]'
+
+- id: sched-scheduler-mamba-split
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler._mamba_block_aligned_split
+  why: fair prefill passes the align-mode chunk ceiling as its fifth argument (prefill_limit) and the Mamba state grid comes from vllm_sm80.sched.hooks.mamba_block_size
+  sha256: 771929accac989ea2f3151dda3d4cfe53b59ec4e7756055a0d07088f0f584457
+  signature: '(self, request: vllm.v1.request.Request, num_new_tokens: int, num_new_local_computed_tokens: int = 0, num_external_computed_tokens: int = 0, prefill_limit: int | None = None) -> int'
+
+- id: sched-scheduler-reserve-prefill-lookahead
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler._reserve_prefill_lookahead
+  why: refuses to end a chunk within num_prefill_lookahead of the prefill end; the fair-prefill budgets are floored at num_prefill_lookahead + 1 so a chunk can always end
+  sha256: e73f7f59d2373ce25ac04d376747135794baaab3d2ada4b0f36d4007fe7f19cf
+  signature: '(self, request: vllm.v1.request.Request, num_computed_tokens: int, num_new_tokens: int) -> int'
+
+- id: sched-async-update-after-schedule
+  kind: method
+  target: vllm.v1.core.sched.async_scheduler:AsyncScheduler._update_after_schedule
+  why: hands every scheduled decode the same placeholder spec_token_ids list, so the adaptive-k truncation rebinds the list instead of mutating it
+  sha256: 43a8c1ed4cdc278442cb8997ad8c874d9b7a3026cf8e66ff16670fcfceada714
+  signature: '(self, scheduler_output: vllm.v1.core.sched.output.SchedulerOutput) -> None'
+
+- id: sched-config-get-scheduler-cls
+  kind: method
+  target: vllm.config.scheduler:SchedulerConfig.get_scheduler_cls
+  why: resolves the 'module.Class' string vllm_sm80.sched.select_scheduler puts in scheduler_cls (left None it would pick Scheduler / AsyncScheduler itself)
+  sha256: d05279a5158f75c1ce508b68191551144e5b54ce3695e8568aab9e39033bf79a
+  signature: (self) -> type['SchedulerInterface']

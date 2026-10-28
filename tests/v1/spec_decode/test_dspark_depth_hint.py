@@ -6,6 +6,7 @@ from types import SimpleNamespace as S
 
 import pytest
 
+from vllm_sm80.sched.scheduler import Sm80SchedulerMixin
 from vllm_sm80.spec_decode import dspark_depth_hint as hint
 
 pytestmark = pytest.mark.cpu_test
@@ -46,16 +47,12 @@ def test_only_request_fields_mark(on, request_, marked):
     assert extra == ({hint.KEY: "full"} if marked else {})
 
 
-def test_off_marks_and_installs_nothing(monkeypatch):
+def test_off_marks_nothing(monkeypatch):
     monkeypatch.delenv("VLLM_DSPARK_DEPTH_HINT", raising=False)
     hint.widths.cache_clear()
     extra = {}
     hint.mark(_chat(tools=[{"type": "function"}]), extra)
     assert extra == {} and not hint.enabled()
-    hint.install()
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    assert not getattr(Scheduler._select_adaptive_k, "_dspark_depth_hint", False)
 
 
 @pytest.mark.parametrize("raw", ["full=7", "full=7;base=5;deep=9"])
@@ -102,61 +99,72 @@ def test_first_and_prefill_steps_take_base(on):
     assert hint.select([_req("a", prefill=True)], {"a": True}, 1, 7) == (5, 5)
 
 
-def _installed(monkeypatch, by_load):
-    """install() on a fresh adaptive-k policy; returns run(running) ->
-    ((verify, draft), drafts left per request)."""
-    from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
-    from vllm.v1.core.sched.scheduler import Scheduler
+class _UpstreamStandIn:
+    """Stand-in for the upstream scheduler methods the fork mixin extends."""
 
-    for cls, name in (
-        (Scheduler, "_select_adaptive_k"),
-        (AdaptiveKPolicy, "observe"),
-        (AdaptiveKPolicy, "forget"),
-    ):
-        monkeypatch.setattr(cls, name, getattr(cls, name))
-    hint.install()
-    hint.install()
-    assert Scheduler._select_adaptive_k._dspark_depth_hint
-    config = AdaptiveKConfig.from_dict({"by_load": by_load, "draft_by_load": True}, 7)
-    policy = AdaptiveKPolicy(config)
+    def make_spec_decoding_stats(self, stats, num_draft, num_accepted, invalid, rid):
+        return None
 
-    def run(running):
-        sched = S(
-            running=running,
-            waiting=[],
-            kv_holding_waiting=[],
-            num_spec_tokens=7,
-            adaptive_k=policy,
-            _forced_depth=lambda: None,
-        )
-        choice = Scheduler._select_adaptive_k(sched)
+    def _free_request(self, request):
+        return None
+
+
+class _Scheduler(Sm80SchedulerMixin, _UpstreamStandIn):
+    def __init__(self, policy):
+        self.running, self.waiting, self.kv_holding_waiting = [], [], []
+        self.num_spec_tokens = 7
+        self.adaptive_k = policy
+        self._depth_hint = True
+        self._host_width = None
+
+    def _forced_depth(self):
+        return None
+
+    def run(self, running):
+        """((verify, draft), drafts left per request) of one step."""
+        self.running = running
+        choice = self._select_adaptive_k()
         return choice, [len(r.spec_token_ids) for r in running]
 
-    return policy, run
+    def observe(self, req_id, num_draft_tokens, num_accepted):
+        self.make_spec_decoding_stats(None, num_draft_tokens, num_accepted, None, req_id)
+
+    def finish(self, req_id):
+        self._free_request(S(request_id=req_id))
 
 
-def test_a_width_without_graphs_refuses(on, monkeypatch):
+def _scheduler(by_load):
+    """The fork scheduler's width choice with the hint on, over a fresh
+    adaptive-k policy."""
+    from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
+
+    config = AdaptiveKConfig.from_dict({"by_load": by_load, "draft_by_load": True}, 7)
+    return _Scheduler(AdaptiveKPolicy(config))
+
+
+def test_a_width_without_graphs_refuses(on):
     # base's 3 is in no by_load entry: its steps would run eager.
-    _, run = _installed(monkeypatch, [7, 7, 5, 5, 5, 5, 5, 5])
+    sched = _scheduler([7, 7, 5, 5, 5, 5, 5, 5])
     with pytest.raises(ValueError, match=r"widths \[3\]"):
-        run([_req("a")])
+        sched.run([_req("a")])
 
 
-def test_wrapper_follows_each_requests_last_round(on, monkeypatch):
+def test_width_follows_each_requests_last_round(on):
     # The ninth entry, past max_num_seqs, captures 3 without serving it.
-    policy, run = _installed(monkeypatch, [7, 7, 5, 5, 5, 5, 5, 5, 3])
+    sched = _scheduler([7, 7, 5, 5, 5, 5, 5, 5, 3])
+    run = sched.run
     assert run([_req("a")]) == ((5, 5), [5])  # no history yet
-    policy.observe("a", 5, 5)  # accepted every draft
+    sched.observe("a", 5, 5)  # accepted every draft
     assert run([_req("a")]) == ((7, 7), [7])
     assert run([_req("a", drafts=5)]) == ((5, 7), [5])  # 5 on hand: ask for 7
-    policy.observe("a", 7, 5)  # a rejection
+    sched.observe("a", 7, 5)  # a rejection
     assert run([_req("a")]) == ((5, 5), [5])
-    policy.mark_padded("a")
-    policy.observe("a", 5, 0)  # placeholder drafts: no information
+    sched._mark_padded("a")
+    sched.observe("a", 5, 0)  # placeholder drafts: no information
     assert run([_req("a")]) == ((5, 5), [5])
     for rid in "bcd":
-        policy.observe(rid, 3, 3)
-    policy.observe("a", 3, 3)
+        sched.observe(rid, 3, 3)
+    sched.observe("a", 3, 3)
     assert run([_req(r) for r in "abcd"]) == ((5, 5), [5, 5, 5, 5])
-    policy.forget("d")
+    sched.finish("d")
     assert run([_req(r) for r in "abcd"]) == ((3, 5), [3, 3, 3, 3])

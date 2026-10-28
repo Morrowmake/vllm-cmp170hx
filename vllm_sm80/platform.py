@@ -25,6 +25,8 @@ where the fork needs it:
 - ``check_and_update_config``: upstream's, then, with ``VLLM_DEV_AB_SWITCH``
   or ``VLLM_HOT_SWAP`` set, the development A/B setter's worker extension
   (``vllm_sm80.dev_ab``).
+- ``check_and_update_config``: last, the fork scheduler
+  (``vllm_sm80.sched.scheduler``) when no scheduler class is configured.
 
 ``Sm80CudaPlatform`` is chosen the way ``vllm.platforms.cuda.CudaPlatform``
 is: the NVML variant when NVML is available, else the non-NVML one.
@@ -115,13 +117,16 @@ class _Sm80CudaPlatformMixin:
 
     @classmethod
     def check_and_update_config(cls, vllm_config) -> None:
-        """Upstream config, optional graph-memory worker, then A/B extension."""
+        """Upstream config, optional graph-memory worker, A/B extension, then
+        the fork scheduler."""
         super().check_and_update_config(vllm_config)  # type: ignore[misc]
         from vllm_sm80.worker.cudagraph_mem import select_worker
         from vllm_sm80.dev_ab import configure
+        from vllm_sm80.sched import select_scheduler
 
         select_worker(vllm_config.parallel_config)
         configure(vllm_config)
+        select_scheduler(vllm_config)
 
 
 class Sm80NvmlCudaPlatform(_Sm80CudaPlatformMixin, NvmlCudaPlatform):

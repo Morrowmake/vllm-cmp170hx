@@ -12,8 +12,7 @@ import torch
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.config import CompilationConfig, CUDAGraphMode, ParallelConfig
 from vllm.config import SchedulerConfig, VllmConfig
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_sm80.sched.scheduler import Sm80AsyncScheduler, Sm80Scheduler
 from vllm_sm80.spec_decode.adaptive_k import AdaptiveKConfig
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
@@ -70,7 +69,7 @@ def test_by_load_config_rejects_bad_input(raw, needle):
 
 
 def _make_scheduler(adaptive_k: dict | None, num_speculative_tokens: int = 5,
-                    cls=Scheduler):
+                    cls=Sm80Scheduler):
     base = create_scheduler(
         max_num_seqs=16,
         max_num_batched_tokens=8192,
@@ -166,7 +165,7 @@ def test_short_draft_list_caps_the_step_for_everyone():
 
 
 def test_async_scheduler_placeholders_are_full_width():
-    scheduler = _make_scheduler(BY_LOAD, cls=AsyncScheduler)
+    scheduler = _make_scheduler(BY_LOAD, cls=Sm80AsyncScheduler)
     requests = create_requests(num_requests=2)
     for request in requests:
         scheduler.add_request(request)
