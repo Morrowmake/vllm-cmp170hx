@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
 from collections.abc import Iterable
@@ -219,6 +220,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        embedding_cls = getattr(quant_config, "ple_embedding_cls", embedding_cls)
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
