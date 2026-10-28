@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Inference-only Qwen4Exp MTP (Multi-Token Predictor) model.
 
 The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
@@ -158,6 +159,9 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+        set_start = getattr(draft_quant_config, "set_mtp_start_layer_idx", None)
+        if set_start is not None:
+            set_start(mtp_start_layer_idx)
 
     draft_vllm_config = replace(
         vllm_config,
