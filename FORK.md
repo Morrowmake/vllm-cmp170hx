@@ -175,7 +175,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 
 | Path | Lines |
 |---|---:|
-| `vllm_sm80/__init__.py` | 41 |
+| `vllm_sm80/__init__.py` | 49 |
 | `vllm_sm80/attention/__init__.py` | 2 |
 | `vllm_sm80/attention/triton_mla_sparse.py` | 386 |
 | `vllm_sm80/capture.py` | 703 |
@@ -239,7 +239,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/state_index_check.py` | 299 |
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
-| **64 files** | **20,466** |
+| **64 files** | **20,474** |
 
 ### `csrc/exl3/`
 
@@ -574,7 +574,7 @@ Grouped by top-level directory.
 | `tests/sm80/launch/test_launch_resolve.py` | 352 |
 | `tests/sm80/launch/test_launch_single_card_model.py` | 227 |
 | `tests/sm80/launch/test_launch_validated.py` | 483 |
-| `tests/sm80/seams.yaml` | 1,795 |
+| `tests/sm80/seams.yaml` | 1,797 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 288 |
 | `tests/sm80/test_dev_ab.py` | 697 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
@@ -601,7 +601,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_mrv2_prepare_inputs_padding.py` | 126 |
 | `tests/sm80/test_plugin_banner.py` | 36 |
 | `tests/sm80/test_plugin_distribution.py` | 114 |
-| `tests/sm80/test_plugin_guard.py` | 299 |
+| `tests/sm80/test_plugin_guard.py` | 302 |
 | `tests/sm80/test_profile_retirement.py` | 185 |
 | `tests/sm80/test_registrations.py` | 137 |
 | `tests/sm80/test_seams.py` | 57 |
@@ -655,7 +655,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **294 files** | **123,845** |
+| **294 files** | **123,850** |
 
 #### `tools/`
 
@@ -947,7 +947,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 240 |
-| Plugin product lines | 81,201 |
+| Plugin product lines | 81,209 |
 | Queue commits | 88 |
 | Queue upstream files | 88 |
 | Queue upstream product files | 73 |
