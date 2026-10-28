@@ -57,7 +57,7 @@ Model code of one model that the plugin registers in place of the upstream class
 
 | Path | Lines |
 |---|---:|
-| `vllm_sm80/models/deepseek_v41/__init__.py` | 2 |
+| `vllm_sm80/models/deepseek_v41/__init__.py` | 7 |
 | `vllm_sm80/models/deepseek_v41/dspark_depth_policy.json` | 300 |
 | `vllm_sm80/models/deepseek_v41/hybrid_capture.py` | 367 |
 | `vllm_sm80/models/deepseek_v41/sm80_attention.py` | 1,171 |
@@ -71,17 +71,17 @@ Model code of one model that the plugin registers in place of the upstream class
 | `vllm_sm80/models/deepseek_v41/sm80_pipeline_capture.py` | 184 |
 | `vllm_sm80/models/deepseek_v41/sm80_split_reduce.py` | 252 |
 | `vllm_sm80/models/deepseek_v41/sm80_swa_meta_batch.py` | 445 |
-| `vllm_sm80/models/glm5next/__init__.py` | 2 |
+| `vllm_sm80/models/glm5next/__init__.py` | 7 |
 | `vllm_sm80/models/glm5next/model_state.py` | 113 |
 | `vllm_sm80/models/glm5next/sm80_kda.py` | 224 |
 | `vllm_sm80/models/glm5next/sm80_mla.py` | 123 |
 | `vllm_sm80/models/glm5next/sm80_model.py` | 470 |
-| `vllm_sm80/models/qwen4_exp/__init__.py` | 2 |
+| `vllm_sm80/models/qwen4_exp/__init__.py` | 7 |
 | `vllm_sm80/models/qwen4_exp/exl3_layout.py` | 190 |
 | `vllm_sm80/models/qwen4_exp/exl3_ple.py` | 948 |
 | `vllm_sm80/models/qwen4_exp/precision.py` | 93 |
 | `vllm_sm80/models/qwen4_exp/sm80_model.py` | 44 |
-| **24 files** | **7,800** |
+| **24 files** | **7,815** |
 
 ### `vllm_sm80/kernels/`
 
@@ -949,7 +949,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 241 |
-| Plugin product lines | 81,612 |
+| Plugin product lines | 81,627 |
 | Queue commits | 88 |
 | Queue upstream files | 88 |
 | Queue upstream product files | 73 |
