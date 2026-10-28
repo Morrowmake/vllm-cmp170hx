@@ -6,7 +6,7 @@ This branch is the `vllm-sm80` plugin of Morrowmake's vLLM fork for the NVIDIA C
 
 Upstream base: 330c5bffeeb48725c0502a351e8ead2b54bd81eb
 
-Queue: queue-p2/330c5bffee 0af5991c009e0c3ff4181f026a8e7dffe1370b45
+Queue: queue/330c5bffee 0af5991c009e0c3ff4181f026a8e7dffe1370b45
 
 Section 1 lists every file of this branch. Section 2 compares the queue (62 commits, one per upstream file) with its upstream base. This file is not listed in its own tables.
 
@@ -65,8 +65,8 @@ Model code of one model that the plugin registers in place of the upstream class
 | `vllm_sm80/models/deepseek_v41/sm80_engram_prefetch.py` | 107 |
 | `vllm_sm80/models/deepseek_v41/sm80_engram_projection.py` | 18 |
 | `vllm_sm80/models/deepseek_v41/sm80_engram_wkv.py` | 196 |
-| `vllm_sm80/models/deepseek_v41/sm80_exl3.py` | 104 |
-| `vllm_sm80/models/deepseek_v41/sm80_model.py` | 552 |
+| `vllm_sm80/models/deepseek_v41/sm80_exl3.py` | 111 |
+| `vllm_sm80/models/deepseek_v41/sm80_model.py` | 578 |
 | `vllm_sm80/models/deepseek_v41/sm80_moe.py` | 537 |
 | `vllm_sm80/models/deepseek_v41/sm80_pipeline_capture.py` | 184 |
 | `vllm_sm80/models/deepseek_v41/sm80_split_reduce.py` | 252 |
@@ -75,15 +75,15 @@ Model code of one model that the plugin registers in place of the upstream class
 | `vllm_sm80/models/glm5next/model_state.py` | 113 |
 | `vllm_sm80/models/glm5next/sm80_indexer.py` | 263 |
 | `vllm_sm80/models/glm5next/sm80_indexer_op.py` | 34 |
-| `vllm_sm80/models/glm5next/sm80_kda.py` | 651 |
+| `vllm_sm80/models/glm5next/sm80_kda.py` | 659 |
 | `vllm_sm80/models/glm5next/sm80_mla.py` | 123 |
 | `vllm_sm80/models/glm5next/sm80_model.py` | 470 |
 | `vllm_sm80/models/qwen4_exp/__init__.py` | 7 |
 | `vllm_sm80/models/qwen4_exp/exl3_layout.py` | 190 |
 | `vllm_sm80/models/qwen4_exp/exl3_ple.py` | 948 |
 | `vllm_sm80/models/qwen4_exp/precision.py` | 107 |
-| `vllm_sm80/models/qwen4_exp/sm80_model.py` | 121 |
-| **26 files** | **8,631** |
+| `vllm_sm80/models/qwen4_exp/sm80_model.py` | 123 |
+| **26 files** | **8,674** |
 
 ### `vllm_sm80/kernels/`
 
@@ -201,7 +201,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/fla/autotune_pins.py` | 210 |
 | `vllm_sm80/fla/pinned_autotune.py` | 384 |
 | `vllm_sm80/guard.py` | 68 |
-| `vllm_sm80/hot_swap.py` | 810 |
+| `vllm_sm80/hot_swap.py` | 824 |
 | `vllm_sm80/jit_extension.py` | 150 |
 | `vllm_sm80/kv_planning.py` | 655 |
 | `vllm_sm80/layers/__init__.py` | 4 |
@@ -265,7 +265,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **86 files** | **23,925** |
+| **86 files** | **23,939** |
 
 ### `csrc/exl3/`
 
@@ -434,7 +434,7 @@ Grouped by top-level directory.
 | `tests/kernels/test_ampere_decode_mhc_v3.py` | 420 |
 | `tests/kernels/test_ampere_idx_glue.py` | 838 |
 | `tests/kernels/test_ampere_indexer_decode_raw_k.py` | 270 |
-| `tests/kernels/test_ampere_kda_dispatch.py` | 805 |
+| `tests/kernels/test_ampere_kda_dispatch.py` | 840 |
 | `tests/kernels/test_ampere_kda_fold.py` | 1,035 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
 | `tests/kernels/test_ampere_kda_recover.py` | 1,007 |
@@ -500,7 +500,7 @@ Grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,900 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica.py` | 459 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica_gpu.py` | 113 |
-| `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
+| `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 166 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 379 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 1,286 |
 | `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
@@ -566,7 +566,7 @@ Grouped by top-level directory.
 | `tests/models/glm5next/test_router_logits_dtype.py` | 156 |
 | `tests/models/kimi_k3/test_kda_zero_draft_rows.py` | 101 |
 | `tests/models/qwen4_exp/fixtures/exl3_names.json` | 451 |
-| `tests/models/qwen4_exp/test_exl3_construction.py` | 273 |
+| `tests/models/qwen4_exp/test_exl3_construction.py` | 287 |
 | `tests/models/qwen4_exp/test_exl3_layout.py` | 232 |
 | `tests/models/qwen4_exp/test_exl3_ple_decode.py` | 233 |
 | `tests/models/qwen4_exp/test_exl3_ple_reader.py` | 1,683 |
@@ -603,6 +603,7 @@ Grouped by top-level directory.
 | `tests/sm80/launch/test_launch_resolve.py` | 352 |
 | `tests/sm80/launch/test_launch_single_card_model.py` | 227 |
 | `tests/sm80/launch/test_launch_validated.py` | 483 |
+| `tests/sm80/seams.165213f91169.yaml` | 2,170 |
 | `tests/sm80/seams.yaml` | 2,170 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 288 |
 | `tests/sm80/test_dev_ab.py` | 697 |
@@ -618,7 +619,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 320 |
 | `tests/sm80/test_gpu_lock_guard.py` | 77 |
-| `tests/sm80/test_hot_swap.py` | 701 |
+| `tests/sm80/test_hot_swap.py` | 750 |
 | `tests/sm80/test_hot_swap_gpu.py` | 124 |
 | `tests/sm80/test_import_cuda_init.py` | 168 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
@@ -627,7 +628,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_kernel_warmup_call.py` | 69 |
 | `tests/sm80/test_kv_planning.py` | 492 |
 | `tests/sm80/test_light_timing.py` | 291 |
-| `tests/sm80/test_modification_notices.py` | 80 |
+| `tests/sm80/test_modification_notices.py` | 155 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_mrv2_prepare_inputs_padding.py` | 149 |
 | `tests/sm80/test_plugin_banner.py` | 36 |
@@ -643,7 +644,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_triton_mla_sparse_block_stride.py` | 151 |
 | `tests/sm80/test_tuning.py` | 288 |
 | `tests/sm80/tuning_rows.py` | 39 |
-| `tests/sm80/update_seams.py` | 252 |
+| `tests/sm80/update_seams.py` | 266 |
 | `tests/test_retired_env_vars.py` | 320 |
 | `tests/tokenizers_/test_sm80_deepseek_v41.py` | 103 |
 | `tests/v1/attention/test_glm_metadata_reuse.py` | 228 |
@@ -689,7 +690,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **302 files** | **126,350** |
+| **303 files** | **128,744** |
 
 #### `tools/`
 
@@ -703,7 +704,7 @@ Grouped by top-level directory.
 
 ## 2. Patched upstream files (the queue)
 
-Every upstream path `queue-p2/330c5bffee` changes against the upstream base. Hunks are counted at zero context lines, so one hunk is one edit site. Tests, docs and `.github` are paths under `tests/`, `docs/` or `.github/` and Markdown files. Everything else is product code.
+Every upstream path `queue/330c5bffee` changes against the upstream base. Hunks are counted at zero context lines, so one hunk is one edit site. Tests, docs and `.github` are paths under `tests/`, `docs/` or `.github/` and Markdown files. Everything else is product code.
 
 ### Product code
 
@@ -956,7 +957,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 266 |
-| Plugin product lines | 85,861 |
+| Plugin product lines | 85,918 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |
