@@ -7,19 +7,21 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+from vllm_sm80.fla.pinned_autotune import pinned_autotune
 from .utils import check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@pinned_autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
 )
@@ -70,7 +72,7 @@ def chunk_local_cumsum_scalar_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST
