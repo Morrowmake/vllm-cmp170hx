@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.speculative import XPRESS_ARCHITECTURES
+from vllm_sm80.spec_decode.speculators import create_speculator as sm80_speculator
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.states import RequestState
@@ -19,6 +21,8 @@ def init_speculator(
     """Build the speculator for this config."""
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if (speculator := sm80_speculator(vllm_config, device)) is not None:
+        return speculator
     if speculative_config.method == "extract_hidden_states":
         from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
             ExtractHiddenStatesSpeculator,
