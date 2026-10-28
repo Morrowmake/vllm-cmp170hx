@@ -38,8 +38,11 @@ blocks. Both variants of a graph site are captured, so the memory profile
 and the KV cache size see both variants' scratch. Each arm replays the same
 topology: the other variant's nodes are present and disabled in both arms.
 
-A pair site never nests inside another. A variant whose capture adds a node
-of another type (an event, a host node, a child graph) is refused at capture.
+A pair site never nests inside another. Only a variant's kernel, memset and
+memcpy nodes are toggled; its event record and wait nodes stay enabled in
+both arms (:func:`_toggled`). A variant whose capture adds a node of any other
+type (a host node, a child graph, a memory allocation) is refused when its
+graph is bound.
 
 A switch is a pair only when both of its arms run on what the boot built:
 the same allocations, process groups and captured graph shapes. Not pairs:
@@ -411,28 +414,36 @@ def _nodes(graph: int) -> set[int]:
     return {int(n) for n in nodes}
 
 
-_TOGGLEABLE = None
+def _toggled(nodes) -> tuple[tuple[int, ...], list[str]]:
+    """The nodes of one variant that an arm toggles, and their kinds (the
+    kernel name of each kernel node, 'memset'/'memcpy' for those).
 
-
-def _node_kinds(nodes) -> list[str]:
-    """The kernel name of each kernel node, 'memset'/'memcpy' for those;
-    raises on any other node type."""
-    global _TOGGLEABLE
+    ``cuGraphNodeSetEnabled`` disables kernel, memset and memcpy nodes only.
+    Event record and wait nodes stay enabled in both arms and are left out:
+    an event record or wait only orders streams. A record that follows
+    disabled kernels still fires once its (now empty) predecessors finish, so
+    the wait on it is satisfied in both arms, and each arm keeps the same
+    ordering between the streams. Any other node type cannot be disabled and
+    raises, so the site is refused."""
     drv = _drv()
     T = drv.CUgraphNodeType
-    if _TOGGLEABLE is None:
-        _TOGGLEABLE = {T.CU_GRAPH_NODE_TYPE_KERNEL, T.CU_GRAPH_NODE_TYPE_MEMSET,
-                       T.CU_GRAPH_NODE_TYPE_MEMCPY}
-    kinds = []
+    toggled, kinds = [], []
     for n in nodes:
         (kind,) = _check(drv.cuGraphNodeGetType(drv.CUgraphNode(n)), "cuGraphNodeGetType")
-        if kind not in _TOGGLEABLE:
-            raise RuntimeError(f"node type {kind.name} cannot be disabled in a graph")
+        if kind in (T.CU_GRAPH_NODE_TYPE_EVENT_RECORD, T.CU_GRAPH_NODE_TYPE_WAIT_EVENT):
+            continue
         if kind == T.CU_GRAPH_NODE_TYPE_KERNEL:
             kinds.append(_kernel_name(n))
+        elif kind == T.CU_GRAPH_NODE_TYPE_MEMSET:
+            kinds.append("memset")
+        elif kind == T.CU_GRAPH_NODE_TYPE_MEMCPY:
+            kinds.append("memcpy")
         else:
-            kinds.append("memset" if kind == T.CU_GRAPH_NODE_TYPE_MEMSET else "memcpy")
-    return kinds
+            raise RuntimeError(
+                f"node type {kind.name} cannot be disabled in a graph; "
+                "the site is refused (fails closed)")
+        toggled.append(n)
+    return tuple(toggled), kinds
 
 
 def _kernel_name(node: int) -> str:
@@ -540,15 +551,18 @@ def _bind(graph) -> None:
     sites = st.pending.pop(int(graph.raw_cuda_graph()), [])
     if not sites:
         return
+    bound = []
     for site in sites:
         names = st.kernels.setdefault(site.name, {"base": set(), "cand": set()})
         try:
-            base_kinds, cand_kinds = _node_kinds(site.base), _node_kinds(site.cand)
+            (base, base_kinds), (cand, cand_kinds) = _toggled(site.base), _toggled(site.cand)
         except RuntimeError as error:
             raise RuntimeError(f"hot pair {site.name}: {error}") from None
+        bound.append(_Site(site.name, base, cand))
         if len(names["base"]) < 16:
             names["base"].update(base_kinds)
             names["cand"].update(cand_kinds)
+    sites = bound
     drv = _drv()
     ex = _Exec(weakref.ref(graph), drv.CUgraphExec(int(graph.raw_cuda_graph_exec())), sites)
     _toggle(ex, st.on, force=True)

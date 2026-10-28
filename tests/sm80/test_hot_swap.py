@@ -4,6 +4,7 @@
 (``vllm_sm80.hot_swap``), on CPU: the CUDA driver calls are replaced by a
 recording fake, the model by stand-ins."""
 import ast
+import enum
 import inspect
 import sys
 import types
@@ -245,7 +246,7 @@ class _CudaGraph:
 def driver(monkeypatch):
     fake = _FakeDriver()
     monkeypatch.setattr(hot_swap, "_drv", lambda: fake)
-    monkeypatch.setattr(hot_swap, "_node_kinds", lambda nodes: ["k"] * len(nodes))
+    monkeypatch.setattr(hot_swap, "_toggled", lambda nodes: (tuple(nodes), ["k"] * len(nodes)))
     torch = pytest.importorskip("torch")
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=0))
@@ -292,6 +293,54 @@ def test_partial_toggle_is_repaired_by_force(state, driver):
     driver.enabled[(900, 1)], driver.enabled[(900, 2)] = 0, 0  # half-way: neither runs
     hot_swap._toggle(ex, frozenset(), force=True)
     assert driver.enabled == {(900, 1): 1, (900, 2): 0}
+
+
+_NodeType = enum.Enum("_NodeType", [
+    "CU_GRAPH_NODE_TYPE_KERNEL", "CU_GRAPH_NODE_TYPE_MEMCPY", "CU_GRAPH_NODE_TYPE_MEMSET",
+    "CU_GRAPH_NODE_TYPE_EVENT_RECORD", "CU_GRAPH_NODE_TYPE_WAIT_EVENT",
+    "CU_GRAPH_NODE_TYPE_GRAPH"])
+
+
+@pytest.fixture
+def typed_driver(monkeypatch, driver):
+    """The fake driver with a node type per node; _toggled runs for real."""
+    types_by_node: dict[int, _NodeType] = {}
+    driver.CUgraphNodeType = _NodeType
+    driver.cuGraphNodeGetType = lambda node: (0, types_by_node[node])
+    monkeypatch.setattr(hot_swap, "_toggled", _REAL_TOGGLED)
+    monkeypatch.setattr(hot_swap, "_kernel_name", lambda node: f"kernel{node}")
+    return types_by_node
+
+
+_REAL_TOGGLED = hot_swap._toggled
+
+
+def test_bind_leaves_event_nodes_enabled(state, driver, typed_driver):
+    """A region with event record and wait nodes beside its kernels binds,
+    and only the kernel nodes are toggled."""
+    T = _NodeType
+    typed_driver.update({
+        1: T.CU_GRAPH_NODE_TYPE_KERNEL, 2: T.CU_GRAPH_NODE_TYPE_EVENT_RECORD,
+        3: T.CU_GRAPH_NODE_TYPE_KERNEL, 4: T.CU_GRAPH_NODE_TYPE_WAIT_EVENT,
+        5: T.CU_GRAPH_NODE_TYPE_KERNEL})
+    state.pending[10] = [hot_swap._Site("graph_pair", (1, 2), (3, 4, 5))]
+    graph = _CudaGraph(10, 900)
+    hot_swap._bind(graph)
+    assert driver.enabled == {(900, 1): 1, (900, 3): 0, (900, 5): 0}
+    hot_swap._apply(RUNNER, frozenset({"graph_pair"}))
+    assert driver.enabled == {(900, 1): 0, (900, 3): 1, (900, 5): 1}
+    assert state.kernels["graph_pair"] == {"base": {"kernel1"}, "cand": {"kernel3", "kernel5"}}
+
+
+def test_bind_refuses_a_node_that_cannot_be_disabled(state, driver, typed_driver):
+    T = _NodeType
+    typed_driver.update({1: T.CU_GRAPH_NODE_TYPE_KERNEL, 2: T.CU_GRAPH_NODE_TYPE_GRAPH})
+    state.pending[10] = [hot_swap._Site("graph_pair", (1,), (2,))]
+    with pytest.raises(RuntimeError, match=(
+            r"hot pair graph_pair: node type CU_GRAPH_NODE_TYPE_GRAPH cannot be disabled"
+            r" in a graph; the site is refused \(fails closed\)")):
+        hot_swap._bind(_CudaGraph(10, 900))
+    assert driver.enabled == {} and not state.execs
 
 
 def _worker(resident=0):
