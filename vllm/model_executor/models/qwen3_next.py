@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Inference-only Qwen3Next model."""
 
 from collections.abc import Iterable
@@ -165,6 +166,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             shared_expert_group_size = get_quark_ocp_mx_group_size(
                 quant_config,
                 f"{prefix}.shared_expert.down_proj",
+            )
+            shared_expert_group_size = getattr(
+                quant_config, "shared_expert_shard_group_size", shared_expert_group_size
             )
             self.replicate_shared_expert = _should_replicate_misaligned_shared_expert(
                 config.shared_expert_intermediate_size,
