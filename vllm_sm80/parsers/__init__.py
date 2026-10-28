@@ -5,6 +5,8 @@
 - ``glm45`` / ``glm47``: ``vllm_sm80.parsers.glm47``, upstream's GLM-4.7
   parser plus the ``tool_choice="none"`` decode mask
   (``VLLM_TOOL_CHOICE_NONE_MASK``).
+- ``ling3``: ``vllm_sm80.parsers.ling3``, upstream's Ling3 parser (built on
+  the GLM-4.7 parser) plus the same decode mask.
 - ``deepseek_v41``: ``vllm_sm80.parsers.deepseek_v41``, upstream's V4.1 parser
   with damaged-call recovery (``vllm_sm80.deepseek_v41_recovery``).
 
@@ -25,6 +27,11 @@ PARSERS = {
         "vllm_sm80.parsers.glm47",
         "Sm80Glm47MoeToolParser",
         "Sm80Glm47MoeReasoningParser",
+    ),
+    "ling3": (
+        "vllm_sm80.parsers.ling3",
+        "Sm80Ling3ToolParser",
+        "Sm80Ling3ReasoningParser",
     ),
     "deepseek_v41": (
         "vllm_sm80.parsers.deepseek_v41",

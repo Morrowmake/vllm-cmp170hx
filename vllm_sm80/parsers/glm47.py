@@ -6,7 +6,8 @@
 with ``tool_choice="none"`` the tool-call start token is a bad word, so the
 model cannot open a tool call the request does not allow. Off, a request is
 adjusted exactly as upstream adjusts it. Registered as ``glm45`` / ``glm47``
-(``vllm_sm80.parsers``).
+(``vllm_sm80.parsers``); :class:`ToolChoiceNoneMask` also serves upstream's
+parsers built on the GLM-4.7 parser (``vllm_sm80.parsers.ling3``).
 """
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -22,14 +23,16 @@ from vllm import envs
 logger = init_logger(__name__)
 
 
-class Sm80Glm47MoeParser(Glm47MoeParser):
+class ToolChoiceNoneMask:
+    """The decode mask over a GLM-4.7-format parser engine (listed before it)."""
+
     # Read by vllm_sm80.parsers.adjust_on_tool_choice_none.
     adjust_request_when_tool_choice_none = True
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
-        request = super().adjust_request(request)
+        request = super().adjust_request(request)  # type: ignore[misc]
         if (
             request.tool_choice == "none"
             and envs.VLLM_TOOL_CHOICE_NONE_MASK
@@ -37,6 +40,10 @@ class Sm80Glm47MoeParser(Glm47MoeParser):
         ):
             request.bad_words = [*request.bad_words, TOOL_CALL_START]
         return request
+
+
+class Sm80Glm47MoeParser(ToolChoiceNoneMask, Glm47MoeParser):
+    pass
 
 
 # The engine's own adapter attributes, as upstream sets them for its parser.
@@ -53,7 +60,8 @@ class Sm80Glm47MoeToolParser(Glm47MoeModelToolParser):
 
 def log_mask_state() -> None:
     """The startup line naming the mask's state (once per process; logged
-    when a server first resolves a GLM parser, which imports this module)."""
+    when a server first resolves a GLM or Ling3 parser, which imports this
+    module)."""
     logger.info_once(
         "GLM tool_choice=none decode mask: %s (VLLM_TOOL_CHOICE_NONE_MASK)",
         "enabled" if envs.VLLM_TOOL_CHOICE_NONE_MASK else "disabled",

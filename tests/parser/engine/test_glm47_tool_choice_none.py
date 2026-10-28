@@ -196,10 +196,12 @@ def test_startup_banner(enabled, monkeypatch):
 @pytest.mark.parametrize("api", ["chat", "responses"])
 @pytest.mark.parametrize("configuration", ["tool", "reasoning", "both"])
 @pytest.mark.parametrize("enabled", ["0", "1"])
-def test_managed_parser(api, configuration, enabled, monkeypatch):
+# ling3: upstream's Ling3 parser extends the GLM-4.7 one and keeps the mask.
+@pytest.mark.parametrize("name", ["glm47", "ling3"])
+def test_managed_parser(name, api, configuration, enabled, monkeypatch):
     monkeypatch.setenv("VLLM_TOOL_CHOICE_NONE_MASK", enabled)
-    tool = "glm47" if configuration in ("tool", "both") else None
-    reasoning = "glm47" if configuration in ("reasoning", "both") else None
+    tool = name if configuration in ("tool", "both") else None
+    reasoning = name if configuration in ("reasoning", "both") else None
     tokenizer = _parser().model_tokenizer
     renderer = OnlineRenderer(
         SimpleNamespace(hf_config=SimpleNamespace(model_type="glm5next"), model="glm"),
