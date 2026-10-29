@@ -869,13 +869,23 @@ def attend_layer(
     if pipeline:
         if fused or workspace is None:
             raise ValueError("pipeline needs workspace and excludes pre-RoPE fused mode")
+        from vllm_sm80 import hot_swap
         from vllm_sm80.models.deepseek_v41.ops.sm80_attn_fused import sparse_attention_triton
 
-        sparse_attention_triton(q[:T], batch.positions, weights.freqs, caches.swa,
-            batch.swa_indices, caches.comp, batch.comp_block_table,
-            caches.topk[:T] if cfg.compress_ratio else None, batch.token_to_req,
-            weights.attn_sink, cfg.softmax_scale, post_rope=True, final_out=out,
-            scores_out=workspace.attention_scores, split_scratch=workspace.split_scratch)
+        def attend(split: bool) -> torch.Tensor:
+            return sparse_attention_triton(q[:T], batch.positions, weights.freqs, caches.swa,
+                batch.swa_indices, caches.comp, batch.comp_block_table,
+                caches.topk[:T] if cfg.compress_ratio else None, batch.token_to_req,
+                weights.attn_sink, cfg.softmax_scale, post_rope=True, final_out=out,
+                scores_out=workspace.attention_scores,
+                split_scratch=workspace.split_scratch if split else None)
+
+        if hot_swap.listed("splitkv_decode"):
+            # VLLM_HOT_SWAP: the shipped ordered pass and split-KV side by side,
+            # both writing ``out``.
+            hot_swap.pair("splitkv_decode", lambda: attend(False), lambda _out: attend(True))
+        else:
+            attend(workspace.split_scratch is not None)
         return
     if fused:
         from vllm_sm80.models.deepseek_v41.ops import sm80_attn_fused

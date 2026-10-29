@@ -255,10 +255,13 @@ class PipelineWorkspace:
 
 
 def _split_rows(rows):
-    """Rows x splits of the split-KV scratch, 0 with the switch off."""
+    """Rows x splits of the split-KV scratch: 0 unless the switch is on or a
+    hot server carries the ``splitkv_decode`` pair (both arms captured)."""
     import vllm.envs as envs
 
-    if not envs.VLLM_DEEPSEEK_V41_SPLITKV_DECODE:
+    from vllm_sm80 import hot_swap
+
+    if not (envs.VLLM_DEEPSEEK_V41_SPLITKV_DECODE or hot_swap.listed("splitkv_decode")):
         return 0
     from vllm_sm80.models.deepseek_v41.ops.sm80_attn_fused import split_scratch_rows
 

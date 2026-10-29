@@ -480,6 +480,7 @@ def test_hot_pairs_are_ast_readable():
         "sparse_mla_prefill": "VLLM_SM80_SPARSE_MLA_PREFILL",
         "topk_canonical_ties": "VLLM_SM80_TOPK_CANONICAL_TIES",
         "topk_sorted": "VLLM_SM80_TOPK_SORTED",
+        "splitkv_decode": "VLLM_DEEPSEEK_V41_SPLITKV_DECODE",
     }
     assert set(names) == set(hot_swap.HOT_PAIRS)
     from vllm_sm80 import envs as sm80_envs

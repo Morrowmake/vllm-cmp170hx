@@ -237,6 +237,19 @@ def _topk_unavailable(runner) -> str | None:
     return None
 
 
+def _splitkv_unavailable(runner) -> str | None:
+    """DeepSeek-V4.1 attention layers of this rank on the attention pipeline,
+    whose decode attention is the pair site (``sm80_attn_core.attend_layer``);
+    the pipeline workspace holds the split-KV scratch while the pair is listed."""
+    if not any(
+        getattr(m, "_sm80_attn_pipeline_enabled", False)
+        and getattr(m, "_sm80_attn_pipeline_eligible", False)
+        for m in runner.model.modules()
+    ):
+        return "no DeepSeek-V4.1 attention layer on the attention pipeline (VLLM_DEEPSEEK_V41_ATTN_PIPELINE)"
+    return None
+
+
 HOT_PAIRS: dict[str, HotPair] = {
     p.name: p
     for p in (
@@ -265,6 +278,10 @@ HOT_PAIRS: dict[str, HotPair] = {
             _topk_unavailable,
         ),
         HotPair("topk_sorted", "VLLM_SM80_TOPK_SORTED", _topk_unavailable),
+        HotPair(
+            "splitkv_decode", "VLLM_DEEPSEEK_V41_SPLITKV_DECODE",
+            _splitkv_unavailable,
+        ),
     )
 }
 
