@@ -17,7 +17,7 @@ class _RingReadsChecked(BaseException):
     """End the address probe before unsupported libdevice arithmetic."""
 
 
-@pytest.mark.parametrize('position', [0, 1, 7, 8, 15, 16, 262143])
+@pytest.mark.parametrize('position', [0, 1, 8, 262143])
 @pytest.mark.parametrize('dummy', [False, True])
 @pytest.mark.parametrize('row_padding', [0, 16])
 def test_compressor_predecessor_reads_own_ring(

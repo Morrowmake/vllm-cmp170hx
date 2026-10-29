@@ -9,7 +9,8 @@ eps 1e-6, RMS eps 1e-20).
   rounding and at each path's own rounding points (``fp64_cases``, the
   ``.rp`` outputs): mean error at most 1.10x and max error
   at most 1.25x the torch formulas' (``ops/sm80_mhc.py``, on the same card),
-  at every graph capture size and two prefill sizes, each case pooling
+  at one row count per kernel A form and row-block boundary (``ROWS``),
+  each case pooling
   independent calls up to 64 tokens (as a captured case pools the calls of
   its shape); up to 8 rows (one kernel A form), rows run alone give the
   bits of the whole call wherever they do for the torch formulas.
@@ -35,12 +36,7 @@ eps 1e-6, RMS eps 1e-20).
   candidate change, judged by the same rule); bounds and references unchanged.
 
 - Bitwise run-to-run determinism, CUDA graph replay equal to eager.
-- Kernels per call: two (three with ``capture_aux``) with the finish kernel;
-  with the torch finish (``VLLM_DEEPSEEK_V41_FUSED_MHC`` alone: the reference arm the
-  finish kernel is measured against, not a speed path) a fixed count,
-  TORCH_FINISH_KERNELS. Until the second GPU run this asserted fewer kernels
-  than the torch formulas; the FP64 torch finish launches more (177 against
-  158), and as this arm carries no speed claim the count is now fixed.
+- Kernels per call with the finish kernel: two (three with ``capture_aux``).
 
 Synthetic inputs; the real-input check is the ``mhc_delayed`` /
 ``mhc_pre_delayed`` families of ``fp64_cases.py`` on captured calls.
@@ -64,12 +60,11 @@ pytestmark = [
 
 HIDDEN = 5120
 CUDA = torch.device("cuda")
-# the served graph capture sizes (verify steps of DSpark up to 48 rows) and two
-# prefill sizes
-ROWS = (1, 2, 3, 4, 6, 8, 12, 16, 18, 24, 30, 36, 42, 48, 256, 2048)
+# one row count per kernel A dispatch (decode.post_prenorm): the transposed
+# form (<= 8 rows: 1, 8), one 16-row block (12, 16), several (18, 48), and the
+# finish v2's largest call (2048)
+ROWS = (1, 8, 12, 16, 18, 48, 2048)
 VARIANTS = ("fused", "fused_identity", "pre_only", "pre_only_identity")
-# kernel A + the torch finish, one fused post + pre call (measured, 9418cf08c4)
-TORCH_FINISH_KERNELS = 177
 
 
 def _outputs(variant: str) -> list[str]:
@@ -154,7 +149,10 @@ def _kernels(fn) -> int:
 
 
 @pytest.mark.parametrize("T", (1, 48))
-def test_kernels_per_call(T, fused):
+def test_kernels_per_call(T, monkeypatch):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused as fused
+
+    monkeypatch.setattr(fused, "FINISH_KERNEL", True)
     a = _cuda(variants(T, HIDDEN)["fused"])
     common = [a[k] for k in ("fn", "hc_scale", "hc_base", "rms_eps", "hc_pre_eps",
                              "hc_sinkhorn_eps", "hc_post_mult_value", "sinkhorn_repeat")]
@@ -165,12 +163,6 @@ def test_kernels_per_call(T, fused):
             a["x"], a["residual"], a["post_layer_mix"], a["comb_res_mix"], *common,
             capture_aux=aux, **kw)
 
-    if fused.FINISH_KERNEL:
-        assert _kernels(post_pre) == 2
-        assert _kernels(lambda: post_pre(aux=True)) == 3
-        assert _kernels(lambda: fused.mhc_pre_delayed(a["residual"], *common, **kw)) == 2
-    else:
-        # kernel A, then the torch finish: the reference arm, not a speed path;
-        # its count is fixed as measured on the second GPU run (9418cf08c4:
-        # 177 at 1 and 48 rows)
-        assert _kernels(post_pre) == TORCH_FINISH_KERNELS
+    assert _kernels(post_pre) == 2
+    assert _kernels(lambda: post_pre(aux=True)) == 3
+    assert _kernels(lambda: fused.mhc_pre_delayed(a["residual"], *common, **kw)) == 2

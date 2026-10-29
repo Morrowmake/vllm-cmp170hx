@@ -12,8 +12,7 @@
   or +inf, and rows wider than one part (the two-level merge), with and
   without the producer's first histogram; both equal ``topk_canonical``.
   Its candidate scratch is poisoned beforehand and its tickets are back to
-  zero afterwards. With the switch on a call is one launch; off, fifteen or
-  sixteen.
+  zero afterwards. With the switch on a call is one launch.
 - The kernel compiles for sm_80 (no GPU needed) with the release/acquire
   ticket, the CTA barrier before it and L2 loads of the other parts' slots.
 - The switch is off by default and gates on rows, slots and ``k``.
@@ -157,7 +156,7 @@ def interpreted_results() -> dict:
                 same_bytes=bool(torch.equal(got["0"][0], got["1"][0])),
                 canonical=bool(torch.equal(got["1"][0], want)),
                 multi_canonical=bool(torch.equal(got["0"][0], want)),
-                launches_on=got["1"][1], launches_off=len(got["0"][1]),
+                launches_on=got["1"][1],
                 tickets=got["1"][2] == [0] * rows,
                 merged=got["1"][3],
                 wide=bool((n_vis.long().clamp(max=width) > PART).any()),
@@ -188,8 +187,6 @@ def test_one_launch_bytes_equal_the_multi_launch_path(interpreted):
 def test_one_launch_is_one_launch_and_resets_its_tickets(interpreted):
     assert sum(c["wide"] for c in interpreted.values()) == 2 * 3
     for key, c in interpreted.items():
-        first = key.endswith("first1")
-        assert c["launches_off"] == (15 if first else 16), (key, c)
         assert c["launches_on"] == ["_select_one_launch"], (key, c)
         assert c["tickets"], (key, c)
         assert c["merged"] and all(c["merged"]) if c["wide"] else c["merged"] == [], (key, c)

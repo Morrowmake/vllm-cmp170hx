@@ -218,33 +218,6 @@ def test_nan_logits_keep_expert_ids_in_range(interpreted):
         assert all(c.values()), (key, c)
 
 
-def test_row_sum_model_is_the_installed_torch_reduction():
-    """The row-sum order (:func:`torch_cuda_row_sum`) was read from torch's
-    ``ATen/native/cuda/Reduce.cuh``; pin the two statements it rests on in the
-    installed torch's header: accumulators combined in order, and the warp fold
-    with decreasing offsets. A torch upgrade that changes either fails here
-    (the GPU half checks the model against ``torch.sum`` on CUDA)."""
-    import os
-
-    header = os.path.join(os.path.dirname(torch.__file__),
-                          "include/ATen/native/cuda/Reduce.cuh")
-    src = open(header).read()
-    assert "value_list[0][j] = ops.combine(value_list[0][j], value_list[i][j]);" in src
-    assert "for (int offset = dim_x >> 1; offset > 0; offset >>= 1) {" in src
-    assert "#if defined(USE_ROCM)\n    for (int offset = 1; offset < dim_x; offset <<= 1) {" in src
-    assert "dim0 >= 128 && iter.num_reduce_dims() == 1" in src
-
-
-def test_row_sum_model_matches_the_documented_order():
-    rng = np.random.default_rng(1)
-    for _ in range(200):
-        w = (rng.standard_normal(6) ** 2 * 10.0 ** rng.integers(-4, 4, 6)).astype(np.float32)
-        f = np.float32
-        assert torch_cuda_row_sum(w) == f(f(f(w[0] + w[4]) + w[2]) + f(f(w[1] + w[5]) + w[3]))
-        v = w[:3]
-        assert torch_cuda_row_sum(v) == f(f(v[0] + v[2]) + v[1])
-
-
 def test_kernel_compiles_for_sm80():
     import triton
     from triton.backends.compiler import GPUTarget

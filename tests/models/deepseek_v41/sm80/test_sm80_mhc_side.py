@@ -4,9 +4,8 @@
 (``VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM``, ``ops/sm80_mhc_side.py``) on CPU.
 
 - The switch is declared and off by default; ``layer_scope`` takes only the
-  fused path with the finish kernel and refuses microbatching; the finish
-  warmup launches apart only once a layer took the scope; a decoder layer's
-  forward runs inside its scope.
+  fused path with the finish kernel and refuses microbatching; taking it
+  marks the scope in use; a decoder layer's forward runs inside its scope.
 - The order of work, with the streams, the event and the finish kernels
   replaced by recorders: inside a layer's forward a finish launches its
   layer-input CTAs in place and defers its coefficient CTAs; the all-reduce
@@ -34,7 +33,6 @@
 
 import collections
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -47,7 +45,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from .test_sm80_mhc_finish_v2 import _args, _cuobjdump, _Launch
+from .test_sm80_mhc_finish_v2 import _args, _cuobjdump
 from .test_sm80_mhc_fused import ROOT, _stand_in_kernel_a, call, variants
 
 # sha256 of every SASS instruction line of the finish kernels before PART,
@@ -90,7 +88,6 @@ def test_layer_scope_takes_only_the_fused_finish_kernel(monkeypatch):
 
 def test_layer_scope_refuses_microbatching_and_marks_the_warmup(monkeypatch):
     from vllm_sm80.models.deepseek_v41.ops import sm80_mhc
-    from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_finish_v2 as finish_v2
     from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_fused as fused
     from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_side as side
 
@@ -104,8 +101,6 @@ def test_layer_scope_refuses_microbatching_and_marks_the_warmup(monkeypatch):
     assert side.IN_USE is False
     monkeypatch.setattr(side, "_microbatching", lambda: False)
     assert side.layer_scope(fused) is side.LAYER and side.IN_USE is True
-    # The finish warmup launches the CTAs apart only for a scope in use.
-    assert "sm80_mhc_side.IN_USE" in inspect.getsource(finish_v2.FinishV2Warmup.compile)
 
 
 def test_layer_forward_runs_inside_its_scope(monkeypatch):
@@ -199,10 +194,9 @@ FORK_JOIN = [("wait_stream", "side", "main"), ("finish", "side", (6, 1), 1),
              ("record", "side", "done"), ("all_reduce", "main"), ("wait_event", "main", "done")]
 
 
-@pytest.mark.parametrize("fused_form", [True, False], ids=["fused", "pre_only"])
-def test_coefficients_go_beside_the_all_reduce(side, fused_form):
+def test_coefficients_go_beside_the_all_reduce(side):
     with side.side.LAYER:
-        call(side.fused, _args(6, fused=fused_form))
+        call(side.fused, _args(6))
         out = side.side.beside(side.all_reduce, "partial")
         assert out == "partial"
         # nothing waits for an all-reduce without a deferred finish
@@ -270,22 +264,6 @@ def test_a_flush_on_another_stream_launches_them_where_deferred(side):
             side.side.flush()
     assert side.log == [("kernel_a", "main"), ("finish", "main", (6, 1), 2),
                         ("finish", "main", (6, 1), 1), ("wait_stream", "other", "main")]
-
-
-def test_finish_v2_launch_grid_per_part(monkeypatch):
-    from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_finish_v2 as finish_v2
-
-    rec = _Launch()
-    monkeypatch.setattr(finish_v2, "_delayed_finish_v2_kernel", rec)
-    mix, sqr = torch.zeros(160, 6, 24), torch.zeros(160, 6)
-    rc = torch.zeros(6, 4, 5120, dtype=torch.bfloat16)
-    args = (mix, sqr, None, None, rc, None, None, None, None, None, None,
-            1e-20, 1e-6, 2.0, 1e-6, 20)
-    finish_v2.delayed_finish_v2(*args, has_pre_in=True, has_norm=True)
-    for part in (0, 1, 2):
-        finish_v2.delayed_finish_v2(*args, has_pre_in=True, has_norm=True, part=part)
-    assert [(g, k["PART"]) for g, _, k in rec.calls] == [((6, 2), 0), ((6, 2), 0),
-                                                         ((6, 1), 1), ((6, 1), 2)]
 
 
 def interpreted_split_bits(T: int = 5, hidden: int = 1056, calls: int = 3) -> dict:
@@ -429,7 +407,7 @@ def test_parts_keep_the_finish_code(key):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
     reason="needs an sm_80 card",
 )
-@pytest.mark.parametrize("T", [1, 4, 6, 16, 32, 40])
+@pytest.mark.parametrize("T", [1, 6, 16, 32, 40])
 def test_finish_v2_apart_on_the_card_writes_the_bits_of_one_launch(monkeypatch, T):
     from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_fused as fused
     from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_side as side

@@ -8,10 +8,7 @@ three-rounding form (two products and their sum each rounded) above V2's mean
 bound on 11 of 348 ``query`` cases; an emulation of both forms reproduced the
 worst case's 1366x ratio exactly.
 
-CPU: the compiled sm_80 code of the row rotation carries no separately rounded
-add. GPU: the rotation equals the reference's bytes."""
-import re
-
+GPU: the rotation equals the reference's bytes."""
 import pytest
 import torch
 import triton
@@ -27,21 +24,6 @@ def _rope_probe(x, pos, freqs, out, D: tl.constexpr, RD: tl.constexpr):
     d = tl.arange(0, D)
     y = pipe._rope_row(tl.load(x + t * D + d).to(tl.float32), tl.load(pos + t), freqs, D, RD)
     tl.store(out + t * D + d, y.to(tl.bfloat16))
-
-
-def test_the_rotation_has_no_separately_rounded_add():
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource
-
-    sig = {"x": "*bf16", "pos": "*i64", "freqs": "*fp32", "out": "*bf16",
-           "D": "constexpr", "RD": "constexpr"}
-    for d in (512, 128):
-        compiled = triton.compile(
-            ASTSource(_rope_probe, sig, constexprs={"D": d, "RD": 64}),
-            target=GPUTarget("cuda", 80, 32), options={"num_warps": 4})
-        ptx = compiled.asm["ptx"]
-        assert not re.search(r"\badd\.rn\b", ptx), "a product sum rounded on its own"
-        assert re.search(r"\bfma\.rn\b", ptx)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

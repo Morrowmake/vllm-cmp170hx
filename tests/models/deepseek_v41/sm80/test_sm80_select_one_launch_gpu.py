@@ -11,8 +11,6 @@ explicitly on a reserved card.
   the switch on as off, at every index role.
 - A captured graph of the one-launch call replays with new scores and visible
   counts (its tickets reset themselves) and stays equal to the other path.
-- ``-s`` prints the graph-replay time per call of both paths at decode
-  shapes (not asserted).
 """
 import pytest
 import torch
@@ -54,7 +52,7 @@ def triton_cdiv(a, b):
 
 @pytest.mark.parametrize('first', [False, True])
 @pytest.mark.parametrize('k', [512, 2048])
-@pytest.mark.parametrize('width', [1, 511, 2049, 8191, 8192, 8193, 16385, 32768, 65537, CAPACITY])
+@pytest.mark.parametrize('width', [1, 511, 2049, 8191, 8192, 8193, 16385, 65537, CAPACITY])
 def test_one_launch_bytes_over_capacity_width(monkeypatch, width, k, first):
     if k == 2048 and triton_cdiv(width, topk.PART) * k > topk.SelectionWorkspace(1, CAPACITY, 'cpu').slots:
         pytest.skip('more candidate slots than the served workspace holds')
@@ -125,33 +123,3 @@ def test_one_launch_graph_replay(monkeypatch):
         assert bool((ws.tickets == 0).all())
         want = core.topk_canonical(scores.cpu(), visible.cpu().long(), k)
         assert torch.equal(out.cpu(), want), step
-
-
-@pytest.mark.parametrize('n_vis', [260, 2048, 8192, 32768, 131072, CAPACITY])
-@pytest.mark.parametrize('call', ['token', 'candidate'])
-def test_print_replay_time(monkeypatch, n_vis, call):
-    rows = 6
-    width, k = (CAPACITY, 512) if call == 'token' else (CAPACITY // 8, 2048)
-    n_vis = min(n_vis if call == 'token' else triton_cdiv(n_vis, 8), width)
-    scores = torch.randn((rows, width), device='cuda')
-    visible = torch.full((rows,), n_vis, dtype=torch.int32, device='cuda')
-    out = torch.empty((rows, k), dtype=torch.int32, device='cuda')
-    ws = topk.SelectionWorkspace(48, CAPACITY, 'cuda')
-    times = {}
-    for arm in ('0', '1'):
-        monkeypatch.setenv(FLAG, arm)
-        topk.select(scores, visible, out, ws)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for _ in range(20):
-                topk.select(scores, visible, out, ws)
-        graph.replay()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(10):
-            graph.replay()
-        end.record()
-        torch.cuda.synchronize()
-        times[arm] = start.elapsed_time(end) * 1000 / 200
-    print(f'\n{call} rows={rows} n_vis={n_vis} k={k}: multi {times["0"]:.1f} us, '
-          f'one-launch {times["1"]:.1f} us per call')

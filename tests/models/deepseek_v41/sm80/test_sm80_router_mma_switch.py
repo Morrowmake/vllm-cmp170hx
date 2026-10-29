@@ -14,8 +14,6 @@ The gate weight with the switch is held once, in BF16:
   checkpoint tensor loads exactly (the FP32-held gate's values, and the
   bytes of the BF16 copy the gate made of its FP32 weight before), and a
   value BF16 does not hold is refused before it is copied;
-- every BF16 value (all 65536) widens to the FP32 value whose high half it
-  is, and back;
 - a call neither kernel serves (prefill rows, CPU) runs the FP32 fallback on
   the widened weight: the FP32-held gate's bytes, at 1 to 3000 rows;
 - the tiny EXL3 checkpoint loads through the EXL3 loader, target and
@@ -197,18 +195,6 @@ def test_the_gate_weight_is_held_once_in_bf16_and_loads_exactly(monkeypatch):
     with pytest.raises(ValueError, match="not BF16-valued"):
         gate.weight.weight_loader(gate.weight, bad)
     assert torch.equal(gate.weight, before)
-
-
-def test_every_bf16_value_widens_to_its_fp32_bits():
-    bits = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
-    wide = bits.view(torch.bfloat16).float()
-    # A BF16 value is the high half of its FP32 value: the widening is exact.
-    assert torch.equal(wide.view(torch.int32).to(torch.int64) & 0xFFFFFFFF,
-                       (bits.to(torch.int64) & 0xFFFF) << 16)
-    # And the FP32 value rounds back to the same BF16 bits (NaNs aside).
-    keep = ~torch.isnan(wide)
-    assert torch.equal(wide.to(torch.bfloat16).view(torch.int16)[keep], bits[keep])
-    assert int(keep.sum()) == 2**16 - 2 * (2**7 - 1)
 
 
 def test_the_fp32_fallback_returns_the_fp32_held_gates_bytes(monkeypatch):

@@ -42,16 +42,14 @@ def _comm(monkeypatch, ca, **kw):
     [
         ("too_large", 40, True),
         ("whole_fits", 7, False),
-        ("host_takes", 40, False),
-        ("not_fully_connected", 40, False),
     ],
 )
 def test_moe_all_reduce_pieces_or_runner_path(monkeypatch, case, rows, in_pieces):
     """A BF16 MoE output too large for the custom all-reduce whole goes through
     it in pieces (FP32 sum rounded once); any other message keeps the runner's
     all-reduce, in BF16 as before."""
-    ca = _PieceCustomAllreduce(_MAX, fully_connected=case != "not_fully_connected")
-    seen = _comm(monkeypatch, ca, host_takes=case == "host_takes")
+    ca = _PieceCustomAllreduce(_MAX)
+    seen = _comm(monkeypatch, ca)
     g = torch.Generator().manual_seed(4)
     out = torch.randn(rows, 64, generator=g).to(BF16)
     got = sm80_moe.moe_all_reduce(out)
