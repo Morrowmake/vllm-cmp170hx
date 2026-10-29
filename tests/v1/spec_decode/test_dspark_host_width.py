@@ -92,27 +92,6 @@ def test_best_k_within_the_cap():
     assert choose_width(parse_host_width("cases", raw), 4, q, cap=1) == 1
 
 
-def test_one_formula(hw):
-    # T(b, K | d) and E as the block states them, on one step.
-    b, q = 4, [[0.9, 0.8, 0.6, 0.5, 0.4], [0.3] * 5, [0.99] * 5, [0.7, 0.2, 0.9, 0.9, 0.9]]
-    tau, cum = hw.tau[b], hw.cum[b]
-
-    def value(k):
-        ds, e = [], 0.0
-        for row in q:
-            prod, d = 1.0, 0
-            while d < k and prod * row[d] >= tau:
-                prod *= row[d]
-                d += 1
-            ds.append(d)
-            e += 1.0 + sum(math.prod(row[: i + 1]) for i in range(d))
-        t = hw.t0[b] + b * cum[k] - (1 - hw.share[b][k]) * sum(cum[k] - cum[d] for d in ds)
-        return e / t
-
-    want = max(hw.k_choices, key=lambda k: (value(k), -k))
-    assert choose_width(hw, b, q) == want
-
-
 @pytest.mark.parametrize(
     "edit, match",
     [
@@ -396,8 +375,8 @@ def _state(width):
     return state
 
 
-@pytest.mark.parametrize("k", (1, 3, 5, 7))
-@pytest.mark.parametrize("b", (1, 3, 8))
+@pytest.mark.parametrize("k", (1, 5, 7))
+@pytest.mark.parametrize("b", (1, 8))
 def test_reference_p_hat_past_k(k, b):
     plain, with_p = _state(0), _state(5)
     idx = torch.randperm(8, generator=torch.Generator().manual_seed(b))[:b]

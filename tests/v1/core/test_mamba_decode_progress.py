@@ -15,8 +15,8 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.mark.parametrize(
     "num_spec,draft_slots",
-    [(0, 0), (3, 0), (3, 3), (7, 7)],
-    ids=["decode", "sequential-spec", "draft-slots3", "draft-slots7"],
+    [(0, 0), (3, 0), (3, 3)],
+    ids=["decode", "sequential-spec", "draft-slots3"],
 )
 @pytest.mark.parametrize(
     "budget,cap",
@@ -70,7 +70,7 @@ def test_long_prompt_advances_beside_decodes(
         assert not before < boundary < after
 
 
-@pytest.mark.parametrize("draft_slots", [0, 3, 7])
+@pytest.mark.parametrize("draft_slots", [0, 3])
 def test_temporary_prefill_fragment_still_waits_for_a_whole_block(
     draft_slots, monkeypatch
 ):

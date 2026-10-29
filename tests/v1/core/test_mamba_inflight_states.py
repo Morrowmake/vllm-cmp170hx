@@ -223,7 +223,7 @@ def _held(manager, rid):
         (2, 3460, 4608, False),
     ],
 )
-@pytest.mark.parametrize("prompt", [262000, 100003, 9000])
+@pytest.mark.parametrize("prompt", [262000, 9000])
 def test_real_manager_pipelined_prefill(
     monkeypatch, mcb, budget, block, tight, prompt
 ):

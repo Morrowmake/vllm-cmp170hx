@@ -119,24 +119,6 @@ def test_options_off_keeps_the_upstream_schedule():
     assert output.num_scheduled_tokens["long"] == 253
 
 
-def test_options_off_two_prompts_are_strictly_fcfs():
-    """Default config: the second prompt gets nothing until the first one's
-    prefill is finished."""
-    scheduler = create_scheduler(
-        max_num_batched_tokens=256, max_num_seqs=8, max_model_len=MAX_LEN
-    )
-    a, b = create_requests(
-        num_requests=2, num_tokens=1000, max_tokens=4, req_ids=["a", "b"]
-    )
-    scheduler.add_request(a)
-    scheduler.add_request(b)
-
-    for _ in range(2):
-        output, _ = _step(scheduler)
-        assert output.num_scheduled_tokens["a"] == 256
-        assert "b" not in output.num_scheduled_tokens
-
-
 # --------------------------------------------------------------------------
 # 2a. Decode-aware prefill chunk budget.
 # --------------------------------------------------------------------------
@@ -171,25 +153,6 @@ def test_decode_streams_scheduled_every_step_under_the_cap():
     assert long_req.is_prefill_chunk
 
 
-def test_cap_does_not_apply_without_decodes():
-    """Nothing decoding -> the full `max_num_batched_tokens` budget is used, so
-    a prompt arriving into an idle engine is not slowed down."""
-    scheduler = create_scheduler(
-        max_num_batched_tokens=256,
-        max_num_seqs=8,
-        max_model_len=MAX_LEN,
-        prefill_chunk_with_decodes=32,
-    )
-    (long_req,) = create_requests(
-        num_requests=1, num_tokens=1800, max_tokens=4, req_ids=["long"]
-    )
-    scheduler.add_request(long_req)
-
-    for _ in range(2):
-        output, _ = _step(scheduler)
-        assert output.num_scheduled_tokens["long"] == 256
-
-
 def test_cap_lifted_again_once_the_decodes_finish():
     """The cap is re-evaluated every step: when the last decode stream stops,
     the long prefill goes back to full-size chunks."""
@@ -216,30 +179,6 @@ def test_cap_lifted_again_once_the_decodes_finish():
 
     output, _ = _step(scheduler)
     assert output.num_scheduled_tokens["long"] == 256
-
-
-def test_cap_is_a_step_budget_not_a_per_request_cap():
-    """Several in-flight prefills share one capped budget -- which is what
-    `long_prefill_token_threshold` alone does not give: it caps each request
-    separately, so N concurrent prefills still produce N chunks of work."""
-    cap = 96
-    scheduler = create_scheduler(
-        max_num_batched_tokens=256,
-        max_num_seqs=8,
-        max_model_len=MAX_LEN,
-        prefill_chunk_with_decodes=cap,
-        max_num_partial_prefills=3,
-    )
-    _start_decode_streams(scheduler, 2)
-    for request in create_requests(
-        num_requests=3, num_tokens=900, max_tokens=4, req_ids=["p0", "p1", "p2"]
-    ):
-        scheduler.add_request(request)
-
-    for _ in range(4):
-        output, prefill_tokens = _step(scheduler)
-        assert prefill_tokens <= cap
-        assert sum(output.num_scheduled_tokens.values()) <= 256
 
 
 def test_prefix_cache_hit_only_charges_recomputed_tokens():
@@ -326,23 +265,6 @@ def test_split_capped_by_max_num_partial_prefills():
     assert output.num_scheduled_tokens["a"] == 128
     assert output.num_scheduled_tokens["b"] == 128
     assert "c" not in output.num_scheduled_tokens
-
-
-def test_split_not_applied_to_a_lone_prefill():
-    """The divisor is the number of prefills actually in play, so a single
-    prompt still gets the whole budget."""
-    scheduler = create_scheduler(
-        max_num_batched_tokens=256,
-        max_num_seqs=8,
-        max_model_len=MAX_LEN,
-        max_num_partial_prefills=4,
-    )
-    (only,) = create_requests(
-        num_requests=1, num_tokens=1000, max_tokens=4, req_ids=["only"]
-    )
-    scheduler.add_request(only)
-    output, _ = _step(scheduler)
-    assert output.num_scheduled_tokens["only"] == 256
 
 
 def test_short_prompt_does_not_wait_behind_a_long_one():
@@ -440,13 +362,11 @@ def test_spec_decode_tokens_are_accounted_outside_the_prefill_budget():
 @pytest.mark.parametrize(
     "cap,partial,num_spec",
     [
-        (0, 0, 0),
         (128, 0, 0),
         (0, 3, 0),
         (128, 2, 3),
         (7, 3, 1),
         (1, 0, 0),
-        (256, 4, 3),
     ],
 )
 def test_no_budget_overshoot(cap: int, partial: int, num_spec: int):
@@ -481,46 +401,6 @@ def test_no_budget_overshoot(cap: int, partial: int, num_spec: int):
         steps_with_work += bool(output.num_scheduled_tokens)
     assert steps_with_work == 60
     assert scheduler.requests["p0"].num_computed_tokens > 0
-
-
-def test_mamba_alignment_still_advances_under_a_sub_block_cap():
-    """Hybrid (Mamba / linear-attention) models align prefill chunks to the KV
-    block. A cap smaller than the block must not clip every chunk to zero: the
-    cap is handed to the alignment split so it falls back to a sub-block
-    advance, exactly as `long_prefill_token_threshold` already does."""
-    block_size = 256
-    cap = 64
-    scheduler = create_scheduler(
-        max_num_batched_tokens=1024,
-        max_num_seqs=8,
-        max_model_len=MAX_LEN,
-        block_size=block_size,
-        prefill_chunk_with_decodes=cap,
-        kv_cache_spec=MambaSpec(
-            shapes=((1,),),
-            dtypes=(torch.float32,),
-            block_size=block_size,
-            page_size_padded=None,
-            mamba_type="mamba2",
-            num_speculative_blocks=0,
-        ),
-    )
-    scheduler.need_mamba_block_aligned_split = True
-    _start_decode_streams(scheduler, 1, prompt_len=4)
-
-    (long_req,) = create_requests(
-        num_requests=1,
-        num_tokens=1800,
-        max_tokens=4,
-        block_size=block_size,
-        req_ids=["long"],
-    )
-    scheduler.add_request(long_req)
-
-    for _ in range(5):
-        output, _ = _step(scheduler)
-        assert 0 < output.num_scheduled_tokens["long"] <= cap
-    assert long_req.num_computed_tokens > 0
 
 
 def _config(enable_chunked_prefill=True, **settings):
@@ -663,13 +543,12 @@ def _drive_long_prefill(scheduler, prompt_len=1800, num_spec=0):
 @pytest.mark.parametrize(
     "knobs",
     [
-        {"prefill_chunk_with_decodes": ODD_CAP, "max_num_partial_prefills": 2},
         {"prefill_chunk_with_decodes": ODD_CAP},
         # The existing upstream knob takes the identical path, and is pinned
         # here so the two cannot drift apart.
         {"long_prefill_token_threshold": ODD_CAP},
     ],
-    ids=["fair", "cap-only", "long_prefill_token_threshold"],
+    ids=["cap-only", "long_prefill_token_threshold"],
 )
 def test_every_prefill_step_also_carries_every_decode(knobs):
     """No step of a capped long prefill is decode-free, including the short

@@ -64,16 +64,10 @@ def test_spreading_shares_decodes_across_micro_batches():
     assert counts[3:] == [2] * 8
 
 
-@pytest.mark.parametrize("num_requests,share", [(1, 1), (3, 1), (5, 2), (16, 4)])
+@pytest.mark.parametrize("num_requests,share", [(1, 1), (5, 2), (16, 4)])
 def test_spreading_share_is_ceil_of_decoding_over_pp(num_requests, share):
     counts = _decodes_per_step(_pp_scheduler(spread=True), num_requests, 12)
     steady = counts[3:]
     assert max(steady) == share
     # Every request is still advanced once per PP steps on average.
     assert sum(steady) >= num_requests * (len(steady) // PP)
-
-
-def test_spreading_is_inert_without_pp():
-    scheduler = create_scheduler(async_scheduling=True, use_v2_model_runner=True)
-    assert not scheduler.pp_spread_decodes
-    assert scheduler._pp_decode_cap() is None

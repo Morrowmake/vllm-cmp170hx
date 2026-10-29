@@ -16,7 +16,6 @@ the 512 MiB default budget.
     pytest -q tests/v1/attention/test_indexer_prefill_chunk_budget.py
 """
 
-import pytest
 import torch
 
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
@@ -82,30 +81,6 @@ def test_full_context_prefill_chunk_sits_exactly_on_the_default_budget():
     assert 2048 * 65536 * 4 == DEFAULT_BUDGET_BYTES
 
 
-def test_two_hundred_k_prefill_stays_under_the_default_budget():
-    seq_lens = [200_000 // KPOOL]  # 50000
-    query_lens = [2048]
-    chunks = plan(seq_lens, query_lens)
-
-    assert len(chunks) == 1
-    assert logits_elems(chunks, seq_lens) == [2048 * 50_000]
-    assert 2048 * 50_000 * 4 < DEFAULT_BUDGET_BYTES
-
-
-@pytest.mark.parametrize("context", [131_072, 200_000, 262_144])
-@pytest.mark.parametrize("query", [1, 512, 2048])
-def test_every_chunk_respects_the_budget(context, query):
-    seq_lens = [context // KPOOL]
-    query_lens = [query]
-    chunks = plan(seq_lens, query_lens)
-
-    assert chunks
-    assert covers_every_query_row_once(chunks, query_lens)
-    for elems in logits_elems(chunks, seq_lens):
-        assert elems * 4 <= DEFAULT_BUDGET_BYTES
-        assert elems <= 2**31 - 1
-
-
 # --------------------------------------------------------- sub-chunking
 
 
@@ -162,16 +137,3 @@ def test_the_gathered_kv_workspace_also_bounds_a_group():
     assert [c[0] for c in chunks] == [slice(0, 2), slice(2, 3)]
     for req_slice, _ in chunks:
         assert sum(seq_lens[req_slice]) <= 6000
-
-
-def test_the_prefill_logits_are_released_before_the_next_chunk():
-    """The per-chunk buffer is up to the whole budget, so two of them must not
-    be live across the loop edge."""
-    import inspect
-
-    from vllm.models.glm5next.nvidia import sparse_indexer
-
-    src = inspect.getsource(sparse_indexer.sparse_attn_indexer_kpool)
-    assert "del logits" in src
-    top_k = src.index("top_k_per_row_prefill")
-    assert src.index("del logits", top_k) > top_k

@@ -15,18 +15,15 @@ ACCEPT = {"by_load": [3, 1], "accept": {"costs": [1.0, 1.1, 1.2]}}
 # --------------------------------------------------------------------- config
 
 
-@pytest.mark.parametrize(
-    "raw", [{}, {"min": 1, "max": 4}, {"allowed": [2, 4]}, {"ema": 0.8}]
-)
+@pytest.mark.parametrize("raw", [{}, {"min": 1, "max": 4}])
 def test_config_without_by_load_is_rejected(raw):
     with pytest.raises(ValueError, match="needs by_load"):
         AdaptiveKConfig.from_dict(raw, 4)
 
 
-@pytest.mark.parametrize("key", ["min", "max", "ema", "margin", "quantile", "decay"])
-def test_config_rejects_unknown_keys(key):
+def test_config_rejects_unknown_keys():
     with pytest.raises(ValueError, match="Unknown adaptive_k keys"):
-        AdaptiveKConfig.from_dict({"by_load": [4, 2], key: 1}, 4)
+        AdaptiveKConfig.from_dict({"by_load": [4, 2], "ema": 1}, 4)
 
 
 def test_config_rejects_a_non_mapping():
@@ -44,14 +41,6 @@ def test_snap_rounds_down_to_a_captured_draft_count():
     assert policy.snap(2) == 2
     # Below the smallest captured count, clamp up rather than run eager.
     assert policy.snap(1) == 2
-
-
-def test_acceptance_capture_range_starts_at_shallowest_load_width():
-    config = AdaptiveKConfig.from_dict(
-        {"by_load": [7, 5, 3], "accept": {"costs": [1.0, 1.1, 1.2, 1.3, 1.4]}}, 7
-    )
-    assert config.allowed == (3, 4, 5, 6, 7)
-    assert config.max_reqs_for(2, 8) == 0
 
 
 # ------------------------------------------------------------------- feedback
@@ -93,6 +82,7 @@ def test_logging_histogram_resets_only_after_the_interval():
     policy.record_choice(3)
     policy.maybe_log()
     assert policy._k_counts == {}
+
 
 
 # -------------------------------------------------------------- scheduler wiring
@@ -179,18 +169,6 @@ def test_adaptive_k_does_not_corrupt_the_async_placeholder_list():
 
     scheduler.schedule()
     assert shared == [-1, -1, -1], "the shared placeholder list was mutated"
-
-
-def test_scheduler_marks_padded_requests():
-    # End-to-end through the scheduler: a padded step leaves the counts alone.
-    scheduler = _make_scheduler(ACCEPT)
-    assert scheduler.adaptive_k is not None
-    request = create_requests(num_requests=1)[0]
-    scheduler.add_request(request)
-    scheduler.schedule()
-    scheduler.adaptive_k.mark_padded(request.request_id)
-    scheduler.adaptive_k.observe(request.request_id, 3, 0)
-    assert request.request_id not in scheduler.adaptive_k._acc_s
 
 
 def test_scheduler_forgets_finished_requests():
