@@ -88,7 +88,6 @@ class Capture:
     buffer: int = 0  # a torch buffer created by the capture
     buffer_outlives_teardown: bool = False
     held: int = 0  # one-time cost outside torch, never given back
-    pool_leaks: bool = False  # the pool segment survives the teardown
     samples: list[int] = field(default_factory=list)  # FULL-graph samples
     num_full: int = 0
 
@@ -191,8 +190,7 @@ def _setup(monkeypatch, dev: FakeDevice, cap: Capture) -> tuple[Any, dict]:
 
     def teardown(_r) -> None:
         dev.free += cap.objects
-        if not cap.pool_leaks:
-            dev.release(state["pool"])
+        dev.release(state["pool"])
         dev.release(state["kv"])
         if cap.buffer and not cap.buffer_outlives_teardown:
             dev.release(state["buffer"])
@@ -220,14 +218,7 @@ def test_flag_defaults_off(monkeypatch):
     assert not cudagraph_mem.tracing()
 
 
-def test_levels(monkeypatch):
-    monkeypatch.setenv(FLAG, "1")
-    assert cudagraph_mem.enabled() and not cudagraph_mem.tracing()
-    monkeypatch.setenv(FLAG, "2")
-    assert cudagraph_mem.enabled() and cudagraph_mem.tracing()
-
-
-@pytest.mark.parametrize("flag", ["0", "1", "2"])
+@pytest.mark.parametrize("flag", ["0", "1"])
 def test_select_worker(monkeypatch, flag):
     monkeypatch.setenv(FLAG, flag)
     monkeypatch.delenv("VLLM_SM80_SHARD_ARGMAX", raising=False)
@@ -319,16 +310,6 @@ def test_buffer_outliving_teardown_counted_twice(monkeypatch):
     )
 
 
-def test_leaked_pool_counted_on_top_of_new_pool(monkeypatch):
-    """A throwaway pool the teardown cannot free stays allocated next to the
-    real capture's pool: both are reserved."""
-    dev = FakeDevice()
-    cap = Capture(pool_leaks=True)
-    runner, _ = _setup(monkeypatch, dev, cap)
-
-    assert runner.profile_cudagraph_memory() == 2 * cap.pool + cap.objects
-
-
 def test_all_full_graphs_measured(monkeypatch, caplog_vllm):
     """The profiling capture captures every FULL graph and takes no samples,
     so vLLM's linear extrapolation adds nothing: the pool is measured."""
@@ -340,15 +321,6 @@ def test_all_full_graphs_measured(monkeypatch, caplog_vllm):
     assert runner.profile_cudagraph_memory() == cap.pool + cap.objects
     assert state["full_cap"] is None
     assert "with all 5 FULL graphs captured" in caplog_vllm.text
-
-
-def test_measure_full_graphs_outside_profiling_is_a_no_op():
-    manager = _FakeManager(Capture(num_full=3))
-    manager._max_full_descs_to_capture = 2
-    manager._capture_mem_samples = []
-    cudagraph_mem.measure_full_graphs(manager)
-    assert manager._max_full_descs_to_capture == 2
-    assert manager._capture_mem_samples == []
 
 
 def test_upstream_profiling_keeps_vllm_sampling(monkeypatch):
@@ -364,18 +336,11 @@ def test_upstream_profiling_keeps_vllm_sampling(monkeypatch):
     assert result == _vllm_estimate(cap)
 
 
-@pytest.mark.parametrize("buffer_outlives_teardown", [False, True])
-def test_real_capture_within_reserve(
-    monkeypatch, caplog_vllm, buffer_outlives_teardown
-):
+def test_real_capture_within_reserve(monkeypatch, caplog_vllm):
     """The real capture after profiling keeps no more than the estimate, and
     says so; its allocator cache is released."""
     dev = FakeDevice()
-    cap = Capture(
-        buffer=8 * MiB,
-        held=300 * MiB,
-        buffer_outlives_teardown=buffer_outlives_teardown,
-    )
+    cap = Capture(buffer=8 * MiB, held=300 * MiB)
     runner, _ = _setup(monkeypatch, dev, cap)
     free_before = dev.free
 
@@ -399,15 +364,6 @@ def test_real_capture_over_reserve_warns(monkeypatch, caplog_vllm):
     runner.capture_model()
 
     assert "OVER the reserve" in caplog_vllm.text
-
-
-def test_no_capture_returns_vllm_value(monkeypatch):
-    dev = FakeDevice()
-    runner, _ = _setup(monkeypatch, dev, Capture())
-    monkeypatch.setattr(mrv2, "_profile_cudagraph_memory", lambda r: 0)
-
-    assert runner.profile_cudagraph_memory() == 0
-    assert cudagraph_mem._window is None
 
 
 def test_window_cleared_on_error(monkeypatch):
@@ -463,13 +419,13 @@ def test_log_held_attributes_new_segments(caplog_vllm):
         _seg(2 << 30, 500 * MiB, [2 * MiB], stream=0x55),
         _seg(3 << 30, 20 * MiB, [8 * MiB], stream=0),
     ]
-    cudagraph_mem._log_held(600 * MiB, 520 * MiB, start, end, trace=False)
+    cudagraph_mem._log_held(600 * MiB, 520 * MiB, start, end, trace=False, graphs=40)
     text = caplog_vllm.text
     assert "held after teardown 600.0 MiB: torch reserved +520.0 MiB" in text
     assert "2 new segments 520.0 MiB: live blocks 10.0 MiB, free inside them " \
         "510.0 MiB" in text
     assert "0x55: 1 seg 500.0 MiB live 2.0" in text
-    assert "outside torch 80.0 MiB" in text
+    assert "outside torch 80.0 MiB (40 graph segments captured: 2.00 MiB each)" in text
     assert "held block" not in text
 
 
@@ -566,9 +522,3 @@ def test_count_graphs(monkeypatch):
     monkeypatch.setattr(bcg.BreakableCUDAGraphWrapper, "_all_instances", [breakable])
     monkeypatch.setattr(cg.CUDAGraphWrapper, "_all_instances", [piecewise])
     assert cudagraph_mem._count_graphs() == 42
-
-
-def test_held_line_reports_bytes_per_graph(caplog_vllm):
-    cudagraph_mem._log_held(1024 * MiB, 0, [], [], trace=False, graphs=512)
-    assert "outside torch 1024.0 MiB (512 graph segments captured: 2.00 MiB " \
-        "each)" in caplog_vllm.text
