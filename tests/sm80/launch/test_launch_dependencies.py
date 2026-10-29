@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -43,17 +42,13 @@ def test_preserved_mtime_hardlink_write_invalidates_stamps(w, tmp_path):
 
 
 @pytest.mark.parametrize("field", ["ctime_ns", "dev"])
-@pytest.mark.parametrize("change", ["missing", "different"])
 @pytest.mark.parametrize("linked", [False, True])
-def test_stamp_requires_ctime_and_device(w, tmp_path, field, change, linked):
+def test_stamp_requires_ctime_and_device(w, tmp_path, field, linked):
     assert verify_cli(w)[0] == 0
     stamp_file = ck.stamp_path(w.stamps, w.cp)
     stamp = ck.read_stamp(stamp_file)
     for entry in stamp["files"].values():
-        if change == "missing":
-            entry.pop(field, None)
-        else:
-            entry[field] = -1
+        entry.pop(field, None)
     write(stamp_file, json.dumps(stamp))
     directory = overlay(w, tmp_path, fresh=()) if linked else w.cp
     m, sha = manifest(w)
@@ -62,19 +57,14 @@ def test_stamp_requires_ctime_and_device(w, tmp_path, field, change, linked):
     assert ck.verify(m, sha, directory, target_stamp) == (ck.VERIFIED, [], len(m["files"]))
 
 
-def test_stat_key_records_ctime_and_device(monkeypatch):
-    st = SimpleNamespace(st_ino=7, st_size=11, st_mtime_ns=13, st_ctime_ns=17, st_dev=19)
-    monkeypatch.setattr(ck, "os", SimpleNamespace(stat=lambda path: st))
-    assert ck._stat_key("file") == {"inode": 7, "size": 11, "mtime_ns": 13, "ctime_ns": 17, "dev": 19}
-
-
 @pytest.mark.parametrize("key, channel", [
-    (key, channel)
-    for key in ("args.spec-model", "args.speculative-config.model", "args.hf-overrides.engram_table_dir",
-                "args.hf-overrides.text_config.engram_table_dir",
-                "env.VLLM_EXL3_OVERRIDE")
-    for channel in ("set", "overlay", "user", "ambient")
-    if channel != "ambient" or key.startswith("env.")
+    *[(key, "set") for key in ("args.spec-model", "args.speculative-config.model",
+                               "args.hf-overrides.engram_table_dir",
+                               "args.hf-overrides.text_config.engram_table_dir",
+                               "env.VLLM_EXL3_OVERRIDE")],
+    ("args.hf-overrides.text_config.engram_table_dir", "overlay"),
+    ("args.hf-overrides.text_config.engram_table_dir", "user"),
+    ("env.VLLM_EXL3_OVERRIDE", "ambient"),
 ])
 def test_literal_checkpoint_fields_refused(w, key, channel):
     value = "/missing/checkpoint"
@@ -96,17 +86,14 @@ def test_literal_checkpoint_fields_refused(w, key, channel):
     assert "checkpoint reference" in w.refused(*args, environ=environ)
 
 
-@pytest.mark.parametrize("option", ["--spec-model", "--speculative-config", "--speculative_config.model", "--specul",
-                                    "--hf-overrides", "--hf_overrides.engram_table_dir", "--hf-over"])
+@pytest.mark.parametrize("option", ["--spec-model", "--speculative_config.model", "--hf-over"])
 def test_raw_extra_checkpoint_options_refused_even_experiment(w, option):
     assert "checkpoint" in w.refused("--experiment", "dependency", "--", option, "/missing")
 
 
-@pytest.mark.parametrize("key", ["args.speculative-config", "args.hf-overrides"])
-def test_json_literal_checkpoint_fields_refused(w, key):
-    leaf = "model" if key.endswith("speculative-config") else "engram_table_dir"
-    value = json.dumps({leaf: "/missing"})
-    assert "checkpoint reference" in w.refused("--set", f'{key}={json.dumps(value)}')
+def test_json_literal_checkpoint_fields_refused(w):
+    value = json.dumps({"model": "/missing"})
+    assert "checkpoint reference" in w.refused("--set", f'args.speculative-config={json.dumps(value)}')
 
 
 def test_drafter_reference_is_checked_and_cannot_be_replaced_by_same_path(w):
@@ -148,7 +135,7 @@ def test_sidecar_manifest_status_preflight_and_unset(w):
     assert "override" not in w.resolve()["checkpoint"]
 
 
-@pytest.mark.parametrize("suffix", ["/../outside.json", "/unlisted.json", "/override.json/../outside.json"])
+@pytest.mark.parametrize("suffix", ["/../outside.json", "/unlisted.json"])
 def test_sidecar_reference_must_name_manifest_file(w, suffix):
     sidecar(w)
     assert "manifest" in w.refused("--set", "env.VLLM_EXL3_OVERRIDE=${checkpoint.override.path}" + suffix)

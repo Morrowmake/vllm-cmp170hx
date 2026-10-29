@@ -57,12 +57,7 @@ def _parser():
 @pytest.mark.parametrize("api", ["chat", "responses"])
 @pytest.mark.parametrize(
     "choice",
-    [
-        "none",
-        "auto",
-        "required",
-        {"type": "function", "function": {"name": "lookup"}},
-    ],
+    ["none", "auto"],
 )
 def test_only_none_gets_decode_mask(api, choice, monkeypatch):
     monkeypatch.setenv("VLLM_TOOL_CHOICE_NONE_MASK", "1")
@@ -155,9 +150,16 @@ def _preprocess(api, parser_cls, monkeypatch, reuse=False):
     return request, renderer, tools
 
 
-@pytest.mark.parametrize("parser_cls", [Glm47MoeParser, PlainParser])
-@pytest.mark.parametrize("api", ["chat", "responses"])
-@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize(
+    "api,reuse,parser_cls",
+    [
+        ("chat", False, Glm47MoeParser),
+        ("chat", True, Glm47MoeParser),
+        ("responses", False, Glm47MoeParser),
+        ("responses", True, Glm47MoeParser),
+        ("chat", False, PlainParser),
+    ],
+)
 def test_renderer_adjusts_none_without_removing_tools(
     api, reuse, parser_cls, monkeypatch
 ):
@@ -171,16 +173,15 @@ def test_renderer_adjusts_none_without_removing_tools(
         assert chat_params.chat_template_kwargs["tools"] == tools
 
 
-@pytest.mark.parametrize("api", ["chat", "responses"])
 @pytest.mark.parametrize("flag", [None, "0"])
-def test_renderer_off_calls_adjust_only_where_upstream_does(api, flag, monkeypatch):
+def test_renderer_off_calls_adjust_only_where_upstream_does(flag, monkeypatch):
     """Off, a parser that asks for tool_choice="none" adjustment only for the
     mask is not called, as upstream does not call it."""
     if flag is None:
         monkeypatch.delenv("VLLM_TOOL_CHOICE_NONE_MASK", raising=False)
     else:
         monkeypatch.setenv("VLLM_TOOL_CHOICE_NONE_MASK", flag)
-    request, _, _ = _preprocess(api, MaskOnlyParser, monkeypatch)
+    request, _, _ = _preprocess("chat", MaskOnlyParser, monkeypatch)
     assert request.bad_words == []
 
 

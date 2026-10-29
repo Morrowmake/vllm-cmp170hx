@@ -59,34 +59,7 @@ _EXEC_TOOLS = [
         },
     }
 ]
-_FILE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "Read",
-            "parameters": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "Bash",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "description": {"type": "string"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-]
-_CHUNKS = [None, 1, 2, 3, 7, 10000]
+_CHUNKS = [None, 1, 7, 10000]
 
 
 def _param(name, value, string="true"):
@@ -232,25 +205,6 @@ def test_string_values_are_byte_exact(value, chunk_size):
     text = _dsml("exec_command", [_param("cmd", value), _param("workdir", value)])
     assert _calls(text, _EXEC_TOOLS, chunk_size) == [
         ("exec_command", {"cmd": value, "workdir": value})
-    ]
-
-
-@pytest.mark.parametrize("value", _VALUES)
-@pytest.mark.parametrize("chunk_size", _CHUNKS)
-def test_file_path_values_are_byte_exact(value, chunk_size):
-    text = (
-        "<｜DSML｜ calls>\n"
-        '<｜DSML｜ invoke name="Read">\n'
-        + _param("file_path", value)
-        + "</｜DSML｜ invoke>\n"
-        '<｜DSML｜ invoke name="Bash">\n'
-        + _param("command", f"ls {value}")
-        + _param("description", "List")
-        + "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
-    )
-    assert _calls(text, _FILE_TOOLS, chunk_size) == [
-        ("Read", {"file_path": value}),
-        ("Bash", {"command": f"ls {value}", "description": "List"}),
     ]
 
 

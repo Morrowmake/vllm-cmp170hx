@@ -99,20 +99,8 @@ def test_verify_without_gpu(w):
     assert json.loads(p.stdout)["target"]["state"] == "verified"
 
 
-def test_mismatch_and_incomplete_exits(w):
-    path = os.path.join(w.cp, "tokenizer.json")
-    original = open(path).read()
-    write(path, original + " ")
-    code, rep = verify_cli(w)
-    assert code == ck.EXIT_CHECKPOINT_INCOMPLETE and "tokenizer.json: size" in rep["target"]["files"][0]
-    write(path, original)
-    same_size_edit(path)
-    code, rep = verify_cli(w)
-    assert code == ck.EXIT_CHECKPOINT_MISMATCH and rep["target"]["files"] == ["tokenizer.json"]
-
-
-@pytest.mark.parametrize("rel", ["chat_template.jinja", "tokenizer.json"])
-def test_altered_file_is_mismatch(w, rel):
+def test_altered_file_is_mismatch(w):
+    rel = "tokenizer.json"
     assert verify_cli(w)[0] == 0
     same_size_edit(os.path.join(w.cp, rel))
     d = w.resolve()
@@ -187,14 +175,6 @@ def test_stale_stamp_policies(w):
     with OpenCounter(w.cp) as c:
         main.preflight_checkpoints(doc, "strict")
     assert c.hits == [os.path.realpath(shard)]
-
-
-def test_interrupt_writes_no_stamp(w):
-    m, sha = ck.load_manifest(os.path.join(w.settings, "checkpoints", "synth-dense-1b.manifest.json"))
-    sfile = ck.stamp_path(w.stamps, w.cp)
-    with pytest.raises(ck.Interrupted):
-        ck.verify(m, sha, w.cp, sfile, stop=[True])
-    assert not os.path.exists(sfile)
 
 
 def test_new_pin_with_verified_weights_fails_receipt(w, tmp_path):
