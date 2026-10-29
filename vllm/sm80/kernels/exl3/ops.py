@@ -4,15 +4,14 @@
 
 import importlib
 import weakref
-from functools import lru_cache
+from functools import cache
 
 import torch
 
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.sm80 import capture
-from vllm.sm80.kernels.exl3 import dense_prefill_tc
-from vllm.sm80.kernels.exl3 import capture_points
+from vllm.sm80.kernels.exl3 import capture_points, dense_prefill_tc
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -25,8 +24,8 @@ _fakes_registered = False
 # Fixed by ensure_extension, before any launch or graph capture.
 _dense_splitk = False
 
-# One fixed FP32 scratch (32 MiB) per stream role, whatever the batch size.
-# Each matrix processes rows in chunks whose native workspace fits it.
+# Fixed FP32 scratch per stream role: 32 MiB normally, 128 MiB when the
+# validated PP2 prefill path is active, to amortize its full-width row chunks.
 LINEAR_SCRATCH_ELEMENTS = 8 << 20
 
 # VLLM_EXL3_MOE_PREFILL_UNCHUNKED (default off): moe_out_prefill_v2's calls of
@@ -46,6 +45,10 @@ MOE_V2_MAX_ROWS = 64
 MOE_V2_CONFIGS = {
     # Half the experts local (tensor parallel size 2 with expert parallelism).
     (2560, 640, 10, 256, 512): (10,),
+    # Whole experts local (tensor parallel size 1: pipeline stages split
+    # layers, not experts; validated with the same checkpoint at PP2, see
+    # quant._prefill_layout_closed_reason for the layout cross-check).
+    (2560, 640, 10, 512, 512): (10,),
     # Whole experts, a quarter of them local (expert parallel size 4).
     (5120, 2304, 6, 96, 384): (6, 4),
     # Tensor-parallel routed experts: every expert local, each rank a 640- or
@@ -64,10 +67,14 @@ MOE_V2_CONFIGS = {
 # keep moe_out: moe_out_v2 has bits_x2 8 kernels for those shapes, but their
 # output has not been checked through the drafter's consumer.
 MOE_V2_DRAFT_CONFIGS = frozenset({(5120, 2304, 3, 32, 128)})
-# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
+# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the hidden-2560
+# configurations (its served_shape accepts either local-expert count); it
 # serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
 # validated range: one 3460-token prefill chunk).
-MOE_PREFILL_CONFIGS = {(2560, 640, 10, 256, 512): (10,)}
+MOE_PREFILL_CONFIGS = {
+    (2560, 640, 10, 256, 512): (10,),
+    (2560, 640, 10, 512, 512): (10,),
+}
 MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 MOE_PREFILL_MAX_ROWS = 3460
 # moe_out_prefill_v2 (csrc/exl3/moe_prefill_v2.cu) covers the hidden-5120
@@ -284,21 +291,24 @@ def ensure_extension() -> None:
     _loaded = True
 
 
-@lru_cache(maxsize=None)
+@cache
 def linear_workspace_size(max_rows: int, padded_in: int, padded_out: int) -> int:
     ensure_extension()
     return torch.ops._exl3_C.linear_workspace_size(max_rows, padded_in, padded_out)
 
 
-@lru_cache(maxsize=None)
-def linear_row_chunk(padded_in: int, padded_out: int) -> int:
-    """Return the most rows whose linear workspace fits the fixed scratch."""
-    rows, limit = 0, LINEAR_SCRATCH_ELEMENTS
+def linear_scratch_elements() -> int:
+    wide_pp2 = dense_prefill_tc.active and dense_prefill_tc.active_layout == (1, 2)
+    return LINEAR_SCRATCH_ELEMENTS * (4 if wide_pp2 else 1)
+
+
+@cache
+def _linear_row_chunk(padded_in: int, padded_out: int, budget: int) -> int:
+    """Return the most rows whose native workspace fits this fixed budget."""
+    rows, limit = 0, budget
     while rows < limit:
         middle = (rows + limit + 1) // 2
-        if linear_workspace_size(middle, padded_in, padded_out) <= (
-            LINEAR_SCRATCH_ELEMENTS
-        ):
+        if linear_workspace_size(middle, padded_in, padded_out) <= budget:
             rows = middle
         else:
             limit = middle - 1
@@ -307,7 +317,12 @@ def linear_row_chunk(padded_in: int, padded_out: int) -> int:
     return rows
 
 
-@lru_cache(maxsize=None)
+def linear_row_chunk(padded_in: int, padded_out: int) -> int:
+    ensure_extension()
+    return _linear_row_chunk(padded_in, padded_out, linear_scratch_elements())
+
+
+@cache
 def moe_workspace_size(
     max_rows: int,
     hidden_size: int,
@@ -321,7 +336,7 @@ def moe_workspace_size(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size_v2(
     max_rows: int,
     hidden_size: int,
@@ -694,7 +709,7 @@ def require_moe_v2_try() -> None:
         _moe_v2_try_fake_registered = True
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size_v2_try(
     max_rows: int,
     hidden_size: int,
@@ -745,9 +760,7 @@ def require_moe_v2_draft() -> None:
     (built from a tree before them; its moe_v2_draft_force_rows marks them)."""
     ensure_extension()
     try:
-        torch._C._dispatch_find_schema_or_throw(
-            "_exl3_C::moe_v2_draft_force_rows", ""
-        )
+        torch._C._dispatch_find_schema_or_throw("_exl3_C::moe_v2_draft_force_rows", "")
     except RuntimeError as exc:
         raise RuntimeError(
             "VLLM_EXL3_MOE_V2_DRAFT needs the bits_x2 8 kernels of "
@@ -839,7 +852,7 @@ def warmup_moe_v2(
     _moe_v2_warm.add(key)
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size_prefill(
     max_rows: int,
     hidden_size: int,
@@ -865,8 +878,9 @@ def moe_out_prefill(
     workspace,
     swiglu_limit: float = 0.0,
 ) -> None:
-    """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
-    the moe_out_v2 configuration; see csrc/exl3/moe_prefill.cu."""
+    """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of a
+    served configuration (moe_prefill_closed_reason); see
+    csrc/exl3/moe_prefill.cu."""
     ensure_extension()
     torch.ops._exl3_C.moe_out_prefill(
         x,
@@ -932,7 +946,7 @@ def warmup_moe_prefill(
         workspace,
         swiglu_limit=swiglu_limit,
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     _moe_prefill_warm_devices.add(device)
 
 
@@ -962,13 +976,15 @@ def require_moe_prefill_v2() -> None:
                     torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
                 except RuntimeError as exc:
                     raise RuntimeError(
-                        f"VLLM_EXL3_MOE_PREFILL_UNCHUNKED=1 needs _exl3_C::{name}: rebuild the "
-                        f"EXL3 extension from this tree, or unset it. Detail: {exc}"
+                        f"VLLM_EXL3_MOE_PREFILL_UNCHUNKED=1 needs _exl3_C::{name}: "
+                        "rebuild the EXL3 extension from this tree, "
+                        f"or unset it. Detail: {exc}"
                     ) from exc
             torch.library.register_fake("_exl3_C::moe_out_prefill_try")(_moe_v2_fake)
             logger.info_once(
-                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of 65..2048 rows of the "
-                "whole-expert configuration (hidden 5120, intermediate 2304, top-6, "
+                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of "
+                "65..2048 rows of the whole-expert configuration "
+                "(hidden 5120, intermediate 2304, top-6, "
                 "96 of 384 experts local, bits_x2 6 or 4) run moe_out_prefill_try."
             )
         _moe_prefill_v2_fake_registered = True
@@ -976,10 +992,15 @@ def require_moe_prefill_v2() -> None:
 
 def _try_moe_prefill(hidden: int, intermediate: int, topk: int, local: int) -> bool:
     """VLLM_EXL3_MOE_PREFILL_UNCHUNKED is set and the shape is the one it covers."""
-    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) == (5120, 2304, 6, 96)
+    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) == (
+        5120,
+        2304,
+        6,
+        96,
+    )
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size_prefill_v2(
     max_rows: int,
     hidden_size: int,
@@ -994,9 +1015,12 @@ def moe_workspace_size_prefill_v2(
         max_rows, hidden_size, intermediate_size, topk, local_experts
     )
     if _try_moe_prefill(hidden_size, intermediate_size, topk, local_experts):
-        size = max(size, torch.ops._exl3_C.moe_workspace_size_prefill_try(
-            max_rows, hidden_size, intermediate_size, topk, local_experts
-        ))
+        size = max(
+            size,
+            torch.ops._exl3_C.moe_workspace_size_prefill_try(
+                max_rows, hidden_size, intermediate_size, topk, local_experts
+            ),
+        )
     return size
 
 
@@ -1025,8 +1049,9 @@ def moe_out_prefill_v2(
     )
     op = torch.ops._exl3_C.moe_out_prefill_v2
     if (
-        _try_moe_prefill(x.shape[1], intermediate_size, topk_ids.shape[1],
-                         packed_ptrs.shape[0])
+        _try_moe_prefill(
+            x.shape[1], intermediate_size, topk_ids.shape[1], packed_ptrs.shape[0]
+        )
         and expert_map.numel() == 384
         and bits_x2 in (6, 4)
         and TRY_MOE_PREFILL_ROWS[0] <= x.shape[0] <= TRY_MOE_PREFILL_ROWS[1]
@@ -1143,7 +1168,9 @@ def warmup_moe_prefill_v2(
         ids = torch.tensor(
             [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
         )
-        weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+        weights = torch.full(
+            (rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device
+        )
         x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
         out = torch.empty_like(x)
         workspace = torch.empty(
@@ -1304,6 +1331,9 @@ def _linear_scratch(device: torch.device) -> torch.Tensor:
     from vllm.utils.torch_utils import aux_stream, current_stream
     from vllm.v1.worker.workspace import current_workspace_manager
 
+    ensure_extension()
+    budget = linear_scratch_elements()
+
     def allocate():
         if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("EXL3 scratch must be allocated before graph capture")
@@ -1313,7 +1343,7 @@ def _linear_scratch(device: torch.device) -> torch.Tensor:
         # on first use, before memory profiling ends, and never resized.
         count = 1 if aux_stream() is None else 2
         return [
-            torch.empty(LINEAR_SCRATCH_ELEMENTS, dtype=torch.float32, device=device)
+            torch.empty(budget, dtype=torch.float32, device=device)
             for _ in range(count)
         ]
 

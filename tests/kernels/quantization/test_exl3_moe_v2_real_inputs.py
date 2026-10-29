@@ -247,9 +247,13 @@ def _expert_set(checkpoint, prefix, expert_map, device):
         if local >= 0:
             assert local not in owner, "expert map assigns a local expert twice"
             owner[local] = g
-    assert sorted(owner) == list(range(LOCAL)), "expert map leaves a gap"
+    # The partition follows the expert map: 256 of the 512 experts at tensor
+    # parallel size 2, and all 512 where the pipeline splits the layers at
+    # tensor parallel size 1.
+    local_experts = len(owner)
+    assert sorted(owner) == list(range(local_experts)), "expert map leaves a gap"
     weights, pointers, meta = [], [], []
-    for local in range(LOCAL):
+    for local in range(local_experts):
         ptrs, rows = [], []
         for role in ROLES:
             name = f"{prefix}.{owner[local]}.{role}"
@@ -306,7 +310,7 @@ def test_v2_holds_moe_outs_error_against_fp64_on_real_inputs():
                 live += 1
             calls.append((x, ids, weights))
             results.append((case, name, port.cpu(), shipped.cpu()))
-        decoded = {}
+        decoded: dict[int, list[tuple]] = {}
 
         def decode(local, served=served, decoded=decoded):
             if local not in decoded:
@@ -322,7 +326,7 @@ def test_v2_holds_moe_outs_error_against_fp64_on_real_inputs():
         for (case, name, port, shipped), ref in zip(results, refs):
             pool_of[real.pool_key(case)].add(port, shipped, ref.cpu(), name)
         del served, calls, refs, decoded
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     failures = []
     for key, pool in pool_of.items():
         role, rows, phase, drafter = key

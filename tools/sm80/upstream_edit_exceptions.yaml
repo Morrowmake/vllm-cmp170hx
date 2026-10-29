@@ -57,37 +57,43 @@ exceptions:
     this file, so that it no longer differs from upstream.
 
 - file: vllm/models/qwen4_exp/nvidia/model.py
-  hunks: [2bd7c3af5842]
+  hunks: [2bd7c3af5842, 5739a7a35996, ff13555a4616, a0d4eab07e29, 7c6fcf040f84, 91aae54efae1, 2a6511401186, aa7ff7ef60f4, 79c68c9ff6a5, ffeb4f2d894d, c3cb952f352d]
   reason: >-
-    The Apache-2.0 modification notice after the SPDX header, a comment line
-    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
-    It belongs in the file it describes; no extension point can hold it.
-  owner: fork licence compliance
+    PP needs stage-local mixer ownership and a fixed failed-token field in the
+    model's intermediate schema. No model hook changes both construction and
+    the intermediate tensors returned by forward. PPMissingLayer lets the
+    ordinary loader account for remote weights rather than ignoring a prefix.
+    The existing modification notice remains required.
+  owner: Qwen4Exp pipeline-parallel serving
   removal: >-
-    Delete the notice line in the change that removes the last fork edit of
-    this file, so that it no longer differs from upstream.
+    Remove when upstream Qwen4Exp supplies stage-local mixer construction and
+    failed-input metadata in pipeline intermediates, retaining loader ownership
+    and failure-propagation coverage.
 
 - file: vllm/models/qwen4_exp/nvidia/mtp.py
-  hunks: [2bd7c3af5842]
+  hunks: [2bd7c3af5842, fa97c250f1d2, 80f99682ad8d]
   reason: >-
-    The Apache-2.0 modification notice after the SPDX header, a comment line
-    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
-    It belongs in the file it describes; no extension point can hold it.
-  owner: fork licence compliance
+    The MTP model runs entirely on the final pipeline rank, but its forward
+    entry branch used the rank instead of the presence of pipeline inputs.
+    No hook selects that branch. The existing modification notice remains.
+  owner: Qwen4Exp pipeline-parallel serving
   removal: >-
-    Delete the notice line in the change that removes the last fork edit of
-    this file, so that it no longer differs from upstream.
+    Remove when upstream MTP accepts entry inputs on the final pipeline rank;
+    retain the last-rank MTP execution regression.
 
 - file: vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-  hunks: [2bd7c3af5842]
+  hunks: [2bd7c3af5842, c5b42a165850, 6f2e05f4f920, 97af4f404986, 70bf610f9711, f55428ce9957, 992ecb9898ce, 57eabe822ea5, b2ba0d01a768, e807ac39f501, 05817987c538, 0b2d518de971, d6950ddd0d74]
   reason: >-
-    The Apache-2.0 modification notice after the SPDX header, a comment line
-    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
-    It belongs in the file it describes; no extension point can hold it.
-  owner: fork licence compliance
+    File-backed PLE needs storage selection during construction and persistent
+    row staging before FULL graph replay. The existing quantization hook only
+    chooses an embedding class; it cannot select the lookup/prefetch lifetime
+    or forward the source mapping to mmap storage during loading.
+    The existing modification notice remains required.
+  owner: Qwen4Exp file-backed PLE and graph replay
   removal: >-
-    Delete the notice line in the change that removes the last fork edit of
-    this file, so that it no longer differs from upstream.
+    Remove when upstream PLE exposes storage, pre-replay row preparation and
+    file-backed loading hooks; retain mmap lifetime, mode selection and replay
+    correctness coverage.
 
 - file: vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
   hunks: [2bd7c3af5842]
@@ -173,7 +179,7 @@ exceptions:
     Remove this exact decorator exception when upstream provides one Engram implementation factory covering storage construction and projection; retain storage, ordinary-projection and early-gather tests.
 
 - file: vllm/v1/worker/gpu/model_runner.py
-  hunks: [ff7a814b29b9, 9b96f0854408, 183d60859f35, a35c6ff88a1c, 276b0ee249b6, 20c6cc21da36, ba753e35fcca, 75b463763419, 645d5ea70245]
+  hunks: [ff7a814b29b9, 9b96f0854408, 183d60859f35, a35c6ff88a1c, 276b0ee249b6, 20c6cc21da36, 423409fd3bf0, 75b463763419, 645d5ea70245, 74fa81428881, f8d0c6cd6d6a, 28b6af066c0e, 4585eaed54a1, 7b470d3ef26e]
   reason: >-
     (ff7a814b29b9) The existing pipeline draft-tail controller must be constructed and attached after speculative configuration and PP ranks exist, before model loading. A graph-capture decorator cannot supply this constructor lifetime.
     (9b96f0854408) The existing folded drafter projection configures the loaded target and PP handler before the drafter loads. It needs local target weights and cannot run at graph capture or output publication.
@@ -181,9 +187,11 @@ exceptions:
     (a35c6ff88a1c) The existing optional memory inventory reads the completed target/drafter load and its measured allocator delta. Constructor, capture and request callbacks do not expose that same completed-load boundary.
     (276b0ee249b6) The existing optional KV-allocation observer brackets actual temporary profiling or serving KV construction. It must remain around this allocation scope, not around the later graph-capture method.
     (20c6cc21da36) The existing optional profiling stage recorder is constructed at the memory-profile boundary and used by its nested stages. It cannot be initialized at model construction without changing its measured interval.
-    (ba753e35fcca) The existing failed-input delivery consumes per-step model failure tokens with the actual request query offsets when constructing asynchronous output. Capture-time registration cannot supply those per-request values.
+    (423409fd3bf0) Failed-input delivery consumes the mask retained in ExecuteModelState with the actual request query offsets when constructing asynchronous output. Capture-time registration cannot supply these per-request values.
     (75b463763419) The DSpark row mask's live lengths must be written after the step's batch and draft counts are final and before the target forward or its graph replay reads them; no runner hook sits between input preparation and the forward. The call returns at once with VLLM_DSPARK_ADAPTIVE_DEPTH unset.
     (645d5ea70245) The row mask's drafts past each live length must join the rejection sampler's invalid drafts after the target forward (whose inputs keep the real drafts) and before rejection; no sampler hook exists there. The call returns its argument at once with VLLM_DSPARK_ADAPTIVE_DEPTH unset.
+    (74fa81428881) Model-state input preparation needs the actual graph dispatch mode, not eligibility, before staging file-backed rows.
+    (f8d0c6cd6d6a, 28b6af066c0e, 4585eaed54a1, 7b470d3ef26e) PP must relay each stage's failed-input mask before forwarding intermediates and retain the final mask until asynchronous sampling. No runner hook owns that complete per-step lifetime.
   owner: >-
     (ff7a814b29b9) pipeline draft-tail lifecycle
     (9b96f0854408) pipeline folded draft projection
@@ -191,9 +199,10 @@ exceptions:
     (a35c6ff88a1c) sm_80 memory attribution
     (276b0ee249b6) sm_80 memory attribution
     (20c6cc21da36) sm_80 memory attribution
-    (ba753e35fcca) sm_80 failed-input delivery
+    (423409fd3bf0) sm_80 failed-input delivery
     (75b463763419) DeepSeek-V4.1-Flash DSpark row mask
     (645d5ea70245) DeepSeek-V4.1-Flash DSpark row mask
+    (74fa81428881, f8d0c6cd6d6a, 28b6af066c0e, 4585eaed54a1, 7b470d3ef26e) Qwen4Exp pipeline-parallel serving and graph replay
   removal: >-
     (ff7a814b29b9) Move controller construction behind an upstream runner-component factory when available, preserving PP draft-tail ownership and load ordering.
     (9b96f0854408) Remove when an upstream target-loaded callback owns projection configuration; retain folded-versus-unfolded arithmetic and PP handoff tests.
@@ -201,9 +210,11 @@ exceptions:
     (a35c6ff88a1c) Move the inventory behind an upstream completed-model-load observer that supplies the same measured allocation interval.
     (276b0ee249b6) Remove when upstream exposes one KV-allocation context observer retaining the profiling-versus-serving distinction.
     (20c6cc21da36) Move the recorder to an upstream memory-profiler observer with the same stage boundaries and allocation accounting.
-    (ba753e35fcca) Remove when upstream exposes per-output failed-token metadata through the runner output constructor without adding another per-step lookup.
+    (423409fd3bf0) Remove when upstream exposes per-output failed-token metadata through the runner output constructor without adding another per-step lookup.
     (75b463763419) Remove when upstream exposes a pre-forward runner hook with the step's input batch (or when the row mask moves into upstream adaptive verification); retain the row-mask kernel and live-row identity tests.
     (645d5ea70245) Remove when upstream exposes a pre-rejection hook over invalid drafts, or the cap moves into upstream adaptive verification; retain the greedy truncation and num_rejected tests.
+    (74fa81428881) Remove when upstream passes the dispatched graph mode into model-state preparation.
+    (f8d0c6cd6d6a, 28b6af066c0e, 4585eaed54a1, 7b470d3ef26e) Remove when upstream carries failed-input metadata through PP and asynchronous output, retaining receive-buffer-reuse coverage.
 
 - file: vllm/envs.py
   hunks: [61396cef5c73]
@@ -219,3 +230,93 @@ exceptions:
     Remove when vLLM accepts variables from plugins (a registration hook its
     environment table calls), or when the fork's variables move to a plugin
     entry point that registers them before vllm.envs is read.
+
+- file: vllm/config/engram.py
+  hunks: [ee55a62f9160, b1cddc8c33f0, e41bc934a248, 9c47a63f7b81, ba2e733374e8, c1da06c2a208, 1060c89c694e, 60ee0fb2a945]
+  reason: >-
+    EngramConfig owns the storage schema and compatibility checks. No plugin
+    hook can add its mmap option or validate offload, sharding and model
+    compatibility. The modification notice belongs beside the changed code.
+  owner: Qwen4Exp file-backed PLE
+  removal: >-
+    Remove when upstream supports file-backed PLE storage in EngramConfig;
+    retain invalid-combination and architecture-boundary tests.
+
+- file: vllm/model_executor/models/config.py
+  hunks: [ee55a62f9160, c6f794773075, b68079417563, e0d57982d720, 986014986790]
+  reason: >-
+    Qwen4Exp's existing configuration adjustment rejects all PLE with PP.
+    Replace that rejection with actual stage-zero ownership validation and
+    validate mmap/loading compatibility before allocating model weights.
+    No extension point overrides this existing adjustment. The notice is required.
+  owner: Qwen4Exp pipeline-parallel serving
+  removal: >-
+    Remove when upstream validates the actual PP layer partition and accepts
+    the file-backed PLE loader; retain boundary and invalid-storage tests.
+
+- file: vllm/models/qwen4_exp/nvidia/model_state.py
+  hunks: [ee55a62f9160, 46aa325850ea, ff80cde81a52, d6136adad891, 0abbb68c8ac3, 4efda5c5dd36, d42fd05398ef]
+  reason: >-
+    This model state owns raw input IDs, PLE convolution state and pre-forward
+    preparation. Only stage zero has those inputs. Its methods must prepare
+    persistent rows before FULL replay and zero dummy rows before capture;
+    there is no per-storage staging callback. The notice is required.
+  owner: Qwen4Exp file-backed PLE and graph replay
+  removal: >-
+    Remove when upstream supplies stage-aware PLE state and pre-replay storage
+    preparation, retaining stage-zero allocation and graph-mode regressions.
+
+- file: vllm/v1/core/kv_cache_planning.py
+  hunks: [59490d36bd30, 1b0c727095cc]
+  reason: >-
+    Uniform cache groups retain global specs after PP projection. Allocation
+    must iterate the worker's layer_names, not every global spec. No hook
+    changes this allocator's iteration; this is a general PP correctness fix.
+  owner: pipeline-parallel KV cache planning
+  removal: >-
+    Remove when upstream allocates only stage-owned layers in uniform groups;
+    retain asymmetric-stage and empty-projection regressions.
+
+- file: vllm/v1/worker/gpu/input_batch.py
+  hunks: [ee55a62f9160, 41bc08fc9a3f, ee397837066f]
+  reason: >-
+    Model-state preparation needs the actual graph dispatch mode on its input
+    batch. No existing field or callback exposes it. The notice is required.
+  owner: file-backed input staging
+  removal: >-
+    Remove when upstream carries the dispatched graph mode into model-state
+    preparation; retain FULL-versus-PIECEWISE staging coverage.
+
+- file: vllm/v1/worker/gpu/pp_utils.py
+  hunks: [7ed1c1321181, beace95120ec]
+  reason: >-
+    Filtering stale PP draft rows with a GPU boolean index synchronizes the
+    host. The keep mask is already known on the CPU; asynchronously transfer
+    row indices and use index_select in both immediate and deferred paths.
+    Neither filtering site has an extension hook.
+  owner: asynchronous PP draft delivery
+  removal: >-
+    Remove when upstream uses synchronization-free filtering in both paths;
+    retain stale-request, unsampled-row and deferred-event regressions.
+
+- file: vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+  hunks: [ee55a62f9160, 3371a18ac43c]
+  reason: >-
+    The PP early return must allow an explicit missing-layer draft embedding
+    to share the final stage's resident target embedding. No sharing-policy
+    hook exists before this return. The notice is required.
+  owner: Qwen4Exp native MTP under PP
+  removal: >-
+    Remove when upstream honors missing draft embeddings under PP;
+    retain target/draft sharing coverage without duplicate allocation.
+
+- file: vllm/v1/worker/utils.py
+  hunks: [ee55a62f9160, 2454619687f0, 5a855b315608]
+  reason: >-
+    Cache allocation must report a tensor with no stage-local cache group
+    explicitly instead of leaking StopIteration. The lookup has no error
+    hook. The modification notice belongs beside this allocator fix.
+  owner: pipeline-parallel KV cache allocation
+  removal: >-
+    Remove when upstream diagnoses missing group ownership; retain the
+    malformed-plan regression alongside stage-local planning coverage.

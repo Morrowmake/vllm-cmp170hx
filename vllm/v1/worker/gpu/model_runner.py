@@ -66,14 +66,14 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.sm80.failed_inputs import take_failed_tokens
+from vllm.sm80.dev_ab import with_ab_capture
+from vllm.sm80.failed_inputs import relay_failed_tokens
 from vllm.sm80.spec_decode.aux_fc_fold import (
     mark_drafter_aux_fc_folded,
     maybe_configure_aux_fc_fold,
 )
 from vllm.sm80.spec_decode.dspark_row_mask_kernel import begin_target_step
 from vllm.sm80.spec_decode.dspark_row_mask_reject import cap_drafts
-from vllm.sm80.dev_ab import with_ab_capture
 from vllm.sm80.worker import mem_attribution
 from vllm.sm80.worker.pp_draft_tail import DraftTailController
 from vllm.tasks import SupportedTask
@@ -2159,6 +2159,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 
+        input_batch.cg_mode = batch_desc.cg_mode
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
@@ -2269,6 +2270,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        failed_tokens = relay_failed_tokens(
+            self.model,
+            model_inputs["intermediate_tensors"],
+            output_intermediate_tensors,
+        )
+
         finished_req_ids = scheduler_output.finished_req_ids
         # Propose no drafts (K=0) when no DP rank's scheduled requests can use them.
         skip_drafts = (
@@ -2289,6 +2296,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_spec_tokens_to_schedule=(
                 0 if skip_drafts else scheduler_output.num_spec_tokens_to_schedule
             ),
+            failed_tokens=failed_tokens,
         )
 
         if not self.is_last_pp_rank:
@@ -2319,6 +2327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        failed_tokens = self.execute_model_state.failed_tokens
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2413,7 +2422,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
-            failed_tokens=take_failed_tokens(self.model),
+            failed_tokens=failed_tokens,
             query_start_loc_np=input_batch.query_start_loc_np,
         )
 
@@ -2665,6 +2674,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
+    failed_tokens: torch.Tensor | None = None
 
 
 class BatchReqState(NamedTuple):

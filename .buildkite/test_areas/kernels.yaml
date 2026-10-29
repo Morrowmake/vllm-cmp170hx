@@ -443,6 +443,8 @@ steps:
   timeout_in_minutes: 30
   source_file_dependencies:
   - csrc/quantization/
+  - csrc/exl3/
+  - vllm/sm80/kernels/exl3/
   - vllm/model_executor/layers/quantization
   - tests/kernels/quantization
   commands:

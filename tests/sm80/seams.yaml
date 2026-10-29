@@ -1119,13 +1119,6 @@ seams:
   sha256: 0007cbb1594abcf9a5bce004418d75e110d556fe6b5b7a5eaca74e6139c100a2
   signature: '(vllm_config: vllm.config.vllm.VllmConfig) -> vllm.config.load.LoadConfig'
 
-- id: qwen4-ngram-embedding-init
-  kind: method
-  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.__init__
-  why: exl3.loader._setup_ple_file reads ngram_embedding, ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers set here
-  sha256: bd9bf99b75a30333fae31a5bb540f048684a50117bffaac48cdbc399c5573dbb
-  signature: '(self, config: transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig, embedding_dim: int, ple_dense_layer_id: int, max_total_tokens: int, *, data_parallel_rank: int, prefix: str, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, params_dtype: torch.dtype | None = None, use_sequence_parallel: bool = False) -> None'
-
 - id: kv-coordinator-init
   kind: method
   target: vllm.v1.core.kv_cache_coordinator:KVCacheCoordinator.__init__

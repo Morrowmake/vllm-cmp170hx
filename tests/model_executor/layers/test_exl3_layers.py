@@ -258,8 +258,8 @@ def test_qsa_fused_qkv_indexer_shards_heads_and_replicates_the_indexer(
 ):
     import vllm.models.qwen4_exp.nvidia.model as qwen_model
     from vllm.models.qwen4_exp.nvidia import mtp as qwen_mtp
-    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAQKVIndexerLinear
     from vllm.models.qwen4_exp.nvidia.exl3_layout import Qwen4ExpExl3Layout
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAQKVIndexerLinear
 
     # The target's packed mapping lists the indexer, the MTP draft's does not;
     # both build the same layers.
@@ -469,6 +469,7 @@ def test_moe_assigns_whole_experts_from_the_ep_map(exl3_config, strategy):
         local, expert_map, _ = determine_expert_map(
             2, rank, EXPERTS, expert_placement_strategy=strategy
         )
+        assert expert_map is not None
         method = exl3_module.Exl3MoEMethod(exl3_config, prefix, _moe_config(rank))
         layer = _RoutedExperts(expert_map)
         method.create_weights(
@@ -531,20 +532,42 @@ def test_moe_scratch_rows_follow_the_dispatch_actually_used():
     assert exl3_module.dispatched_rows(sequence, moe) == 4 * 1731
 
 
-def test_linear_row_chunk_keeps_scratch_fixed():
-    budget = exl3_ops.LINEAR_SCRATCH_ELEMENTS
-    for padded_in, padded_out in ((2560, 124160), (2560, 10240), (128, 128)):
-        chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
-        assert exl3_ops.linear_workspace_size(chunk, padded_in, padded_out) <= budget
-        assert exl3_ops.linear_workspace_size(chunk + 1, padded_in, padded_out) > budget
-    # The TP2 LM head shard runs 66 rows per launch within 32 MiB.
-    assert exl3_ops.linear_row_chunk(2560, 124160) == 66
+def test_linear_row_chunk_keeps_scratch_fixed_across_budgets(monkeypatch):
+    exl3_ops.ensure_extension()
+    for prefill, layout in (
+        (False, None),
+        (True, (2, 1)),
+        (True, (1, 2)),
+        (True, (2, 1)),
+        (False, None),
+    ):
+        monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active", prefill)
+        monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active_layout", layout)
+        budget = exl3_ops.linear_scratch_elements()
+        if prefill and layout == (1, 2):
+            assert budget > exl3_ops.LINEAR_SCRATCH_ELEMENTS
+        else:
+            assert budget == exl3_ops.LINEAR_SCRATCH_ELEMENTS
+        for padded_in, padded_out in ((2560, 124160), (2560, 10240), (128, 128)):
+            chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
+            assert (
+                exl3_ops.linear_workspace_size(chunk, padded_in, padded_out) <= budget
+            )
+            assert (
+                exl3_ops.linear_workspace_size(chunk + 1, padded_in, padded_out)
+                > budget
+            )
 
 
-def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch):
+@pytest.mark.parametrize("prefill", [False, True])
+def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch, prefill):
     from vllm.utils import torch_utils
     from vllm.v1.worker import workspace
 
+    exl3_ops.ensure_extension()
+    monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active", prefill)
+    monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active_layout", (1, 2))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch_utils, "aux_stream", lambda: None)
     monkeypatch.setattr(workspace, "_manager", None)
     workspace.init_workspace_manager(torch.device("cpu"))
@@ -576,7 +599,7 @@ def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch):
         ]
         assert torch.equal(out[:, 0], x[:, 0])
         assert {c[1:] for c in calls} == {
-            (calls[0][1], exl3_ops.LINEAR_SCRATCH_ELEMENTS)
+            (calls[0][1], exl3_ops.linear_scratch_elements())
         }
         if rows == 1:
             first = calls[0][1]
@@ -595,8 +618,26 @@ def test_target_manifest_outlives_the_target_until_the_draft_loads(
 
     spec = SimpleNamespace(draft_model_config=object()) if draft_model else None
     assert manifest_still_needed(
-        SimpleNamespace(speculative_config=spec), is_draft
+        SimpleNamespace(
+            speculative_config=spec,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        ),
+        is_draft,
     ) is (needed)
+
+
+@pytest.mark.parametrize("is_last_rank", [False, True])
+def test_only_the_draft_owning_stage_retains_its_manifest(monkeypatch, is_last_rank):
+    from vllm.sm80.kernels.exl3 import loader
+
+    monkeypatch.setattr(
+        loader, "get_pp_group", lambda: SimpleNamespace(is_last_rank=is_last_rank)
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    assert loader.manifest_still_needed(config, is_draft=False) is is_last_rank
 
 
 def test_release_frees_the_loader_and_layer_configs(exl3_config):

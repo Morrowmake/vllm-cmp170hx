@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by AlexBrandes for CMP 170HX support; see repository history.
 import torch
 import torch.nn as nn
 
@@ -56,8 +57,12 @@ def maybe_share_target_embed(
         target_embed = target_embed.base_layer
     draft_embed = getattr(draft_inner, "embed_tokens", None)
 
-    if get_pp_group().world_size > 1 and not hasattr(
-        draft_model, "has_own_embed_tokens"
+    # A missing-layer placeholder explicitly requires the target embedding.
+    # Qwen EXL3 keeps that embedding resident on the final target PP stage.
+    if (
+        get_pp_group().world_size > 1
+        and not hasattr(draft_model, "has_own_embed_tokens")
+        and not isinstance(draft_embed, PPMissingLayer)
     ):
         return
 

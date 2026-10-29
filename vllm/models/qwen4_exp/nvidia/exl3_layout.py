@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by AlexBrandes for CMP 170HX support; see repository history.
 """Qwen4Exp EXL3 checkpoint layout (vllm/sm80/kernels/exl3/layout.py).
 
 The checkpoint keeps the HF module names under ``model.language_model.``, the
@@ -55,9 +56,7 @@ class Qwen4ExpExl3Layout(Exl3Layout):
             f"{_MIXER}.input_mix_weight_down.weight": (rank, hidden),
             f"{_MIXER}.input_mix_weight_up.weight": (hidden, rank),
         }
-        actual = {
-            k for k, h in manifest.tensors.items() if h.path.name == _MIXER_PATCH
-        }
+        actual = {k for k, h in manifest.tensors.items() if h.path.name == _MIXER_PATCH}
         if actual != expected.keys():
             raise ValueError("Unexpected EXL3 MTP mixer patch keys")
         for name, shape in expected.items():
@@ -123,11 +122,11 @@ class Qwen4ExpExl3Layout(Exl3Layout):
         return model_config.hf_config.model_type == "qwen4_exp_mtp"
 
     def assign_owners(self, model, config, ledger, model_config, is_draft):
+        # The base marks tensors whose module another pipeline stage builds.
+        super().assign_owners(model, config, ledger, model_config, is_draft)
         manifest = config.manifest
         shared: set[str] = set()
-        if is_draft and self.mtp_shares_target_embeddings(
-            model_config.hf_text_config
-        ):
+        if is_draft and self.mtp_shares_target_embeddings(model_config.hf_text_config):
             # The draft reuses the target's embedding and head: no draft owner.
             shared = {
                 name
@@ -167,7 +166,9 @@ class Qwen4ExpExl3Layout(Exl3Layout):
                     f"Incomplete or unexpected EXL3 PLE source join: {source}"
                 )
             for key in sorted(consumed):
-                ledger.mark(key, "file-backed" if key == table.name else "consumed", name)
+                ledger.mark(
+                    key, "file-backed" if key == table.name else "consumed", name
+                )
             file_backed.add(f"{name}.ngram_embedding.weight")
         return file_backed
 

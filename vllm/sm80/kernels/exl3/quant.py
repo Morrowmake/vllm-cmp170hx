@@ -6,12 +6,13 @@ import math
 import re
 from functools import cache, partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from torch import nn
 
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
@@ -34,8 +35,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.sm80 import capture
-from vllm.sm80 import tuning
+from vllm.sm80 import capture, tuning
 from vllm.sm80.kernels.exl3.hybrid import (
     EXL3,
     UNQUANTIZED,
@@ -53,6 +53,45 @@ from vllm.sm80.kernels.exl3.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+# Expert partitions the EXL3 MoE tensor-core operators (moe_out_v2,
+# VLLM_EXL3_MOE_V2; moe_out_prefill, VLLM_EXL3_MOE_PREFILL_TC) are validated
+# on for the Qwen3.8-Flash-Next hidden-2560 512-expert shape, each layout
+# with the local expert count it produces: at tensor parallel size 2 with
+# expert parallelism the experts are split over the two ranks (256 of 512
+# local), and at tensor parallel size 1 with pipeline parallel size 2 the
+# pipeline splits the layers and every stage holds all 512. Any other
+# layout/partition combination keeps moe_out. The shape-keyed DeepSeek
+# configurations (ops.MOE_V2_CONFIGS) are validated without a layout gate.
+_VALIDATED_MOE_PARTITIONS = {(2, 1): 256, (1, 2): 512}
+
+
+def _moe_partition_closed_reason(
+    vllm_config, hidden_size: int, local_experts: int, global_experts: int
+) -> str | None:
+    """Why the MoE tensor-core operators must not serve this engine's
+    expert partition, or None: the shape-keyed gates in ops accept any
+    engine that presents a validated matrix shape, so the layouts and
+    expert partitions validated for the 512-expert Qwen shape are checked
+    here (an arbitrary topology holding a validated-looking partition is
+    not a validated configuration)."""
+    if (hidden_size, global_experts) != (2560, 512):
+        return None
+    validated = _VALIDATED_MOE_PARTITIONS
+    if vllm_config is None:
+        return "no vLLM config is set to pair a layout with its partition"
+    parallel = vllm_config.parallel_config
+    layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
+    if layout not in validated:
+        first, second = tuple(validated)
+        return f"(tensor, pipeline) parallel size {layout}, not {first} or {second}"
+    if local_experts != validated[layout]:
+        return (
+            f"layout {layout} holds {local_experts} experts locally, not the "
+            f"{validated[layout]} it is validated with"
+        )
+    return None
 
 
 def _verify_launch_options(vllm_config) -> None:
@@ -130,7 +169,7 @@ class Exl3Config(QuantizationConfig):
                 self.weight_block_size = block
 
     @classmethod
-    def get_name(cls) -> Literal["exl3"]:
+    def get_name(cls) -> Any:
         return "exl3"
 
     @classmethod
@@ -181,7 +220,7 @@ class Exl3Config(QuantizationConfig):
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         if self.manifest is None:
             raise ValueError("EXL3 name mapping requires a checkpoint manifest")
-        mapped_prefixes = {}
+        mapped_prefixes: dict[str, str] = {}
         for source in self.manifest.matrices:
             mapped = hf_to_vllm_mapper.map_name(f"{source}.weight")
             if mapped is None:
@@ -496,9 +535,7 @@ class Exl3LinearMethod(LinearMethodBase):
         if params_dtype != torch.bfloat16:
             raise ValueError("EXL3 requires BF16 activations")
         if isinstance(layer, ParallelLMHead):
-            self._create_head_weights(
-                layer, input_size, sum(output_partition_sizes)
-            )
+            self._create_head_weights(layer, input_size, sum(output_partition_sizes))
             return
         rank, size = layer.tp_rank, layer.tp_size
         if isinstance(layer, ReplicatedLinear):
@@ -599,8 +636,8 @@ class Exl3LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
-        from vllm.sm80.kernels.exl3 import ops as exl3_ops
         from vllm.sm80.kernels.exl3 import capture_points
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         self.row_chunks = []
         for weight in layer.exl3_weights:
@@ -611,9 +648,7 @@ class Exl3LinearMethod(LinearMethodBase):
             self.row_chunks.append(
                 exl3_ops.linear_row_chunk(weight.padded_in, weight.padded_out)
             )
-            capture_points.register_linear(
-                weight, self.row_chunks[-1], self.out_dtype
-            )
+            capture_points.register_linear(weight, self.row_chunks[-1], self.out_dtype)
 
     def apply(self, layer, x, bias=None):
         shape = x.shape[:-1]
@@ -771,7 +806,9 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
         if sum(output_partition_sizes) != local * group_out:
             raise ValueError("EXL3 group widths do not match the layer partition")
         weights = []
-        for matrix in self.matrices[layer.tp_rank * local : (layer.tp_rank + 1) * local]:
+        for matrix in self.matrices[
+            layer.tp_rank * local : (layer.tp_rank + 1) * local
+        ]:
             matrix.validate_logical(input_size, group_out)
             weights.append(
                 Exl3PackedWeight(
@@ -896,9 +933,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise ValueError("EXL3 experts support SiLU with an optional clamp only")
         # SwiGLU clamp before SiLU(gate) * up: gate from above, up on both
         # sides (0: none). The native operators take it as swiglu_limit.
-        self.swiglu_limit = (
-            0.0 if moe.swiglu_limit is None else float(moe.swiglu_limit)
-        )
+        self.swiglu_limit = 0.0 if moe.swiglu_limit is None else float(moe.swiglu_limit)
         if not self.swiglu_limit >= 0.0:
             raise ValueError(f"Invalid EXL3 SwiGLU limit: {moe.swiglu_limit}")
         # Set by set_moe_prefill_v2 before the weights load: this layer's
@@ -947,6 +982,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
         self.hidden_size = hidden_size
+
         self.global_expert_ids = [-1] * num_experts
         self.nonlocal_keys = []
         # (local expert, matrix, (logical in, logical out, input slice, output
@@ -1093,8 +1129,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         prefill_v2_bits_x2 = prefill_v2_decode_len = 0
         if self.prefill_v2:
-            prefill_v2_bits_x2, prefill_v2_decode_len, workspace = (
-                self._moe_prefill_v2(layer, metadata, max_rows, workspace)
+            prefill_v2_bits_x2, prefill_v2_decode_len, workspace = self._moe_prefill_v2(
+                layer, metadata, max_rows, workspace
             )
         if moe_out_rows < max_rows:
             logger.info_once(
@@ -1126,6 +1162,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_v2_decode_len=prefill_v2_decode_len,
             swiglu_limit=self.swiglu_limit,
         )
+        assert prepare is not None
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
     def _moe_v2(
@@ -1138,6 +1175,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         device = layer.exl3_ptrs.device
+        config = get_current_vllm_config_or_none()
         reason = exl3_ops.moe_v2_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
             self.moe.in_dtype,
@@ -1149,6 +1187,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             metadata,
             draft=draft,
         )
+        if reason is None:
+            reason = _moe_partition_closed_reason(
+                config, self.hidden_size, self.local_experts, layer.global_num_experts
+            )
         if reason is not None:
             if draft:
                 logger.info_once(
@@ -1308,7 +1350,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
         vllm_config = get_current_vllm_config()
         if reason is None:
-            reason = _prefill_layout_closed_reason(vllm_config)
+            reason = _prefill_layout_closed_reason(vllm_config, self.local_experts)
         if reason is not None:
             logger.info_once(
                 "VLLM_EXL3_MOE_PREFILL_TC is set but the gate is closed: %s; "
@@ -1366,7 +1408,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         (bits_x2 0: the gate is closed)."""
         from vllm.config import get_current_vllm_config
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
-        from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
 
         device = layer.exl3_ptrs.device
         reason = exl3_ops.moe_prefill_v2_closed_reason(
@@ -1695,15 +1736,11 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         return operator
 
 
-def _prefill_layout_closed_reason(vllm_config) -> str | None:
-    """Why moe_out_prefill must not serve this engine, or None: it is
-    validated at tensor parallel size 2 without pipeline parallelism, and its
-    prefill-step rule (step_phase) cannot tell the decode steps of drafters
-    with parallel drafting slots (DFlash, DSpark) from prefill steps."""
-    parallel = vllm_config.parallel_config
-    layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
-    if layout != (2, 1):
-        return f"(tensor, pipeline) parallel size {layout}, not (2, 1)"
+def _prefill_layout_closed_reason(vllm_config, local_experts: int) -> str | None:
+    """Qwen's prefill partition gate and its sequential-drafter requirement."""
+    reason = _moe_partition_closed_reason(vllm_config, 2560, local_experts, 512)
+    if reason is not None:
+        return reason
     spec = vllm_config.speculative_config
     if spec is not None and (
         getattr(spec, "parallel_drafting", False)

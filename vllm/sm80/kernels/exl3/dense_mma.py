@@ -4,15 +4,14 @@
 
 The kernels are part of the shipped library (csrc/exl3/dense_mma.cu) and run
 inside linear_out_splitk, which hands them every launch they cover: launches
-of 1..32 rows of the dense matrices of one tensor-parallel rank of
-Qwen3.8-Flash-Next at TP2 (the library's served shapes, the LM head
-included). resolve() is called once per process by ops.ensure_extension,
-before any launch or graph capture: with the switch on and its gate open
-(the split-K operator active, sm_80 with 74 multiprocessors, tensor
-parallel size 2 and pipeline parallel size 1, the configuration the plans
-were measured and validated in) it checks the library, applies the
-diagnostic plan override, prepares every kernel instantiation on the
-current device (shared-memory attributes and occupancy), sets the
+of 1..32 rows of the dense matrices of Qwen3.8-Flash-Next at TP2/PP1 or
+TP1/PP2 (the library's served shapes, including both LM-head widths).
+resolve() is called once per process by ops.ensure_extension, before any
+launch or graph capture: with the switch on and its gate open (the split-K
+operator active, sm_80 with 74 multiprocessors, and a supported parallel
+layout) it checks the library, applies the diagnostic plan override,
+prepares every kernel instantiation on the current device (shared-memory
+attributes and occupancy), sets the
 library's process switch and logs the banner.
 """
 
@@ -25,8 +24,8 @@ logger = init_logger(__name__)
 
 # The multiprocessor count the plans were measured and validated at.
 VALIDATED_SMS = 74
-# The layout the matrices were validated in: (tensor, pipeline) parallel size.
-VALIDATED_PARALLEL = (2, 1)
+# (tensor, pipeline) parallel layouts covered by the matrix allowlist.
+VALIDATED_LAYOUTS = ((2, 1), (1, 2))
 
 # Library functions resolve() needs; a library without them is refused.
 _OPERATORS = (
@@ -60,8 +59,8 @@ def closed_reason(
         return "no vLLM config is set, so the parallel layout is unknown"
     parallel = vllm_config.parallel_config
     layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
-    if layout != VALIDATED_PARALLEL:
-        return f"(tensor, pipeline) parallel size {layout}, not {VALIDATED_PARALLEL}"
+    if layout not in VALIDATED_LAYOUTS:
+        return f"(tensor, pipeline) parallel size {layout}, not in {VALIDATED_LAYOUTS}"
     return None
 
 
@@ -113,7 +112,7 @@ def resolve() -> None:
     if torch.cuda.is_available():
         capability = tuple(torch.cuda.get_device_capability())
         sms = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
+            torch.accelerator.current_device_index()
         ).multi_processor_count
     reason = closed_reason(
         ops._resolve_dense_splitk(),
@@ -137,8 +136,9 @@ def resolve() -> None:
     active = True
     logger.info_once(
         "EXL3 dense MMA active (VLLM_EXL3_DENSE_MMA): dense launches of 1..32 "
-        "rows of the validated TP2 matrices (bits_x2 10/12/14, codebook 2; the "
-        "LM head included) run on tensor-core blocks inside linear_out_splitk; "
+        "rows of the validated TP2/PP1 or TP1/PP2 matrices (bits_x2 10/12/14, "
+        "codebook 2; the LM head included) run on tensor-core blocks inside "
+        "linear_out_splitk; "
         "other launches keep the split-K operator's path.",
         scope="process",
     )

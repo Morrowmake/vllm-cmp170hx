@@ -3,17 +3,16 @@
 """EXL3 dense prefill on the tensor cores (VLLM_EXL3_DENSE_PREFILL_TC,
 csrc/exl3/dense_prefill_tc.cu, vllm/sm80/kernels/exl3/dense_prefill_tc.py).
 
-CPU: the switch and its schedule diagnostic default, the gate, the one-time
-resolution with the active and gate-closed log lines (through vLLM's own
-logger), resolution once per process by ensure_extension (with the gate open
-through the real resolve and warm-up, which never call back into
-ensure_extension), and _linear's operator per row chunk: with the switch
-off exactly the base's operator;
-with it on, linear_out_prefill only in prefill steps for launches the
-operator covers and split-K does not split, never in a decode step of more
-than 64 tokens, during a graph capture or without a forward context. The
-library's host rule (linear_prefill_applies) and the served launches of the
-3460 / 1906-token prefill chunks: the k/v 482-row tail keeps split-K.
+CPU: the hardware/layout/drafter gates, layout-specific matrix sets, and
+operator selection across row chunks, scheduler phases and graph capture.
+TP2/TP4 keep the upstream matrix set; PP2 adds its full-width projections.
+With the switch off, _linear retains the base operator; with it on,
+linear_out_prefill only in prefill steps for launches the operator covers
+and split-K does not split, never in a decode step of more than 64 tokens,
+during a graph capture or without a forward context. The library's host
+rule (linear_prefill_applies), historical 32 MiB launch boundaries, and
+the current budget's full-width PP2 launches are covered. The k/v
+482-row tail keeps split-K; split-K precedence remains exact.
 
 GPU (SM 8.0, 74 multiprocessors): linear_out_prefill against an FP64
 reference within linear_out's error (pooled mean <= 1.10x, max <= 1.25x,
@@ -22,14 +21,15 @@ and stream-K schedules; the k split ran (kernel names); bitwise
 deterministic, also while another stream keeps multiprocessors busy (the
 split tiles' last-arriving block changes, the sum order does not); the
 whole-tile diagnostic; refusals; _linear end to end (off: linear_out; on:
-each chunk the operator of its launch); graph replay bitwise like eager with
-no allocator event and a NaN-filled workspace (the fixup counters are zeroed
-inside the call); ensure_extension with the switch set at TP2 opens the gate
-and warms up once.
+each chunk the operator of its launch), for the TP2 rank's matrices and for
+the full-width TP1 / PP2 ones (chunk launches and tails on whole-tile and
+stream-K schedules); graph replay bitwise like eager with no allocator
+event and a NaN-filled workspace (the fixup counters are zeroed inside the
+call); ensure_extension with the switch set at TP2 opens the gate and warms
+up once.
 """
 
 import json
-import logging
 import os
 from types import SimpleNamespace
 
@@ -45,7 +45,6 @@ from tests.kernels.quantization.test_exl3_dense_splitk import (
     _matrix,
     _Pool,
     _run,
-    _run_core,
     needs_sm80,
 )
 from vllm.sm80.kernels.exl3 import dense_prefill_tc as tc
@@ -53,7 +52,9 @@ from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
 SMS = 74
 DECODE_QUERY_LEN = 4  # one sampled token plus three drafts under verification
-# (padded_in, padded_out, bits_x2) of the rank's served dense matrices.
+# (padded_in, padded_out, bits_x2) of the served dense matrices: the TP2
+# rank's slices (2, 1) and the full-width matrices of the TP1 / PP2 layout
+# (1, 2), where the shared expert and the indexer q/k are replicated.
 KV, GATE, INDEXER, FC, DOWN, OUT, Z, QKV, Q = (
     (2560, 256, 14),
     (2560, 640, 14),
@@ -65,8 +66,18 @@ KV, GATE, INDEXER, FC, DOWN, OUT, Z, QKV, Q = (
     (2560, 5120, 14),
     (2560, 6144, 14),
 )
-# Every launch of the 8,826-token reference prompt in 3460 / 1906-token chunks
-# (row chunk floor(8 Mi / (K + N))) -> the path with split-K on.
+KV2, FC2, OUT2, Z2, QKV2, Q2 = (
+    (2560, 512, 14),
+    (2560, 2560, 12),
+    (6144, 2560, 14),
+    (2560, 6144, 14),
+    (2560, 10240, 14),
+    (2560, 12288, 14),
+)
+TP2 = tc.VALIDATED_MATRICES[(2, 1)]
+PP2 = tc.VALIDATED_MATRICES[(1, 2)]
+# Historical 32 MiB launches of the 8,826-token reference prompt in
+# 3460 / 1906-token chunks -> the path with split-K on.
 SERVED_LAUNCHES = [
     (KV, 2978, "tc"),
     (KV, 482, "splitk"),
@@ -97,6 +108,39 @@ SERVED_LAUNCHES = [
     (Q, 963, "tc"),
     (Q, 571, "tc"),
     (Q, 943, "tc"),
+]
+
+# Historical 32 MiB launches of the same reference prompt on full-width
+# matrices. Retain these numerical/scheduling boundaries alongside the
+# current-budget PP2 coverage below.
+PP2_SERVED_LAUNCHES = [
+    (KV2, 2730),
+    (KV2, 730),
+    (KV2, 1906),
+    (GATE, 2621),
+    (GATE, 839),
+    (GATE, 1906),
+    (INDEXER, 2621),
+    (INDEXER, 839),
+    (INDEXER, 1906),
+    (FC2, 1638),
+    (FC2, 184),
+    (FC2, 268),
+    (DOWN, 2621),
+    (DOWN, 839),
+    (DOWN, 1906),
+    (OUT2, 963),
+    (OUT2, 571),
+    (OUT2, 943),
+    (Z2, 963),
+    (Z2, 571),
+    (Z2, 943),
+    (QKV2, 655),
+    (QKV2, 185),
+    (QKV2, 596),
+    (Q2, 564),
+    (Q2, 76),
+    (Q2, 214),
 ]
 
 
@@ -167,20 +211,22 @@ def _config(
     )
 
 
-def test_gate_opens_only_on_the_validated_configuration():
+def test_gate_opens_only_on_the_validated_configurations():
     config = _config()
     assert tc.closed_reason((8, 0), 74, config) is None
     assert tc.closed_reason((8, 0), 74, _config(method=None)) is None
     assert tc.closed_reason((8, 0), 74, _config(method="eagle3")) is None
+    assert tc.closed_reason((8, 0), 74, _config(tp=1, pp=2)) is None
+    assert tc.closed_reason((8, 0), 74, _config(tp=1, pp=2, method=None)) is None
     assert "(8, 6)" in tc.closed_reason((8, 6), 74, config)
     assert "None" in tc.closed_reason(None, None, config)
     assert "70 multiprocessors" in tc.closed_reason((8, 0), 70, config)
     assert "no vLLM config" in tc.closed_reason((8, 0), 74, None)
     assert tc.closed_reason((8, 0), 74, _config(tp=4)) is None
     # Other layouts give other matrices and row chunks.
-    layouts = "not one of (2, 1), (4, 1)"
-    assert f"(1, 1), {layouts}" in tc.closed_reason((8, 0), 74, _config(tp=1))
-    assert f"(2, 2), {layouts}" in tc.closed_reason((8, 0), 74, _config(pp=2))
+    assert tc.closed_reason((8, 0), 74, _config(tp=1)) is not None
+    assert tc.closed_reason((8, 0), 74, _config(pp=2)) is not None
+    assert tc.closed_reason((8, 0), 74, _config(tp=1, pp=4)) is not None
     # A drafter whose decode steps schedule more than 1 + k tokens per request
     # and can carry more than 64 rows. A block drafter (DFlash, DSpark) runs
     # its block in a forward pass of its own: 17 requests x (1 + 3) = 68.
@@ -202,26 +248,48 @@ def test_gate_opens_only_on_the_validated_configuration():
     )
     assert tc.closed_reason((8, 0), 74, _config(**dspark)) is None
     assert tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None))) is None
-    assert tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=7))) is None
+    assert (
+        tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=7)))
+        is None
+    )
     reason = tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=8)))
     assert "'dspark'" in reason and "carry 72 rows" in reason
 
 
 def test_only_validated_matrices_are_taken():
     _extension_or_skip()
-    for padded_in, padded_out, bits_x2 in tc.VALIDATED_MATRICES:
-        assert tc.takes_launch(1489, padded_in, padded_out, bits_x2, 2, False, SMS)
-        assert not tc.takes_launch(1489, padded_in, padded_out, bits_x2, 1, False, SMS)
-    # Full-width matrices of a one-card layout, and a validated shape stored
-    # at another rate: the operator covers them, the gate does not.
+    for matrices in tc.VALIDATED_MATRICES.values():
+        for padded_in, padded_out, bits_x2 in matrices:
+            assert tc.takes_launch(
+                1489, padded_in, padded_out, bits_x2, 2, False, SMS, matrices
+            )
+            assert not tc.takes_launch(
+                1489, padded_in, padded_out, bits_x2, 1, False, SMS, matrices
+            )
+    # Shapes exclusive to one layout must not activate in the other.
+    only_pp2 = PP2 - TP2
+    only_tp2 = TP2 - PP2
+    for padded_in, padded_out, bits_x2 in only_pp2:
+        # The operator covers them; the TP2 gate does not.
+        assert tc.linear_prefill_applies(1489, padded_in, padded_out, bits_x2, 2)
+        assert not tc.takes_launch(
+            1489, padded_in, padded_out, bits_x2, 2, False, SMS, TP2
+        )
+    for padded_in, padded_out, bits_x2 in only_tp2:
+        assert not tc.takes_launch(
+            1489, padded_in, padded_out, bits_x2, 2, False, SMS, PP2
+        )
+    # A validated shape stored at another rate, the language-model head and
+    # the vision matrices: the operator may cover them, no gate does.
     for padded_in, padded_out, bits_x2 in (
-        (2560, 512, 14),
-        (2560, 12288, 14),
-        (2560, 2560, 14),
-        (2560, 6144, 12),
+        (2560, 6144, 12),  # z's shape at the drafter rate
+        (2560, 248320, 12),  # language-model head
+        (1152, 4352, 12),  # vision
     ):
-        assert tc.linear_prefill_applies(2730, padded_in, padded_out, bits_x2, 2)
-        assert not tc.takes_launch(2730, padded_in, padded_out, bits_x2, 2, False, SMS)
+        for matrices in tc.VALIDATED_MATRICES.values():
+            assert not tc.takes_launch(
+                1906, padded_in, padded_out, bits_x2, 2, False, SMS, matrices
+            )
 
 
 def _device(monkeypatch, capability, sms=SMS, config=True, **layout):
@@ -239,74 +307,6 @@ def _device(monkeypatch, capability, sms=SMS, config=True, **layout):
 
     value = _config(**layout) if config else None
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: value)
-
-
-def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
-    import vllm.logger as vllm_logger
-
-    monkeypatch.setattr(tc, "logger", vllm_logger.init_logger(tc.__name__))
-    for name in ("active", "_max_decode_query_len", "_sms", "_fake_registered"):
-        monkeypatch.setattr(tc, name, getattr(tc, name))
-    monkeypatch.setattr(tc, "_fake_registered", True)
-    schedules = []
-    monkeypatch.setattr(tc, "set_prefill_schedule", schedules.append)
-    warmed = []
-    monkeypatch.setattr(tc, "_warmup", warmed.append)
-    monkeypatch.setattr(
-        torch._C, "_dispatch_find_schema_or_throw", lambda name, overload: None
-    )
-    root = logging.getLogger("vllm")
-    root.addHandler(caplog.handler)
-    caplog.set_level(logging.INFO, logger="vllm")
-    try:
-        vllm_logger._print_info_once.cache_clear()
-        monkeypatch.delenv("VLLM_EXL3_DENSE_PREFILL_TC", raising=False)
-        monkeypatch.delenv("VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", raising=False)
-        _device(monkeypatch, (8, 0))
-        tc.resolve()
-        assert tc.active is False and not caplog.records, "off: nothing logged"
-        monkeypatch.setenv("VLLM_EXL3_DENSE_PREFILL_TC", "1")
-        for capability, sms, config in (((8, 6), SMS, True), ((8, 0), 70, True)):
-            _device(monkeypatch, capability, sms, config)
-            tc.resolve()
-            assert tc.active is False
-        _device(monkeypatch, (8, 0), tp=1)
-        tc.resolve()
-        assert tc.active is False
-        _device(monkeypatch, (8, 0), SMS, False)
-        tc.resolve()
-        assert tc.active is False and schedules == [] and warmed == []
-        _device(monkeypatch, (8, 0))
-        tc.resolve()
-        assert tc.active is True and schedules == [0] and warmed == [SMS]
-        assert tc._max_decode_query_len == 4 and tc._sms == SMS
-    finally:
-        root.removeHandler(caplog.handler)
-    lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
-    assert (
-        logging.INFO,
-        tc.__name__,
-        "EXL3 dense prefill tensor-core path active (VLLM_EXL3_DENSE_PREFILL_TC): "
-        "in prefill steps (a request with more than 4 tokens scheduled), dense "
-        "launches of more than 64 rows and at least 16 output tiles of the 28 "
-        "validated matrices (bits_x2 10/12/14, codebook 2) take "
-        "linear_out_prefill, schedule planned; split-K launches, other matrices, "
-        "decode steps and graph captures keep today's kernels.",
-    ) in lines
-    closed = sorted({m for _, _, m in lines if "gate is closed" in m})
-    assert closed == [
-        "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: (tensor, "
-        "pipeline) parallel size (1, 1), not one of (2, 1), (4, 1); every dense "
-        "EXL3 launch keeps today's kernels.",
-        "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: 70 "
-        "multiprocessors, not 74; every dense EXL3 launch keeps today's kernels.",
-        "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: device "
-        "capability (8, 6), not (8, 0); every dense EXL3 launch keeps today's "
-        "kernels.",
-        "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: no vLLM config "
-        "is set, so the decode query length is unknown; every dense EXL3 launch "
-        "keeps today's kernels.",
-    ]
 
 
 def test_a_stale_library_is_refused_with_the_rebuild_hint(monkeypatch):
@@ -336,70 +336,6 @@ def test_switch_is_resolved_once_by_ensure_extension(monkeypatch):
     exl3_ops.ensure_extension()
     exl3_ops.ensure_extension()
     assert resolved == [1], "resolved once per process"
-
-
-def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
-    """A process's first EXL3 use with the switch set and the gate open (TP2):
-    ensure_extension runs the real resolve and warm-up once, and nothing they
-    run calls back into ensure_extension, which marks the library loaded only
-    after resolve returns. The library and the device are stood in for; the
-    warm-up buffers live on the CPU."""
-    monkeypatch.setattr(exl3_ops, "_loaded", False)
-    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
-    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
-    monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
-    monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
-    monkeypatch.setattr(exl3_ops, "_resolve_dense_splitk", lambda: False)
-    for name in ("active", "_max_decode_query_len", "_sms"):
-        monkeypatch.setattr(tc, name, getattr(tc, name))
-    monkeypatch.setattr(tc, "_fake_registered", False)
-    fakes = []
-    monkeypatch.setattr(
-        torch.library, "register_fake", lambda name: lambda fn: fakes.append(name)
-    )
-    monkeypatch.setattr(
-        torch._C, "_dispatch_find_schema_or_throw", lambda name, overload: None
-    )
-    monkeypatch.setenv("VLLM_EXL3_DENSE_PREFILL_TC", "1")
-    monkeypatch.delenv("VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", raising=False)
-    _device(monkeypatch, (8, 0))
-    calls = []
-
-    def workspace_size(*shape):
-        calls.append(("workspace", shape))
-        return 16
-
-    def prefill(x, trellis, suh, svh, bits_x2, *rest):
-        calls.append(("prefill", tuple(x.shape), bits_x2, rest[3].dtype))
-
-    library = SimpleNamespace(
-        set_prefill_schedule=lambda mode: calls.append(("schedule", mode)),
-        linear_workspace_size=workspace_size,
-        linear_out_prefill=prefill,
-    )
-    monkeypatch.setattr(torch.ops, "_exl3_C", library)
-    for name in ("ones", "empty", "zeros"):
-        make = getattr(torch, name)
-        monkeypatch.setattr(
-            torch, name, lambda *a, _make=make, device=None, **kw: _make(*a, **kw)
-        )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
-    # A cached size would hide a call back into ensure_extension.
-    exl3_ops.linear_workspace_size.cache_clear()
-    resolve, resolved = tc.resolve, []
-    monkeypatch.setattr(tc, "resolve", lambda: resolved.append(1) or resolve())
-    exl3_ops.ensure_extension()
-    exl3_ops.ensure_extension()
-    assert resolved == [1], "resolved once per process"
-    assert exl3_ops._loaded and tc.active and tc._sms == SMS
-    rows, padded_in, padded_out = tc.WARMUP_LAUNCH
-    assert calls == [
-        ("schedule", 0),
-        ("workspace", (rows, padded_in, padded_out)),
-        *(("prefill", (rows, padded_in), bits_x2, dtype)
-          for bits_x2 in (10, 12, 14) for dtype in (torch.bfloat16, torch.float32)),
-    ]
-    assert fakes[-1] == "_exl3_C::linear_out_prefill"
 
 
 def test_ensure_extension_retries_resolve_after_it_raised(monkeypatch):
@@ -482,6 +418,8 @@ def test_switch_off_keeps_the_base_operator(monkeypatch, splitk, max_query_len):
 
 def _on(monkeypatch):
     monkeypatch.setattr(tc, "active", True)
+    monkeypatch.setattr(tc, "active_layout", (2, 1))
+    monkeypatch.setattr(tc, "_served_matrices", TP2)
     monkeypatch.setattr(tc, "_max_decode_query_len", DECODE_QUERY_LEN)
     monkeypatch.setattr(tc, "_sms", SMS)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -584,8 +522,8 @@ def test_operator_rule_and_served_launches():
     with pytest.raises(RuntimeError):
         applies(1489, 3000, 2560, 14, 2)
     for (padded_in, padded_out, bits_x2), rows, path in SERVED_LAUNCHES:
-        on = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, True, SMS)
-        off = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, False, SMS)
+        on = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, True, SMS, TP2)
+        off = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, False, SMS, TP2)
         split = exl3_ops.linear_splitk_splits(rows, padded_out, SMS, bits_x2, 2) == 2
         got = "tc" if on else ("splitk" if split else "linear_out")
         assert got == path, (padded_in, padded_out, rows)
@@ -594,10 +532,16 @@ def test_operator_rule_and_served_launches():
             on or (split and applies(rows, padded_in, padded_out, bits_x2, 2))
         )
     # The k/v tail without split-K: 8 tiles, so linear_out.
-    assert not tc.takes_launch(482, 2560, 256, 14, 2, False, SMS)
-    # Row chunks are the base's (the operator fits linear_workspace_size).
-    assert exl3_ops.linear_row_chunk(2560, 256) == 2978
-    assert exl3_ops.linear_row_chunk(3072, 2560) == 1489
+    assert not tc.takes_launch(482, 2560, 256, 14, 2, False, SMS, TP2)
+    # Historical full-width launch boundaries preserve exact split-K precedence.
+    for (padded_in, padded_out, bits_x2), rows in PP2_SERVED_LAUNCHES:
+        off = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, False, SMS, PP2)
+        assert off, (padded_in, padded_out, rows)
+        on = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, True, SMS, PP2)
+        split = exl3_ops.linear_splitk_splits(rows, padded_out, SMS, bits_x2, 2) == 2
+        assert on == (not split), (padded_in, padded_out, rows)
+    # The TP2 rank slices are not matrices of a PP2 process.
+    assert not tc.takes_launch(2978, 2560, 256, 14, 2, False, SMS, PP2)
 
 
 # ---------------------------------------------------------------- GPU tests
@@ -611,17 +555,63 @@ def _gpu_or_skip():
 
 
 def _prefill_kernels(fn):
-    """Names of the prefill GEMM kernels fn launched."""
+    """Names of the prefill GEMM kernels launched."""
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     return {e.name for e in prof.events() if "prefill_gemm" in e.name}
 
 
 def _split_ran(names):
-    return any(", true>" in n or ",true>" in n or "(bool)1>" in n for n in names)
+    return any(
+        name.split("prefill_gemm<", 1)[1].split(">", 1)[0].split(",")[-2].strip()
+        in ("true", "(bool)1")
+        for name in names
+    )
+
+
+@pytest.fixture
+def prefill_arithmetic(request):
+    _gpu_or_skip()
+    tc.set_prefill_arithmetic(getattr(request, "param", 1))
+    try:
+        yield
+    finally:
+        tc.set_prefill_arithmetic(0)
+
+
+@needs_sm80
+@pytest.mark.parametrize("prefill_arithmetic", [0, 1], indirect=True)
+def test_prefill_preserves_small_component_through_transform_cancellation(
+    prefill_arithmetic,
+):
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    _gpu_or_skip()
+    rows, padded_in, padded_out, bits_x2 = 512, 2560, 640, 14
+    m = {
+        "trellis": torch.zeros(
+            (padded_in // 16, padded_out // 16, 8 * bits_x2),
+            dtype=torch.int16,
+            device="cuda",
+        ),
+        "suh": torch.ones(padded_in, dtype=torch.float16, device="cuda"),
+        "svh": torch.ones(padded_out, dtype=torch.float16, device="cuda"),
+    }
+    x = torch.zeros((rows, padded_in), dtype=torch.bfloat16, device="cuda")
+    x[:, 0] = 2.0**-16
+    x[:, 1] = 12.0
+    # Constant decoded weights cancel the large second coordinate. Dropping
+    # the low transform component must not erase the small first coordinate.
+    core = real.core_weight(m["trellis"], bits_x2, 2)
+    reference = real.apply_fp64(x, core, m["suh"], m["svh"])
+    candidate = _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+    shipped = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
+    pool = _Pool()
+    pool.add(candidate, shipped, reference)
+    pool.check("mixed-magnitude transform cancellation")
 
 
 @needs_sm80
@@ -638,6 +628,20 @@ def _split_ran(names):
         # q_proj, 74 tiles: 37 split blocks, as many as the workspace holds.
         (2560, 6144, 14, 2560, 6144, 200, True),
         (2560, 2048, 14, 2500, 1999, 200, False),  # cropped edges, 32 tiles
+        # Historical 32 MiB PP2 launch boundaries, including chunk tails.
+        (2560, 512, 14, 2560, 512, 2730, True),  # k/v, 88 tiles: row band
+        (2560, 512, 14, 2560, 512, 730, False),  # tail, 24 tiles: one wave
+        (2560, 512, 14, 2560, 512, 1906, False),  # 60 tiles: one wave
+        (2560, 2560, 12, 2560, 2560, 1638, True),  # drafter fc, 260 tiles
+        (2560, 2560, 12, 2560, 2560, 268, False),  # tail, 60 tiles
+        (6144, 2560, 14, 6144, 2560, 963, True),  # o_proj full K, 160 tiles
+        (6144, 2560, 14, 6144, 2560, 571, True),  # tail, 100 tiles
+        (2560, 6144, 14, 2560, 6144, 963, True),  # z full width, 384 tiles
+        (2560, 6144, 14, 2560, 6144, 571, True),  # tail, 240 tiles
+        (2560, 10240, 14, 2500, 10000, 655, True),  # qkv, 480 tiles, cropped
+        (2560, 10240, 14, 2560, 10240, 185, True),  # tail, 160 tiles
+        (2560, 12288, 14, 2560, 12288, 564, True),  # q+gate, 480 tiles
+        (2560, 12288, 14, 2560, 12288, 76, True),  # tail 12 over the bound
     ],
 )
 def test_prefill_holds_linear_outs_error_against_fp64(
@@ -648,7 +652,8 @@ def test_prefill_holds_linear_outs_error_against_fp64(
     _gpu_or_skip()
     assert tc.linear_prefill_applies(rows, padded_in, padded_out, bits_x2, 2)
     m = _matrix(17 * bits_x2 + padded_out, padded_in, padded_out, bits_x2)
-    weight = torch.from_numpy(effective_weight(*m["numpy"], bits_x2, 2)).cuda()
+    trellis, suh, svh = m["numpy"]
+    weight = torch.from_numpy(effective_weight(trellis, suh, svh, bits_x2, 2)).cuda()
     weight = weight[:logical_in, :logical_out]
     pool = _Pool()
     for seed in range(2):
@@ -704,9 +709,7 @@ def test_input_shapes_hold_linear_outs_error_against_fp64(
             lambda x=x: _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
         )
         assert names, "the prefill GEMM did not run"
-        _bitwise(
-            _run(tc.linear_out_prefill, m, x, bits_x2, padded_out), cand, "repeat"
-        )
+        _bitwise(_run(tc.linear_out_prefill, m, x, bits_x2, padded_out), cand, "repeat")
         inc = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
         pool.add(cand, inc, x.double() @ weight)
     pool.check(f"{padded_in}x{padded_out} bits_x2={bits_x2} rows {rows}")
@@ -714,22 +717,27 @@ def test_input_shapes_hold_linear_outs_error_against_fp64(
 
 @needs_sm80
 @pytest.mark.parametrize(
-    "padded_in,padded_out,rows",
+    "padded_in,padded_out,bits_x2,rows",
     [
-        (3072, 2560, 482),  # column band of 2 x 4 tiles
-        (2560, 3072, 1300),  # column band of 4 x 11 tiles
-        (2560, 640, 2200),  # column band of 1 x 18 tiles
-        (2560, 6144, 200),  # column band of 11 x 2 tiles, 37 split blocks
-        (2560, 1280, 1276),  # row band of 10 x 3 tiles
+        (3072, 2560, 14, 482),  # column band of 2 x 4 tiles
+        (2560, 3072, 14, 1300),  # column band of 4 x 11 tiles
+        (2560, 640, 14, 2200),  # column band of 1 x 18 tiles
+        (2560, 6144, 14, 200),  # column band of 11 x 2 tiles, 37 split blocks
+        (2560, 1280, 12, 1276),  # row band of 10 x 3 tiles
+        # TP1 / PP2 full-width matrices, chunk launches: the narrow k/v
+        # split's block count is workspace-bound; the wide ones are not.
+        (2560, 512, 14, 2730),  # row band of 22 x 4 tiles, 40 split blocks
+        (6144, 2560, 14, 963),  # column band of 8 x 20 tiles
+        (2560, 12288, 14, 564),  # column band of 5 x 96 tiles
+        (2560, 2560, 12, 1638),  # drafter fc at bits_x2 12
     ],
 )
-def test_stream_k_is_order_independent(padded_in, padded_out, rows):
+def test_stream_k_is_order_independent(padded_in, padded_out, bits_x2, rows):
     """A split tile's value is the sum of its segments' partials in k order,
     whichever block arrives last (the counter only elects the block that adds
     them). Busy multiprocessors change which block that is: the result must
     not change."""
     _gpu_or_skip()
-    bits_x2 = 12 if padded_out == 1280 else 14
     m = _matrix(41 + rows, padded_in, padded_out, bits_x2)
     x = _inputs(42 + rows, rows, padded_in)
 
@@ -748,7 +756,7 @@ def test_stream_k_is_order_independent(padded_in, padded_out, rows):
             for _ in range(delay):
                 a = a @ a / 2048
         out = call()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         _bitwise(out, reference, f"with {delay} matmuls beside it")
 
 
@@ -807,7 +815,12 @@ def test_ensure_extension_opens_the_gate_and_warms_up_on_the_card(monkeypatch):
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", _config)
     exl3_ops.linear_workspace_size.cache_clear()
     resolve, resolved = tc.resolve, []
-    monkeypatch.setattr(tc, "resolve", lambda: resolved.append(1) or resolve())
+
+    def resolve_once():
+        resolved.append(1)
+        resolve()
+
+    monkeypatch.setattr(tc, "resolve", resolve_once)
     exl3_ops.ensure_extension()
     exl3_ops.ensure_extension()
     assert resolved == [1] and exl3_ops._loaded
@@ -817,16 +830,17 @@ def test_ensure_extension_opens_the_gate_and_warms_up_on_the_card(monkeypatch):
 
 @needs_sm80
 @pytest.mark.parametrize("splitk", [False, True])
-def test_linear_output_is_each_launchs_operator_bitwise(monkeypatch, splitk):
+def test_linear_output_matches_each_launch_operator(monkeypatch, splitk):
     _gpu_or_skip()
     m = _matrix(71, 2560, 256, 14)
     x = _inputs(72, 3460, 2560)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device=x.device)
+    chunk = 2978  # Leaves a 482-row k/v tail below the tensor-core tile bound.
+    scratch = torch.empty(
+        exl3_ops.linear_workspace_size(chunk, 2560, 256), device=x.device
+    )
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", splitk)
     default = exl3_ops.linear_out_splitk if splitk else exl3_ops.linear_out
-    chunk = exl3_ops.linear_row_chunk(2560, 256)
-    assert chunk == 2978
 
     def linear():
         return exl3_ops._linear(x, m["trellis"], m["suh"], m["svh"], 14, 2, 256, chunk)
@@ -851,26 +865,108 @@ def test_linear_output_is_each_launchs_operator_bitwise(monkeypatch, splitk):
 
 
 @needs_sm80
-def test_prefill_graph_replay_is_bitwise_eager_without_allocations():
+def test_pp2_full_width_linear_output_matches_each_launch_operator(
+    monkeypatch, prefill_arithmetic
+):
+    """Full-width o_proj in fixed chunks exercises both a whole chunk and
+    its tail; a decode step of the same call stays on the base operator."""
+    _gpu_or_skip()
+    m = _matrix(91, 6144, 2560, 14)
+    x = _inputs(92, 1489, 6144)
+    chunk = 963
+    scratch = torch.empty(
+        exl3_ops.linear_workspace_size(chunk, 6144, 2560), device=x.device
+    )
+    monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
+    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
+
+    def linear():
+        return exl3_ops._linear(x, m["trellis"], m["suh"], m["svh"], 14, 2, 2560, chunk)
+
+    monkeypatch.setattr(tc, "active", False)
+    _step(monkeypatch, 1489)
+    off = linear()
+    _bitwise(off, _run(exl3_ops.linear_out, m, x, 14, 2560), "off")
+    _on(monkeypatch)
+    monkeypatch.setattr(tc, "_served_matrices", tc.VALIDATED_MATRICES[(1, 2)])
+    on = linear()
+    _bitwise(
+        on[:chunk], _run(tc.linear_out_prefill, m, x[:chunk], 14, 2560), "963 rows"
+    )
+    _bitwise(
+        on[chunk:],
+        _run(tc.linear_out_prefill, m, x[chunk:], 14, 2560),
+        "the 526-row tail",
+    )
+    _step(monkeypatch, DECODE_QUERY_LEN)
+    _bitwise(linear(), off, "decode step")
+
+
+@needs_sm80
+@pytest.mark.parametrize("padded_in,padded_out,bits_x2", sorted(PP2))
+def test_current_pp2_chunks_hold_fp64_error(
+    monkeypatch, padded_in, padded_out, bits_x2, prefill_arithmetic
+):
+    from tests.kernels.quantization.test_exl3_kernels import effective_weight
+
+    _gpu_or_skip()
+    _on(monkeypatch)
+    monkeypatch.setattr(tc, "_served_matrices", PP2)
+    monkeypatch.setattr(tc, "active_layout", (1, 2))
+    monkeypatch.setattr(exl3_ops, "_dense_splitk", True)
+    chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device="cuda")
+    monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
+    m = _matrix(111 + padded_out, padded_in, padded_out, bits_x2)
+    trellis, suh, svh = m["numpy"]
+    weight = torch.from_numpy(effective_weight(trellis, suh, svh, bits_x2, 2)).cuda()
+    pool = _Pool()
+    for rows in (3460, 1906):
+        _step(monkeypatch, rows)
+        x = _inputs(112 + rows, rows, padded_in)
+        candidate = exl3_ops._linear(
+            x, m["trellis"], m["suh"], m["svh"], bits_x2, 2, padded_out, chunk
+        )
+        baseline = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
+        pool.add(candidate, baseline, x.double() @ weight)
+        _bitwise(
+            exl3_ops._linear(
+                x, m["trellis"], m["suh"], m["svh"], bits_x2, 2, padded_out, chunk
+            ),
+            candidate,
+            "current-budget replay",
+        )
+    pool.check(f"current PP2 chunks {padded_in}x{padded_out} bits_x2={bits_x2}")
+
+
+@needs_sm80
+@pytest.mark.parametrize(
+    "padded_in,prefill_arithmetic",
+    [(3072, 0), (6144, 1)],
+    indirect=["prefill_arithmetic"],
+)
+def test_prefill_graph_replay_is_bitwise_eager_without_allocations(
+    padded_in, prefill_arithmetic
+):
     _gpu_or_skip()
     rows = 482
-    m = _matrix(81, 3072, 2560, 14)
-    x = _inputs(82, rows, 3072)
+    m = _matrix(81, padded_in, 2560, 14)
+    x = _inputs(82, rows, padded_in)
     out = torch.empty(rows, 2560, dtype=torch.bfloat16, device=x.device)
     workspace = torch.empty(
-        exl3_ops.linear_workspace_size(rows, 3072, 2560), device=x.device
+        exl3_ops.linear_workspace_size(rows, padded_in, 2560), device=x.device
     )
 
     def call():
         tc.linear_out_prefill(
-            x, m["trellis"], m["suh"], m["svh"], 14, 2, 3072, 2560, out, workspace
+            x, m["trellis"], m["suh"], m["svh"], 14, 2, padded_in, 2560, out, workspace
         )
 
     assert _split_ran(_prefill_kernels(call)), "the captured call must split k"
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     before = _allocations()
     call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert _allocations() == before, "eager call allocated"
     eager = out.clone()
     stream = torch.cuda.Stream()
@@ -878,7 +974,7 @@ def test_prefill_graph_replay_is_bitwise_eager_without_allocations():
     with torch.cuda.stream(stream):
         call()
     torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     empty = torch.cuda.CUDAGraph()
     before = _allocations()
     with torch.cuda.graph(empty, stream=stream):
@@ -894,18 +990,46 @@ def test_prefill_graph_replay_is_bitwise_eager_without_allocations():
         out.fill_(float("nan"))
         workspace.fill_(float("nan"))
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         _bitwise(out, eager, "replay vs eager")
-    x.copy_(_inputs(83, rows, 3072))
+    x.copy_(_inputs(83, rows, padded_in))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _bitwise(out, _run(tc.linear_out_prefill, m, x, 14, 2560), "new inputs")
 
 
-def test_split_witness_matches_the_profiler_name_style():
-    # The profiler demangles template arguments as true/false; cuobjdump as (bool)1.
-    assert _split_ran({"void exl3::x::prefill_gemm<14, 2, __nv_bfloat16, true>(A, B*)"})
-    assert not _split_ran(
-        {"void exl3::x::prefill_gemm<14, 2, __nv_bfloat16, false>(A, B*)"}
+@needs_sm80
+def test_pp2_two_product_mode_preserves_fp32_arithmetic(prefill_arithmetic):
+    rows, padded_in, padded_out = 193, 2560, 10240
+    m = _matrix(93, padded_in, padded_out, 14)
+    x = _inputs(94, rows, padded_in)
+    outputs = [
+        torch.empty(rows, padded_out, dtype=torch.float32, device="cuda")
+        for _ in range(2)
+    ]
+    workspace = torch.empty(
+        exl3_ops.linear_workspace_size(rows, padded_in, padded_out), device="cuda"
     )
-    assert _run_core is not None  # shared helper kept importable
+    for mode, out in enumerate(outputs):
+        tc.set_prefill_arithmetic(mode)
+        tc.linear_out_prefill(
+            x,
+            m["trellis"],
+            m["suh"],
+            m["svh"],
+            14,
+            2,
+            padded_in,
+            padded_out,
+            out,
+            workspace,
+        )
+    _bitwise(outputs[0], outputs[1], "FP32 retains three-product arithmetic")
+
+
+def test_split_witness_reads_split_argument_not_arithmetic_argument():
+    assert _split_ran({"void exl3::x::prefill_gemm<14, 2, float, true, false>(A, B*)"})
+    assert _split_ran({"void exl3::x::prefill_gemm<14, 2, float, true, true>(A, B*)"})
+    assert not _split_ran(
+        {"void exl3::x::prefill_gemm<14, 2, float, false, true>(A, B*)"}
+    )

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by AlexBrandes for CMP 170HX support; see repository history.
 """Bounded compressed PLE storage and selected-row decoding."""
 
 import atexit
@@ -174,7 +175,6 @@ class Exl3PLETiming:
             read.sum() / 1e3 / max(rows.sum(), 1.0),
         )
         self.samples.clear()
-
 
 
 class Exl3PLERowReader:
@@ -451,8 +451,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
             # Sequence parallelism defers the ETP sum to a reduce-scatter, but
             # read-failure masking needs the summed rows of every token here.
             raise NotImplementedError(
-                "EXL3 PLE does not support sequence parallelism "
-                "(reduce_results=False)"
+                "EXL3 PLE does not support sequence parallelism (reduce_results=False)"
             )
         self.placement = self.embedding_method.placement
         self._heads = num_ngram_heads
@@ -462,6 +461,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._pool = None
         self._slot: Exl3PLESlot | None = None
         self._failed_tokens: torch.Tensor | None = None
+        self._staged_rows: torch.Tensor | None = None
         self._timing: Exl3PLETiming | None = None
         # SSD reads run at finalize, after the layers before this one queue.
         self.overlap_reads = envs.VLLM_EXL3_PLE_OVERLAP
@@ -941,6 +941,56 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         output = self._decoded.new_empty((total_tokens, self._output_dim))
         self._finalize_prefetch(output)
         return output
+
+    @property
+    def supports_external_staging(self) -> bool:
+        # Cross-DP ETP needs metadata from the forward context, which is not
+        # available yet when the runner prepares model inputs.
+        return self.etp_data_parallel_size == 1
+
+    def view(self, total_tokens: int) -> torch.Tensor:
+        """Persistent rows consumed by full graph replays."""
+        self.check_ready()
+        if not self.supports_external_staging:
+            raise RuntimeError(
+                "External EXL3 PLE staging requires ETP within one DP rank"
+            )
+        capacity = self._capacity // self._heads
+        if not 0 <= total_tokens <= capacity:
+            raise ValueError(f"PLE rows capacity exceeded: {total_tokens}/{capacity}")
+        if self._staged_rows is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "EXL3 PLE rows must be allocated before graph capture"
+                )
+            # Separate from the reader's decoded slot: that slot can be reused
+            # once the copy completes, while the model still consumes these rows.
+            self._staged_rows = self._decoded.new_empty((capacity, self._output_dim))
+        return self._staged_rows[:total_tokens]
+
+    def prepare(self, ngram_ids: torch.Tensor, num_tokens_after_padding: int) -> None:
+        """Read/decode outside capture with the existing slot and failure rules."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("EXL3 PLE rows must be prepared outside graph capture")
+        if ngram_ids.ndim != 2 or ngram_ids.shape[1] != self._heads:
+            raise ValueError("PLE staging requires one row index per head and token")
+        tokens = ngram_ids.shape[0]
+        if tokens > num_tokens_after_padding:
+            raise ValueError(
+                "PLE rows cannot be padded to fewer than the active tokens"
+            )
+        rows = self.view(num_tokens_after_padding)
+        if tokens:
+            self.start_prefetch(ngram_ids)
+            self._finalize_prefetch(rows[:tokens])
+        else:
+            self._failed_tokens = None
+        rows[tokens:].zero_()
+
+    def zero_rows(self, total_tokens: int) -> None:
+        """Prepare dummy inputs without retaining a previous request's failures."""
+        self.view(total_tokens).zero_()
+        self._failed_tokens = None
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         raise RuntimeError(

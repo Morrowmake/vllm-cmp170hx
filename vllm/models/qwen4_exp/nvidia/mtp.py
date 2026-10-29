@@ -307,7 +307,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
 
-        if get_pp_group().is_first_rank:
+        # Branch on the inputs, not the rank: the drafter is built entirely
+        # on the last PP stage, where `get_pp_group().is_first_rank` is False.
+        if intermediate_tensors is None:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None
@@ -335,7 +337,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         current_step_idx = spec_step_idx % self.num_mtp_layers
         full_num_tokens = positions.shape[-1]
         if self.use_hc_sequence_parallel:
-            # SP requires PP=1, so the first-rank branch sets prev_block_output.
+            # SP requires PP=1, so the entry branch sets prev_block_output.
             assert prev_block_output is not None
             if (
                 self.use_sequence_parallel

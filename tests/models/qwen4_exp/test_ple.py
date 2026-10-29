@@ -1385,6 +1385,7 @@ def test_ngram_prefetch_ids_outlive_start_prefetch() -> None:
     module.heads_per_ngram = params["heads_per_ngram"]
     num_heads = params["ngram_heads_vocab_sizes"].numel()
     module._prefetch_ids = torch.empty(8, num_heads, dtype=torch.long, device=device)
+    module.staged_rows_enabled = False
     prefetched: list[torch.Tensor] = []
     module.ngram_embedding = SimpleNamespace(
         supports_prefetch=True,

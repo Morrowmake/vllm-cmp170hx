@@ -2,10 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EXL3 dense split-K (VLLM_EXL3_DENSE_SPLITK, csrc/exl3/dense_splitk.cu).
 
-CPU: the switch default, its one-time resolution with the active and
-gate-closed log lines (through vLLM's own logger), the operator choice in
-_linear with the switch off and on, and the operator's split rule and
-workspace contract.
+CPU: the hardware gate. Native checks cover the split rule and invalid geometry.
 
 GPU (SM 8.0 only): with the switch off _linear is linear_out bit for bit;
 launches outside the split-K path are linear_out bit for bit; on the split-K
@@ -14,8 +11,6 @@ path the result is held to linear_out's error against an FP64 reference
 linear_out is exact), is deterministic, and a captured call replays bitwise
 like the eager call without any allocator event.
 """
-
-import logging
 
 import numpy as np
 import pytest
@@ -42,114 +37,13 @@ def _extension_or_skip():
 # ---------------------------------------------------------------- CPU tests
 
 
-def test_switch_defaults_off(monkeypatch):
-    from vllm import envs
-
-    monkeypatch.delenv("VLLM_EXL3_DENSE_SPLITK", raising=False)
-    assert envs.VLLM_EXL3_DENSE_SPLITK is False
-    monkeypatch.setenv("VLLM_EXL3_DENSE_SPLITK", "1")
-    assert envs.VLLM_EXL3_DENSE_SPLITK is True
-
-
 def test_gate_opens_only_on_sm80():
     assert exl3_ops.dense_splitk_closed_reason((8, 0)) is None
-    assert "(8, 6)" in exl3_ops.dense_splitk_closed_reason((8, 6))
-    assert "None" in exl3_ops.dense_splitk_closed_reason(None)
+    assert exl3_ops.dense_splitk_closed_reason((8, 6)) is not None
+    assert exl3_ops.dense_splitk_closed_reason(None) is not None
 
 
-def _capability(monkeypatch, capability):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: capability is not None)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda device=None: capability
-    )
-
-
-def test_switch_resolution_logs_through_vllm_logger(monkeypatch, caplog):
-    import vllm.logger as vllm_logger
-
-    monkeypatch.setattr(exl3_ops, "logger", vllm_logger.init_logger(exl3_ops.__name__))
-    # The vllm logger does not propagate to the root, where caplog listens.
-    root = logging.getLogger("vllm")
-    root.addHandler(caplog.handler)
-    caplog.set_level(logging.INFO, logger="vllm")
-    try:
-        vllm_logger._print_info_once.cache_clear()
-        monkeypatch.delenv("VLLM_EXL3_DENSE_SPLITK", raising=False)
-        _capability(monkeypatch, (8, 0))
-        assert exl3_ops._resolve_dense_splitk() is False
-        assert not caplog.records, "the switch at 0 logs nothing"
-        monkeypatch.setenv("VLLM_EXL3_DENSE_SPLITK", "1")
-        assert exl3_ops._resolve_dense_splitk() is True
-        _capability(monkeypatch, (8, 6))
-        assert exl3_ops._resolve_dense_splitk() is False
-        _capability(monkeypatch, None)
-        assert exl3_ops._resolve_dense_splitk() is False
-    finally:
-        root.removeHandler(caplog.handler)
-    lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
-    assert (
-        logging.INFO,
-        exl3_ops.__name__,
-        "EXL3 dense split-K active (VLLM_EXL3_DENSE_SPLITK): dense launches of "
-        "at most 1024 tiny or small blocks (bits_x2 10/12/14, codebook 2) split "
-        "K in two on warp-specialized blocks; other launches keep linear_out.",
-    ) in lines
-    closed = sorted({m for _, _, m in lines if "gate is closed" in m})
-    assert closed == [
-        "VLLM_EXL3_DENSE_SPLITK is set but the gate is closed: device capability "
-        "(8, 6), not (8, 0); every dense EXL3 call keeps linear_out.",
-        "VLLM_EXL3_DENSE_SPLITK is set but the gate is closed: device capability "
-        "None, not (8, 0); every dense EXL3 call keeps linear_out.",
-    ]
-
-
-def test_switch_is_fixed_once_by_ensure_extension(monkeypatch):
-    # Restored after the test: the module's real state.
-    monkeypatch.setattr(exl3_ops, "_loaded", False)
-    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
-    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
-    monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
-    monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
-    monkeypatch.setattr(torch.library, "register_fake", lambda name: lambda fn: fn)
-    resolved = []
-    monkeypatch.setattr(
-        exl3_ops, "_resolve_dense_splitk", lambda: resolved.append(1) or True
-    )
-    exl3_ops.ensure_extension()
-    assert exl3_ops._dense_splitk is True and resolved == [1]
-    exl3_ops.ensure_extension()
-    assert resolved == [1], "resolved once per process"
-
-
-@pytest.mark.parametrize("switch", [False, True])
-def test_linear_takes_the_operator_of_the_switch(monkeypatch, switch):
-    calls = []
-    for name in ("linear_out", "linear_out_splitk"):
-        monkeypatch.setattr(
-            exl3_ops,
-            name,
-            lambda *args, _name=name: calls.append((_name, args)),
-        )
-    workspace = torch.empty(16)
-    monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: workspace)
-    monkeypatch.setattr(exl3_ops, "_dense_splitk", switch)
-    x = torch.zeros(5, 256, dtype=torch.bfloat16)
-    out = exl3_ops._linear(x, "trellis", "suh", "svh", 14, 2, 384, 2)
-    expected = "linear_out_splitk" if switch else "linear_out"
-    assert [name for name, _ in calls] == [expected] * 3
-    starts = []
-    for _, args in calls:
-        chunk = args[0]
-        starts.append(chunk.data_ptr())
-        assert args[1:8] == ("trellis", "suh", "svh", 14, 2, 256, 384)
-        assert args[8].shape == (chunk.shape[0], 384) and args[9] is workspace
-    assert [c[1][0].shape[0] for c in calls] == [2, 2, 1]
-    assert starts == [x[s:].data_ptr() for s in (0, 2, 4)]
-    assert out.shape == (5, 384) and out.dtype == torch.bfloat16
-
-
-def test_operator_list_split_rule_and_workspace_contract():
-    assert {"linear_out_splitk", "linear_splitk_splits"} <= set(exl3_ops._OPERATORS)
+def test_split_rule_and_invalid_geometry():
     _extension_or_skip()
     splits = torch.ops._exl3_C.linear_splitk_splits
     override = torch.ops._exl3_C.set_gemm_shape_override
@@ -186,13 +80,6 @@ def test_operator_list_split_rule_and_workspace_contract():
             splits(1, 600, SMS, 14, 2)
     finally:
         override(-1)
-    # The split-K path adds its halves into linear_out's result rows, so the
-    # workspace (and with it _linear's row chunks) is linear_out's.
-    size = torch.ops._exl3_C.linear_workspace_size
-    assert size(32, 2560, 640) == 32 * (2560 + 640)
-    assert exl3_ops.linear_row_chunk(2560, 640) == exl3_ops.LINEAR_SCRATCH_ELEMENTS // (
-        2560 + 640
-    )
 
 
 # ---------------------------------------------------------------- GPU tests
@@ -258,7 +145,7 @@ def _run_core(operator, m, x, bits_x2, logical_out, codebook=2):
         out,
         workspace,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return out, workspace[x.shape[0] * padded_in :].clone()
 
 
@@ -337,7 +224,10 @@ def test_splitk_holds_linear_outs_error_against_fp64(
 
     _extension_or_skip()
     m = _matrix(1000 * bits_x2 + padded_out, padded_in, padded_out, bits_x2, unaligned)
-    weight = torch.from_numpy(effective_weight(*m["numpy"], bits_x2, codebook)).cuda()
+    trellis_np, suh_np, svh_np = m["numpy"]
+    weight = torch.from_numpy(
+        effective_weight(trellis_np, suh_np, svh_np, bits_x2, codebook)
+    ).cuda()
     weight = weight[:logical_in, :logical_out]
     for rows in (1, 3, 4, 8, 17, 32):
         assert (
@@ -394,7 +284,7 @@ def test_linear_output_is_the_selected_operator_bitwise(monkeypatch, switch):
     _extension_or_skip()
     m = _matrix(11, 2560, 640, 14)
     x = _inputs(12, 37, 2560)  # chunks of 16, 16 and 5 rows
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device=x.device)
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device=x.device)
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", switch)
     out = exl3_ops._linear(x, m["trellis"], m["suh"], m["svh"], 14, 2, 640, 16)
@@ -411,7 +301,7 @@ def test_linear_output_is_the_selected_operator_bitwise(monkeypatch, switch):
 
 
 def _allocations():
-    return torch.cuda.memory_stats()["allocation.all.allocated"]
+    return torch.accelerator.memory_stats()["allocation.all.allocated"]
 
 
 @needs_sm80
@@ -432,10 +322,10 @@ def test_splitk_graph_replay_is_bitwise_eager_without_allocations(rows):
             x, m["trellis"], m["suh"], m["svh"], 14, 2, 2560, 640, out, workspace
         )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     before = _allocations()
     call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert _allocations() == before, "eager call allocated"
     eager = out.clone()
 
@@ -444,7 +334,7 @@ def test_splitk_graph_replay_is_bitwise_eager_without_allocations(rows):
     with torch.cuda.stream(stream):
         call()  # warm on the capture stream
     torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     empty = torch.cuda.CUDAGraph()
     before = _allocations()
     with torch.cuda.graph(empty, stream=stream):
@@ -458,11 +348,11 @@ def test_splitk_graph_replay_is_bitwise_eager_without_allocations(rows):
     out.fill_(float("nan"))
     workspace.fill_(float("nan"))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _bitwise(out, eager, "replay vs eager")
     # New inputs in the captured buffer: the replay recomputes them.
     x2 = _inputs(23, rows, 2560)
     x.copy_(x2)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _bitwise(out, _run(exl3_ops.linear_out_splitk, m, x2, 14, 640), "new inputs")

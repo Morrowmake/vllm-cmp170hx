@@ -10,7 +10,9 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm.config import get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_etp_group, get_tp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -30,6 +32,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from ..common.ops.ple import ple_ngram_ids
+from .mmap_ple import Qwen4ExpPLEMmapEmbedding
 
 logger = init_logger(__name__)
 
@@ -214,12 +217,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
+        embedding_cls: type[Qwen4ExpPLEEmbedding] = (
             Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if engram_config is not None and engram_config.mmap:
+            embedding_cls = Qwen4ExpPLEMmapEmbedding
         embedding_cls = getattr(quant_config, "ple_embedding_cls", embedding_cls)
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
@@ -237,10 +243,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
             reduce_results=not self.use_reduce_scatter,
+            **(
+                {"num_shards": self.split_ngram_parts}
+                if embedding_cls is Qwen4ExpPLEMmapEmbedding
+                else {}
+            ),
         )
-        if self.ngram_embedding.supports_prefetch:
-            # The side-stream lookup outlives eager-break args, whose
-            # graph-pool storage later segments may reuse.
+        graph_mode = vllm_config.compilation_config.cudagraph_mode
+        self.staged_rows_enabled = isinstance(
+            self.ngram_embedding, Qwen4ExpPLEMmapEmbedding
+        ) or (
+            getattr(self.ngram_embedding, "supports_external_staging", False)
+            and graph_mode is not None
+            and graph_mode.has_full_cudagraphs()
+        )
+        if self.ngram_embedding.supports_prefetch or self.staged_rows_enabled:
+            # Keep IDs alive across side-stream reads and eager graph breaks.
             self._prefetch_ids = torch.empty(
                 max_total_tokens, self.ngram_heads, dtype=torch.long
             )
@@ -378,6 +396,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embeddings = sp_shard(embeddings)
         return embeddings.view(output_dtype)
 
+    def uses_staged_rows(self, mode: CUDAGraphMode | None = None) -> bool:
+        """Use external EXL3 rows for FULL capture/replay; mmap always stages."""
+        if not self.staged_rows_enabled:
+            return False
+        if isinstance(self.ngram_embedding, Qwen4ExpPLEMmapEmbedding):
+            return True
+        if mode is None and is_forward_context_available():
+            mode = get_forward_context().cudagraph_runtime_mode
+        # The runner captures FULL graphs with runtime mode NONE to avoid
+        # recursively invoking graph wrappers. PIECEWISE retains its own mode.
+        return mode == CUDAGraphMode.FULL or (
+            mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -387,7 +419,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
         embedding = self.ngram_embedding
-        if embedding.supports_prefetch:
+        if self.uses_staged_rows():
+            embeddings = embedding.view(input_ids.shape[0])
+        elif embedding.supports_prefetch:
             # Prefetch contains full tokens even when hidden states are sharded.
             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
         else:
@@ -399,6 +433,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return embeddings
         return self._sp_shard_embeddings(embeddings)
 
+    def prepare_staged_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        num_tokens: int,
+        num_tokens_after_padding: int,
+    ) -> None:
+        """Stage the current batch's PLE rows before model execution."""
+        embedding = self.ngram_embedding
+        assert self.staged_rows_enabled
+        if not (
+            0 <= num_tokens <= num_tokens_after_padding <= self._prefetch_ids.shape[0]
+        ):
+            raise ValueError("PLE batch exceeds its staging capacity")
+        ids = self._prefetch_ids[:num_tokens]
+        if num_tokens:
+            self.compute_ngram_ids(
+                input_ids[:num_tokens],
+                query_start_loc,
+                ngram_context,
+                output=ids,
+            )
+        embedding.prepare(ids, num_tokens_after_padding)
+
     def start_prefetch(
         self,
         input_ids: torch.Tensor,
@@ -407,7 +466,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
-        if not embedding.supports_prefetch:
+        if self.uses_staged_rows() or not embedding.supports_prefetch:
             return
         ngram_ids = self.compute_ngram_ids(
             input_ids,
@@ -482,11 +541,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"NVFP4 PLE shard {shard_index} {suffix} requires "
                         f"{parameter.dtype}, got {loaded_weight.dtype}"
                     )
-                parameter.weight_loader(
-                    parameter,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                )
+                if isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+                    embedding.load_shard(shard_index, loaded_weight)
+                else:
+                    parameter.weight_loader(
+                        parameter,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                    )
                 loaded.add(f"ngram_embedding.{suffix}")
                 continue
             if nvfp4_method is not None and name in (

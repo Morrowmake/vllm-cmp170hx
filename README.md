@@ -265,9 +265,8 @@ is retained only in tests.
 ## Upstream base
 
 The fork sits on upstream `main` at
-[`4e0681ed56`](https://github.com/vllm-project/vllm/commit/4e0681ed5654c1d8afb3c104d4381afd08529de8)
-(2026-10-14), the vLLM **0.32.0** development line (`git describe`:
-`v0.32.0rc0`, plus the fork's commits). `main` on this fork stays a clean
+[`330c5bffee`](https://github.com/vllm-project/vllm/commit/330c5bffeeb48725c0502a351e8ead2b54bd81eb)
+(2026-10-26), the vLLM **0.32.1** development line. `main` on this fork stays a clean
 mirror of upstream; general fixes are offered back upstream as pull requests.
 
 ## Branches and releases
@@ -295,7 +294,7 @@ Release notes live in each recipe's changelog:
 
 The recipes serve the engine only as a container image; each recipe's
 `docker/README.md` shows how that image is built and is the reference. In
-short, on Python 3.12 with torch 2.13.0 (CUDA 13.0):
+short, the current `ampere` branch uses Python 3.12 with torch 2.14.0 (CUDA 13.0):
 
 ```bash
 git clone -b ampere https://github.com/Morrowmake/vllm-cmp170hx.git && cd vllm-cmp170hx

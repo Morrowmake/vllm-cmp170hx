@@ -197,7 +197,8 @@ def _moe_case(rng, experts, hidden, intermediate, formats):
             trellis, suh, svh = _random_matrix(rng, k, n, bits_x2)
             projections.append((trellis, suh, svh, bits_x2, codebook))
         matrices.append(projections)
-    pointers, metadata = [], []
+    pointers: list[list[list[int]]] = []
+    metadata: list[list[list[int]]] = []
     for projections in matrices:
         pointers.append([])
         metadata.append([])
@@ -281,7 +282,7 @@ def _checkpoint_tiles():
     from vllm.sm80.kernels.exl3.utils import Exl3Manifest
 
     manifest = Exl3Manifest(CHECKPOINT)
-    chosen = {}
+    chosen: dict[tuple[int, int], str] = {}
     for prefix, matrix in manifest.matrices.items():
         chosen.setdefault((matrix.bits_x2, matrix.codebook), prefix)
     for (bits_x2, codebook), prefix in sorted(chosen.items()):
@@ -330,10 +331,16 @@ def test_linear_matches_fp64_on_checkpoint_tiles():
         _assert_close_to_fp64(actual, expected, prefix)
 
 
-def test_linear_scratch_is_shared_with_capture_and_separate_on_aux(monkeypatch):
+@pytest.mark.parametrize("prefill", [False, True])
+def test_linear_scratch_is_shared_with_capture_and_separate_on_aux(
+    monkeypatch, prefill
+):
     from vllm.utils.torch_utils import aux_stream
     from vllm.v1.worker import workspace
 
+    exl3_ops.ensure_extension()
+    monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active", prefill)
+    monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active_layout", (1, 2))
     device = torch.device("cuda")
     monkeypatch.setattr(workspace, "_manager", None)
     workspace.init_workspace_manager(device)
@@ -358,12 +365,12 @@ def test_linear_scratch_is_shared_with_capture_and_separate_on_aux(monkeypatch):
     torch.cuda.current_stream().wait_stream(capture_stream)
     main.fill_(float("nan"))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(captured, eager)
     with torch.cuda.stream(aux_stream()):
         aux = exl3_ops._linear_scratch(device)
     assert aux.data_ptr() != main.data_ptr()
-    assert aux.numel() == main.numel() == exl3_ops.LINEAR_SCRATCH_ELEMENTS
+    assert aux.numel() == main.numel() == exl3_ops.linear_scratch_elements()
     expected = _expected_linear(x.cpu(), trellis, suh, svh, 10, 2, 384)
     _assert_close_to_fp64(eager, expected, "chunked op")
     workspace.reset_workspace_manager()

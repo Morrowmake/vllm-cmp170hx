@@ -11,15 +11,16 @@ a k split whose partial tiles the last arriving block adds in k order
 of its launch and the row's position in it (which tiles the schedule
 splits).
 
-``ops._linear`` asks ``route`` for the operator of each call. A row chunk of
-the call takes ``linear_out_prefill`` only when all of these hold:
 - the flag is set and ``resolve`` found the gate open: sm_80 with 74
   multiprocessors, a validated layout (tensor parallel size 2 or 4,
-  pipeline parallel size 1), and either no speculative decoding, an MTP /
+  pipeline parallel size 1, or tensor parallel size 1 with pipeline
+  parallel size 2), and either no speculative decoding, an MTP /
   EAGLE drafter without parallel drafting (the drafters ``step_phase``
   covers), or a drafter whose decode steps carry at most MAX_SHIPPED_ROWS
   rows in every forward pass (``step_phase.max_decode_step_rows``), so the
-  row floor below keeps every decode step on today's kernels;
+  row floor below keeps every decode step on today's kernels; at the
+  (1, 2) layout the BF16 launches take the cheaper two-product arithmetic
+  (``set_prefill_arithmetic``, validated against that deployment);
 - the running step is a prefill step by the scheduler (``step_phase``: some
   request has more than 1 + num_speculative_tokens tokens scheduled), never
   judged from a row count, and the stream is not capturing a CUDA graph;
@@ -51,11 +52,11 @@ MAX_SHIPPED_ROWS = 64
 # The multiprocessor count the schedule was validated at.
 VALIDATED_SMS = 74
 # The layouts the matrices were validated in: (tensor, pipeline) parallel size.
-VALIDATED_PARALLEL = ((2, 1), (4, 1))
-# (padded_in, padded_out, bits_x2) of the validated matrices, codebook 2: the
-# dense matrices of the tensor-parallel ranks of the validated models, each
-# validated at the row chunks of its layout.
-VALIDATED_MATRICES = frozenset(
+VALIDATED_PARALLEL = ((2, 1), (4, 1), (1, 2))
+# Preserve the upstream shape allowlist at its existing TP2/TP4 layouts.
+# PP2 gets its own full-width Qwen allowlist; it must not enable those
+# additional shapes in the existing tensor-parallel configurations.
+_UPSTREAM_MATRICES = frozenset(
     {
         # Qwen3.8-Flash-Next at TP2.
         (2560, 256, 14),  # attention k/v
@@ -89,19 +90,43 @@ VALIDATED_MATRICES = frozenset(
         (15360, 5120, 12),  # drafter hidden-state projection
     }
 )
+VALIDATED_MATRICES = {
+    (2, 1): _UPSTREAM_MATRICES,
+    (4, 1): _UPSTREAM_MATRICES,
+    (1, 2): frozenset(
+        {
+            (2560, 512, 14),  # attention k/v
+            (2560, 640, 14),  # replicated shared expert gate/up
+            (2560, 640, 10),  # replicated indexer q/k
+            (2560, 2560, 12),  # MTP embedding / hidden-state projections
+            (640, 2560, 14),  # replicated shared expert down
+            (6144, 2560, 14),  # output projections
+            (2560, 6144, 14),  # linear-attention z
+            (2560, 10240, 14),  # linear-attention qkv
+            (2560, 12288, 14),  # attention q with output gate
+        }
+    ),
+}
 VALIDATED_CODEBOOK = 2
 # Speculative methods whose decode steps step_phase reads as decode steps.
 COVERED_DRAFTERS = ("mtp", "eagle", "eagle3")
 # VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE -> set_prefill_schedule mode.
 SCHEDULES = {"planned": 0, "whole": 1}
 # The library operators this path needs (csrc/exl3/dense_prefill_tc.cu).
-OPERATORS = ("linear_out_prefill", "linear_prefill_applies", "set_prefill_schedule")
+OPERATORS = (
+    "linear_out_prefill",
+    "linear_prefill_applies",
+    "set_prefill_schedule",
+    "set_prefill_arithmetic",
+)
 # A warm-up launch per covered format: (rows, padded_in, padded_out). Its plan
 # runs both kernels (whole tiles and the k split) at 74 multiprocessors.
 WARMUP_LAUNCH = (482, 2560, 2560)
 
 # Fixed by resolve(), before any launch or graph capture.
 active = False
+active_layout: tuple[int, int] | None = None
+_served_matrices: frozenset[tuple[int, int, int]] = frozenset()
 _max_decode_query_len = 0
 _sms = 0
 _fake_registered = False
@@ -149,7 +174,7 @@ def _warmup(sms: int) -> None:
     The temporary buffers are freed again. ops.ensure_extension runs this
     before it marks the library loaded, so the workspace size comes from the
     library itself: ops.linear_workspace_size would call ensure_extension."""
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda")
     rows, padded_in, padded_out = WARMUP_LAUNCH
 
     x = torch.ones((rows, padded_in), dtype=torch.bfloat16, device=device)
@@ -164,7 +189,9 @@ def _warmup(sms: int) -> None:
     )
     suh = torch.ones(padded_in, dtype=torch.float16, device=device)
     svh = torch.ones(padded_out, dtype=torch.float16, device=device)
-    for bits_x2 in sorted({b for _, _, b in VALIDATED_MATRICES}):
+    for bits_x2 in sorted(
+        {b for matrices in VALIDATED_MATRICES.values() for _, _, b in matrices}
+    ):
         trellis = torch.zeros(
             (padded_in // 16, padded_out // 16, 8 * bits_x2),
             dtype=torch.int16,
@@ -193,6 +220,7 @@ def resolve() -> None:
     ensure_extension returns: nothing here may call an ops function that calls
     ensure_extension."""
     global active, _max_decode_query_len, _sms, _fake_registered
+    global active_layout, _served_matrices
     if not envs.VLLM_EXL3_DENSE_PREFILL_TC:
         return
     from vllm.config import get_current_vllm_config_or_none
@@ -200,9 +228,7 @@ def resolve() -> None:
     capability, sms = None, None
     if torch.cuda.is_available():
         capability = tuple(torch.cuda.get_device_capability())
-        sms = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
+        sms = torch.cuda.get_device_properties().multi_processor_count
     vllm_config = get_current_vllm_config_or_none()
     reason = closed_reason(capability, sms, vllm_config)
     if reason is not None:
@@ -213,6 +239,11 @@ def resolve() -> None:
             scope="process",
         )
         return
+    assert vllm_config is not None and sms is not None
+    layout = (
+        vllm_config.parallel_config.tensor_parallel_size,
+        vllm_config.parallel_config.pipeline_parallel_size,
+    )
     schedule = envs.VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE
     for name in OPERATORS:
         try:
@@ -230,6 +261,7 @@ def resolve() -> None:
         torch.library.register_fake("_exl3_C::linear_out_prefill")(_linear_fake)
         _fake_registered = True
     set_prefill_schedule(SCHEDULES[schedule])
+    set_prefill_arithmetic(int(layout == (1, 2)))
     _warmup(sms)
     _max_decode_query_len = step_phase.max_decode_query_len(vllm_config)
     _sms = sms
@@ -237,15 +269,19 @@ def resolve() -> None:
         "EXL3 dense prefill tensor-core path active (VLLM_EXL3_DENSE_PREFILL_TC): "
         "in prefill steps (a request with more than %d tokens scheduled), dense "
         "launches of more than %d rows and at least 16 output tiles of the %d "
-        "validated matrices (bits_x2 10/12/14, codebook 2) take "
+        "validated matrices (bits_x2 10/12/14, codebook 2) at TP%d/PP%d take "
         "linear_out_prefill, schedule %s; split-K launches, other matrices, "
         "decode steps and graph captures keep today's kernels.",
         _max_decode_query_len,
         MAX_SHIPPED_ROWS,
-        len(VALIDATED_MATRICES),
+        len(VALIDATED_MATRICES[layout]),
+        layout[0],
+        layout[1],
         schedule,
         scope="process",
     )
+    active_layout = layout
+    _served_matrices = VALIDATED_MATRICES[layout]
     active = True
 
 
@@ -263,6 +299,13 @@ def set_prefill_schedule(mode: int) -> None:
     torch.ops._exl3_C.set_prefill_schedule(mode)
 
 
+def set_prefill_arithmetic(mode: int) -> None:
+    """The arithmetic of this process's BF16 prefill GEMMs: 0 exact dominant
+    term (three products), 1 the two-product combine of the TP1/PP2 full-width
+    matrices."""
+    torch.ops._exl3_C.set_prefill_arithmetic(mode)
+
+
 @functools.cache
 def takes_launch(
     rows: int,
@@ -272,15 +315,16 @@ def takes_launch(
     codebook: int,
     splitk: bool,
     sms: int,
+    matrices: frozenset[tuple[int, int, int]],
 ) -> bool:
     """Whether a prefill-step launch of this shape goes to linear_out_prefill:
-    a validated matrix the operator covers at this row count and, with
-    split-K on, split-K does not split it."""
+    a validated matrix the operator covers at this row count
+    and, with split-K on, split-K does not split it."""
     from vllm.sm80.kernels.exl3.ops import linear_splitk_splits
 
     if (
         codebook != VALIDATED_CODEBOOK
-        or (padded_in, padded_out, bits_x2) not in VALIDATED_MATRICES
+        or (padded_in, padded_out, bits_x2) not in matrices
     ):
         return False
     if splitk and linear_splitk_splits(rows, padded_out, sms, bits_x2, codebook) == 2:
@@ -332,7 +376,14 @@ def _launch(
     padded_in, padded_out = trellis.shape[0] * 16, trellis.shape[1] * 16
     operator = default
     if trellis.data_ptr() % 16 == 0 and takes_launch(
-        x.shape[0], padded_in, padded_out, bits_x2, codebook, splitk, _sms
+        x.shape[0],
+        padded_in,
+        padded_out,
+        bits_x2,
+        codebook,
+        splitk,
+        _sms,
+        _served_matrices,
     ):
         operator = linear_out_prefill
     operator(

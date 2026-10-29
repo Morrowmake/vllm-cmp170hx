@@ -33,13 +33,20 @@ from vllm.models.qwen4_exp.nvidia.exl3_ple import (
     pread_exact_into,
 )
 
-
 _PLE_PREFIX = "model.layers.0.ple.ple_embedding.ngram_embedding"
 
 
 def _packed_ple_file(
-    tmp_path, offset=32, *, bits=6, dim=160, sizes=(5, 4), rows=10, offsets=None,
-    metadata=None, written_rows=None,
+    tmp_path,
+    offset=32,
+    *,
+    bits=6,
+    dim=160,
+    sizes=(5, 4),
+    rows=10,
+    offsets=None,
+    metadata=None,
+    written_rows=None,
 ):
     """Small real PLE file: two heads, a sparse gap before the trellis and one
     padded row. Row r holds the byte r + 1 repeated."""
@@ -57,18 +64,26 @@ def _packed_ple_file(
     ]
     header = {
         "__metadata__": {
-            "format": "exl3_ngram_trellis", "version": "1", "K": str(bits),
-            "codebook": "mul1", "row_dim": str(dim), "rows": str(rows),
+            "format": "exl3_ngram_trellis",
+            "version": "1",
+            "K": str(bits),
+            "codebook": "mul1",
+            "row_dim": str(dim),
+            "rows": str(rows),
             **(metadata or {}),
         }
     }
     end = 0
     for name, dtype, shape, _ in parts:
-        size = (2 if dtype in ("F16", "I16") else 8) * shape[0] * (
-            shape[1] if len(shape) > 1 else 1
+        size = (
+            (2 if dtype in ("F16", "I16") else 8)
+            * shape[0]
+            * (shape[1] if len(shape) > 1 else 1)
         )
         header[f"{_PLE_PREFIX}.{name}"] = {
-            "dtype": dtype, "shape": shape, "data_offsets": [end, end + size],
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [end, end + size],
         }
         end += size
     raw = json.dumps(header).encode()
@@ -99,9 +114,7 @@ _PLE_LAYOUTS = [
 
 @pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
 @pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
-def test_exl3_ple_positional_rows_preserve_order_and_masks(
-    tmp_path, offset, bits, dim
-):
+def test_exl3_ple_positional_rows_preserve_order_and_masks(tmp_path, offset, bits, dim):
     path, key, rows, base = _packed_ple_file(tmp_path, offset, bits=bits, dim=dim)
     reader = Exl3PLERowReader(str(path), key, 4, 10)
     try:
@@ -346,6 +359,7 @@ def test_exl3_ple_page_cache_residency_counts_table_pages(tmp_path):
 
 def test_exl3_ple_slot_waits_for_copy_before_reuse():
     """A released lease still waits for the asynchronous output copy."""
+
     class Completion:
         def __init__(self):
             self.entered = threading.Event()
@@ -424,10 +438,15 @@ def test_exl3_ple_timing_logs_one_line_per_window():
         assert len(messages) == 1 and timing.samples == []
         line = messages[0]
         # reads 800/900/1000/1200 us over 4 x 64 rows; waits 10/10/10/50 us
-        for part in ("EXL3 PLE timing owner=[0,10) workers=8", "4 prefetches",
-                     "rows mean 64.0 max 64", "ids wait us p50 10 p90 38 max 50;",
-                     "row reads us p50 950 ", "max 1200 mean 975",
-                     "us per row 15.23"):
+        for part in (
+            "EXL3 PLE timing owner=[0,10) workers=8",
+            "4 prefetches",
+            "rows mean 64.0 max 64",
+            "ids wait us p50 10 p90 38 max 50;",
+            "row reads us p50 950 ",
+            "max 1200 mean 975",
+            "us per row 15.23",
+        ):
             assert part in line, (part, line)
         timing.add(512, 1_000, 2_400_000)
         timing.flush()  # a partial window at close
@@ -522,6 +541,7 @@ def _embedding_module(reader, device, *, overlap, native, hostfn):
     module._pool = ThreadPoolExecutor(max_workers=2)
     module._timing = None
     module._failed_tokens = None
+    module._staged_rows = None
     module.head_bias = torch.zeros(
         _HEADS, layout.dim, dtype=torch.float16, device=device
     )
@@ -1654,7 +1674,7 @@ def test_exl3_ple_hostfn_module_matches_the_native_reader_on_the_gpu(
             for index, step_ids in enumerate(ids):
                 restore = None
                 if index == 5:
-                    torch.cuda.synchronize()  # earlier reads see the whole table
+                    torch.accelerator.synchronize()  # earlier reads see the whole table
                     restore = _truncated(
                         path, module._reader.base + 6 * module._reader.row_bytes + 10
                     )
@@ -1664,9 +1684,9 @@ def test_exl3_ple_hostfn_module_matches_the_native_reader_on_the_gpu(
                 output = module.finalize_prefetch(step_ids.shape[0])
                 outputs.append((output, module.take_failed_tokens()))
                 if restore is not None:
-                    torch.cuda.synchronize()  # this step's read has run
+                    torch.accelerator.synchronize()  # this step's read has run
                     restore()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             results[name] = [
                 (output.view(torch.int16).cpu(), failed.cpu())
                 for output, failed in outputs
@@ -1681,3 +1701,159 @@ def test_exl3_ple_hostfn_module_matches_the_native_reader_on_the_gpu(
     for (output, failed), (ref_output, ref_failed) in zip(results["hostfn"], reference):
         assert torch.equal(output, ref_output)
         assert torch.equal(failed, ref_failed)
+
+
+@_needs_cuda
+@pytest.mark.parametrize("reader", ["python", "native", "hostfn"])
+def test_exl3_ple_external_rows_follow_graph_replays(tmp_path, native_reader, reader):
+    """New IDs, padding and read failures must not reuse a prior replay's rows."""
+    module, path = _cuda_ssd_embedding(
+        tmp_path, native=reader == "native", hostfn=reader == "hostfn"
+    )
+    steps = [
+        ([[3, 5]], 5, False),
+        ([[4, 8], [0, 9], [3, 6]], 5, False),
+        ([[5, 7], [8, 3]], 3, False),
+        ([[6, 4]], 3, True),
+        ([], 5, False),
+        ([[8, 6], [3, 4]], 5, False),
+    ]
+    observed = []
+    try:
+        module.zero_rows(5)
+        address = module.view(5).data_ptr()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graphs = {}
+        with torch.cuda.stream(stream):
+            for padded in (3, 5):
+                for _ in range(3):
+                    module.view(padded).float().sum(-1)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = module.view(padded).float().sum(-1)
+                graphs[padded] = graph, output
+        torch.cuda.current_stream().wait_stream(stream)
+
+        for values, padded, truncate in steps:
+            ids = torch.tensor(values, dtype=torch.int64, device="cuda").reshape(
+                -1, _HEADS
+            )
+            restore = None
+            if truncate:
+                torch.accelerator.synchronize()
+                restore = _truncated(
+                    path, module._reader.base + 6 * module._reader.row_bytes + 10
+                )
+            try:
+                expected = torch.zeros(padded, device="cuda")
+                expected_failed = None
+                if values:
+                    module.start_prefetch(ids)
+                    rows = module.finalize_prefetch(len(values))
+                    expected[: len(values)] = rows.float().sum(-1)
+                    expected_failed = module.take_failed_tokens()
+                module.prepare(ids, padded)
+                assert module.view(padded).data_ptr() == address
+                graph, output = graphs[padded]
+                graph.replay()
+                observed.append(
+                    (
+                        output.clone(),
+                        expected,
+                        module.take_failed_tokens(),
+                        expected_failed,
+                    )
+                )
+                assert module.take_failed_tokens() is None
+            finally:
+                if restore is not None:
+                    torch.accelerator.synchronize()
+                    restore()
+        module.zero_rows(5)
+        graphs[5][0].replay()
+        torch.accelerator.synchronize()
+        assert not graphs[5][1].any()
+        assert observed[3][2].tolist() == [True]
+        for output, expected, failed, expected_failed in observed:
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            if expected_failed is None:
+                assert failed is None
+            else:
+                assert torch.equal(failed, expected_failed)
+    finally:
+        module.close()
+
+
+@_needs_cuda
+def test_exl3_ngram_rows_survive_full_piecewise_and_eager_transitions(
+    tmp_path, native_reader
+):
+    from vllm.config import VllmConfig
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.forward_context import set_forward_context
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
+
+    backend, _ = _cuda_ssd_embedding(tmp_path, native=True, hostfn=False)
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.ngram_embedding = backend
+    module.staged_rows_enabled = True
+    module.use_sequence_parallel = False
+    module.heads_per_ngram = 1
+    module.eos_token_id = 99
+    module.register_buffer("layer_multipliers", torch.tensor([3, 5, 7], device="cuda"))
+    module.register_buffer("ngram_heads_vocab_sizes", backend.head_vocab_sizes)
+    module.register_buffer("ngram_heads_offsets", backend.head_offsets)
+    module._prefetch_ids = torch.empty(_TOKENS, _HEADS, dtype=torch.long, device="cuda")
+    ids = torch.zeros(2, dtype=torch.int32, device="cuda")
+    starts = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    context = torch.tensor([[1, 2]], dtype=torch.int32, device="cuda")
+    hidden = torch.zeros(2, backend._output_dim, device="cuda")
+    config = VllmConfig()
+    try:
+        backend.zero_rows(2)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            backend.view(2).clone()
+            with (
+                set_forward_context(
+                    None,
+                    config,
+                    num_tokens=2,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                ),
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                module.start_prefetch(ids, starts, context)
+                captured = module(hidden, ids, starts, context).clone()
+        torch.cuda.current_stream().wait_stream(stream)
+        steps = [
+            (CUDAGraphMode.NONE, [11, 12]),
+            (CUDAGraphMode.FULL, [13, 17]),
+            (CUDAGraphMode.PIECEWISE, [21, 22]),
+            (CUDAGraphMode.FULL, [23, 29]),
+            (CUDAGraphMode.NONE, [31, 34]),
+        ]
+        for mode, tokens in steps:
+            ids.copy_(torch.tensor(tokens, dtype=ids.dtype, device="cuda"))
+            lookup = module.compute_ngram_ids(ids, starts, context)
+            backend.start_prefetch(lookup)
+            expected = backend.finalize_prefetch(2)
+            backend.take_failed_tokens()
+            if mode == CUDAGraphMode.FULL:
+                module.prepare_staged_rows(ids, starts, context, 2, 2)
+                graph.replay()
+                actual = captured
+            else:
+                with set_forward_context(
+                    None, config, num_tokens=2, cudagraph_runtime_mode=mode
+                ):
+                    module.start_prefetch(ids, starts, context)
+                    actual = module(hidden, ids, starts, context)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            backend.take_failed_tokens()
+    finally:
+        backend.close()

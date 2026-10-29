@@ -229,6 +229,8 @@ inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
 certifi = "certifi"
+# EXL3 checkpoint scale tensor.
+suh = "suh"
 MoNE = "MoNE"
 mone = "mone"
 Hel = "Hel"

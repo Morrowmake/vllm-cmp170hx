@@ -7,8 +7,11 @@ Inputs: VLLM_EXL3_TEST_PORT_CASES names the case set (layout in
 exl3_real_cases.py) and VLLM_EXL3_TEST_CHECKPOINT the EXL3 checkpoint the
 calls ran on (the Qwen3.8-Flash-Next 5.05 bpw checkpoint); with either unset
 or missing, the tests that need it skip and say which. Every case is a dense
-launch of the served model at tensor parallel size 2, rank 0, 74
-multiprocessors, its phase taken from the scheduler step that made it.
+launch of the served model at a validated (tensor, pipeline) layout:
+tensor-parallel rank 0 at (2, 1), or the full-width rank 0 of tensor
+parallel size 1 with two pipeline stages at (1, 2) (the manifest's
+tp_size and pp_size), at 74 multiprocessors, its phase taken from the
+scheduler step that made it.
 
 CPU: the required cells against the operator's rule, and (case set given)
 every file's sha256 and one case per required (rows, phase) cell.
@@ -27,13 +30,14 @@ the switch on: decode-step calls (the drafter's hidden-state projection at
 the k/v 482-row chunk tail keeps linear_out_splitk) are bitwise today's
 operator. A failing pool fails.
 
-Coverage (REQUIRED_CELLS): every prefill launch row count the dispatch sends
-to linear_out_prefill with split-K off (a superset of split-K on) among the
-launches of 3460 / 1906-token chunks of an 8,826-token prompt split by the row
-chunk and every captured prefill call of more than 64 rows, plus the decode
-cells of more than 64 rows (kept on today's path). Sliced cases (the last rows
-of a longer live launch of the same matrix and phase) stand for chunk tails no
-capture holds whole.
+Coverage: per layout (the manifest's tp_size and pp_size), every prefill
+launch row count the dispatch sends to linear_out_prefill with split-K off
+(a superset of split-K on) among the launches of 3460 / 1906-token chunks
+of an 8,826-token prompt split by the row chunk and every captured prefill
+call of more than 64 rows, plus (TP2) the decode cells of more than 64 rows
+(kept on today's path); a case set of a layout that is not validated skips.
+Sliced cases (the last rows of a longer live launch of the same matrix and
+phase) stand for chunk tails no capture holds whole.
 """
 
 import collections
@@ -65,9 +69,33 @@ TC_PREFILL_ROWS = [
     2481, 2621, 2978,
 ]  # fmt: skip
 DECODE_CONTROL_ROWS = [80, 96, 112, 128, 176, 192, 208, 224, 240, 256]
-REQUIRED_CELLS = {(r, "prefill") for r in TC_PREFILL_ROWS} | {
-    (r, "decode") for r in DECODE_CONTROL_ROWS
-}
+# Prefill launch rows of the reference prompt on the full-width matrices of
+# the TP1 / PP2 layout: the 3460 and 1906 scheduler chunks split at each
+# role's row chunk floor(8 Mi / (K + N)); see PP2_SERVED_LAUNCHES in
+# test_exl3_dense_prefill_tc.
+TC_PREFILL_ROWS_PP2 = [
+    76, 184, 185, 214, 268, 564, 571, 596, 655, 730, 839, 943, 963, 1638,
+    1906, 2621, 2730,
+]  # fmt: skip
+
+
+def layout_of(header):
+    """The (tensor, pipeline) layout of a case set; manifests predating
+    the pipeline field were captured at pipeline parallel size 1."""
+    return (header["tp_size"], header.get("pp_size", 1))
+
+
+def required_cells(layout):
+    """The (rows, phase) cells a case set of a validated layout must
+    cover: the served prefill launches of that layout, plus (TP2 only)
+    the decode controls of more than 64 rows."""
+    if layout == (2, 1):
+        return {(r, "prefill") for r in TC_PREFILL_ROWS} | {
+            (r, "decode") for r in DECODE_CONTROL_ROWS
+        }
+    return {(r, "prefill") for r in TC_PREFILL_ROWS_PP2}
+
+
 DECODE_QUERY_LEN = 4
 SMS = 74
 
@@ -77,7 +105,7 @@ def _padded(case):
     return padded_in, sum(b - a for a, b in case["output_slices"])
 
 
-def _takes(case, splitk):
+def _takes(case, splitk, matrices):
     padded_in, padded_out = _padded(case)
     return tc.takes_launch(
         case["rows"],
@@ -87,6 +115,7 @@ def _takes(case, splitk):
         case["codebook"],
         splitk,
         SMS,
+        matrices,
     )
 
 
@@ -95,20 +124,17 @@ def _takes(case, splitk):
 
 def test_required_cells_follow_the_operator_rule():
     _extension_or_skip()
-    # Every required prefill row count is covered for some served matrix;
-    # the decode controls are calls of more than 64 rows.
-    served = [
-        (2560, 256, 14),
-        (2560, 640, 14),
-        (2560, 640, 10),
-        (2560, 1280, 12),
-        (640, 2560, 14),
-        (3072, 2560, 14),
-        (2560, 3072, 14),
-        (2560, 5120, 14),
-        (2560, 6144, 14),
+    # Every required prefill row count is covered for some matrix of its
+    # layout; the decode controls are calls of more than 64 rows.
+    cells = [
+        (rows, sorted(tc.VALIDATED_MATRICES[layout]))
+        for layout, row_counts in (
+            ((2, 1), TC_PREFILL_ROWS),
+            ((1, 2), TC_PREFILL_ROWS_PP2),
+        )
+        for rows in row_counts
     ]
-    for rows in TC_PREFILL_ROWS:
+    for rows, served in cells:
         assert any(tc.linear_prefill_applies(rows, k, n, b, 2) for k, n, b in served), (
             rows
         )
@@ -120,15 +146,19 @@ def test_case_set_files_and_coverage():
     _extension_or_skip()
     header, cases = real.load_manifest(directory, "dense")
     assert header["sm_count"] == SMS
+    layout = layout_of(header)
+    if layout not in tc.VALIDATED_MATRICES:
+        pytest.skip(f"case-set layout (tp, pp) {layout} is not validated")
     for case in cases:
         real.load_case(directory, "dense", case)
-    real.require_cells(cases, REQUIRED_CELLS, "dense prefill tc")
+    real.require_cells(cases, required_cells(layout), "dense prefill tc")
     taken = {
         (c["rows"], c["phase"])
         for c in cases
-        if c["phase"] == "prefill" and _takes(c, False)
+        if c["phase"] == "prefill" and _takes(c, False, tc.VALIDATED_MATRICES[layout])
     }
-    assert {(r, "prefill") for r in TC_PREFILL_ROWS} <= taken
+    rows = TC_PREFILL_ROWS if layout == (2, 1) else TC_PREFILL_ROWS_PP2
+    assert {(r, "prefill") for r in rows} <= taken
 
 
 # ---------------------------------------------------------------- GPU tests
@@ -162,31 +192,44 @@ def _linear(m, x, case, splitk, monkeypatch, scratch):
 
 
 @needs_sm80
-def test_prefill_holds_linear_outs_error_against_fp64_on_real_inputs(monkeypatch):
+def test_prefill_holds_linear_outs_error_against_fp64_on_real_inputs(
+    monkeypatch, request
+):
     directory = real.case_dir_or_skip()
     checkpoint = real.Checkpoint(real.checkpoint_or_skip())
     _extension_or_skip()
     header, cases = real.load_manifest(directory, "dense")
+    layout = layout_of(header)
+    if layout not in tc.VALIDATED_MATRICES:
+        pytest.skip(f"case-set layout (tp, pp) {layout} is not validated")
+    cells = required_cells(layout)
+    matrices = tc.VALIDATED_MATRICES[layout]
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if sms != header["sm_count"]:
         pytest.skip(
             f"cases recorded at {header['sm_count']} multiprocessors, device has {sms}"
         )
-    real.require_cells(cases, REQUIRED_CELLS, "dense prefill tc")
+    tc.set_prefill_arithmetic(int(layout == (1, 2)))
+    request.addfinalizer(lambda: tc.set_prefill_arithmetic(0))
+    real.require_cells(cases, cells, "dense prefill tc")
     device = torch.device("cuda")
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device=device)
-    monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(tc, "active", True)
+    monkeypatch.setattr(tc, "active_layout", layout)
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device=device)
+    monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(tc, "_max_decode_query_len", DECODE_QUERY_LEN)
     monkeypatch.setattr(tc, "_sms", sms)
+    monkeypatch.setattr(tc, "_served_matrices", matrices)
     grouped = collections.defaultdict(list)
     for case in cases:
         key = (case["prefix"], tuple(case["input_slice"]))
         grouped[key + tuple(map(tuple, case["output_slices"]))].append(case)
     pools = real.pools(cases)
-    pool_of = {}
-    errors = collections.defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0])
-    counts = collections.Counter()
+    pool_of: dict[tuple, _Pool] = {}
+    errors: collections.defaultdict[tuple, list[float]] = collections.defaultdict(
+        lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
+    )
+    counts: collections.Counter[str] = collections.Counter()
     for (prefix, *_), group in sorted(grouped.items()):
         first = group[0]
         trellis, suh, svh = checkpoint.shard(
@@ -217,7 +260,7 @@ def test_prefill_holds_linear_outs_error_against_fp64_on_real_inputs(monkeypatch
                 padded_in, padded_out = _padded(case)
                 chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
                 assert rows <= chunk, f"{name}: one launch per case"
-                if case["phase"] == "prefill" and _takes(case, splitk):
+                if case["phase"] == "prefill" and _takes(case, splitk, matrices):
                     expected = _run(
                         tc.linear_out_prefill, m, x, bits_x2, logical_out, codebook
                     )
@@ -229,7 +272,7 @@ def test_prefill_holds_linear_outs_error_against_fp64_on_real_inputs(monkeypatch
             if case["phase"] != "prefill":
                 continue
             padded_in, padded_out = _padded(case)
-            if _takes(case, False):
+            if _takes(case, False, matrices):
                 operator, kind = tc.linear_out_prefill, "dense-prefill-tc"
             elif (
                 exl3_ops.linear_splitk_splits(rows, padded_out, sms, bits_x2, codebook)
@@ -251,14 +294,14 @@ def test_prefill_holds_linear_outs_error_against_fp64_on_real_inputs(monkeypatch
             e[3] = max(e[3], float(es.max()))
             e[4] += ep.numel()
         del m, core
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     failures = []
-    for key, pool in sorted(pool_of.items()):
-        kind, role, rows, phase, drafter = key
+    for pool_key, pool in sorted(pool_of.items()):
+        kind, role, rows, phase, drafter = pool_key
         name = f"POOL {kind} {role} rows={rows} {phase} drafter={int(drafter)}"
-        group = pools[key[1:]]
+        group = pools[pool_key[1:]]
         sources = collections.Counter(c["source"] for c in group)
-        e = errors[key]
+        e = errors[pool_key]
         detail = (
             f"cases={len(group)} live={sources['live']} sliced={sources['sliced']} "
             f"port mean|err| {e[0] / e[4]:.3e} max {e[1]:.3e} "

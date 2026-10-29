@@ -10,6 +10,12 @@ tests take the set's prefill calls of more than 64 rows (the calls
 Exl3Experts.apply sends to moe_out_prefill); the dispatch check takes every
 case.
 
+The case set's layout (the manifest's tp_size and pp_size, the convention the
+dense real-input tests use) picks the expert partition the set must hold: 256
+of the 512 experts at tensor parallel size 2, all 512 at tensor parallel size 1
+with pipeline parallel size 2; a set captured on another layout skips and says
+so.
+
 CPU: the required cells against the dispatch rule; the dispatch rule over
 every case of the set, with the step phase the case was captured in (no
 decode call, whatever its rows, and no call of at most 64 rows reaches
@@ -51,7 +57,6 @@ from tests.kernels.quantization.test_exl3_moe_v2 import (
     GLOBAL,
     HIDDEN,
     INTERMEDIATE,
-    LOCAL,
     TOPK,
     _apply,
     _bitwise,
@@ -80,6 +85,24 @@ def _prefill_cases(cases):
         for case in cases
         if case["phase"] == "prefill" and case["rows"] >= exl3_ops.MOE_PREFILL_MIN_ROWS
     ]
+
+
+# Expert partitions recorded by the Qwen checkpoint capture protocol.
+PREFILL_PARTITION = {(2, 1): 256, (1, 2): 512}
+
+
+def _local_experts_or_skip(header) -> int:
+    """How many experts are local on the layout the cases were captured on
+    (the manifest's tp_size and pp_size), skipping a set captured on a layout
+    the prefill operator is not validated on: its expert map and pointer table
+    would not be the served ones."""
+    layout = (header["tp_size"], header.get("pp_size", 1))
+    if layout not in PREFILL_PARTITION:
+        pytest.skip(
+            f"case set layout (tensor, pipeline) parallel size {layout} is not "
+            f"a validated prefill partition, one of {list(PREFILL_PARTITION)}"
+        )
+    return PREFILL_PARTITION[layout]
 
 
 # ---------------------------------------------------------------- CPU tests
@@ -122,7 +145,8 @@ def test_case_set_dispatch_and_coverage(monkeypatch, moe_v2_rows):
     the case was captured in: only prefill calls of more than 64 rows reach
     moe_out_prefill."""
     directory = real.case_dir_or_skip()
-    _, cases = real.load_manifest(directory, "moe")
+    header, cases = real.load_manifest(directory, "moe")
+    local = _local_experts_or_skip(header)
     calls = []
     for name in ("moe_out", "moe_out_v2", "moe_out_prefill"):
         monkeypatch.setattr(
@@ -130,7 +154,7 @@ def test_case_set_dispatch_and_coverage(monkeypatch, moe_v2_rows):
         )
     experts = _experts(moe_v2_rows, DECODE_LEN)
     workspace2 = torch.zeros(8, dtype=torch.bfloat16)
-    reached = collections.Counter()
+    reached: collections.Counter[tuple[str, str]] = collections.Counter()
     for case in cases:
         _phase(monkeypatch, case["phase"])
         x = torch.zeros(case["rows"], HIDDEN, dtype=torch.bfloat16)
@@ -149,7 +173,7 @@ def test_case_set_dispatch_and_coverage(monkeypatch, moe_v2_rows):
         tensors = real.load_case(directory, "moe", case)
         assert tensors["topk_ids"].shape[1] == TOPK, case["id"]
         assert tensors["expert_map"].shape == (GLOBAL,), case["id"]
-        assert int((tensors["expert_map"] >= 0).sum()) == LOCAL, case["id"]
+        assert int((tensors["expert_map"] >= 0).sum()) == local, case["id"]
     real.require_cells(prefill, REQUIRED_CELLS, "MoE prefill")
 
 
@@ -161,7 +185,7 @@ def _prefill(served, x, ids, weights):
     workspace = torch.full(
         (
             exl3_ops.moe_workspace_size_prefill(
-                x.shape[0], x.shape[1], INTERMEDIATE, TOPK, LOCAL
+                x.shape[0], x.shape[1], INTERMEDIATE, TOPK, served.pointers.shape[0]
             ),
         ),
         float("nan"),
@@ -186,7 +210,8 @@ def test_prefill_holds_moe_outs_error_against_fp64_on_real_inputs():
     directory = real.case_dir_or_skip()
     checkpoint = real.Checkpoint(real.checkpoint_or_skip())
     _extension_or_skip()
-    _, cases = real.load_manifest(directory, "moe")
+    header, cases = real.load_manifest(directory, "moe")
+    local = _local_experts_or_skip(header)
     cases = _prefill_cases(cases)
     real.require_cells(cases, REQUIRED_CELLS, "MoE prefill")
     device = torch.device("cuda")
@@ -199,6 +224,7 @@ def test_prefill_holds_moe_outs_error_against_fp64_on_real_inputs():
     live = 0
     for (prefix, _), group in sorted(layers.items()):
         first = real.load_case(directory, "moe", group[0])
+        assert int((first["expert_map"] >= 0).sum()) == local, prefix
         served = _expert_set(checkpoint, prefix, first["expert_map"], device)
         calls, results = [], []
         for case in group:
@@ -221,7 +247,7 @@ def test_prefill_holds_moe_outs_error_against_fp64_on_real_inputs():
             calls.append((x.cpu(), ids.cpu(), weights.cpu()))
             results.append((case, name, port.cpu(), shipped.cpu()))
             del x, ids, weights, shipped, port
-        decoded = {}
+        decoded: dict[int, list[tuple]] = {}
 
         def decode(local, served=served, decoded=decoded):
             if local not in decoded:
@@ -238,7 +264,7 @@ def test_prefill_holds_moe_outs_error_against_fp64_on_real_inputs():
         for (case, name, port, shipped), ref in zip(results, refs):
             pool_of[real.pool_key(case)].add(port, shipped, ref.cpu(), name)
         del served, calls, gpu_calls, refs, decoded
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     failures = []
     for key, pool in pool_of.items():
         role, rows, phase, drafter = key
