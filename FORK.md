@@ -47,9 +47,9 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm_sm80/models/glm5next/ops/__init__.py` | 2 |
 | `vllm_sm80/models/glm5next/ops/idx_glue.py` | 538 |
 | `vllm_sm80/models/glm5next/ops/idx_glue_gates.py` | 99 |
-| `vllm_sm80/models/glm5next/ops/kda_decode.py` | 1,048 |
-| `vllm_sm80/models/glm5next/ops/kda_prefill.py` | 1,393 |
-| **27 files** | **9,774** |
+| `vllm_sm80/models/glm5next/ops/kda_decode.py` | 1,054 |
+| `vllm_sm80/models/glm5next/ops/kda_prefill.py` | 1,405 |
+| **27 files** | **9,792** |
 
 ### `vllm_sm80/models/<model>/`
 
@@ -123,7 +123,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm_sm80/kernels/marlin_moe/decode.py` | 420 |
 | `vllm_sm80/kernels/marlin_moe/experts.py` | 105 |
 | `vllm_sm80/kernels/marlin_moe/extension.py` | 170 |
-| `vllm_sm80/kernels/marlin_moe/prefill.py` | 501 |
+| `vllm_sm80/kernels/marlin_moe/prefill.py` | 506 |
 | `vllm_sm80/kernels/marlin_moe/split_align.py` | 224 |
 | `vllm_sm80/kernels/mhc/__init__.py` | 160 |
 | `vllm_sm80/kernels/mhc/decode.py` | 953 |
@@ -145,7 +145,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm_sm80/kernels/thin_gemm/warmup.py` | 154 |
 | `vllm_sm80/kernels/warmup.py` | 132 |
 | `vllm_sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **18,846** |
+| **54 files** | **18,851** |
 
 ### `vllm_sm80/launch/`
 
@@ -195,7 +195,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm_sm80/distributed/step_errors.py` | 167 |
 | `vllm_sm80/engine_args.py` | 103 |
-| `vllm_sm80/envs.py` | 1,654 |
+| `vllm_sm80/envs.py` | 1,656 |
 | `vllm_sm80/failed_inputs.py` | 175 |
 | `vllm_sm80/fla/__init__.py` | 2 |
 | `vllm_sm80/fla/autotune_pins.py` | 210 |
@@ -265,7 +265,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **86 files** | **23,975** |
+| **86 files** | **23,977** |
 
 ### `csrc/exl3/`
 
@@ -430,18 +430,18 @@ Grouped by top-level directory.
 | `tests/kernels/quantization/test_sm80_capture.py` | 563 |
 | `tests/kernels/replay_inputs.py` | 51 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
-| `tests/kernels/test_ampere_decode.py` | 473 |
+| `tests/kernels/test_ampere_decode.py` | 475 |
 | `tests/kernels/test_ampere_decode_mhc_v3.py` | 420 |
 | `tests/kernels/test_ampere_idx_glue.py` | 840 |
 | `tests/kernels/test_ampere_indexer_decode_raw_k.py` | 270 |
-| `tests/kernels/test_ampere_kda_dispatch.py` | 840 |
+| `tests/kernels/test_ampere_kda_dispatch.py` | 841 |
 | `tests/kernels/test_ampere_kda_fold.py` | 1,028 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
 | `tests/kernels/test_ampere_kda_recover.py` | 1,007 |
 | `tests/kernels/test_ampere_kda_small_stack.py` | 492 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 185 |
 | `tests/kernels/test_ampere_marlin_decode_v2.py` | 617 |
-| `tests/kernels/test_ampere_marlin_optional.py` | 237 |
+| `tests/kernels/test_ampere_marlin_optional.py` | 238 |
 | `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 406 |
 | `tests/kernels/test_ampere_marlin_prefill_tiles.py` | 864 |
 | `tests/kernels/test_ampere_moe_route.py` | 407 |
@@ -456,7 +456,7 @@ Grouped by top-level directory.
 | `tests/kernels/test_ampere_thin_gemm_gluon.py` | 989 |
 | `tests/kernels/test_ampere_thin_gemm_gluon_real_inputs.py` | 242 |
 | `tests/kernels/test_ampere_thin_gemm_v74.py` | 286 |
-| `tests/kernels/test_ampere_tp4_kda_prefill.py` | 364 |
+| `tests/kernels/test_ampere_tp4_kda_prefill.py` | 365 |
 | `tests/kernels/test_ampere_tp4_marlin_prefill.py` | 408 |
 | `tests/kernels/test_deterministic_moe_align.py` | 411 |
 | `tests/kernels/test_fla_autotune_pin.py` | 614 |
@@ -690,7 +690,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **303 files** | **126,672** |
+| **303 files** | **126,677** |
 
 #### `tools/`
 
@@ -957,7 +957,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 266 |
-| Plugin product lines | 85,954 |
+| Plugin product lines | 85,979 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |
