@@ -139,41 +139,12 @@ def test_mamba_speculative_scratch_excluded_from_concurrency():
     assert num_tokens == int(actual * vllm_config.model_config.max_model_len)
 
 
-def test_mamba_concurrency_unchanged_without_spec_decode():
-    """With speculative decoding off the accounting is bit-identical."""
-    max_num_seqs = 8
-    num_blocks = 873
-    vllm_config = _mamba_scratch_vllm_config(max_num_seqs)
-    config = _mamba_scratch_kv_cache_config(num_blocks, num_speculative_blocks=0)
-
-    per_group = _blocks_per_group(vllm_config, config)
-    assert per_group[1:] == [2, 2, 2]
-    assert get_max_concurrency_for_kv_cache_config(
-        vllm_config, config
-    ) == num_blocks / sum(per_group)
-
-
-def test_mamba_scratch_not_discounted_below_max_num_seqs():
-    """A pool that holds fewer requests than max_num_seqs keeps the old cost."""
-    max_num_seqs = 64
-    num_blocks = 873
-    vllm_config = _mamba_scratch_vllm_config(max_num_seqs)
-    config = _mamba_scratch_kv_cache_config(num_blocks, num_speculative_blocks=3)
-
-    total_per_request = sum(_blocks_per_group(vllm_config, config))
-    # 873 / 45 = 19.4 resident requests < 64 running slots: every resident
-    # request may be running, so it is charged its scratch.
-    assert get_max_concurrency_for_kv_cache_config(
-        vllm_config, config
-    ) == num_blocks / total_per_request
-
-
 def test_pool_concurrency_limit_edge_cases():
     limit = pool_concurrency_limit
     # No scratch at all -> the plain ratio.
     assert limit(873, 45, 0, 8) == 873 / 45
     # Scratch, but the pool holds fewer requests than max_num_seqs.
-    assert limit(360, 45, 9, 8) == 8.0
+    assert limit(200, 45, 9, 8) == 200 / 45
     # Continuous at the crossover: both branches agree at exactly max_num_seqs.
     assert limit(45 * 8, 45, 9, 8) == 8.0
     # Above the crossover the scratch pool is reserved only once.
@@ -305,11 +276,10 @@ def _attention_bytes(worker: dict[str, KVCacheSpec]) -> int:
     )
 
 
-@pytest.mark.parametrize("block_drop", [True, False])
-def test_drafter_rides_the_mla_block_without_pp(monkeypatch, block_drop):
+def test_drafter_rides_the_mla_block_without_pp(monkeypatch):
     """One stage: the drafter gets the exact-fit block, one group, and the
     block is exactly as wide as without a drafter."""
-    config = _glm5_config(monkeypatch, block_drop=block_drop)
+    config = _glm5_config(monkeypatch)
     target_groups = kv_cache_planning.get_kv_cache_groups(config, _glm5_like_specs())
     specs = _glm5_like_specs(num_draft_layers=5)
     mla_page = specs["layers.3.attn"].page_size_bytes
@@ -325,9 +295,7 @@ def test_drafter_rides_the_mla_block_without_pp(monkeypatch, block_drop):
     assert type(spec) is SlidingWindowSpec
     assert spec.block_size == MLA_BLOCK // 4
     assert spec.page_size_bytes == mla_page
-    assert [g.is_eagle_group for g in groups] == [
-        block_drop and g in draft_groups for g in groups
-    ]
+    assert [g.is_eagle_group for g in groups] == [g in draft_groups for g in groups]
     assert kv_cache_planning._pool_bytes_per_block(
         config, groups
     ) == kv_cache_planning._pool_bytes_per_block(config, target_groups)

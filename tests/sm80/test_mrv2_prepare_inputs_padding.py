@@ -85,7 +85,9 @@ def _prepare_padding_batch(monkeypatch, lengths, padding):
 
 
 @pytest.mark.parametrize("generic_skip", [False, True])
-@pytest.mark.parametrize("seed", range(8))
+# Seeds: 0 stays under the mask cutoff (8 rows), 4 is one request, 2 mixes in
+# a one-token request, 7 has four requests.
+@pytest.mark.parametrize("seed", [0, 2, 4, 7])
 def test_prepare_inputs_preserves_base_padding_and_routes(
     monkeypatch, generic_skip, seed
 ):

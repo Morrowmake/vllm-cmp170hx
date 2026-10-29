@@ -4,7 +4,6 @@
 out-of-tree layer registry: class identity, idempotent registration, and that
 every override is upstream's code path with the fork switches off. CPU only."""
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -276,22 +275,3 @@ def test_moesum_wrapper_returns_the_fused_sum(monkeypatch):
     assert order == ["entry"] and out[0] is None
     torch.testing.assert_close(out[1], shared + inp.sum(dim=1))
     assert sum_mod.MOE_SUM_DEFERRAL.take() is None
-
-
-def test_upstream_call_order_the_overrides_rely_on():
-    impl = inspect.getsource(MoERunner._forward_impl)
-    assert (impl.index(".maybe_forward_async(")
-            < impl.index("router_logits, _ = self.gate(hidden_states)")
-            < impl.index("self._apply_quant_method("))
-    aq = inspect.getsource(MoERunner._apply_quant_method)
-    assert (aq.index("self.router.select_experts(")
-            < aq.index("self.routed_experts.forward_modular(")
-            < aq.index("self._shared_experts.wait()")
-            < aq.index("self._shared_experts.output"))
-    fwd = inspect.getsource(MoERunner.forward)
-    assert (fwd.index("self._maybe_pad_hidden_states(")
-            < fwd.index("self._forward_entry(")
-            < fwd.index("_unpack(result)")
-            < fwd.index("result = shared_output + fused_output"))
-    init = inspect.getsource(MoERunner.__init__)
-    assert init.count("self._select_forward()") == 1

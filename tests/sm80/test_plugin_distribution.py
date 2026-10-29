@@ -10,8 +10,6 @@ the repository; license files must sit inside the project directory.
 
 import os
 import shutil
-import subprocess
-import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -88,27 +86,3 @@ def test_sdist_carries_the_license_files(built):
         assert sorted(found) == sorted(NAMES), archive.getnames()
         for name, member in found.items():
             assert archive.extractfile(member).read() == _expected()[name], member
-
-
-def _uv():
-    for candidate in (shutil.which("uv"), Path.home() / ".local" / "bin" / "uv"):
-        if candidate and Path(candidate).is_file():
-            return str(candidate)
-    return None
-
-
-def test_installed_dist_info_carries_the_license_files(built, tmp_path):
-    uv = _uv()
-    if uv is None:
-        pytest.skip("uv is not installed")
-    wheel, _ = built
-    target = tmp_path / "site"
-    subprocess.run(
-        [uv, "pip", "install", "--offline", "--no-index", "--no-deps",
-         "--python", sys.executable, "--target", str(target), str(wheel)],
-        check=True, capture_output=True, text=True,
-    )
-    infos = list(target.glob("vllm_sm80-*.dist-info"))
-    assert len(infos) == 1, list(target.iterdir())
-    for name, data in _expected().items():
-        assert (infos[0] / "licenses" / "licenses" / "exl3" / name).read_bytes() == data

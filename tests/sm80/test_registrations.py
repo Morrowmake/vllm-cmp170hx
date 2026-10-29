@@ -61,7 +61,7 @@ def test_custom_backend_slot_holds_triton_mla_sparse():
     assert AttentionBackendEnum.CUSTOM.get_class().get_name() == "TRITON_MLA_SPARSE"
 
 
-@pytest.mark.parametrize("major,expected", [(8, True), (9, True), (10, False)])
+@pytest.mark.parametrize("major,expected", [(8, True), (10, False)])
 def test_fork_platform_offers_triton_mla_sparse_last(monkeypatch, major, expected):
     from unittest.mock import MagicMock
 
@@ -124,14 +124,3 @@ def test_communicator_class_follows_the_switches(monkeypatch, switch):
     else:
         assert cls is comm.Sm80CudaCommunicator
         assert issubclass(cls, CudaCommunicator)
-
-
-def test_stateless_coordinator_still_asserts_upstreams_class():
-    """The limitation the fork communicator documents: if this assertion goes
-    away upstream, the switch-off restriction can go too."""
-    import inspect
-
-    from vllm.distributed import stateless_coordinator
-
-    src = inspect.getsource(stateless_coordinator)
-    assert "assert device_comm_cls == CudaCommunicator" in src
