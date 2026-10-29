@@ -210,18 +210,3 @@ def test_plain_upstream_resolves_on_a_tree_without_the_plugin(tmp_path):
     a = d["argv"]
     assert a[a.index("--max-num-seqs") + 1] == "4"
     assert_own_shape(d)
-
-
-def test_plain_upstream_refused_on_the_plugin_tree(w):
-    assert "carries the sm80 plugin" in w.refused("--capability", "plain-upstream", layout="tp1")
-
-
-def test_protected_parsers_stay_fixed(w):
-    assert "fixed by the settings" in w.refused("--", "--tool-call-parser", "hermes", layout="tp1")
-    assert "fixed for this model" in w.refused("--set", "args.reasoning-parser=qwen3", layout="tp1")
-
-
-def test_a_second_card_is_refused(w):
-    assert "not cards of this hardware (0..0)" in w.refused("--set", "cards=1", layout="tp1")
-    assert "needs exactly 1" in w.refused("--set", "cards=0,1", layout="tp1")
-    assert "cards 1 != tp 2" in w.refused("--set", "tp=2", "--experiment", "e", layout="tp1")

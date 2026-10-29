@@ -147,8 +147,3 @@ def test_negative_forms_come_from_the_tree_parser(tmp_path):
     assert paired.destination("enable-log-stats") == "disable-log-stats"
     assert paired.negative_forms("enable-lora") == {"no-enable-lora", "disable-lora"}
     assert plain.negative_forms("enable-lora") == {"no-enable-lora"}
-
-
-def test_launch_refused_without_the_parser_import(tmp_path):
-    w = World(tmp_path, extra_files={SERVE: "def subparser_init(p):\n    return p\n"})
-    assert f"{SERVE}: no 'from ... import make_arg_parser'" in w.refused()

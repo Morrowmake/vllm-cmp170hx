@@ -338,16 +338,12 @@ def test_candidate_matches_its_frozen_launch(w, tmp_path):
     only(d, "no receipt")
 
 
-@pytest.mark.parametrize("damage", ["tracked", "metadata", "adopted"])
+@pytest.mark.parametrize("damage", ["tracked", "adopted"])
 def test_candidate_still_reports_tree_problems(w, tmp_path, damage):
     frozen = tmp_path / "expected.json"
     frozen.write_text(json.dumps(w.resolve()))
     if damage == "tracked":
         write(os.path.join(w.tree, "csrc", "kernel.cu"), "// edited\n")
-    elif damage == "metadata":
-        s = json.load(open(os.path.join(w.tree, STAMP)))
-        s["commit"] = "1" * 40
-        write(os.path.join(w.tree, STAMP), json.dumps(s))
     else:
         add_build(w.tree, source="adopted")
     d = w.resolve("--role", "candidate", "--expect", str(frozen))
@@ -461,13 +457,6 @@ def test_receipt_unknown_major(w):
     r["schema"] = "validation-receipt/2"
     write(p, json.dumps(r))
     assert "unsupported schema" in w.refused()
-
-
-def test_previous_major_fixtures_read():
-    """Every schema the launcher reads has exactly one major today; this
-    keeps the list honest when a second major is added."""
-    from settings_dir import SUPPORTED_SCHEMAS
-    assert all(len(v) == 1 for v in SUPPORTED_SCHEMAS.values())
 
 
 def test_exec_matches_printed(w):

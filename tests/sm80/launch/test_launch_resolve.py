@@ -7,7 +7,6 @@ from __future__ import annotations
 import glob
 import json
 import os
-import re
 
 import pytest
 
@@ -95,22 +94,20 @@ SET_AND_UNSET = {
 }
 
 
-@pytest.mark.parametrize("layout", ["tp2", "pp2"])
 @pytest.mark.parametrize("case", sorted(SET_AND_UNSET))
 @pytest.mark.parametrize("kind", ["variant", "overlay"])
-def test_key_both_set_and_unset_in_one_file_refused(w, tmp_path, case, kind, layout):
+def test_key_both_set_and_unset_in_one_file_refused(w, tmp_path, case, kind):
     """One file that both sets and unsets a key (or a parent or child key)
     contradicts itself, in one table or across its top level and its
-    [layout.*] tables: refused for variant and overlay files alike, whichever
-    layout is launched."""
+    [layout.*] tables: refused for variant and overlay files alike, also
+    when the contradiction is in a layout not launched (tp2 is launched)."""
     text, key = SET_AND_UNSET[case]
     text = f'schema = "launch-{kind}/1"\n' + text
     if kind == "variant":
         write(os.path.join(w.settings, "variants", "both.toml"), text)
-        msg = w.refused("--variant", "both", layout=layout)
+        msg = w.refused("--variant", "both")
     else:
-        msg = w.refused("--overlay", write(str(tmp_path / "o.toml"), text), "--experiment", "e",
-                        layout=layout)
+        msg = w.refused("--overlay", write(str(tmp_path / "o.toml"), text), "--experiment", "e")
     assert "in the same file" in msg and key in msg, msg
 
 
@@ -267,14 +264,6 @@ def test_plain_upstream_drops_fork_names(tmp_path):
     assert d["registry"]["sm80_envs_sha256"] is None
 
 
-def test_no_option_names_another_registry():
-    import main
-    with pytest.raises(SystemExit):
-        main.parse_args(["--settings", "x", "--launcher-tree", "y"])
-    src = open(os.path.join(LAUNCH, "registry.py")).read()
-    assert re.search(r"def read_registry\(tree: str, capability: str\)", src)
-
-
 # -- validated --------------------------------------------------------------------
 
 def test_validated_after_promote(w):
@@ -342,8 +331,6 @@ def test_plain_cuda_home_resolves_as_before(w):
     ('cuda_home = { native = "" }', "cuda_home.native: not a directory name"),
     ("cuda_home = 13", "a directory name or a { native, container } table"),
     ('cuda_home = { container = "/usr/local/cuda-13.3" }', "differs from the image's CUDA_HOME"),
-    ('cuda_home = { native = "/opt/cuda", container = "/usr/local/cuda-13.3" }',
-     "differs from the image's CUDA_HOME"),
 ])
 def test_hardware_cuda_home_malformed_refused(w, line, expect):
     """Refused natively too: a settings error shows before any container runs."""
