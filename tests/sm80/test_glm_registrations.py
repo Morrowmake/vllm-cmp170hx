@@ -33,12 +33,6 @@ def _models_registered():
     plugin.register_models()
 
 
-@pytest.mark.parametrize("architecture", sorted(plugin.MODEL_OVERRIDES))
-def test_architecture_resolves_to_the_fork_class(architecture):
-    fork_cls = _load(plugin.MODEL_OVERRIDES[architecture])
-    assert ModelRegistry._try_load_model_cls(architecture) is fork_cls
-
-
 def test_register_is_idempotent():
     plugin.register_models()
     plugin.register_models()

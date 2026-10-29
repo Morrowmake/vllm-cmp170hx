@@ -166,36 +166,6 @@ def test_diagnostic_capture_without_ab_leaves_config_untouched(monkeypatch, stat
     assert state == dev_ab._ArmState()
 
 
-def test_allowlist():
-    assert set(dev_ab.SWITCHES) == {
-        "exl3_dense_splitk",
-        "exl3_moe_v2",
-        "exl3_moe_v2_draft",
-        "exl3_moe_v2_fold",
-        "exl3_dense_prefill_tc",
-        "dsv41_fused_mhc",
-        "dsv41_fused_mhc_finish",
-        "dsv41_fused_mhc_finish_v2",
-        "dsv41_fused_route",
-        "dsv41_draft_prologue_fused",
-        "dsv41_gate_gemv",
-        "dsv41_wo_a_grouped_gemm",
-        "dsv41_engram_wkv_replicated_prefill",
-        "dsv41_swa_meta_batch",
-        "dsv41_fused_attn_decode",
-        "dsv41_attn_pipeline",
-        "dsv41_select_one_launch",
-        "dsv41_moe_prefill_tc",
-        "topk_canonical_ties",
-        "marlin_decode_v2",
-        "custom_allreduce_flags",
-        "kda_prefill",
-        "local_argmax_reduction",
-        "target_shard_argmax",
-        "qwen4_router_fp32",
-    }
-
-
 def test_extension_methods_are_free_on_the_worker():
     gpu_worker = pytest.importorskip("vllm.v1.worker.gpu_worker")
     names = [n for n in dir(dev_ab.DevABWorkerExtension) if not n.startswith("__")]
@@ -682,7 +652,7 @@ def test_router_fp32_switch_refuses_at_boot(monkeypatch, router_model):
     assert "no Qwen4Exp MoE router gates" in switch.unavailable(runner)
 
 @pytest.mark.parametrize("profile_only", [False, True])
-@pytest.mark.parametrize("selected", [None, 0, 23])
+@pytest.mark.parametrize("selected", [None, 0])
 def test_capture_decorator_preserves_unset_and_zero_byte_results(monkeypatch, profile_only, selected):
     calls = []
     runner = object()

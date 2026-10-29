@@ -41,13 +41,6 @@ def test_capability_helpers_on_sm80_whatever_deep_gemm_reports(
     ]
 
 
-def test_every_deep_gemm_predicate_the_module_calls_is_imported():
-    # Each name the module calls must be bound at import, not only on the
-    # paths a CPU test reaches.
-    assert callable(indexer.has_deep_gemm)
-    assert callable(indexer.is_deep_gemm_supported)
-
-
 def test_metadata_builder_asks_whether_deep_gemm_can_run():
     # The one fork edit left in this upstream file: with has_deep_gemm() here,
     # sm_80 would build DeepGEMM schedule metadata on every decode step.

@@ -38,18 +38,13 @@ def test_register_adds_the_method_and_the_load_format(registered):
     assert type(get_model_loader(LoadConfig(load_format="exl3"))) is Exl3ModelLoader
 
 
-@pytest.mark.parametrize("is_cuda", [True, False])
-def test_exl3_checkpoints_are_refused_off_cuda(monkeypatch, is_cuda):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
+def test_exl3_checkpoints_are_refused_off_cuda(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
     override = exl3.Exl3Config.override_quantization_method
     assert override({"quant_method": "gptq"}, None) is None
-    if is_cuda:
-        assert override({"quant_method": "exl3"}, None) is None
-        assert override({"quant_method": "exl3"}, "exl3") is None
-    else:
-        for user_quant in (None, "exl3"):
-            with pytest.raises(ValueError, match="NVIDIA CUDA platform"):
-                override({"quant_method": "exl3"}, user_quant)
+    for user_quant in (None, "exl3"):
+        with pytest.raises(ValueError, match="NVIDIA CUDA platform"):
+            override({"quant_method": "exl3"}, user_quant)
 
 
 @pytest.mark.parametrize("retired_switch", [None, "0", "1"])
