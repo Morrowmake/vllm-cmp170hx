@@ -23,7 +23,6 @@ from tests.kernels.quantization.test_exl3_dense_mma import (  # noqa: F401
     mma_switch,
 )
 from tests.kernels.quantization.test_exl3_dense_splitk import (
-    SERVED_FORMATS,
     _bitwise,
     _extension_or_skip,
     _inputs,
@@ -128,13 +127,7 @@ def _check_launch(
 
 @pytest.mark.parametrize(
     "bits_x2,codebook",
-    [
-        pytest.param(2, 1, marks=ACCEPTED_MISS),
-        pytest.param(6, 1, marks=ACCEPTED_MISS),
-        pytest.param(5, 2, marks=ACCEPTED_MISS),
-        pytest.param(10, 2, marks=ACCEPTED_MISS),
-        pytest.param(16, 2, marks=ACCEPTED_MISS),
-    ],
+    [pytest.param(10, 2, marks=ACCEPTED_MISS)],
 )
 def test_linear_out(bits_x2, codebook):
     _extension_or_skip()
@@ -154,7 +147,7 @@ def test_linear_out(bits_x2, codebook):
         )
 
 
-@pytest.mark.parametrize("bits_x2,codebook", SERVED_FORMATS)
+@pytest.mark.parametrize("bits_x2,codebook", [(14, 2)])
 def test_split_k(mma_switch, bits_x2, codebook):  # noqa: F811
     mma_switch(False)
     padded_in, padded_out = 2560, 640

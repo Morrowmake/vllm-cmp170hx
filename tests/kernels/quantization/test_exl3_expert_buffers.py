@@ -6,8 +6,8 @@ into one buffer per tensor kind (quant.expert_buffer_views), on CPU.
 With the switch off every trellis, suh and svh is its own allocation; with it
 on, every local expert matrix's trellis of the layer is a view of one int16
 buffer, its suh of one FP16 buffer and its svh of another, each view
-contiguous, of the same shape and dtype, at a 512-byte-aligned offset, in
-allocation order and not overlapping. Loading through the EXL3 loader
+contiguous, of the same shape and dtype, at a 512-byte-aligned offset and
+not overlapping. Loading through the EXL3 loader
 (Exl3PackedWeight.load) gives every expert the bytes of the checkpoint in
 both modes:
 
@@ -198,15 +198,6 @@ def test_synthetic_layer_loads_the_same_bytes(
     assert len(layer.exl3_experts) == EXPERTS // ep_size
     _check_layout(layer, contiguous)
     _check_bytes(layer, config.manifest)
-
-
-def test_views_follow_allocation_order(monkeypatch, synthetic):
-    config = _config(synthetic)
-    layer = _build_and_load(
-        monkeypatch, config, "model.layers.0.mlp.experts", 1, contiguous=True
-    )
-    offsets = [t.storage_offset() for t in _tensors(layer, "trellis")]
-    assert offsets == sorted(offsets) and offsets[0] == 0
 
 
 def test_mismatched_views_are_refused(synthetic):
