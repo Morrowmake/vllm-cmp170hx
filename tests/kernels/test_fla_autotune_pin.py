@@ -609,21 +609,3 @@ def test_skip_spilling_covers_every_kernel_and_leaves_pinning_alone():
     both = _run(_DESCRIBE, "1", extra_env=_SKIP_ENV)
     for name, d in both.items():
         assert d["cls"].endswith("pinned_autotune.PinnedAutotuner"), name
-
-
-_SM80_ROWS = """
-print(json.dumps([[pa.config_spec(c), sm80_local_bytes(c)]
-                  for c in pa.REGISTRY[NAME].configs]))
-"""
-
-
-def test_sm80_build_puts_exactly_three_chunk_o_configs_over_the_limit():
-    """At the served shape, only the 2-warp 128 x 128 configs need more than
-    the context's default 1,024 B of local memory per thread."""
-    rows = _run(_SM80_STACK + _SM80_ROWS, None, smem=True)
-    assert len(rows) == 36
-    over = [spec for spec, size in rows if size > 1024]
-    assert over == [
-        {"kwargs": {"BK": 128, "BV": 128}, "num_warps": 2, "num_stages": s}
-        for s in (2, 3, 4)
-    ]

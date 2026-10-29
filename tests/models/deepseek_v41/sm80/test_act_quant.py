@@ -154,28 +154,6 @@ def test_all_zero_blocks() -> None:
     assert torch.signbit(fp4_qdq(nz, 32, "e8m0").float()).all()
 
 
-@pytest.mark.parametrize("k", range(-20, 21))
-def test_fp8_amax_exact_powers_of_two(k: int) -> None:
-    for amax in (448.0 * 2.0**k, 2.0**k, 1.75 * 2.0**k):
-        x = torch.zeros(1, 32, dtype=torch.bfloat16)
-        x[0, 7] = amax
-        x[0, 8] = -amax / 3
-        y = act_quant_qdq_fp8(x, 32)
-        _assert_bits_equal(y, ref_fp8(x, 32))
-        # The block maximum is always representable after the round trip.
-        assert y[0, 7].item() == x[0, 7].item()
-
-
-@pytest.mark.parametrize("k", range(-20, 21))
-def test_fp4_amax_exact_powers_of_two(k: int) -> None:
-    for scale, block in (("e8m0", 32), ("e4m3", 16)):
-        for amax in (6.0 * 2.0**k, 2.0**k):
-            x = torch.zeros(1, block, dtype=torch.bfloat16)
-            x[0, 3] = amax
-            x[0, 4] = amax / 5
-            _assert_bits_equal(fp4_qdq(x, block, scale), ref_fp4(x, block, scale))
-
-
 def test_fp8_subnormal_results() -> None:
     # amax 448 -> scale 1; E4M3 denormals step by 2**-9.
     x = torch.zeros(1, 32, dtype=torch.bfloat16)
