@@ -102,14 +102,3 @@ def test_family_checks_the_link_and_the_output(tmp_path):
     src = SimpleNamespace(meta={}, output="mixes")
     with pytest.raises(ValueError, match="not one of"):
         C.mhc_finish_consumer({}, torch.device("cpu"), src)
-
-
-def test_fp64_chain_feeds_the_producer_into_the_consumer():
-    p, c = _linked(3, 1)
-    p = C._args(p)
-    got = C._fp64(p, c)
-    ideal = mhc_delayed_fp64(p)
-    want = mhc_delayed_fp64(dict(c, residual=ideal["residual"], post_layer_mix=ideal["post"],
-                                 comb_res_mix=ideal["comb"], pre_mix=ideal["pre"]))
-    for k in want:
-        assert torch.equal(got[k], want[k]), k

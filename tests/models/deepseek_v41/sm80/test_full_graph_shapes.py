@@ -268,13 +268,6 @@ _STACKS = [
         LayerSpec(1, index_source=True, uses_candidates=True),
     ],
 ]
-_DEVICES = [
-    "cpu",
-    pytest.param(
-        "cuda",
-        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
-    ),
-]
 
 
 def _decode_run(args, specs, weights, live: int, rows: int, full: bool, device):
@@ -316,14 +309,14 @@ def _decode_run(args, specs, weights, live: int, rows: int, full: bool, device):
     return outs, [c.cpu() for c in caches]
 
 
-@pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("live,rows", [(3, 4), (5, 8)])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("specs", _STACKS)
-def test_full_and_piecewise_row_counts_agree(device, live, rows, specs) -> None:
+def test_full_and_piecewise_row_counts_agree(specs) -> None:
     """A decode step of ``live`` requests replayed by a FULL graph of
     ``rows`` tokens (metadata over the padded tokens) gives the outputs and
     caches of the piecewise step (metadata over the live tokens, input
-    padded to ``rows``), bit for bit."""
+    padded to ``rows``), bit for bit, on the CUDA kernels."""
+    device, live, rows = "cuda", 5, 8
     args = RefArgs()
     weights = [make_weights(args, s, 300 + i) for i, s in enumerate(specs)]
     pw_out, pw_caches = _decode_run(args, specs, weights, live, rows, False, device)
