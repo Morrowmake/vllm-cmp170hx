@@ -875,7 +875,7 @@ def attend_layer(
             batch.swa_indices, caches.comp, batch.comp_block_table,
             caches.topk[:T] if cfg.compress_ratio else None, batch.token_to_req,
             weights.attn_sink, cfg.softmax_scale, post_rope=True, final_out=out,
-            scores_out=workspace.attention_scores)
+            scores_out=workspace.attention_scores, split_scratch=workspace.split_scratch)
         return
     if fused:
         from vllm_sm80.models.deepseek_v41.ops import sm80_attn_fused

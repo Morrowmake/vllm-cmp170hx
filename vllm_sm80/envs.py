@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
+    VLLM_DEEPSEEK_V41_SPLITKV_DECODE: bool = False
     VLLM_SM80_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
@@ -920,6 +921,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # OFF. Read in vllm_sm80/models/deepseek_v41/ops/sm80_index_topk.py.
     "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80, the attention pipeline's decode attention as
+    # split-KV: each row's window and selected compressed keys split a fixed
+    # number of ways per shape, merged in split order (bit stable run to run;
+    # changes rounding). Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/ops/sm80_attn_pipeline.py.
+    "VLLM_DEEPSEEK_V41_SPLITKV_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SPLITKV_DECODE", "0"))
     ),
     # Greedy argmax over a vocabulary-parallel head without the all-gather of
     # the logits, for greedy target sampling and greedy drafting. Each TP rank

@@ -440,6 +440,17 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             from vllm_sm80.models.deepseek_v41.ops.sm80_attn_pipeline import PIPELINE_WARMUP
 
             PIPELINE_WARMUP.register_warmup(self)
+        if envs.VLLM_DEEPSEEK_V41_SPLITKV_DECODE:
+            if self._sm80_attn_pipeline_enabled and self._sm80_attn_pipeline_eligible:
+                logger.info_once(
+                    "DeepSeek-V4.1 sm_80: the attention pipeline's decode attention "
+                    "runs split-KV (VLLM_DEEPSEEK_V41_SPLITKV_DECODE=1)", scope="global",
+                )
+            else:
+                logger.warning_once(
+                    "DeepSeek-V4.1 sm_80: VLLM_DEEPSEEK_V41_SPLITKV_DECODE=1 has no "
+                    "effect: the attention pipeline is off", scope="global",
+                )
         if self.indexer is not None and vllm_config.kernel_config.enable_jit_warmup:
             from vllm_sm80.models.deepseek_v41.ops.sm80_index_scores import (
                 INDEX_SCORES_WARMUP,
