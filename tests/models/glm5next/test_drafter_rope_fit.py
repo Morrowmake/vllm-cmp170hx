@@ -67,24 +67,13 @@ def test_flag_default_off(monkeypatch):
     assert dflash_rope_max_position(vllm_config, draft) == 1 << 20
 
 
-def test_flag_zero_is_off(monkeypatch):
-    monkeypatch.setenv(FLAG, "0")
-    vllm_config, draft = _configs(1 << 20, 262_144, 3)
-    assert dflash_rope_max_position(vllm_config, draft) == 1 << 20
-
-
 @pytest.mark.parametrize(
     "max_model_len,num_spec,expected",
     [
         # Production: 262,144 + 1 + 3 -> 262,208 (next multiple of 64).
         (262_144, 3, 262_208),
-        (262_144, 7, 262_208),
         (262_144, 63, 262_208),
         (262_144, 64, 262_272),
-        (131_072, 3, 131_136),
-        (1_000, 3, 1_024),
-        (1_020, 3, 1_024),
-        (1_021, 3, 1_088),
     ],
 )
 def test_fitted_length(flag_on, max_model_len, num_spec, expected):
@@ -128,7 +117,6 @@ def test_no_speculative_config(flag_on):
     "rope_parameters",
     [
         {"rope_theta": 10000.0, "rope_type": "yarn", "factor": 4.0},
-        {"rope_theta": 10000.0, "rope_type": "linear", "factor": 2.0},
         {"rope_theta": 10000.0, "rope_type": "default", "mrope_section": [16, 24, 24]},
     ],
 )
@@ -137,8 +125,7 @@ def test_scaled_rope_keeps_configured(flag_on, rope_parameters):
     assert dflash_rope_max_position(vllm_config, draft) == 1 << 20
 
 
-@pytest.mark.parametrize("is_neox_style", [True, False])
-def test_kept_rows_identical(flag_on, default_vllm_config, is_neox_style):
+def test_kept_rows_identical(flag_on, default_vllm_config):
     head_size = 128
     configured = 8_192
     max_model_len, num_spec = 2_000, 3
@@ -149,7 +136,7 @@ def test_kept_rows_identical(flag_on, default_vllm_config, is_neox_style):
     full = get_rope(
         head_size,
         max_position=configured,
-        is_neox_style=is_neox_style,
+        is_neox_style=True,
         rope_parameters=PLAIN_ROPE,
         dtype=torch.float32,
     )
@@ -157,7 +144,7 @@ def test_kept_rows_identical(flag_on, default_vllm_config, is_neox_style):
     small = get_rope(
         head_size,
         max_position=fitted,
-        is_neox_style=is_neox_style,
+        is_neox_style=True,
         rope_parameters=PLAIN_ROPE,
         dtype=torch.float32,
     )

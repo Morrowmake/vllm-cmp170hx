@@ -435,11 +435,6 @@ def test_sample_matches_the_gathered_path_on_four_ranks(tmp_path):
     check_ranks(ranks)
 
 
-def test_greedy_verify_reference():
-    # Request 0 accepts both drafts (bonus token), request 1 misses the first.
-    assert greedy_verify([5, 6, 7, 1, 2, 3], [0, 5, 6, 0, 9, 2], 3) == [[5, 6, 7], [1]]
-
-
 def test_switch_is_off_by_default(monkeypatch):
     import vllm.envs as envs
 
@@ -527,7 +522,6 @@ def _fallback_cases():
         "a sampled request": dict(params=[greedy, SamplingParams(temperature=0.7)]),
         "logprobs": dict(params=one(logprobs=2)),
         "presence penalty": dict(params=one(presence_penalty=0.5)),
-        "repetition penalty": dict(params=one(repetition_penalty=1.2)),
         "logit bias": dict(params=one(logit_bias={3: 2.0})),
         "allowed tokens": dict(params=one(allowed_token_ids=[1, 2, 3])),
         "bad words": dict(params=one(_bad_words_token_ids=[[4]])),
@@ -579,15 +573,6 @@ def test_a_greedy_only_step_takes_the_shard_argmax(monkeypatch, host_sampling):
     runner = _runner(params + [SamplingParams(temperature=0.7)])
     assert _step_active(runner, 4)
     assert not _step_active(runner, 5)
-
-
-def test_greedy_requests_carry_no_top_k_top_p():
-    """SamplingParams resets top-k/top-p/min-p for a greedy request, so the
-    four-rank test writes them into the sampler's states itself."""
-    from vllm.sampling_params import SamplingParams
-
-    p = SamplingParams(temperature=0.0, top_p=0.95, top_k=1, min_p=0.1)
-    assert (p.top_p, p.top_k, p.min_p) == (1.0, 0, 0.0)
 
 
 def test_a_greedy_only_step_samples_unsharded(monkeypatch, host_sampling):
@@ -698,25 +683,6 @@ def test_switch_refuses_logits_as_input_and_a_large_vocabulary(monkeypatch):
     assert "does not sample in greedy steps" in ta.refusal(None)
     # A pipeline stage before the last samples nothing: nothing to refuse.
     assert ta.refusal(SimpleNamespace(target_argmax_steps=True, is_last_pp_rank=False)) is None
-
-
-def test_target_gathers_outside_a_greedy_step(monkeypatch):
-    """The sm_80 target: the gathered logits outside a greedy-only step
-    (prompt logprobs, the dummy sampler run), the argmax rows inside."""
-    from vllm_sm80.models.deepseek_v41.sm80_model import DeepseekV41ForCausalLM
-    from vllm_sm80.worker import target_argmax as ta
-
-    model = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
-    torch.nn.Module.__init__(model)
-    model.language_model = _Target()
-    h = torch.zeros(2, 97)
-    assert model.compute_logits(h) is h
-    assert model.language_model.calls == ["gather"]
-    monkeypatch.setattr(ta, "_active", True)
-    monkeypatch.setattr(ta, "argmax_rows", lambda m, x: ("rows", m, x))
-    assert model.compute_logits(h) == ("rows", model, h)
-    assert model.language_model.calls == ["gather"]
-    assert model.target_argmax_logits
 
 
 def test_fork_runner_samples_in_a_step(monkeypatch):

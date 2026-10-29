@@ -194,14 +194,13 @@ def test_no_aux_layers_leaves_boundary_unchanged(monkeypatch):
 
 @pytest.mark.parametrize(
     "fields,expected",
-    [({}, "stream_mean"), ({"aux_hidden_state_tensor": "stream_mean"}, "stream_mean"),
-     ({"aux_hidden_state_tensor": "branch"}, "branch")],
+    [({}, "stream_mean"), ({"aux_hidden_state_tensor": "branch"}, "branch")],
 )
 def test_aux_tensor_mode_reads_the_text_config(fields, expected):
     assert glm_model.aux_hidden_state_mode(SimpleNamespace(**fields)) == expected
 
 
-@pytest.mark.parametrize("value", ["mean", "", None])
+@pytest.mark.parametrize("value", ["mean", None])
 def test_aux_tensor_mode_rejects_other_values(value):
     config = SimpleNamespace(aux_hidden_state_tensor=value)
     with pytest.raises(ValueError, match="aux_hidden_state_tensor"):

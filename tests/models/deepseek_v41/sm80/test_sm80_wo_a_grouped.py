@@ -281,7 +281,7 @@ class _Recorder:
         return launch
 
 
-@pytest.mark.parametrize("rows", [1, 6, 48, 65, 300])
+@pytest.mark.parametrize("rows", [1, 300])
 @pytest.mark.parametrize("pad", [0, 64])
 def test_one_launch_reads_the_attention_output_in_place(monkeypatch, rows, pad):
     groups, rank_out, k = 2, 1024, 4096

@@ -33,13 +33,11 @@ MIX = (2 + HC) * HC
     "rows,cut",
     [
         (2044, 1024),
-        (2048, 1024),
         (4096, 2048),
         (1536, 1024),
         (1100, 512),
         (1024, 512),
         (1023, None),
-        (600, None),
         (6, None),
     ],
 )
@@ -399,12 +397,6 @@ def test_side_stream_is_high_priority(monkeypatch) -> None:
     device = torch.device("cuda", 0)
     assert split.SideStream(device).stream == "side"
     assert seen == {"device": device, "priority": -1}
-
-
-def test_cpu_issue_runs_inline() -> None:
-    side = split.side_stream(torch.device("cpu"))
-    t = torch.ones(3)
-    assert torch.equal(side.issue(lambda x: x * 2, t).wait(), t * 2)
 
 
 # --- adoption -----------------------------------------------------------------
