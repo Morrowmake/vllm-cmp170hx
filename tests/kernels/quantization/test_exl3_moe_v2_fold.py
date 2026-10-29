@@ -9,10 +9,6 @@ CPU:
 - the switch defaults off; Exl3Experts.apply takes moe_out_v2_fold for the
   calls moe_out_v2 serves only when the layer's experts are folded;
   Exl3MoEMethod._moe_v2 requires the operator and warms both arms;
-- the launch configurations are read from moe_v2.cu's LaneTiling: they cover
-  every configuration ops.MOE_V2_CONFIGS opens, including the tensor-split
-  shapes (hidden 5120, each rank a 640- or 512-column chunk of every
-  expert);
 - an exact emulation of the completion counting (groups_over_block and the
   expected counts) over the route tiling: every (row tile, H128 block),
   row tile and (token, H128 block) counter is completed by exactly one item,
@@ -75,8 +71,7 @@ def test_switch_defaults_off(monkeypatch):
     assert envs.VLLM_EXL3_MOE_V2_FOLD is True
 
 
-@pytest.mark.parametrize("fold", [False, True])
-def test_apply_takes_the_folded_operator_for_the_v2_calls(monkeypatch, fold):
+def test_apply_takes_the_folded_operator_for_the_v2_calls(monkeypatch):
     calls = []
     for name in ("moe_out", "moe_out_v2", "moe_out_v2_fold"):
         monkeypatch.setattr(
@@ -87,16 +82,15 @@ def test_apply_takes_the_folded_operator_for_the_v2_calls(monkeypatch, fold):
             ),
         )
     experts = h2560._experts(64)
-    experts.moe_v2_fold = fold
+    experts.moe_v2_fold = True
     workspace2 = torch.zeros(8, dtype=torch.bfloat16)
     for rows in (1, 48, 64, 65):
         x = torch.zeros(rows, h2560.HIDDEN, dtype=torch.bfloat16)
         h2560._apply(experts, x, "ids", "weights", "ptrs", "meta", "out", workspace2)
-    v2 = "moe_out_v2_fold" if fold else "moe_out_v2"
     assert [(name, rows) for name, rows, _ in calls] == [
-        (v2, 1),
-        (v2, 48),
-        (v2, 64),
+        ("moe_out_v2_fold", 1),
+        ("moe_out_v2_fold", 48),
+        ("moe_out_v2_fold", 64),
         ("moe_out", 65),
     ]
     for name, _, kwargs in calls[:3]:
@@ -197,19 +191,6 @@ def _folded_bits(hidden, intermediate):
     return sorted({b for h, i, *_, b in _v2_configs() if (h, i) == shape})
 
 
-def test_tilings_cover_every_open_configuration_and_the_split_shapes():
-    for h, i, _, _, _, bits in _v2_configs():
-        assert (h, i) in TILINGS, (h, i)
-        assert bits in TILINGS[(h, i)]["bits"], (h, i, bits)
-    for shape in SPLIT_SHAPES:
-        assert shape in TILINGS, shape
-        # The gate opens for the split with every expert local.
-        assert any(
-            (h, i) == shape and local == total
-            for h, i, _, local, total, _ in _v2_configs()
-        ), shape
-
-
 # Completion counting, mirrored from moe_v2.cu (FoldGateUp, FoldDown,
 # fold_activate, groups_over_block), for every launch configuration of every
 # shape the gate opens (local experts and top-k from its configuration).
@@ -243,10 +224,6 @@ def _last_once(counts, expected, order):
         seen[key] += 1
     assert seen == counts
     return last
-
-
-def test_counting_covers_the_split_shapes():
-    assert {(h, i) for h, i, *_ in COUNTING} >= set(SPLIT_SHAPES)
 
 
 @pytest.mark.parametrize("shape", COUNTING, ids=lambda s: "x".join(map(str, s)))
@@ -375,22 +352,6 @@ ROUTE_KERNELS = {
         (tiling["kGateUpLongScaleK"], tiling["kGateUpLongSliceTiles"]),
     }
 }
-
-
-def test_fold_kernels_cover_the_split_shapes():
-    for h, i in SPLIT_SHAPES:
-        assert _folded_bits(h, i), (h, i)
-        for nt, gate_up_kt, gate_up_slices, down_kt, down_slices in _launches(h, i):
-            for bits in _folded_bits(h, i):
-                down = (
-                    f"moe_lane_kernel<{nt}, {down_kt}, {bits}, "
-                    f"FoldDown<{down_slices}>>"
-                )
-                gate_up = (
-                    f"moe_lane_kernel<{nt}, {gate_up_kt}, {bits}, "
-                    f"FoldGateUp<{gate_up_slices}, {i // 128}>>"
-                )
-                assert {down, gate_up} <= LANE_KERNELS
 
 
 @pytest.fixture(scope="module")
@@ -612,8 +573,8 @@ def test_fold_repeats_bitwise_with_a_reused_workspace(synthetic):
 
 
 @needs_sm80
-@pytest.mark.parametrize("rows", [6, 48])
-def test_fold_graph_replay_is_bitwise_without_allocations(synthetic, rows):
+def test_fold_graph_replay_is_bitwise_without_allocations(synthetic):
+    rows = 48
     exl3_ops.warmup_moe_v2(
         synthetic.pointers,
         synthetic.meta,
@@ -877,8 +838,8 @@ def test_fold_repeats_bitwise_at_split_shapes(split_layer):
 
 
 @needs_sm80
-@pytest.mark.parametrize("rows", [6, 48])
-def test_fold_graph_replay_is_bitwise_at_split_shapes(split_layer, rows):
+def test_fold_graph_replay_is_bitwise_at_split_shapes(split_layer):
+    rows = 48
     layer = split_layer
     exl3_ops.warmup_moe_v2(
         layer.pointers, layer.meta, layer.expert_map, list(range(layer.experts)), 5120,

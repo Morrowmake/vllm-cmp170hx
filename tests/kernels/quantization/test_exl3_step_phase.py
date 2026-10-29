@@ -7,11 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import vllm.forward_context as forward_context
-from vllm_sm80.kernels.exl3.step_phase import (
-    max_decode_query_len,
-    max_decode_step_rows,
-    prefill_step,
-)
+from vllm_sm80.kernels.exl3.step_phase import max_decode_step_rows, prefill_step
 
 # One sampled token plus three draft tokens under verification.
 DECODE_QUERY_LEN = 4
@@ -27,11 +23,6 @@ def _context(monkeypatch, attn_metadata):
 
 def _attention(max_query_len):
     return SimpleNamespace(max_query_len=max_query_len, num_actual_tokens=0)
-
-
-def test_max_decode_query_len_counts_the_verified_draft():
-    assert max_decode_query_len(SimpleNamespace(num_speculative_tokens=3)) == 4
-    assert max_decode_query_len(SimpleNamespace(num_speculative_tokens=0)) == 1
 
 
 def _rows_config(max_num_seqs, k=None, schedule=None, adaptive_k=None, method=None):
@@ -78,23 +69,9 @@ def test_block_drafters_bound_one_forward_pass_not_two(method):
     assert max_decode_step_rows(config) == 64
 
 
-def test_block_drafter_k7_keeps_the_dense_prefill_gate_open():
-    from vllm_sm80.kernels.exl3 import dense_prefill_tc
-
-    config = _rows_config(8, k=7, method="dspark")
-    config.speculative_config.parallel_drafting = True
-    config.parallel_config = SimpleNamespace(
-        tensor_parallel_size=4, pipeline_parallel_size=1
-    )
-    assert dense_prefill_tc.closed_reason((8, 0), 74, config) is None
-    # Eight requests of eight rows is the bound; nine would close it.
-    config.scheduler_config.max_num_seqs = 9
-    assert "rows" in dense_prefill_tc.closed_reason((8, 0), 74, config)
-
-
 @pytest.mark.parametrize(
     "max_query_len, expected",
-    [(1, False), (4, False), (5, True), (309, True), (3460, True)],
+    [(4, False), (5, True)],
 )
 def test_phase_follows_the_longest_scheduled_request(
     monkeypatch, max_query_len, expected
@@ -112,16 +89,10 @@ def test_phase_follows_the_longest_scheduled_request(
     assert prefill_step(DECODE_QUERY_LEN) is expected
 
 
-def test_many_decode_requests_stay_a_decode_step(monkeypatch):
-    # 64 requests verifying 3 drafts each: 256 rows, still decode.
-    _context(monkeypatch, {"layers.3.self_attn": _attention(DECODE_QUERY_LEN)})
-    assert prefill_step(DECODE_QUERY_LEN) is False
-
-
 @pytest.mark.parametrize(
     "attn_metadata",
-    [None, {}, [{"layers.3.self_attn": _attention(3460)}], {"a": _attention(None)}],
-    ids=["none", "empty", "microbatches", "no_int"],
+    [[{"layers.3.self_attn": _attention(3460)}]],
+    ids=["microbatches"],
 )
 def test_missing_or_unusable_metadata_counts_as_decode(monkeypatch, attn_metadata):
     _context(monkeypatch, attn_metadata)

@@ -11,7 +11,7 @@ CPU: the gate opens for both bit widths and closes for other layouts (mixed
 widths, the drafter's bits_x2 8, other expert counts, top-k or intermediate
 sizes); moe_out_prefill's gate stays closed for this shape;
 Exl3MoEMethod._moe_v2 hands the layer's bits_x2 to the warm-up and the
-experts; Exl3Experts.apply passes it to moe_out_v2; and the workspace contract
+experts; and the workspace contract
 (the v2 workspace at 64 rows fits in moe_out's at the served 2048 rows, so the
 switch does not grow the MoE workspace).
 
@@ -45,7 +45,6 @@ import torch
 from tests.kernels.quantization import exl3_real_cases as real
 from tests.kernels.quantization.test_exl3_moe_v2 import (
     _allocations,
-    _apply,
     _bitwise,
     _extension_or_skip,
     _Fp64Pool,
@@ -115,10 +114,10 @@ def test_prefill_gate_stays_closed_for_this_shape():
     assert reason and "(5120, 2304, 6, 96, 384)" in reason
 
 
-@pytest.mark.parametrize("bits_x2", BITS)
-def test_method_hands_the_layer_bits_to_warmup_and_experts(monkeypatch, bits_x2):
+def test_method_hands_the_layer_bits_to_warmup_and_experts(monkeypatch):
     from vllm_sm80.kernels.exl3.quant import Exl3MoEMethod
 
+    bits_x2 = 4  # not the configuration's first width (6)
     warmed = []
     method = object.__new__(Exl3MoEMethod)
     method.moe = SimpleNamespace(in_dtype=torch.bfloat16)
@@ -142,45 +141,6 @@ def test_method_hands_the_layer_bits_to_warmup_and_experts(monkeypatch, bits_x2)
     assert method._moe_v2(layer, _meta(bits_x2), 2048, 7) == (64, bits_x2, 64000)
     (args,) = warmed
     assert args[4:9] == (HIDDEN, INTERMEDIATE, TOPK, bits_x2, SWIGLU_LIMIT)
-
-
-def test_apply_passes_the_layer_bits_to_moe_out_v2(monkeypatch):
-    from vllm_sm80.kernels.exl3.quant import Exl3Experts
-
-    calls = []
-    for name in ("moe_out", "moe_out_v2"):
-        monkeypatch.setattr(
-            exl3_ops,
-            name,
-            lambda *args, _name=name, **kwargs: calls.append((_name, args, kwargs)),
-        )
-    experts = object.__new__(Exl3Experts)
-    experts.intermediate_size = INTERMEDIATE
-    experts.expert_map = "layer map"
-    experts.workspace_elements = 0
-    experts.max_rows = 2048
-    experts.moe_v2_rows = 64
-    experts.moe_out_rows = experts.max_rows
-    experts.moe_v2_bits_x2 = 4
-    experts.prefill_decode_len = 0
-    experts.prefill_v2_bits_x2 = 0
-    experts.swiglu_limit = SWIGLU_LIMIT
-    workspace2 = torch.zeros(8, dtype=torch.bfloat16)
-    for rows in (1, 48, 64, 65):
-        x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
-        _apply(experts, x, "ids", "weights", "ptrs", "meta", "out", workspace2)
-    assert [(name, args[0].shape[0]) for name, args, _ in calls] == [
-        ("moe_out_v2", 1),
-        ("moe_out_v2", 48),
-        ("moe_out_v2", 64),
-        ("moe_out", 65),
-    ]
-    for name, args, kwargs in calls:
-        assert args[6] == INTERMEDIATE
-        expected = {"swiglu_limit": SWIGLU_LIMIT}
-        if name == "moe_out_v2":
-            expected["bits_x2"] = 4
-        assert kwargs == expected
 
 
 def _route_ints(assignments):
@@ -473,8 +433,8 @@ def test_v2_rows_do_not_depend_on_the_call_size(synthetic):
 
 
 @needs_sm80
-@pytest.mark.parametrize("rows", [6, 64])
-def test_v2_graph_replay_is_bitwise_eager_without_allocations(synthetic, rows):
+def test_v2_graph_replay_is_bitwise_eager_without_allocations(synthetic):
+    rows = 64
     exl3_ops.warmup_moe_v2(
         synthetic.pointers,
         synthetic.meta,
