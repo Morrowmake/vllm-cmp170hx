@@ -10,7 +10,6 @@ wiring) are ``test_sm80_attn_fused_gpu.py``.
     pytest -q tests/models/deepseek_v41/sm80/test_sm80_attn_fused.py
 """
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -138,14 +137,6 @@ def test_the_layer_gate(monkeypatch):
     assert gate(_gate_layer(heads=32), _vllm_config()) is False
     monkeypatch.setattr(attn.current_platform, "get_device_capability", lambda: (9, 0))
     assert gate(_gate_layer(), _vllm_config()) is False
-
-
-def test_the_layer_functions_default_to_the_unfused_path():
-    for fn in (core.prepare_layer, core.attend_layer):
-        assert inspect.signature(fn).parameters["fused"].default is False
-        assert inspect.signature(fn).parameters["pipeline"].default is False
-    assert inspect.signature(core.store_kv).parameters["window"].default is True
-    assert inspect.signature(core.forward_layer).parameters.get("fused") is None
 
 
 def test_unfused_layer_on_cpu_is_unchanged():

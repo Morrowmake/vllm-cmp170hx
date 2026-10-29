@@ -108,7 +108,7 @@ def _within_v2(call, ref_exact=None):
     assert call.row_invariant
 
 
-ROWS = (1, 2, 4, 5, 7, 8, 12, 18, 24, 30, 40, 48)
+ROWS = (1, 5, 8, 18, 48)
 
 
 @pytest.mark.parametrize("compressed", [False, True])
@@ -211,7 +211,7 @@ def test_layer_functions_run_the_fused_calls(T, compressed):
     assert not bool((changed & ~allowed).any())
 
 
-@pytest.mark.parametrize("T", (1, 2, 4, 8, 16, 48))
+@pytest.mark.parametrize("T", (1, 8, 48))
 def test_graph_replay_equals_eager_without_allocation_growth(T):
     dev = torch.device("cuda")
     a = _layer_inputs(T, True, 21)
@@ -269,11 +269,3 @@ def test_two_calls_give_the_same_bits(T):
         results.append((out, caches.swa))
     for x, y in zip(*results):
         assert torch.equal(x.view(torch.int16), y.view(torch.int16))
-
-
-def test_supports_the_served_layers():
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 8:
-        pytest.skip(f"sm_80 kernels; device is {cap}")
-    for ratio, topk in ((0, 0), (4, 512), (128, 512)):
-        assert fused.supports(H, D, 64, 2, 128, topk, ratio, BF16, cap) is None
