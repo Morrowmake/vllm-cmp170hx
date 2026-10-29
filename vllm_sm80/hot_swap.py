@@ -44,6 +44,14 @@ both arms (:func:`_toggled`). A variant whose capture adds a node of any other
 type (a host node, a child graph, a memory allocation) is refused when its
 graph is bound.
 
+A pair is swappable only when it declares ``collective_neutral=True``:
+switching it keeps every rank on the same sequence of cross-rank collectives,
+because its arms issue the same collectives or because the committed arm alone
+(set on every rank at once) selects them. Other pairs are refused when the
+server is configured, with the pair's reason. Flags-in-data all-reduce calls
+count their sequence on each rank, so ranks that disagree on one call wait on
+each other until the flags wait traps.
+
 A switch is a pair only when both of its arms run on what the boot built:
 the same allocations, process groups and captured graph shapes. Not pairs:
 
@@ -96,6 +104,9 @@ class HotPair:
     ``apply(runner, on)``, when given, sets the pair's eager state on this
     rank, outside CUDA capture. ``eager``: the pair changes steps that run
     outside CUDA graphs, so it is carried without a graph site.
+    ``collective_neutral`` (required): switching the pair keeps every rank on
+    the same collective sequence (module docstring); when False,
+    ``not_neutral`` says why, and :func:`configure` refuses the pair.
     """
 
     name: str
@@ -103,6 +114,15 @@ class HotPair:
     unavailable: Callable[[Any], str | None]
     apply: Callable[[Any, bool], None] | None = None
     eager: bool = False
+    collective_neutral: bool = field(kw_only=True)
+    not_neutral: str = field(default="", kw_only=True)
+
+    def __post_init__(self):
+        if self.collective_neutral == bool(self.not_neutral):
+            raise ValueError(
+                f"hot pair {self.name}: give not_neutral exactly when "
+                "collective_neutral is False"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -243,28 +263,39 @@ HOT_PAIRS: dict[str, HotPair] = {
         HotPair(
             "shard_argmax", "VLLM_SM80_SHARD_ARGMAX",
             _argmax_unavailable, _argmax_apply, eager=True,
+            collective_neutral=False,
+            not_neutral=(
+                "its candidate drops the all-gather of the target logits, and "
+                "switching it inside one server left the TP ranks on different "
+                "custom all-reduce calls until the flags wait trapped; compare "
+                "it across two boots"
+            ),
         ),
         HotPair(
             "prefill_reduce_overlap", "VLLM_SM80_PREFILL_REDUCE_OVERLAP",
             _split_unavailable, _split_apply, eager=True,
+            collective_neutral=True,  # the committed arm alone splits the sums
         ),
         HotPair(
             "kda_prefill", "VLLM_SM80_KDA_PREFILL",
-            _kda_unavailable, _kda_apply, eager=True,
+            _kda_unavailable, _kda_apply, eager=True, collective_neutral=True,
         ),
         HotPair(
             "mhc_prefill", "VLLM_SM80_MHC_PREFILL",
-            lambda runner: None, eager=True,
+            lambda runner: None, eager=True, collective_neutral=True,
         ),
         HotPair(
             "sparse_mla_prefill", "VLLM_SM80_SPARSE_MLA_PREFILL",
-            _sparse_mla_unavailable, eager=True,
+            _sparse_mla_unavailable, eager=True, collective_neutral=True,
         ),
         HotPair(
             "topk_canonical_ties", "VLLM_SM80_TOPK_CANONICAL_TIES",
-            _topk_unavailable,
+            _topk_unavailable, collective_neutral=True,
         ),
-        HotPair("topk_sorted", "VLLM_SM80_TOPK_SORTED", _topk_unavailable),
+        HotPair(
+            "topk_sorted", "VLLM_SM80_TOPK_SORTED", _topk_unavailable,
+            collective_neutral=True,
+        ),
     )
 }
 
@@ -365,10 +396,15 @@ def configure(vllm_config) -> bool:
     if envs.VLLM_SM80_CAPTURE:
         raise ValueError("VLLM_HOT_SWAP cannot be combined with VLLM_SM80_CAPTURE")
     for name in _STATE.listed:
-        env = HOT_PAIRS[name].env
-        if os.environ.get(env, "0") not in ("", "0"):
+        hot = HOT_PAIRS[name]
+        if not hot.collective_neutral:
             raise ValueError(
-                f"VLLM_HOT_SWAP={name}: {env} must be off (the server boots on "
+                f"VLLM_HOT_SWAP={name}: not collective-neutral, so not "
+                f"swappable: {hot.not_neutral}"
+            )
+        if os.environ.get(hot.env, "0") not in ("", "0"):
+            raise ValueError(
+                f"VLLM_HOT_SWAP={name}: {hot.env} must be off (the server boots on "
                 "every incumbent; set_hot_arms selects candidates)"
             )
     return True

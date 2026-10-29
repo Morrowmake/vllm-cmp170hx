@@ -29,11 +29,11 @@ class _Trap:
 def applied(monkeypatch):
     """Calls of the eager pair's apply hook."""
     calls = []
-    monkeypatch.setitem(hot_swap.HOT_PAIRS, "graph_pair",
-                        hot_swap.HotPair("graph_pair", "VLLM_FAKE_GRAPH", lambda runner: None))
+    monkeypatch.setitem(hot_swap.HOT_PAIRS, "graph_pair", hot_swap.HotPair(
+        "graph_pair", "VLLM_FAKE_GRAPH", lambda runner: None, collective_neutral=True))
     monkeypatch.setitem(hot_swap.HOT_PAIRS, "eager_pair", hot_swap.HotPair(
         "eager_pair", "VLLM_FAKE_EAGER", lambda runner: None,
-        lambda runner, on: calls.append(on), eager=True))
+        lambda runner, on: calls.append(on), eager=True, collective_neutral=True))
     return calls
 
 
@@ -93,7 +93,7 @@ def test_parse_refusals():
 
 
 def test_configure_refusals(monkeypatch):
-    monkeypatch.setattr(hot_swap, "_STATE", hot_swap._HotState(listed=("shard_argmax",)))
+    monkeypatch.setattr(hot_swap, "_STATE", hot_swap._HotState(listed=("kda_prefill",)))
     monkeypatch.setenv("VLLM_DEV_AB_SWITCH", "kda_prefill")
     with pytest.raises(ValueError, match="VLLM_DEV_AB_SWITCH"):
         hot_swap.configure(_Trap())
@@ -102,11 +102,36 @@ def test_configure_refusals(monkeypatch):
     with pytest.raises(ValueError, match="VLLM_SM80_CAPTURE"):
         hot_swap.configure(_Trap())
     monkeypatch.delenv("VLLM_SM80_CAPTURE")
-    monkeypatch.setenv("VLLM_SM80_SHARD_ARGMAX", "1")
+    monkeypatch.setenv("VLLM_SM80_KDA_PREFILL", "1")
     with pytest.raises(ValueError, match="must be off"):
         hot_swap.configure(_Trap())
-    monkeypatch.setenv("VLLM_SM80_SHARD_ARGMAX", "0")
+    monkeypatch.setenv("VLLM_SM80_KDA_PREFILL", "0")
     assert hot_swap.configure(_Trap())
+
+
+def test_configure_refuses_a_pair_that_is_not_collective_neutral(monkeypatch):
+    monkeypatch.delenv("VLLM_DEV_AB_SWITCH", raising=False)
+    monkeypatch.delenv("VLLM_SM80_CAPTURE", raising=False)
+    monkeypatch.setenv("VLLM_SM80_SHARD_ARGMAX", "0")
+    monkeypatch.setattr(
+        hot_swap, "_STATE", hot_swap._HotState(listed=("kda_prefill", "shard_argmax"))
+    )
+    with pytest.raises(ValueError, match="shard_argmax: not collective-neutral.*all-gather"):
+        hot_swap.configure(_Trap())
+
+
+def test_every_pair_declares_collective_neutrality():
+    refused = {n for n, p in hot_swap.HOT_PAIRS.items() if not p.collective_neutral}
+    assert refused == {"shard_argmax"}
+    assert all(p.not_neutral for n, p in hot_swap.HOT_PAIRS.items() if n in refused)
+    with pytest.raises(TypeError, match="collective_neutral"):
+        hot_swap.HotPair("x", "VLLM_X", lambda runner: None)
+    with pytest.raises(ValueError, match="not_neutral"):
+        hot_swap.HotPair("x", "VLLM_X", lambda runner: None, collective_neutral=False)
+    with pytest.raises(ValueError, match="not_neutral"):
+        hot_swap.HotPair(
+            "x", "VLLM_X", lambda runner: None, collective_neutral=True, not_neutral="why"
+        )
 
 
 def test_dev_ab_injects_the_extension_for_hot_pairs(monkeypatch, state):
@@ -392,7 +417,8 @@ def test_set_arms_refusals(transaction, state, on, generation, resident, why):
 def test_set_arms_refuses_an_unavailable_pair(monkeypatch, transaction, state):
     state.resolved = False
     monkeypatch.setitem(hot_swap.HOT_PAIRS, "graph_pair", hot_swap.HotPair(
-        "graph_pair", "VLLM_FAKE_GRAPH", lambda runner: "no such layer"))
+        "graph_pair", "VLLM_FAKE_GRAPH", lambda runner: "no such layer",
+        collective_neutral=True))
     reply = hot_swap.set_arms(_worker(), ["graph_pair"], 1)
     assert not reply["ok"] and "no such layer" in reply["reason"]
     reply = hot_swap.get_arms(_worker())

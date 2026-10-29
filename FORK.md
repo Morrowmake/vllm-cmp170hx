@@ -201,7 +201,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/fla/autotune_pins.py` | 210 |
 | `vllm_sm80/fla/pinned_autotune.py` | 384 |
 | `vllm_sm80/guard.py` | 68 |
-| `vllm_sm80/hot_swap.py` | 824 |
+| `vllm_sm80/hot_swap.py` | 860 |
 | `vllm_sm80/jit_extension.py` | 150 |
 | `vllm_sm80/kv_planning.py` | 655 |
 | `vllm_sm80/layers/__init__.py` | 4 |
@@ -265,7 +265,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **86 files** | **23,939** |
+| **86 files** | **23,975** |
 
 ### `csrc/exl3/`
 
@@ -619,8 +619,8 @@ Grouped by top-level directory.
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 320 |
 | `tests/sm80/test_gpu_lock_guard.py` | 77 |
-| `tests/sm80/test_hot_swap.py` | 750 |
-| `tests/sm80/test_hot_swap_gpu.py` | 124 |
+| `tests/sm80/test_hot_swap.py` | 776 |
+| `tests/sm80/test_hot_swap_gpu.py` | 125 |
 | `tests/sm80/test_import_cuda_init.py` | 168 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
 | `tests/sm80/test_jit_extension_cache.py` | 160 |
@@ -690,7 +690,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **303 files** | **128,744** |
+| **303 files** | **128,771** |
 
 #### `tools/`
 
@@ -957,7 +957,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 266 |
-| Plugin product lines | 85,918 |
+| Plugin product lines | 85,954 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |

@@ -32,7 +32,8 @@ RUNNER = SimpleNamespace(
 def hot(monkeypatch):
     fresh = hot_swap._HotState(listed=("toy",), resolved=True)
     monkeypatch.setattr(hot_swap, "_STATE", fresh)
-    monkeypatch.setitem(hot_swap.HOT_PAIRS, "toy", hot_swap.HotPair("toy", "VLLM_TOY", lambda r: None))
+    monkeypatch.setitem(hot_swap.HOT_PAIRS, "toy", hot_swap.HotPair(
+        "toy", "VLLM_TOY", lambda r: None, collective_neutral=True))
     yield fresh
     torch.cuda.synchronize()
 
