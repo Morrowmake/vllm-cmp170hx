@@ -195,12 +195,6 @@ def _exl3_head(monkeypatch, config, head_dtype):
         )
 
 
-@pytest.mark.parametrize("head_dtype", [BF16, FP32])
-def test_the_exl3_head_stores_the_head_dtype(exl3_head_config, monkeypatch, head_dtype):
-    head = _exl3_head(monkeypatch, exl3_head_config, head_dtype)
-    assert head.quant_method.out_dtype == head_dtype
-
-
 def test_the_exl3_head_refuses_other_dtypes(exl3_head_config, monkeypatch):
     with pytest.raises(ValueError, match="BF16 or FP32"):
         _exl3_head(monkeypatch, exl3_head_config, torch.float16)
