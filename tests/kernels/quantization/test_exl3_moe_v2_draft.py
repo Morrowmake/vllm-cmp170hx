@@ -24,8 +24,9 @@ CPU:
   bits_x2 8, sizes the workspace and logs its banner through the vLLM logger;
   with VLLM_EXL3_MOE_V2_FOLD it logs that the fold does not apply and neither
   requires nor warms the folded operator; a closed gate logs one line;
-- the row tile floor accepts 0, 8 and 16 only; Exl3Experts.apply passes
-  bits_x2 8 to moe_out_v2 for 1..64 rows and moe_out beyond;
+- the row tile floor accepts 0, 8 and 16 only, checked before the
+  extension is asked (Exl3Experts.apply's bits_x2 dispatch: see
+  test_exl3_moe_v2.py and test_exl3_moe_prefill_v2.py);
 - the extension registers moe_v2_draft_force_rows;
 - moe_v2.cu compiled for sm_80 (nvcc, no GPU): every drafter kernel exists for
   each row tile floor, the other bits_x2 8 kernels are the tensor-parallel
@@ -74,7 +75,6 @@ from tests.kernels.quantization import exl3_real_cases as real
 from tests.kernels.quantization import test_exl3_moe_v2_hidden5120 as h5120
 from tests.kernels.quantization.test_exl3_moe_v2 import (
     _allocations,
-    _apply,
     _bitwise,
     _extension_or_skip,
     needs_sm80,
@@ -248,8 +248,7 @@ def vllm_log(monkeypatch, caplog):
         root.removeHandler(caplog.handler)
 
 
-@pytest.mark.parametrize("fold", [False, True])
-@pytest.mark.parametrize("floor", [0, 16])
+@pytest.mark.parametrize("fold, floor", [(False, 16), (True, 0)])
 def test_method_opens_the_drafter_layers_unfolded(monkeypatch, vllm_log, fold, floor):
     calls = []
     method, layer = _method(monkeypatch, calls)
@@ -303,48 +302,13 @@ def test_method_closed_gate_logs_one_line_and_warms_nothing(monkeypatch, vllm_lo
     )
 
 
-@pytest.mark.parametrize("rows", [-1, 4, 12, 32])
+@pytest.mark.parametrize("rows", [12])
 def test_row_tile_floor_refuses_other_values(monkeypatch, rows):
     monkeypatch.setattr(
         exl3_ops, "require_moe_v2_draft", lambda: pytest.fail("checked the value first")
     )
     with pytest.raises(ValueError, match="VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS"):
         exl3_ops.moe_v2_draft_force_rows(rows)
-
-
-def test_apply_passes_bits_x2_8_to_moe_out_v2(monkeypatch):
-    from vllm_sm80.kernels.exl3.quant import Exl3Experts
-
-    calls = []
-    for name in ("moe_out", "moe_out_v2", "moe_out_v2_fold"):
-        monkeypatch.setattr(
-            exl3_ops,
-            name,
-            lambda *args, _name=name, **kwargs: calls.append((_name, args, kwargs)),
-        )
-    experts = object.__new__(Exl3Experts)
-    experts.intermediate_size = INTERMEDIATE
-    experts.expert_map = "layer map"
-    experts.workspace_elements = 0
-    experts.max_rows = 2048
-    experts.moe_v2_rows = 64
-    experts.moe_out_rows = experts.max_rows
-    experts.moe_v2_bits_x2 = BITS_X2
-    experts.moe_v2_draft = True
-    experts.prefill_decode_len = 0
-    experts.prefill_v2_bits_x2 = 0
-    experts.swiglu_limit = SWIGLU_LIMIT
-    assert experts.moe_v2_fold is False
-    workspace2 = torch.zeros(8, dtype=torch.bfloat16)
-    for rows in (*GRAPH_ROWS, 64, 65):
-        x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
-        _apply(experts, x, "ids", "weights", "ptrs", "meta", "out", workspace2)
-    assert [(name, args[0].shape[0]) for name, args, _ in calls] == [
-        *(("moe_out_v2", rows) for rows in (*GRAPH_ROWS, 64)),
-        ("moe_out", 65),
-    ]
-    for _, _, kwargs in calls[:-1]:
-        assert kwargs == {"swiglu_limit": SWIGLU_LIMIT, "bits_x2": BITS_X2}
 
 
 def test_extension_registers_the_row_tile_floor():

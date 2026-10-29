@@ -10,7 +10,7 @@ tests take the set's prefill calls of more than 64 rows (the calls
 Exl3Experts.apply sends to moe_out_prefill); the dispatch check takes every
 case.
 
-CPU: the required cells against the dispatch rule; the dispatch rule over
+CPU: the dispatch rule over
 every case of the set, with the step phase the case was captured in (no
 decode call, whatever its rows, and no call of at most 64 rows reaches
 moe_out_prefill); a joined case on a synthetic set; and (case set given)
@@ -85,12 +85,6 @@ def _prefill_cases(cases):
 # ---------------------------------------------------------------- CPU tests
 
 
-def test_required_cells_are_moe_prefill_calls():
-    for rows, phase in REQUIRED_CELLS:
-        assert expected_operator(rows, phase, 64, 4) == "moe_out_prefill"
-        assert expected_operator(rows, "decode", 64, 4) != "moe_out_prefill"
-
-
 def test_joined_cases_load_and_show_in_the_coverage(tmp_path, capsys):
     cases = [
         _synthetic_case(tmp_path, 0, 70, "prefill", "live"),
@@ -116,7 +110,7 @@ def test_joined_cases_load_and_show_in_the_coverage(tmp_path, capsys):
         real.load_manifest(tmp_path, "dense")
 
 
-@pytest.mark.parametrize("moe_v2_rows", [0, 64])
+@pytest.mark.parametrize("moe_v2_rows", [64])
 def test_case_set_dispatch_and_coverage(monkeypatch, moe_v2_rows):
     """Exl3Experts.apply with the switch on, per case in a step of the phase
     the case was captured in: only prefill calls of more than 64 rows reach

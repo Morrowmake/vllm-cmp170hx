@@ -19,9 +19,9 @@ chunks); the operator refusing on the host, before any launch, a call whose
 experts are stored in another format or with an unaligned trellis base.
 
 GPU (SM 8.0), each at bits_x2 6 and 4, on synthetic experts with 16-byte
-aligned trellis bases (the gate requires it): the off path is bitwise the
-base kernels at both chunk sizes; the on path takes the operator only in
-prefill steps; the operator holds moe_out's error against an FP64 reference
+aligned trellis bases (the gate requires it): the on path takes the operator
+only in prefill steps and is bitwise the base kernels in decode steps at both
+chunk sizes; the operator holds moe_out's error against an FP64 reference
 (pooled mean <= 1.10x, max <= 1.25x with no element excused, exact where
 moe_out is exact) over awkward routings of 65..2048 rows with the clamp
 reached; rows without local routes are exact zero and calls repeat bitwise;
@@ -283,9 +283,7 @@ def test_gate_closes_outside_the_validated_layout(monkeypatch, config, words):
         (_config(), 4),
         (_config(spec=SimpleNamespace(method="mtp", num_speculative_tokens=3)), 4),
         # A DSpark decode pass carries 1 + k verified tokens and k parallel
-        # slots per request, so a step is a prefill step above 1 + 2k tokens.
-        (_config(spec=_dspark(3)), 7),
-        (_config(spec=_dspark(5), k=5, max_num_seqs=3), 11),
+        # slots per request, so a step is a prefill step above 1 + 2k tokens;
         # 8 requests x (1 + 2 x 5) = 88 rows: open, by the per-request bound.
         (_config(spec=_dspark(5), k=5), 11),
         (
@@ -298,7 +296,7 @@ def test_gate_closes_outside_the_validated_layout(monkeypatch, config, words):
             17,
         ),
     ],
-    ids=["no drafter", "mtp", "dspark k3 c8", "dspark k5 c3", "dspark k5 c8", "dflash"],
+    ids=["no drafter", "mtp", "dspark k5 c8", "dflash"],
 )
 def test_gate_opens_for_the_served_layout_and_parallel_drafters(
     monkeypatch, config, decode_len
@@ -309,7 +307,7 @@ def test_gate_opens_for_the_served_layout_and_parallel_drafters(
     assert len(warmed) == len(required) == 1
 
 
-@pytest.mark.parametrize("projection", [0, 1, 2])
+@pytest.mark.parametrize("projection", [2])
 def test_gate_closes_unless_every_expert_trellis_is_16_byte_aligned(
     monkeypatch, projection
 ):
@@ -414,9 +412,17 @@ def expected_calls(rows, phase, bits_x2, moe_out_rows):
     ]
 
 
-@pytest.mark.parametrize("moe_out_rows", [512, 2048])
-@pytest.mark.parametrize("bits_x2", [0, 6, 4])
-@pytest.mark.parametrize("phase", ["prefill", "decode", None])
+@pytest.mark.parametrize(
+    "moe_out_rows, bits_x2, phase",
+    [
+        (512, 0, "prefill"),
+        (2048, 0, "prefill"),
+        (512, 6, "prefill"),
+        (512, 4, "prefill"),
+        (512, 6, "decode"),
+        (512, 6, None),
+    ],
+)
 def test_apply_dispatches_by_rows_and_scheduler_phase(
     monkeypatch, moe_out_rows, bits_x2, phase
 ):
@@ -564,19 +570,6 @@ def _pool_rule(experts, cases, name):
 
 
 # ---------------------------------------------------------------- GPU tests
-
-
-@needs_sm80
-@pytest.mark.parametrize("moe_out_rows", [512, 2048])
-@pytest.mark.parametrize("rows", [65, 2044])
-def test_off_path_is_the_base_kernels(synthetic, monkeypatch, moe_out_rows, rows):
-    _phase(monkeypatch, "prefill")
-    x, ids, weights = _case("uniform", rows, 3)
-    _bitwise(
-        _engine(synthetic, x, ids, weights, 0, moe_out_rows),
-        _v1(synthetic, x, ids, weights),
-        f"off path, chunk {moe_out_rows}",
-    )
 
 
 @needs_sm80

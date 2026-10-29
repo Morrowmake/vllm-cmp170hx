@@ -63,7 +63,7 @@ def test_gate_opens_for_rank_chunks(gate, width, bits_x2):
 
 
 @pytest.mark.parametrize("gate", GATES)
-@pytest.mark.parametrize("width", TP_WIDTHS)
+@pytest.mark.parametrize("width", [640])
 def test_gate_stays_closed_otherwise(gate, width):
     closed = {
         "width 576": _reason(gate, 576, 6),

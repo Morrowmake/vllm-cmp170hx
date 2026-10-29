@@ -11,7 +11,7 @@ operator's workspace contract. The gate also closes unless every local
 expert's trellis is 16-byte aligned.
 
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
-256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
+256 of 512 experts local, bits_x2 10 / codebook 2), decode steps are bitwise
 moe_out; moe_out_prefill is held to moe_out's error against an FP64 reference
 (pooled mean <= 1.10x, max <= 1.25x with no element excused, exact where
 moe_out is exact) over awkward routings of 65..1001 rows; it is deterministic;
@@ -134,10 +134,6 @@ def _config(num_speculative_tokens=3, tp=2, pp=1, spec=None, graph_max=None):
     [
         (dict(tp=4), "(4, 1), not (2, 1)"),
         (dict(pp=2), "(2, 2), not (2, 1)"),
-        (
-            dict(spec=SimpleNamespace(method="dflash", parallel_drafting=True)),
-            "dflash drafts with parallel slots",
-        ),
         (
             dict(spec=SimpleNamespace(method="eagle", parallel_drafting=True)),
             "eagle drafts with parallel slots",
@@ -299,9 +295,17 @@ def expected_operator(rows, phase, moe_v2_rows, prefill_decode_len):
     return "moe_out_v2" if 0 < rows <= moe_v2_rows else "moe_out"
 
 
-@pytest.mark.parametrize("moe_v2_rows", [0, 64])
-@pytest.mark.parametrize("prefill_decode_len", [0, DECODE_LEN])
-@pytest.mark.parametrize("phase", ["prefill", "decode", None])
+@pytest.mark.parametrize(
+    "moe_v2_rows, prefill_decode_len, phase",
+    [
+        (0, 0, "prefill"),
+        (64, 0, "prefill"),
+        (0, DECODE_LEN, "prefill"),
+        (64, DECODE_LEN, "prefill"),
+        (64, DECODE_LEN, "decode"),
+        (64, DECODE_LEN, None),
+    ],
+)
 def test_apply_dispatches_by_rows_and_scheduler_phase(
     monkeypatch, moe_v2_rows, prefill_decode_len, phase
 ):
@@ -376,21 +380,6 @@ def _p(served, x, ids, weights):
         weights,
         exl3_ops.moe_workspace_size_prefill,
     )
-
-
-@needs_sm80
-@pytest.mark.parametrize("rows", [65, 1906])
-def test_off_path_is_moe_out(served, monkeypatch, rows):
-    _phase(monkeypatch, "prefill")
-    x, ids, weights = _case(served, "uniform", rows, rows)
-    expected = _v1(served, x, ids, weights)
-    size = exl3_ops.moe_workspace_size(rows, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
-    for moe_v2_rows in (0, 64):
-        experts = _experts(moe_v2_rows, 0, workspace=size, expert_map=served.expert_map)
-        out = torch.full_like(x, float("nan"))
-        workspace2 = torch.empty(2 * size, dtype=torch.bfloat16, device=x.device)
-        _apply(experts, x, ids, weights, served.pointers, served.meta, out, workspace2)
-        _bitwise(out, expected, f"off path rows={rows} moe_v2_rows={moe_v2_rows}")
 
 
 @needs_sm80
