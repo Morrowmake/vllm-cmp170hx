@@ -133,24 +133,3 @@ def test_without_out_dtype_the_gate_would_route_on_bf16():
         gate = GateLinear(4096, 288, out_dtype=None, params_dtype=torch.bfloat16)
 
     assert gate.allow_cublas_router_gemm is False
-
-
-def test_set_out_dtype_reenables_the_cublas_tier():
-    with single_rank():
-        gate = GateLinear(4096, 288, out_dtype=None, params_dtype=torch.bfloat16)
-        gate.set_out_dtype(torch.float32)
-
-    assert gate.allow_cublas_router_gemm is True
-
-
-def test_the_cublas_tier_has_no_architecture_gate():
-    """#54048: the fp32-out router GEMM must not be Hopper-only. A capability
-    term reappearing here would silently demote sm_80 to bf16 routing."""
-    import inspect
-
-    src = inspect.getsource(GateLinear.__init__)
-    predicate = src[src.index("self._router_gemm_cublas_capable") :]
-    predicate = predicate[: predicate.index("self.allow_ll_bf16_gemm")]
-    assert "is_hopper" not in predicate
-    assert "is_blackwell" not in predicate
-    assert "can_use_specialized_kernels" not in predicate

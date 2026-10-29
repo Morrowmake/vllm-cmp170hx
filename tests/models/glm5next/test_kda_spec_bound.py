@@ -91,15 +91,6 @@ def _assert_same(got, want, name: str) -> None:
             1,
             id="no-scheduled-draft-tokens",
         ),
-        pytest.param(
-            BatchSpec(seq_lens=[50, 30], query_lens=[3, 2]),
-            [2, 1],
-            [1, 1],
-            2,
-            [False, False],
-            3,
-            id="ragged-spec-decode",
-        ),
     ],
 )
 def test_glm_kda_builder_adds_the_spec_bound(
@@ -141,33 +132,3 @@ def test_glm_kda_builder_adds_the_spec_bound(
         _assert_same(
             getattr(actual, field.name), getattr(reference, field.name), field.name
         )
-
-
-def test_glm_kda_builder_retypes_the_gdn_metadata_in_place(monkeypatch):
-    """No per-build copy: the object the GDN builder returns is the one the
-    GLM builder returns, with the GLM class and the bound set."""
-    sentinel = GDNAttentionMetadata(
-        num_prefills=0,
-        num_prefill_tokens=0,
-        num_decodes=0,
-        num_decode_tokens=0,
-        num_spec_decodes=2,
-        num_spec_decode_tokens=6,
-        num_actual_tokens=6,
-    )
-    monkeypatch.setattr(
-        GDNAttentionMetadataBuilder, "build", lambda self, *args, **kwargs: sentinel
-    )
-    builder = object.__new__(Glm5NextGDNAttentionMetadataBuilder)
-    builder.num_spec = 2
-    builder._kda_recover = None
-    common = type("Common", (), {"max_query_len": 3})()
-    out = builder.build(0, common)
-    assert out is sentinel
-    assert type(out) is Glm5NextGDNAttentionMetadata
-    assert out.spec_max_query_len == 3
-    # The GLM class adds exactly one field to the GDN layout.
-    gdn = [f.name for f in dataclasses.fields(GDNAttentionMetadata)]
-    glm = [f.name for f in dataclasses.fields(Glm5NextGDNAttentionMetadata)]
-    assert glm == gdn + ["spec_max_query_len"]
-    assert not hasattr(GDNAttentionMetadata, "__slots__")

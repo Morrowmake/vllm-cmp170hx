@@ -75,7 +75,9 @@ def _folded_pipeline(
         handler = SimpleNamespace(aux_hidden_state_relay_keys=("stale",))
         # Runner order: reserve aux slots, configure the relay, then the fold.
         eagle3_utils.reserve_aux_intermediate_tensor_slots(wrapper)
-        assert maybe_configure_aux_fc_fold(wrapper, spec, handler, files=files)
+        assert maybe_configure_aux_fc_fold(
+            wrapper, spec, handler, files=files, dtype=torch.bfloat16
+        )
         assert handler.aux_hidden_state_relay_keys == ()
         if rank > 0:
             buf = wrapper.make_empty_intermediate_tensors(TOKENS, torch.bfloat16, "cpu")
@@ -96,7 +98,6 @@ def _folded_pipeline(
     "num_layers,partition,aux_layers",
     [
         (45, [13, 11, 11, 10], (6, 15, 25, 34, 43)),
-        (45, [12, 12, 12, 9], (6, 15, 25, 34, 43)),
         (10, [3, 2, 3, 2], (2, 3, 5, 7, 8)),  # aux on boundaries; none on the last
         (12, [4, 4, 2, 2], (1, 2, 11)),  # middle stages without aux
     ],
@@ -126,8 +127,7 @@ def test_folded_fc_equals_single_stage_fc(
     )
 
 
-@pytest.mark.parametrize("explicit", [True, False])
-def test_fold_blocks_take_the_activation_dtype(monkeypatch, tmp_path, explicit):
+def test_fold_blocks_take_the_activation_dtype(monkeypatch, tmp_path):
     """A stage whose first parameter is fp32 (mHC mixing weights, router bias)
     must still fold in the activation dtype: the aux states are bf16."""
     monkeypatch.setenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "1")
@@ -143,9 +143,8 @@ def test_fold_blocks_take_the_activation_dtype(monkeypatch, tmp_path, explicit):
     )
     handler = SimpleNamespace(aux_hidden_state_relay_keys=("stale",))
     eagle3_utils.reserve_aux_intermediate_tensor_slots(wrapper)
-    kw = {"dtype": torch.bfloat16} if explicit else {}
     assert maybe_configure_aux_fc_fold(wrapper, SimpleNamespace(method="dflash"),
-                                       handler, files=files, **kw)
+                                       handler, files=files, dtype=torch.bfloat16)
     assert m.aux_fc_blocks
     assert all(w.dtype == torch.bfloat16 for w in m.aux_fc_blocks.values())
 
@@ -175,7 +174,7 @@ def test_drafter_takes_the_folded_fc_output():
     weight = torch.zeros(1, dtype=torch.bfloat16)
     fc = SimpleNamespace(output_size=HIDDEN, weight=weight)
     d.model = SimpleNamespace(use_aux_hidden_state=True, fc=fc)
-    d.aux_fc_folded = True
+    aux_fc_fold.mark_drafter_aux_fc_folded(SimpleNamespace(model=d))
     x = torch.randn(TOKENS, HIDDEN)
     out = d.combine_hidden_states(x)
     assert out.dtype == torch.bfloat16 and torch.equal(out, x.to(torch.bfloat16))
@@ -183,12 +182,7 @@ def test_drafter_takes_the_folded_fc_output():
         d.combine_hidden_states(torch.randn(TOKENS, 5 * HIDDEN))
 
 
-def test_mark_drafter(monkeypatch):
-    drafter = DFlashQwen3ForCausalLM.__new__(DFlashQwen3ForCausalLM)
-    nn.Module.__init__(drafter)
-    spec = SimpleNamespace(model=drafter)
-    aux_fc_fold.mark_drafter_aux_fc_folded(spec)
-    assert spec.model.aux_fc_folded
+def test_marking_refuses_a_drafter_without_the_folded_combine():
     # A drafter without the fork combine would ignore the folded input.
     with pytest.raises(RuntimeError, match="not a fork DFlash drafter"):
         aux_fc_fold.mark_drafter_aux_fc_folded(

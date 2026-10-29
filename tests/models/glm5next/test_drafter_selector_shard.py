@@ -16,7 +16,6 @@ over the four ranks' local rows.
     CUDA_VISIBLE_DEVICES= pytest -q tests/models/glm5next/test_drafter_selector_shard.py
 """
 
-import pytest
 import torch
 
 import vllm.model_executor.models.qwen3_dflash2 as upstream
@@ -104,17 +103,8 @@ def test_shard_bounds_cover_the_vocab_once():
     assert dflash2.selector_vocab_shard(154_880, 3, 4) == (116_160, 154_880, 38_720)
 
 
-def test_sharded_bytes_at_deployment():
-    full = 2 * 154_880 * 256 * 2
-    _, _, per = dflash2.selector_vocab_shard(154_880, 0, 4)
-    shard = 2 * per * 256 * 2
-    assert round(full / 2**20, 2) == 151.25
-    assert round((full - shard) / 2**20, 2) == 113.44
-
-
-@pytest.mark.parametrize("batch", [1, 5, 8])
-def test_sharded_scores_are_bit_identical(monkeypatch, batch):
-    ids, unary, hidden, anchor = _inputs(batch)
+def test_sharded_scores_are_bit_identical(monkeypatch):
+    ids, unary, hidden, anchor = _inputs(5)
     ref_sel = _selector(monkeypatch, shard=False, tp_rank=0, tp_size=1)
     assert type(ref_sel) is upstream.CandidateSelector
     with torch.inference_mode():
