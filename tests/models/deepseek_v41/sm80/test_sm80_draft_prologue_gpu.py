@@ -4,8 +4,9 @@
 one sm_80 card.
 
 - The sum: ``torch_cuda_mean_sum`` times ``1 / 512`` is ``mean(-1)`` of the
-  squares on CUDA, bitwise, and the CPU half's NumPy model, at every row
-  count 1..40, 64 and 2048 (all three lane counts).
+  squares on CUDA, bitwise, and the CPU half's NumPy model, at the row
+  counts of ``ROWS`` (both sides of every change of torch's block shape;
+  all three lane counts).
 - RMSNorm: ``rms_norm_row`` is ``sm80_attn_core.rms_norm`` on CUDA, bitwise,
   at the same row counts.
 - Cache bytes: after :func:`store_context_kv` the whole cache equals the
@@ -33,7 +34,10 @@ pytestmark = pytest.mark.skipif(
     reason="needs an sm_80 card",
 )
 
-ROWS = tuple(range(1, 41)) + (64, 2048)
+# Both sides of every change of torch's block shape for ``mean(-1)`` (block
+# height 1, 2, 4, 8, 16: lanes 128, 128, 128, 64, 32), a decode size and the
+# prefill sizes.
+ROWS = (1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 40, 64, 2048)
 WIDTH = 512
 Q_LORA = 1024
 EPS = 1e-6

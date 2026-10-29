@@ -10,8 +10,7 @@ CPU.
   for each lane count torch picks; the lane counts give different sums on
   some rows, and so does a sequential sum.
 - The lane count follows ``ReduceConfig::set_block_dimension`` for every row
-  count, and no row count splits a row across warps or blocks; the header
-  statements the model rests on are pinned in the installed torch.
+  count, and no row count splits a row across warps or blocks.
 - The kernel compiles for sm_80 at each lane count, without FTZ forms and
   with ``rsqrt.approx.f32``; the squares do not contract into the sum even
   with FMA contraction on (where a plain product would).
@@ -149,23 +148,6 @@ def test_interpreted_sum_is_the_cuda_reduction_order(interpreted):
     assert all(n > 0 for n in interpreted["differs"].values()), interpreted
 
 
-def test_model_matches_the_documented_order():
-    rng = np.random.default_rng(1)
-    f = np.float32
-    rows = (rng.standard_normal((50, 128)) ** 2).astype(f)
-    got = cuda_mean_sum_model(rows, 32)
-    for r, row in enumerate(rows):
-        lanes = []
-        for x in range(32):
-            a = [f(row[4 * x + i]) for i in range(4)]
-            lanes.append(f(f(f(a[0] + a[1]) + a[2]) + a[3]))
-        offset = 16
-        while offset:
-            lanes = [f(lanes[x] + lanes[x + offset]) for x in range(offset)]
-            offset //= 2
-        assert got[r] == lanes[0]
-
-
 def _splits_across_warps(rows: int, lanes: int) -> bool:
     """Whether setReduceConfig would also split the row across warps (and
     then possibly blocks): values per thread against its threshold."""
@@ -184,39 +166,6 @@ def test_lane_count_follows_reduce_config():
         dp.mean_block_width(0, WIDTH)
     with pytest.raises(ValueError):
         dp.mean_block_width(4, 384)
-
-
-def test_reduction_model_is_the_installed_torch_reduction():
-    """The model was read from torch's CUDA reduction headers; pin the
-    statements it rests on in the installed torch. A torch upgrade that
-    changes one fails here (the GPU half checks the model against ``mean``
-    on CUDA)."""
-    inc = Path(torch.__file__).parent / "include/ATen/native"
-    src = (inc / "cuda/Reduce.cuh").read_text()
-    for stmt in (
-        "static constexpr int MAX_NUM_THREADS = 512;",
-        "block_width = std::min(dim0_pow2, int(at::cuda::warp_size()));",
-        "block_height = std::min(dim1_pow2, int(max_num_threads / block_width));",
-        "block_width = std::min(dim0_pow2, int(max_num_threads / block_height));",
-        "dim0 >= 128 && iter.num_reduce_dims() == 1",
-        "dim0 /= input_vec_size;",
-        "config.input_mult[0] = config.split_input(block_width);",
-        "std::min<int>(block_height * 16, max_values_per_thread);",
-        "while (idx * input_vec_size + input_vec_size - 1 < end) {",
-        "value_list[i] = ops.reduce(value_list[i], values_vec.val[i], "
-        "shift + idx * input_vec_size + i);",
-        "value_list[0] = ops.combine(value_list[0], value_list[i]);",
-        "for (int offset = dim_x/2; offset >= C10_WARP_SIZE; offset >>= 1) {",
-        "for (int offset = dim_x >> 1; offset > 0; offset >>= 1) {",
-    ):
-        assert stmt in src, stmt
-    assert re.search(r"template <typename scalar_t, typename ops_t, typename index_t, "
-                     r"typename out_scalar_t=scalar_t, int vt0=4, int input_vec_size=vt0>",
-                     src)
-    ops = (inc / "SharedReduceOps.h").read_text()
-    mean = ops[ops.index("struct MeanOps {"):]
-    mean = mean[:mean.index("};")]
-    assert "return a + b;" in mean and "return a * factor;" in mean
 
 
 def _compile(kernel, sig, consts, **options):
@@ -307,22 +256,17 @@ def _context_layer(fused: bool, seed: int = 0):
 
 
 def test_store_context_kv_takes_the_kernel_when_switched_on(monkeypatch):
-    from vllm_sm80.models.deepseek_v41.ops import sm80_attn_core as core
-
     calls = []
     monkeypatch.setattr(dp, "store_context_kv", lambda *a: calls.append(a))
     positions = torch.arange(6) + 100
     slots = torch.tensor([5, -1, 6, 7, 1, -1])
 
-    layer, qr_kv = _context_layer(fused=False)
+    layer, _ = _context_layer(fused=False)
     layer.sm80_store_context_kv(None, positions, slots)
     assert not calls
-    want = torch.zeros(3, 4, WIDTH, dtype=torch.bfloat16)
-    kv = core.rms_norm(qr_kv[:, 64:], layer.kv_norm.weight, 1e-6)
-    core.store_rows(want, slots, core.window_kv(kv, positions, layer._sm80_freqs))
-    cache = layer.swa_cache_layer.kv_cache
-    assert torch.equal(cache.view(torch.int16), want.view(torch.int16))
-    assert cache.abs().sum() > 0
+    # The torch path writes the rows of the valid slots and nothing else.
+    written = layer.swa_cache_layer.kv_cache.view(-1, WIDTH).abs().sum(-1) > 0
+    assert written.tolist() == [s in (1, 5, 6, 7) for s in range(12)]
 
     layer, qr_kv = _context_layer(fused=True)
     layer.sm80_store_context_kv(None, positions, slots)

@@ -44,8 +44,10 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN = 5120
 CUDA = torch.device("cuda")
-# every served decode / verify / draft row count class and the prefill sizes
-ROWS = (1, 2, 5, 6, 8, 10, 12, 16, 17, 18, 20, 24, 28, 32, 40, 48, 267, 2048)
+# one row count of each kernel A form (transposed up to 8 rows, 9..16 rows,
+# 17+ rows with the staging reuse) and specialisation (1 row, rows divisible
+# by 16, others), and the prefill sizes
+ROWS = (1, 6, 8, 10, 16, 17, 32, 267, 2048)
 VARIANTS = ("fused", "fused_identity", "pre_only", "pre_only_identity")
 
 
@@ -68,7 +70,7 @@ def _cpu(d: dict) -> dict:
 
 @pytest.mark.parametrize("options", ["dsv41", "glm53"])
 @pytest.mark.parametrize("has_post", [True, False], ids=["post", "pre_only"])
-@pytest.mark.parametrize("M", [17, 24, 32, 48, 267, 2048])
+@pytest.mark.parametrize("M", [17, 32, 267, 2048])
 def test_kernel_a_staging_reuse_gives_the_same_bits(M, has_post, options):
     from vllm_sm80.kernels.mhc.decode import HB_GLU, post_prenorm
 
@@ -152,7 +154,7 @@ def _compiled(kernels) -> int:
     return sum(len(cache[0]) for k in kernels for cache in k.device_caches.values())
 
 
-@pytest.mark.parametrize("T", (1, 5, 6, 17, 32, 40))
+@pytest.mark.parametrize("T", (1, 6, 17, 32))
 def test_deterministic_graph_replay_equal_and_warmed(T, fused):
     from vllm_sm80.models.deepseek_v41.ops import sm80_mhc_finish_v2 as finish_v2
     from vllm_sm80.kernels.mhc import decode

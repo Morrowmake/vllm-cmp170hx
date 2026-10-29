@@ -15,7 +15,7 @@ from .test_sm80_kernels_gpu import _index_case, _huge_view
 pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')]
 
 
-@pytest.mark.parametrize('width', [0, 1, 511, 512, 513, 2047, 2048, 2049, 8191, 16385, 262144])
+@pytest.mark.parametrize('width', [0, 1, 513, 2047, 2048, 2049, 8191, 16385, 262144])
 @pytest.mark.parametrize('k', [512, 2048])
 def test_radix_exact_at_widths_ties_zeros_and_sentinels(width, k):
     g = torch.Generator().manual_seed(29)

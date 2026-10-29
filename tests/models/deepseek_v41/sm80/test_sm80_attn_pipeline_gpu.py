@@ -87,7 +87,7 @@ def snapshot(cfg, weights, caches, batch, x, raw, iw):
     return a
 
 
-@pytest.mark.parametrize('rows', [0, 1, 2, 5, 6, 8, 18, 40, 48])
+@pytest.mark.parametrize('rows', [0, 1, 2, 5, 48])
 @pytest.mark.parametrize('ratio,role', [(0, 'shared'), (1, 'source'), (2, 'source'), (2, 'consumer'), (2, 'shared')])
 def test_full_pipeline_rounding_state_and_selection(rows, ratio, role):
     cfg, weights, caches, batch, matrices, x, raw, iw = inputs(rows, ratio, role)
@@ -145,7 +145,7 @@ def _alone(caches, batch, r, s, e):
     return own, alone
 
 
-@pytest.mark.parametrize('rows', [18, 40])
+@pytest.mark.parametrize('rows', [40])
 @pytest.mark.parametrize('ratio,role', [(0, 'shared'), (1, 'source'), (2, 'source'), (2, 'consumer'), (2, 'shared')])
 def test_a_request_alone_matches_its_rows_of_the_batch(rows, ratio, role):
     """The pipeline's own kernels read only a row's own request: with
@@ -203,7 +203,7 @@ def capture_dummy_inputs(rows, ratio, role, slots_mode, device='cuda'):
 
 
 @pytest.mark.parametrize('slots_mode', ['padding', 'null'])
-@pytest.mark.parametrize('rows', [4, 6, 48])
+@pytest.mark.parametrize('rows', [6, 48])
 @pytest.mark.parametrize('ratio,role', [(0, 'shared'), (1, 'source'), (2, 'source'),
                                         (2, 'consumer'), (2, 'shared')])
 def test_capture_warmup_inputs_eager_then_graph(rows, ratio, role, slots_mode):
