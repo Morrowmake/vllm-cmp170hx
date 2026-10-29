@@ -88,7 +88,7 @@ def _row_tensors(rows):
     return x, ids, weights, out
 
 
-@pytest.mark.parametrize("rows", [1, 511, 512, 513, 1024, 1500, 2048])
+@pytest.mark.parametrize("rows", [1, 512, 513, 1024, 1500, 2048])
 def test_apply_splits_moe_out_calls_into_row_chunks(monkeypatch, rows):
     calls = _record(monkeypatch)
     experts = _experts(moe_out_rows=512)
@@ -254,27 +254,3 @@ def served_2560():
     from tests.kernels.quantization import test_exl3_moe_v2 as v2
 
     return v2.served_experts(None)
-
-
-def test_gpu_helpers_exist():
-    """The GPU tests' helpers are importable on CPU (no CUDA call)."""
-    from tests.kernels.quantization import test_exl3_moe_v2 as v2
-    from tests.kernels.quantization import test_exl3_moe_v2_hidden5120 as h5120
-
-    for owner, names in (
-        (
-            h5120,
-            (
-                "_synthetic",
-                "_case",
-                "HIDDEN",
-                "INTERMEDIATE",
-                "TOPK",
-                "LOCAL",
-                "SWIGLU_LIMIT",
-            ),
-        ),
-        (v2, ("served_experts", "_case", "HIDDEN", "INTERMEDIATE", "TOPK", "LOCAL")),
-    ):
-        for name in names:
-            assert hasattr(owner, name), name

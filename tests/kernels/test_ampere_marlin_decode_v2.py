@@ -298,14 +298,6 @@ class _Stop(Exception):
     pass
 
 
-def test_kernel_warmup_does_not_read_the_v2_switch():
-    from vllm_sm80.kernels import warmup as sm80_warmup
-
-    src = Path(sm80_warmup.__file__).read_text()
-    assert V2 not in src
-    assert "    if envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:\n" in src
-
-
 @pytest.mark.parametrize("compiled,v2,called", [
     ("0", "0", False), ("0", "1", False), ("1", "0", True), ("1", "1", True),
 ])

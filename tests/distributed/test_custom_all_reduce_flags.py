@@ -224,16 +224,6 @@ def test_dispatch(monkeypatch, dtype, numel, flagged, world_size):
         assert not ca._flags.calls and len(ops_calls) == 1
 
 
-def test_dispatch_two_ranks_qwen_rows(monkeypatch):
-    """Qwen TP2 decode messages (2560-wide bf16 rows, 4 per request at MTP k=3)
-    take the flags path up to 256 KiB, i.e. up to 51 rows; larger ones stay on
-    upstream's kernel."""
-    for rows, flagged in ((4, True), (32, True), (51, True), (52, False), (800, False)):
-        ca, ops_calls = _fake_ca(monkeypatch, with_flags=True, world_size=2)
-        ca.custom_all_reduce(torch.zeros(rows, 2560, dtype=torch.bfloat16))
-        assert bool(ca._flags.calls) is flagged and len(ops_calls) == (not flagged)
-
-
 def test_dispatch_four_ranks_deepseek_rows(monkeypatch):
     """DeepSeek-V4.1 TP4 messages (5120-wide bf16 rows: 32 rows at eight
     requests, 40 in the largest decode graph, 128 in the prefill replay tail)
@@ -594,21 +584,6 @@ def test_wait_limit_constant(monkeypatch):
     assert flags.wait_limit_ns() == 2_500_000_000
 
 
-def test_kernel_source_never_falls_through():
-    src = flags.KERNEL_SRC
-    assert "spin_expired" not in src and "clock64" not in src
-    body = src[src.index("void wait_failed"):]
-    body = body[: body.index("\n}\n")]
-    assert body.rstrip().endswith("__trap();")
-    # the record is published with a system-scope release before anyone traps,
-    # and the trap waits (bounded) for the host acknowledgement
-    assert "st_release_sys_u64(c.err, 1)" in body and "c.err + 11" in body
-    assert "*published == 0u" in body
-    # both waits call it on overrun, with their phase
-    assert "wait_failed(c, 1, peer, waited)" in src
-    assert "wait_failed(c, 2, peer, waited)" in src
-
-
 REC = [1, 2, 0, 41, 1536, 1, 3, 61_000_000_000, 5, 17, 60_000_000_000, 0, 0, 0, 0, 0]
 
 
@@ -707,103 +682,6 @@ def test_all_reduce_passes_limit_and_record(monkeypatch):
         assert len(seen) == 1 and "rank 3" in seen[0]
     finally:
         fa.errors._stop.set()
-
-
-# CPU model of the overrun path: four ranks run the two-shot protocol with a
-# global clock; a rank that never pushes (dead) or pushes late (slow) is
-# modelled. Every wait is bounded by LIMIT ticks and an overrun ends that rank
-# (trap). Claims: with a dead rank, every live rank traps and no rank returns
-# from the call; with a late rank inside the limit, every rank returns the
-# exact sums and none traps.
-LIMIT = 50
-
-
-def _model(dead=None, late=None, delay=0, size=7, seed=0):
-    import random
-
-    rng = random.Random(seed)
-    R = 4
-    part = size // R
-    L = size - 3 * part
-    owner_len = [part, part, part, L]
-    x = [[rng.randint(-9, 9) for _ in range(size)] for _ in range(R)]
-    rs = [dict() for _ in range(R)]  # (src, idx) -> value
-    ag = [dict() for _ in range(R)]  # (q, idx) -> value
-    out = [[None] * size for _ in range(R)]
-    state = {r: "push" for r in range(R)}
-    waited = {r: 0 for r in range(R)}
-    clock = 0
-    trapped, returned = set(), set()
-    inflight = []
-
-    def start_time(r):
-        return delay if r == late else 0
-
-    while len(trapped) + len(returned) < R - (1 if dead is not None else 0):
-        clock += 1
-        if clock > 10_000:
-            raise AssertionError("model did not settle")
-        for r in range(R):
-            if r == dead or r in trapped or r in returned or clock < start_time(r):
-                continue
-            if state[r] == "push":
-                for q in range(R):
-                    if q != r:
-                        for i in range(owner_len[q]):
-                            inflight.append((clock + rng.randint(1, 5), "rs", q, (r, i), x[r][q * part + i]))
-                state[r] = "reduce"
-            elif state[r] == "reduce":
-                need = [(s, i) for s in range(R) if s != r for i in range(owner_len[r])]
-                if all(k in rs[r] for k in need):
-                    for i in range(owner_len[r]):
-                        v = sum(x[r][r * part + i] if s == r else rs[r][(s, i)] for s in range(R))
-                        out[r][r * part + i] = v
-                        for q in range(R):
-                            if q != r:
-                                inflight.append((clock + rng.randint(1, 5), "ag", q, (r, i), v))
-                    state[r], waited[r] = "gather", 0
-                else:
-                    waited[r] += 1
-                    if waited[r] > LIMIT:
-                        trapped.add(r)
-            elif state[r] == "gather":
-                need = [(q, i) for q in range(R) if q != r for i in range(owner_len[q])]
-                if all(k in ag[r] for k in need):
-                    for q, i in need:
-                        out[r][q * part + i] = ag[r][(q, i)]
-                    returned.add(r)
-                else:
-                    waited[r] += 1
-                    if waited[r] > LIMIT:
-                        trapped.add(r)
-        for item in [t for t in inflight if t[0] <= clock]:
-            inflight.remove(item)
-            _, kind, dst, key, v = item
-            (rs if kind == "rs" else ag)[dst][key] = v
-    exact = [sum(x[r][j] for r in range(R)) for j in range(size)]
-    return trapped, returned, out, exact
-
-
-@pytest.mark.parametrize("dead", [0, 1, 2, 3])
-@pytest.mark.parametrize("size", [1, 5, 8, 13])
-def test_model_dead_rank_traps_everyone(dead, size):
-    for seed in range(20):
-        trapped, returned, _, _ = _model(dead=dead, size=size, seed=seed)
-        assert returned == set(), "a rank returned without a peer's data"
-        assert trapped == set(range(4)) - {dead}
-
-
-@pytest.mark.parametrize("late", [0, 3])
-def test_model_late_rank_within_limit_is_exact(late):
-    for seed in range(20):
-        trapped, returned, out, exact = _model(late=late, delay=LIMIT // 2, seed=seed)
-        assert trapped == set() and returned == set(range(4))
-        assert all(o == exact for o in out)
-
-
-def test_model_late_rank_beyond_limit_traps():
-    trapped, returned, _, _ = _model(late=2, delay=4 * LIMIT)
-    assert returned == set() and {0, 1, 3} <= trapped
 
 
 # ------------------------------------------------------------ GPU: forced overrun

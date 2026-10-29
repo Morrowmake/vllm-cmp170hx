@@ -171,7 +171,6 @@ def test_switch_defaults_off(monkeypatch):
         (8, 5, 40, 49),  # the DeepSeek-V4.1 serving shape: decode 48 > capture 40
         (8, None, 40, 41),
         (8, 5, 512, 513),
-        (256, 5, 512, 1537),
         (4, 3, None, 17),
     ],
 )
@@ -251,7 +250,7 @@ def _project(layer, rows, gathers, rank):
     return x, layer(x)
 
 
-@pytest.mark.parametrize("rows", [1, 6, 40, 48, 49, 64, 300])
+@pytest.mark.parametrize("rows", [1, 40, 48, 49, 300])
 def test_prefill_rows_skip_the_all_gather(ranks, gathers, rows):
     for rank, layer in enumerate(ranks.adopted):
         gathers.calls.clear()

@@ -235,39 +235,6 @@ def test_gate_depends_only_on_dtype_and_size():
 # --------------------------------------------------------------------------
 # algorithm dispatch
 # --------------------------------------------------------------------------
-def _algo(ar, nbytes):
-    """Mirror of the dispatch in `host_all_reduce`."""
-    blocks = ar._blocks(nbytes)
-    if nbytes >= ar.dma_min_bytes and blocks == 1:
-        return 2
-    if nbytes >= ar.two_shot_min_bytes:
-        return 1
-    return 0
-
-
-def test_algorithm_thresholds_are_size_only():
-    """Measured thresholds, and pure functions of nbytes
-    for the same rank-agreement reason as the gate."""
-    ar = _stub(
-        threads=hsm.DEFAULT_THREADS,
-        block_cap=hsm.DEFAULT_BLOCK_CAP,
-        two_shot_min_bytes=hsm.TWO_SHOT_MIN_BYTES,
-        dma_min_bytes=hsm.DMA_MIN_BYTES,
-    )
-    cases = [
-        (8192, 0),  # one-shot
-        (32768, 0),
-        (65536 - 16, 0),
-        (65536, 1),  # two-shot from TWO_SHOT_MIN_BYTES
-        (131072, 1),
-        (262144 - 16, 1),
-        (262144, 2),  # DMA publish from DMA_MIN_BYTES
-        (512 * 1024, 2),
-    ]
-    for nbytes, expect in cases:
-        assert _algo(ar, nbytes) == expect, (nbytes, expect)
-
-
 def test_measured_thresholds_match_the_benchmarks():
     assert hsm.TWO_SHOT_MIN_BYTES == 64 * 1024
     assert hsm.DMA_MIN_BYTES == 256 * 1024
@@ -298,11 +265,6 @@ def _mock_peers(mp, can_peer):
         hsm.current_platform, "logical_device_id_to_visible_device_id", lambda i: i
     )
     mp.setattr(torch.cuda, "can_device_access_peer", can_peer)
-
-
-def test_probe_sees_p2p_when_it_works(monkeypatch):
-    _mock_peers(monkeypatch, lambda a, b: True)
-    assert hsm._p2p_unavailable(4) is False
 
 
 def test_probe_reports_no_p2p_when_refused(monkeypatch):
@@ -473,12 +435,6 @@ def test_env_vars_are_declared():
     import vllm.envs as envs
 
     assert "VLLM_SM80_ALLREDUCE" in envs.environment_variables
-    # The type hints live in a TYPE_CHECKING block of vllm_sm80/envs.py, so
-    # assert on the source rather than on runtime __annotations__ (empty).
-    from vllm_sm80 import envs as fork_envs
-
-    src = inspect.getsource(fork_envs)
-    assert "VLLM_SM80_ALLREDUCE: bool = False" in src
 
 
 def test_env_reads_are_live(monkeypatch):

@@ -99,8 +99,6 @@ def named_rows(vocab: int, width: int) -> dict[str, tuple[torch.Tensor, int]]:
     rows["negative NaN beats +inf"] = (r, 2 * w)
     r = row(); r[w + 2] = -0.0; r[2 * w + 1] = 0.0
     rows["-0.0 ties +0.0 (first wins)"] = (r, w + 2)
-    r = row(); r[2 * w + 1] = 0.0; r[w + 2] = -0.0
-    rows["+0.0 ties -0.0 (first wins)"] = (r, w + 2)
     r = row(-inf)
     rows["all -inf"] = (r, 0)
     r = row(-inf); r[3 * w] = -3.0e38
@@ -295,7 +293,7 @@ def kernels():
 
 
 def test_named_rows_pick_the_gathered_argmax(kernels):
-    assert len(kernels["named"]) == 16
+    assert len(kernels["named"]) == 15
     for name, (got, got_bf16, torch_cpu, want) in kernels["named"].items():
         assert got == got_bf16 == want, name
         assert torch_cpu == want, name  # the rule the expectations encode

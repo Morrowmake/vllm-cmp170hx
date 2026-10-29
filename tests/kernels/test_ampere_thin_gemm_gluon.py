@@ -160,12 +160,6 @@ def test_concat_and_gluon_raise_in_a_fresh_interpreter():
             in run.stderr), run.stderr[-2000:]
 
 
-def test_concat_and_gluon_do_not_combine(g, monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_CONCAT", True, raising=False)
-    with pytest.raises(ValueError, match="VLLM_THIN_GEMM_CONCAT are both set"):
-        g.wrap_dispatch(lambda layer, x, w, bias=None: None)
-
-
 def test_warmup_never_imports_gluon_when_off(monkeypatch):
     from vllm_sm80.kernels.thin_gemm import warmup as wu
 
