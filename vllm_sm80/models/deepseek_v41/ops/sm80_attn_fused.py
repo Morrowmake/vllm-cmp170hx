@@ -29,9 +29,11 @@ compressed rows, in the reference's order with an online softmax, a BF16
 probability before the value dot and the sink added to the denominator once.
 With ``VLLM_DEEPSEEK_V41_SPLITKV_DECODE`` the pipeline path instead splits
 each row's keys a fixed number of ways per shape (:func:`split_count`): each
-split runs that online softmax over its interleaved key tiles with in-place
-scores, and one merge pass combines the splits in split order before the
-same epilogue, so results are run to run bit stable.
+split runs the online softmax over its interleaved key tiles with in-place
+scores, its probabilities applied as two BF16 parts (p = hi + lo, two MMAs
+with FP32 accumulation, so p is not rounded to BF16), and one merge pass
+combines the splits in split order before the same epilogue, so results are
+run to run bit stable.
 No host sync, no data-dependent host branching; the scratch tensors come from
 the caching allocator (CUDA-graph pool under capture).
 
@@ -430,7 +432,10 @@ def _split_partial_kernel(
     """One program per (row, head block, split): the online softmax of the
     key tiles ``split, split + SPLITS, ...`` (window tiles first, then the
     compressed ones, as in the ordered value pass), with the scores computed
-    in place. Writes the unnormalised FP32 accumulator and its (max, sum)."""
+    in place. Each FP32 probability weights the rows as two BF16 parts,
+    hi = bf16(p) and lo = bf16(p - hi), in two MMAs into the FP32 accumulator
+    (relative error of p at most ~2^-16 instead of the 2^-8 of one BF16 rounding).
+    Writes the unnormalised FP32 accumulator and its (max, sum)."""
     t = tl.program_id(0).to(tl.int64)
     split = tl.program_id(2)
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -472,7 +477,15 @@ def _split_partial_kernel(
             else:
                 kv = tl.load(comp_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0)
             s = tl.dot(q, tl.trans(kv)) * scale
-            m, l, acc = _attend(s, kv, ok, m, l, acc)
+            s = tl.where(ok[None, :], s, float("-inf"))
+            m_new = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(s - m_new[:, None])
+            l = l * alpha + tl.sum(p, axis=1)
+            hi = p.to(tl.bfloat16)
+            lo = (p - hi.to(tl.float32)).to(tl.bfloat16)
+            acc = tl.dot(lo, kv, tl.dot(hi, kv, acc * alpha[:, None]))
+            m = m_new
     row = (t * SPLITS + split) * n_heads + heads
     tl.store(part_ptr + row[:, None] * D + d[None, :], acc, mask=hmask[:, None])
     tl.store(ml_ptr + row * 2, m, mask=hmask)

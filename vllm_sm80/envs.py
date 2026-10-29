@@ -924,7 +924,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V4.1 on sm_80, the attention pipeline's decode attention as
     # split-KV: each row's window and selected compressed keys split a fixed
-    # number of ways per shape, merged in split order (bit stable run to run;
+    # number of ways per shape, probabilities applied as BF16 hi + lo parts
+    # (not rounded to BF16), merged in split order (bit stable run to run;
     # changes rounding). Default OFF. Read in
     # vllm_sm80/models/deepseek_v41/ops/sm80_attn_pipeline.py.
     "VLLM_DEEPSEEK_V41_SPLITKV_DECODE": lambda: bool(
