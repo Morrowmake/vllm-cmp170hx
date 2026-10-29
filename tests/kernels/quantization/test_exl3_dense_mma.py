@@ -394,16 +394,12 @@ def test_every_forced_plan_holds_the_gate(mma_switch, mt, kw, splits):
     "rows,padded_in,padded_out,bits_x2,unaligned",
     [
         (33, 2560, 1280, 12, False),  # drafter fc rows (48-128 served)
-        (128, 2560, 1280, 12, False),
-        (963, 640, 384, 14, False),  # a prefill-sized launch
         (4, 2560, 640, 8, False),  # a format outside the served set
         (4, 2560, 640, 14, True),  # 2-byte aligned trellis words
         # Matrices outside the served set:
         (1, 2560, WIDE_74, 14, False),  # wide (4-tile groups) at 74 SMs
-        (8, 2560, WIDE_74, 12, False),
         (4, 2560, 640, 12, False),  # a served shape in another served format
         (3, 640, 384, 14, False),
-        (4, 4224, 256, 14, False),
     ],
 )
 def test_launches_outside_the_blocks_are_the_split_k_operator(

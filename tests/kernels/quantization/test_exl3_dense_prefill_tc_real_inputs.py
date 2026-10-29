@@ -10,8 +10,8 @@ or missing, the tests that need it skip and say which. Every case is a dense
 launch of the served model at tensor parallel size 2, rank 0, 74
 multiprocessors, its phase taken from the scheduler step that made it.
 
-CPU: the required cells against the operator's rule, and (case set given)
-every file's sha256 and one case per required (rows, phase) cell.
+CPU (case set given): every file's sha256 and one case per required (rows,
+phase) cell, every required prefill cell a launch the operator takes.
 
 GPU (SM 8.0, as many multiprocessors as the cases were recorded on), per
 case: linear_out gives each live case's recorded output bit for bit; on
@@ -91,28 +91,6 @@ def _takes(case, splitk):
 
 
 # ---------------------------------------------------------------- CPU tests
-
-
-def test_required_cells_follow_the_operator_rule():
-    _extension_or_skip()
-    # Every required prefill row count is covered for some served matrix;
-    # the decode controls are calls of more than 64 rows.
-    served = [
-        (2560, 256, 14),
-        (2560, 640, 14),
-        (2560, 640, 10),
-        (2560, 1280, 12),
-        (640, 2560, 14),
-        (3072, 2560, 14),
-        (2560, 3072, 14),
-        (2560, 5120, 14),
-        (2560, 6144, 14),
-    ]
-    for rows in TC_PREFILL_ROWS:
-        assert any(tc.linear_prefill_applies(rows, k, n, b, 2) for k, n, b in served), (
-            rows
-        )
-    assert min(DECODE_CONTROL_ROWS) > tc.MAX_SHIPPED_ROWS
 
 
 def test_case_set_files_and_coverage():

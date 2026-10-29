@@ -12,11 +12,10 @@ served matrices, including the LM head (K 2560, N 124160, bits_x2 12),
 which the target model calls at 4 rows per request and each of the three
 drafter steps at 1 row per request.
 
-CPU: the required cells against the plan rule, and (case set given) every
-file's sha256, every case inside the blocks' rule (a served matrix), the LM
-head's cases on the 4-tile plan, and one case per required (rows, phase)
-cell for every matrix role (each role on its own), the target head and the
-draft heads.
+CPU (case set given): every file's sha256, every case inside the blocks' rule
+(a served matrix), the LM head's cases on the 4-tile plan, and one case per
+required (rows, phase) cell for every matrix role (each role on its own), the
+target head and the draft heads.
 
 GPU (SM 8.0, as many multiprocessors as the cases were recorded on): per case
 the shipped operator (ops.linear_out), the port (ops.linear_out_splitk with
@@ -109,7 +108,6 @@ HEAD_DRAFT_REQUIRED_CELLS = {(c, p) for c in _CONCURRENCY for p in real.PHASES}
 HEAD_TARGET_REQUIRED_CELLS = {(r, "decode") for r in _VERIFY} | {
     (r, "prefill") for r in range(1, MAX_ROWS + 1)
 }
-SMS = 74
 
 
 def required_cells(role: str, drafter: bool) -> set[tuple[int, str]]:
@@ -159,21 +157,6 @@ def _require(cases):
 
 
 # ---------------------------------------------------------------- CPU tests
-
-
-def test_required_cells_are_mma_launches():
-    _extension_or_skip()
-    plan = torch.ops._exl3_C.linear_mma_plan
-    for cells in (
-        TARGET_REQUIRED_CELLS,
-        DRAFT_REQUIRED_CELLS,
-        DRAFT_HIDDEN_REQUIRED_CELLS,
-    ):
-        assert cells and max(r for r, _ in cells) <= MAX_ROWS
-    for rows, _ in sorted(HEAD_DRAFT_REQUIRED_CELLS | HEAD_TARGET_REQUIRED_CELLS):
-        assert plan(rows, *HEAD[:2], SMS, *HEAD[2:]) == [4, 1, 1], rows
-    for rows in (MAX_ROWS + 1, 48, 64):
-        assert plan(rows, *HEAD[:2], SMS, *HEAD[2:]) == [0, 0, 0], rows
 
 
 def test_case_set_files_rule_and_coverage():

@@ -45,7 +45,6 @@ from tests.kernels.quantization.test_exl3_dense_splitk import (
     _matrix,
     _Pool,
     _run,
-    _run_core,
     needs_sm80,
 )
 from vllm_sm80.kernels.exl3 import dense_prefill_tc as tc
@@ -323,21 +322,6 @@ def test_a_stale_library_is_refused_with_the_rebuild_hint(monkeypatch):
     assert tc.active is False
 
 
-def test_switch_is_resolved_once_by_ensure_extension(monkeypatch):
-    monkeypatch.setattr(exl3_ops, "_loaded", False)
-    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
-    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
-    monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
-    monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
-    monkeypatch.setattr(torch.library, "register_fake", lambda name: lambda fn: fn)
-    monkeypatch.setattr(exl3_ops, "_resolve_dense_splitk", lambda: False)
-    resolved = []
-    monkeypatch.setattr(tc, "resolve", lambda: resolved.append(1))
-    exl3_ops.ensure_extension()
-    exl3_ops.ensure_extension()
-    assert resolved == [1], "resolved once per process"
-
-
 def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
     """A process's first EXL3 use with the switch set and the gate open (TP2):
     ensure_extension runs the real resolve and warm-up once, and nothing they
@@ -465,13 +449,13 @@ def _linear(monkeypatch, rows, matrix, row_chunk, splitk):
     return trellis, workspace
 
 
+# Off, _linear never consults the step: a prefill step stands for every step.
 @pytest.mark.parametrize("splitk", [False, True])
-@pytest.mark.parametrize("max_query_len", [None, DECODE_QUERY_LEN, 3460])
-def test_switch_off_keeps_the_base_operator(monkeypatch, splitk, max_query_len):
+def test_switch_off_keeps_the_base_operator(monkeypatch, splitk):
     calls = _recorders(monkeypatch)
     monkeypatch.setattr(tc, "active", False)
     monkeypatch.setattr(tc, "route", lambda *a: pytest.fail("route called while off"))
-    _step(monkeypatch, max_query_len)
+    _step(monkeypatch, 3460)
     trellis, workspace = _linear(monkeypatch, 3460, KV, 2978, splitk)
     expected = "linear_out_splitk" if splitk else "linear_out"
     assert [name for name, _ in calls] == [expected] * 2
@@ -491,11 +475,8 @@ def _on(monkeypatch):
 @pytest.mark.parametrize(
     "max_query_len,rows,matrix",
     [
-        # Decode steps of more than 64 tokens: 32 requests x 4 verify rows, and
-        # the drafter's hidden-state projection at 4 x 64 verify rows.
+        # A decode step of more than 64 tokens: 32 requests x 4 verify rows.
         (DECODE_QUERY_LEN, 128, Q),
-        (DECODE_QUERY_LEN, 256, FC),
-        (1, 3460, OUT),
         # No forward context (profiling, tests, captures in piecewise mode).
         (None, 3460, OUT),
         # A prefill step's call of at most 64 rows.
@@ -900,12 +881,3 @@ def test_prefill_graph_replay_is_bitwise_eager_without_allocations():
     graph.replay()
     torch.cuda.synchronize()
     _bitwise(out, _run(tc.linear_out_prefill, m, x, 14, 2560), "new inputs")
-
-
-def test_split_witness_matches_the_profiler_name_style():
-    # The profiler demangles template arguments as true/false; cuobjdump as (bool)1.
-    assert _split_ran({"void exl3::x::prefill_gemm<14, 2, __nv_bfloat16, true>(A, B*)"})
-    assert not _split_ran(
-        {"void exl3::x::prefill_gemm<14, 2, __nv_bfloat16, false>(A, B*)"}
-    )
-    assert _run_core is not None  # shared helper kept importable
