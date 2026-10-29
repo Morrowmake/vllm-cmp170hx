@@ -4,15 +4,15 @@
 csrc/exl3/moe_v2_try.cu) and VLLM_EXL3_MOE_PREFILL_UNCHUNKED
 (moe_out_prefill_try, csrc/exl3/moe_prefill_try.cu), for the
 DeepSeek-V4.1 target's routed layers (hidden 5120, top-6, bits_x2 6 or 4):
-the ring for whole experts (intermediate 2304, 96 of 384 local) and the
-tensor-split chunks (640 or 512 columns, all 384 local), the unchunked
-prefill for whole experts only.
+the ring and the unchunked prefill for whole experts (intermediate 2304, 96
+of 384 local) and the tensor-split chunks (640 or 512 columns, all 384
+local).
 
 CPU:
 - both switches are declared, off by default and read through vllm.envs;
 - the ring opens only for its configurations: not the hidden-2560 layers, the
   DSpark drafter (top-3, bits_x2 8) or bits_x2 8; the unchunked prefill
-  only for whole experts, read once at import;
+  likewise only for its shapes, read once at import;
 - Exl3Experts.apply takes moe_out_v2_try for the calls moe_out_v2 serves when
   the layer's experts take it, before moe_out_v2_fold;
 - Exl3MoEMethod._moe_v2_try requires the operator, sizes the workspace for
@@ -30,8 +30,8 @@ without allocator events. For synthetic tensor-split layers (640 and 512
 columns, bits_x2 6 and 4; every expert local, 16-byte aligned weights) it
 returns moe_out_v2's bytes on the same scenarios and at every row count.
 moe_out_prefill_try returns moe_out_prefill_v2's bytes at 65, 1024, 1025 and
-2048 rows and on the routing scenarios, and repeats bitwise with a reused
-workspace.
+2048 rows and on the routing scenarios, for whole experts and the synthetic
+tensor-split layers, and repeats bitwise with a reused workspace.
 
     pytest -q tests/kernels/quantization/test_exl3_moe_v2_switches.py
 """
@@ -94,10 +94,13 @@ def test_unchunked_prefill_is_read_through_envs_once(monkeypatch):
     assert not exl3_ops._try_moe_prefill(5120, 2304, 6, 96)
 
 
-def test_unchunked_prefill_covers_the_whole_expert_shape_only(monkeypatch):
+def test_unchunked_prefill_covers_its_shapes_only(monkeypatch):
     monkeypatch.setattr(exl3_ops, "TRY_MOE_PREFILL", True)
-    assert exl3_ops._try_moe_prefill(5120, 2304, 6, 96)
-    for other in ((5120, 640, 6, 384), (5120, 512, 6, 384), (5120, 2304, 3, 32),
+    shapes = ((5120, 2304, 6, 96), (5120, 640, 6, 384), (5120, 512, 6, 384))
+    assert exl3_ops.TRY_MOE_PREFILL_SHAPES == set(shapes)
+    for shape in shapes:
+        assert exl3_ops._try_moe_prefill(*shape), shape
+    for other in ((5120, 640, 6, 96), (5120, 2304, 3, 32), (5120, 640, 3, 128),
                   (2560, 640, 10, 256)):
         assert not exl3_ops._try_moe_prefill(*other), other
     assert exl3_ops.TRY_MOE_PREFILL_ROWS == (65, 2048)
@@ -435,6 +438,30 @@ def test_unchunked_prefill_is_bitwise_prefill_v2(aligned, scenario, rows, scale)
     want = _prefill("moe_out_prefill_v2", aligned, x, ids, w)
     h2560._bitwise(got, want, f"{scenario} rows={rows}")
     assert not torch.isnan(got).any()
+
+
+@needs_sm80
+def test_unchunked_prefill_is_bitwise_prefill_v2_for_the_tensor_split_chunks(split_layer):
+    layer = split_layer
+    args = (h5120.HIDDEN, layer.width, h5120.TOPK, h5120.GLOBAL)
+    assert exl3_ops.TRY_MOE_PREFILL_SHAPES >= {args}
+
+    def run(op, x, ids, w):
+        size = max(torch.ops._exl3_C.moe_workspace_size_prefill_v2(x.shape[0], *args),
+                   torch.ops._exl3_C.moe_workspace_size_prefill_try(x.shape[0], *args))
+        out = torch.full_like(x, float("nan"))
+        getattr(torch.ops._exl3_C, op)(
+            x, ids, w, layer.pointers, layer.meta, layer.expert_map, layer.width,
+            layer.bits_x2, out, torch.full((size,), float("nan"), device=x.device),
+            h5120.SWIGLU_LIMIT,
+        )  # fmt: skip
+        return out
+
+    for scenario, rows, scale in PREFILL_CASES:
+        x, ids, w = h5120._case(scenario, rows, 13 * rows + 7, scale)
+        got = run("moe_out_prefill_try", x, ids, w)
+        h2560._bitwise(got, run("moe_out_prefill_v2", x, ids, w), f"{scenario} rows={rows}")
+        assert not torch.isnan(got).any(), (scenario, rows)
 
 
 @needs_sm80

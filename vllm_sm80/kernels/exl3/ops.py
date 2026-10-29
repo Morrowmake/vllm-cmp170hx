@@ -979,16 +979,25 @@ def require_moe_prefill_v2() -> None:
                     ) from exc
             torch.library.register_fake("_exl3_C::moe_out_prefill_try")(_moe_v2_fake)
             logger.info_once(
-                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of 65..2048 rows of the "
-                "whole-expert configuration (hidden 5120, intermediate 2304, top-6, "
-                "96 of 384 experts local, bits_x2 6 or 4) run moe_out_prefill_try."
+                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of 65..2048 rows of "
+                "hidden 5120, top-6, bits_x2 6 or 4 (whole experts, intermediate 2304 with 96 "
+                "of 384 local, or the tensor-split 640/512-column chunks of all 384) run "
+                "moe_out_prefill_try."
             )
         _moe_prefill_v2_fake_registered = True
 
 
+# (hidden, intermediate, top-k, local experts) moe_out_prefill_try covers: whole
+# experts at expert parallel size 4, and the tensor-split chunks (only the layout
+# without --enable-expert-parallel reaches those).
+TRY_MOE_PREFILL_SHAPES = frozenset(
+    {(5120, 2304, 6, 96), (5120, 640, 6, 384), (5120, 512, 6, 384)}
+)
+
+
 def _try_moe_prefill(hidden: int, intermediate: int, topk: int, local: int) -> bool:
-    """VLLM_EXL3_MOE_PREFILL_UNCHUNKED is set and the shape is the one it covers."""
-    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) == (5120, 2304, 6, 96)
+    """VLLM_EXL3_MOE_PREFILL_UNCHUNKED is set and the shape is one it covers."""
+    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) in TRY_MOE_PREFILL_SHAPES
 
 
 @lru_cache(maxsize=None)

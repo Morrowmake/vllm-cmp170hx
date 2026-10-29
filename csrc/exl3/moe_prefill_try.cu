@@ -8,7 +8,8 @@
 // EXL3 routed-expert MoE on the tensor cores for prefill-sized calls of the DeepSeek-V4.1-Flash
 // routed experts: moe_out_prefill (moe_prefill.cu) generalised from its one compile-time shape (hidden
 // 2560, intermediate 640, bits_x2 10) to one kernel family parameterised by (hidden, intermediate,
-// bits_x2), instantiated for hidden 5120, intermediate 2304 and bits_x2 6 and 4 (the decoder layers).
+// bits_x2), instantiated for hidden 5120 and bits_x2 6 and 4 (the decoder layers): intermediate 2304
+// (whole experts) and 640 or 512 (the tensor-split chunks, as moe_prefill_v2.cu).
 // Codebook 2 (mul1) only. The caller (vllm_sm80/kernels/exl3/quant.py) takes this
 // operator only for those configurations, for calls of more than 64 rows in prefill steps; every other
 // call keeps moe_out, moe_out_v2 or moe_out_prefill, which this file does not change.
@@ -727,9 +728,13 @@ struct Shape {
   static_assert(kStageBytes % 16 == 0 && kTileBytes % 16 == 0, "16-byte aligned stages and tiles");
 };
 // Two n16 tiles per warp (256-column blocks): every block streams its route tile's
-// hi/lo operand rows over the whole K, so wider blocks halve that traffic.
+// hi/lo operand rows over the whole K, so wider blocks halve that traffic. The
+// 640-column tensor-split chunk is not a whole number of 256-column blocks: one
+// tile per warp there (128-column blocks; as fast as two at 512 on the census
+// chunks, five tiles per warp twice as slow).
 template <class C, int Projections, int First>
-using GateUpShape = Shape<C::kHidden, C::kIntermediate, Projections, First, 2, C::kBitsX2>;
+using GateUpShape = Shape<C::kHidden, C::kIntermediate, Projections, First,
+                          C::kIntermediate % 256 == 0 ? 2 : 1, C::kBitsX2>;
 template <class C>
 using DownShape = Shape<C::kIntermediate, C::kHidden, 1, 2, 2, C::kBitsX2>;
 
@@ -1156,7 +1161,9 @@ void run_call(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch
 }
 
 // The configurations this file is instantiated for: (hidden, intermediate, bits_x2), codebook 2.
-#define EXL3_MOE_PREFILL_CONFIGS(X) X(5120, 2304, 6) X(5120, 2304, 4)
+#define EXL3_MOE_PREFILL_CONFIGS(X)                                                            \
+  X(5120, 2304, 6) X(5120, 2304, 4) X(5120, 640, 6) X(5120, 640, 4) X(5120, 512, 6)            \
+      X(5120, 512, 4)
 
 bool covered(int64_t hidden, int64_t intermediate, int64_t bits_x2) {
 #define EXL3_COVERED(H, I, B) if (hidden == H && intermediate == I && bits_x2 == B) return true;

@@ -1155,9 +1155,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_PREFILL_TC": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_PREFILL_TC", "0"))
     ),
-    # With VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: moe_out_prefill_v2's calls of the
-    # whole-expert configuration (hidden 5120, intermediate 2304, top-6, 96
-    # of 384 experts local, bits_x2 6 or 4, 65..2048 rows) run
+    # With VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: moe_out_prefill_v2's calls of
+    # ops.TRY_MOE_PREFILL_SHAPES (hidden 5120, top-6, bits_x2 6 or 4, 65..2048
+    # rows; whole experts, intermediate 2304 with 96 of 384 local, or in the
+    # tensor-split layout every expert's 640- or 512-column chunk) run
     # moe_out_prefill_try (csrc/exl3/moe_prefill_try.cu) as one launch
     # sequence per call instead of one per 512-row chunk, so each touched
     # expert is decoded once per call; the same arithmetic, bitwise equal.
