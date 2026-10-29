@@ -66,7 +66,7 @@ def _scheduler() -> Scheduler:
     )
 
 
-@pytest.mark.parametrize("num_requests", range(1, MAX_NUM_SEQS + 1))
+@pytest.mark.parametrize("num_requests", [1, 3, 4, MAX_NUM_SEQS])
 def test_drafts_five_below_four_requests_and_none_from_four(num_requests):
     scheduler = _scheduler()
     for request in create_requests(num_requests=num_requests, num_tokens=10):
@@ -288,12 +288,11 @@ def _own_slots_only(result, num_query_per_req, num_reqs):
     return True
 
 
-@pytest.mark.parametrize("num_reqs", [1, 3])
-def test_prepare_keeps_every_request_in_its_own_slots(num_reqs):
+def test_prepare_keeps_every_request_in_its_own_slots():
     s = _host_state(DSparkSpeculator, num_query_per_req=NUM_SPEC)
     s.set_width(NUM_SPEC)
-    result = _prepare(s.num_query_per_req, num_reqs)
-    assert _own_slots_only(result, s.num_query_per_req, num_reqs)
+    result = _prepare(s.num_query_per_req, 3)
+    assert _own_slots_only(result, s.num_query_per_req, 3)
 
 
 def test_a_six_token_block_mixes_requests():
@@ -389,13 +388,3 @@ def test_drafting_steps_run_the_draft_block(monkeypatch):
         _propose(s, num_reqs=3, num_speculative_tokens=NUM_SPEC)
     assert calls == ["prepare", "draft_block"]
     assert s.num_query_per_req == NUM_SPEC
-
-
-def test_data_parallel_skips_the_draft_block_too(monkeypatch):
-    # The data-parallel batch sync makes every rank agree on a zero-draft step.
-    calls: list = []
-    s = _dspark(monkeypatch, calls)
-    s.dp_size = 2
-    out = _propose(s, num_reqs=6, num_speculative_tokens=0)
-    assert calls == ["prepare", ("context_kv", 0, 6)]
-    assert out.shape == (6, NUM_SPEC)

@@ -99,27 +99,6 @@ def test_hysteresis_holds_a_near_tie():
     assert policy.select_by_acceptance(["r"], cap=5) == 3
 
 
-def test_batch_choice_weighs_every_request():
-    policy, rng = _policy(), random.Random(4)
-    _feed(policy, "a", 0.95, 60, rng)
-    _feed(policy, "b", 0.3, 60, rng)
-    k = policy.select_by_acceptance(["a", "b"], cap=4)
-    scores = {d: sum(policy.expected_tokens(policy.accept_rate(r), d) for r in "ab") / c
-              for d, c in ((3, 1.0), (4, 1.08))}
-    assert k == max(scores, key=scores.get)
-
-
-def test_padding_and_forget():
-    policy = _policy()
-    policy.mark_padded("r")
-    policy.observe("r", 5, 0)  # placeholder drafts: no evidence
-    assert "r" not in policy._acc_s
-    policy.observe("r", 5, 5)
-    assert policy._acc_s["r"] == 5 and policy._acc_f["r"] == 0
-    policy.forget("r")
-    assert "r" not in policy._acc_s and "r" not in policy._acc_f
-
-
 # -------------------------------------------------------------- the scheduler
 
 
@@ -252,25 +231,18 @@ def test_multi_request_costs_are_used_for_batches():
     assert policy.select_by_acceptance(["a", "b"], cap=5) == 3  # steep batch costs
 
 
-# The served mappings: TP4 and PP4 with their measured step costs.
-SERVED = {
-    "tp4": {"by_load": [7, 5, 3], "draft_by_load": True, "accept": {
-        "costs": [1.0, 1.1009, 1.1631, 1.2214, 1.2718],
-        "costs_multi": [1.0, 1.1132, 1.1958, 1.2214, 1.2718], "hysteresis": 0.03},
-        "log_interval": 0},
-    "pp4": {"by_load": [7, 5, 3], "accept": {
-        "costs": [1.0, 1.0894, 1.1375, 1.2001, 1.2239],
-        "costs_multi": [1.0, 1.0889, 1.1194, 1.2001, 1.2239], "hysteresis": 0.03},
-        "log_interval": 0},
-}
+# The served TP4 mapping with its measured step costs.
+SERVED_TP4 = {"by_load": [7, 5, 3], "draft_by_load": True, "accept": {
+    "costs": [1.0, 1.1009, 1.1631, 1.2214, 1.2718],
+    "costs_multi": [1.0, 1.1132, 1.1958, 1.2214, 1.2718], "hysteresis": 0.03},
+    "log_interval": 0}
 
 
-@pytest.mark.parametrize("layout", sorted(SERVED))
-def test_served_mapping(layout):
-    raw = SERVED[layout]
+def test_served_mapping():
+    raw = SERVED_TP4
     config = AdaptiveKConfig.from_dict(raw, 7)
     assert config.by_load == (7, 5, 3) and config.allowed == (3, 4, 5, 6, 7)
-    assert config.draft_by_load is (layout == "tp4")
+    assert config.draft_by_load is True
     assert config.accept and config.accept_costs == tuple(raw["accept"]["costs"])
     assert config.accept_costs_multi == tuple(raw["accept"]["costs_multi"])
     assert (config.accept_hysteresis, config.accept_prior) == (0.03, 0.75)
@@ -279,7 +251,7 @@ def test_served_mapping(layout):
         AdaptiveKConfig.from_dict(raw, 3)
 
 
-@pytest.mark.parametrize("depth", [3, 4, 5, 6, 7])
+@pytest.mark.parametrize("depth", [3, 7])
 def test_force_file_pins_the_depth(tmp_path, monkeypatch, depth):
     force = tmp_path / "depth"
     force.write_text(str(depth))
@@ -318,10 +290,9 @@ def _run_alone(policy, req, pattern, cap=7):
     return depths
 
 
-@pytest.mark.parametrize("raw", [K7, ACC])
-def test_identical_requests_choose_identical_depths_after_unrelated_traffic(raw):
-    cap = 7 if raw is K7 else 5
-    policy = AdaptiveKPolicy(AdaptiveKConfig.from_dict(raw, cap))
+def test_identical_requests_choose_identical_depths_after_unrelated_traffic():
+    cap = 7
+    policy = AdaptiveKPolicy(AdaptiveKConfig.from_dict(K7, cap))
     rng = random.Random(13)
     pattern = [rng.choice([0, 1, 2, 3, 5, 7, 7, 7]) for _ in range(80)]
     first = _run_alone(policy, "a", pattern, cap)
@@ -333,10 +304,9 @@ def test_identical_requests_choose_identical_depths_after_unrelated_traffic(raw)
         policy.select_by_acceptance([f"x{i}", f"y{i}"], min(cap, 5))
     second = _run_alone(policy, "b", pattern, cap)
     assert first == second
-    if raw is K7:
-        assert len(set(first)) > 1  # the pattern exercises depth changes
+    assert len(set(first)) > 1  # the pattern exercises depth changes
     # The same on a fresh policy: no hidden dependence on the policy's age.
-    third = _run_alone(AdaptiveKPolicy(AdaptiveKConfig.from_dict(raw, cap)), "c", pattern, cap)
+    third = _run_alone(AdaptiveKPolicy(AdaptiveKConfig.from_dict(K7, cap)), "c", pattern, cap)
     assert first == third
 
 

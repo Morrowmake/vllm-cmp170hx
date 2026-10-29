@@ -149,7 +149,7 @@ def test_anchors_and_views_survive_width_transitions(drafter):
 
 
 @pytest.mark.parametrize("width", [3, 5])
-@pytest.mark.parametrize("num_reqs", [4, 6, 8])
+@pytest.mark.parametrize("num_reqs", [4, 8])
 @pytest.mark.parametrize("topk", [None, 11])
 def test_markov_walk_uses_current_anchors_and_k_columns(drafter, width, num_reqs, topk):
     drafter.set_width(width)

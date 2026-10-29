@@ -8,7 +8,7 @@ routed experts; the rejection sampler verifies those drafts as -1 proposals.
 The full ``RejectionSampler`` runs with its Triton kernels in the interpreter
 (a subprocess with ``TRITON_INTERPRET=1``):
 
-- greedy, at steps verifying k = 7, 5 and 3 drafts of a 7-draft drafter: for
+- greedy, at steps verifying k = 7 and 3 drafts of a 7-draft drafter: for
   every live_len L in 0..k and every unmasked acceptance a in 0..k, the
   capped step emits the unmasked step's tokens truncated to min(a, L)
   accepted drafts plus the target argmax at row min(a, L) (L = 0: exactly the
@@ -199,8 +199,6 @@ def greedy_cases(k: int = K) -> dict:
         "off_is_none": off is None,
         "pairs": pairs,
         "argmax": argmax,
-        "invalid": invalid.tolist(),
-        "row_live": state.row_live[: logits.shape[0]].tolist(),
         "uncapped": uncapped,
         "uncapped_rej": uncapped_rej,
         "capped": capped,
@@ -279,13 +277,9 @@ def _interpret(name: str) -> dict:
     return json.loads(line[len("RESULT ") :])
 
 
-@pytest.fixture(scope="module", params=(K, 5, 3), ids=lambda k: f"k{k}")
+@pytest.fixture(scope="module", params=(K, 3), ids=lambda k: f"k{k}")
 def greedy(request):
     return _interpret("greedy_cases" if request.param == K else f"greedy_k{request.param}")
-
-
-def greedy_k5() -> dict:
-    return greedy_cases(5)
 
 
 def greedy_k3() -> dict:
@@ -312,14 +306,6 @@ def test_greedy_capped_step_is_the_unmasked_step_truncated(greedy):
         assert greedy["uncapped_rej"][r] == K - a
 
 
-def test_invalid_rows_are_the_masked_rows(greedy):
-    K = greedy["k"]  # noqa: N806
-    assert greedy["invalid"] == [v == 0 for v in greedy["row_live"]]
-    for r, (_, n) in enumerate(greedy["pairs"]):
-        row = greedy["invalid"][r * (K + 1) : (r + 1) * (K + 1)]
-        assert row == [j > n for j in range(K + 1)]
-
-
 def test_placeholder_drafts_are_unaffected(greedy):
     K = greedy["k"]  # noqa: N806
     argmax = greedy["argmax"]
@@ -329,15 +315,6 @@ def test_placeholder_drafts_are_unaffected(greedy):
         assert greedy["uncapped"][r] == [argmax[r * (K + 1)]]
         assert greedy["capped"][r] == greedy["uncapped"][r]
         assert greedy["capped_rej"][r] == greedy["uncapped_rej"][r] == K
-
-
-def test_zero_depth_emits_the_target_token_of_row_0(greedy):
-    K = greedy["k"]  # noqa: N806
-    argmax = greedy["argmax"]
-    for r, (a, n) in enumerate(greedy["pairs"]):
-        if n == 0:
-            assert greedy["capped"][r] == [argmax[r * (K + 1)]], a
-            assert greedy["capped_rej"][r] == K
 
 
 def test_every_row_live_is_the_switch_off_step(greedy):

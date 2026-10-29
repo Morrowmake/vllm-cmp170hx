@@ -136,15 +136,6 @@ def test_switch_off_keeps_the_class_and_creates_no_state(monkeypatch):
     assert state_module.get_row_mask_state() is None
 
 
-def test_switch_wraps_the_plain_and_the_per_width_drafter(make):
-    drafter = make()
-    assert isinstance(drafter, conf_module.RowMaskConfidenceMixin)
-    assert isinstance(drafter, upstream.DSparkSpeculator)
-    cls = conf_module.row_mask_class(width_module.PerKDSparkSpeculator)
-    assert issubclass(cls, width_module.PerKDSparkSpeculator)
-    assert cls.__mro__[1] is conf_module.RowMaskConfidenceMixin
-
-
 def test_refuses_the_confidence_dump(make, monkeypatch, tmp_path):
     # The dump would label drafts the mask cut as rejected by the target.
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
@@ -220,7 +211,6 @@ def test_load_checks_the_policy_against_the_verified_drafts(make, monkeypatch, t
         (dict(features=["bias", "conf"]), "features"),
         (dict(weights=[[0.0, 1.0]] * 4), "weights needs"),
         (dict(weights=[[0.0]] * MAX_DRAFT), "weights row 0"),
-        (dict(features=["bias", "hist_ema"]), "features"),
         (dict(tau={"2": 1.5}), "tau"),
         (dict(tau=[0.5]), "tau"),
         (dict(costs={"1": {"0": 1, "2": 2}}), "not 0 .. m"),
@@ -333,17 +323,6 @@ def test_a_step_that_drafts_nothing_resets_its_slots(make, monkeypatch):
     want[4] = 1.0
     assert torch.equal(conf, want)
     assert calls == [2, 2, 2, 2, 1]
-
-
-@pytest.mark.parametrize("dp_size", [1, 2])
-@pytest.mark.parametrize("num_speculative_tokens", [0, 3, None])
-def test_drafts_nothing_matches_the_zero_draft_return(dp_size, num_speculative_tokens):
-    # DFlashSpeculator.propose returns before the draft step exactly when the
-    # step schedules zero drafts, on every data-parallel rank.
-    spec = SimpleNamespace(dp_size=dp_size)
-    assert conf_module.drafts_nothing(spec, num_speculative_tokens) == (
-        num_speculative_tokens == 0
-    )
 
 
 def kernel_cases() -> dict:

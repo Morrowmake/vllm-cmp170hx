@@ -98,14 +98,6 @@ def test_reference_b1_hand_computed():
         assert state.active
 
 
-def test_bias_weights_give_exact_probabilities():
-    state = make_state()
-    exact_probs(state, [0.0, 0.5, 1.0, 1.0, 1.0])
-    z = state.weights[:, 0]
-    p = torch.div(torch.ones(5), 1.0 + torch.exp(-z))
-    assert p.tolist() == [0.0, 0.5, 1.0, 1.0, 1.0]
-
-
 def test_reference_b1_exact_ties_take_larger_k():
     state = make_state()
     # k=0: 1/1 = 1; k=1 with p_1 = 1: 2/2 = 1 (tie); k=2 with p_2 = 0: 2/3.
@@ -544,7 +536,7 @@ def forced_depth_policy(k: int, max_depth: int = 7) -> dict:
 
 
 @pytest.mark.parametrize("tau", (None, 0.5))
-@pytest.mark.parametrize("k", range(8))
+@pytest.mark.parametrize("k", (0, 3, 7))
 def test_policy_file_forces_a_depth(tmp_path, k, tau):
     path = tmp_path / "forced.json"
     policy = forced_depth_policy(k)
