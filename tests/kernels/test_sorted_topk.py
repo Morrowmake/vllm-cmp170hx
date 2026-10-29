@@ -224,10 +224,11 @@ def _function_source(module, name):
     """Source of a top-level function or class, read from its file: importing
     the GLM-5 model module pulls in the vendored FLA ops, which query the
     device at import (and would initialise CUDA on a machine with a GPU)."""
-    import vllm
+    import importlib.util
 
-    parts = module.split(".")[1:]
-    path = pathlib.Path(vllm.__file__).parent.joinpath(*parts).with_suffix(".py")
+    top, *parts = module.split(".")
+    root = pathlib.Path(importlib.util.find_spec(top).origin).parent
+    path = root.joinpath(*parts).with_suffix(".py")
     text = path.read_text()
     node = next(n for n in ast.parse(text).body
                 if isinstance(n, (ast.FunctionDef, ast.ClassDef))
@@ -240,16 +241,20 @@ def test_glm_indexer_calls_the_gate_after_each_topk():
     # Decode: right after the shared decode top-k and before the DCP merge.
     src = _function_source("vllm.models.glm5next.nvidia.sparse_indexer",
                            "sparse_attn_indexer_kpool")
-    assert src.count("canonical_topk_(") == 1
+    assert src.count("sm80_indexer.prefill_topk_tiefix(") == 1
     pre = src.index("torch.ops._C.top_k_per_row_prefill")
-    fix = src.index("canonical_topk_(")
+    fix = src.index("sm80_indexer.prefill_topk_tiefix(")
     assert pre < fix < src.index("expand_pools_and_append_tail")
-    assert src.count("canonical_decode_topk_(") == 1
+    assert src.count("sm80_indexer.decode_topk_tiefix(") == 1
     dec_topk = src.index("get_indexer_topk(topk_backend)(")
-    dec_fix = src.index("canonical_decode_topk_(")
+    dec_fix = src.index("sm80_indexer.decode_topk_tiefix(")
     assert dec_topk < dec_fix < src.index("_merge_dcp_topk_global(", dec_topk)
-    # Its split row bound is the kpool row of the tuning table.
-    assert src.count('indexer="kpool"') == 2
+    # Each fork step runs its gate, with the kpool row of the tuning table as
+    # its split row bound.
+    for step, gate in (("prefill_topk_tiefix", "canonical_topk_("),
+                       ("decode_topk_tiefix", "canonical_decode_topk_(")):
+        step_src = _function_source("vllm_sm80.models.glm5next.sm80_indexer", step)
+        assert step_src.count(gate) == 1 and 'indexer="kpool"' in step_src, step
 
 
 def test_qsa_indexer_calls_the_gate_after_its_topk():

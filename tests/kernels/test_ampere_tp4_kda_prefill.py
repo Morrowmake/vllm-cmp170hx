@@ -214,13 +214,12 @@ def test_warmup_hook_uses_layer_heads(monkeypatch):
 
 
 def test_call_site_passes_head_count():
-    import vllm.models.glm5next.common.kda as kda_mod
     import vllm_sm80.models.glm5next.sm80_kda as layer_mod
 
-    src = open(kda_mod.__file__).read()
-    assert "num_heads=self.local_num_heads," in src
-    # The layer part of the gate is resolved by the fork KDA layer.
+    # The fork KDA layer resolves the gate: the chunk function with the
+    # layer's head count, and the layer part of the gate.
     src = open(layer_mod.__file__).read()
+    assert "num_heads=self.local_num_heads," in src
     assert "allowed_heads=enabled_heads()," in src
     assert "if _envs.VLLM_SM80_KDA_PREFILL:" in src
 

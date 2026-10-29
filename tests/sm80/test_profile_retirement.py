@@ -129,11 +129,12 @@ def test_real_width_managers_retire_and_reinitialize(monkeypatch, speculator_cls
     def teardown(r):
         r.events.append("teardown")
         gc.collect()
-        assert speculator.query_cudagraph_manager is None
         if outcome == "no_graphs":
-            # Nothing was captured, so nothing holds the profiling pool; the
-            # real initialization replaces the managers.
+            # Nothing to capture: upstream returns before the capture, so the
+            # profiling managers stay until the real initialization replaces
+            # them (checked below); nothing was captured into the pool.
             return
+        assert speculator.query_cudagraph_manager is None
         assert speculator._cg_managers == {}
         assert all(ref() is None for ref in profile_refs)
 

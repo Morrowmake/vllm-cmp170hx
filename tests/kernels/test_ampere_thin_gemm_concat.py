@@ -395,11 +395,11 @@ def test_flag_off_exports_the_base_dispatch(monkeypatch):
     objects the dispatch hands out and the indexer binds."""
     import vllm_sm80.kernels.thin_gemm as pkg
     from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
-    from vllm.models.glm5next.common import attention
+    from vllm_sm80.models.glm5next import sm80_indexer as indexer
 
     assert pkg.ampere_thin_gemm.__module__ == PKG
     assert pkg.thin_linear.__module__ == PKG
-    assert attention.thin_linear is pkg.thin_linear
+    assert indexer.thin_linear is pkg.thin_linear
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM", True, raising=False)
     monkeypatch.setattr(pkg, "use_ampere_thin_gemm", lambda: True)
     assert dispatch_unquantized_gemm("auto") is pkg.ampere_thin_gemm
@@ -454,12 +454,12 @@ import types
 from vllm import envs
 import vllm_sm80.kernels.thin_gemm as pkg
 from vllm_sm80.kernels.thin_gemm.warmup import warmup_ampere_thin_gemm
-from vllm.models.glm5next.common import attention
+from vllm_sm80.models.glm5next import sm80_indexer as indexer
 warmup_ampere_thin_gemm(types.SimpleNamespace(device="cpu"), [1, 4])
 print("FLAG", envs.VLLM_THIN_GEMM_CONCAT)
 print("CONCAT_IMPORTED", "vllm_sm80.kernels.thin_gemm.concat" in sys.modules)
 print("DISPATCH", pkg.ampere_thin_gemm.__module__, pkg.thin_linear.__module__,
-      attention.thin_linear is pkg.thin_linear)
+      indexer.thin_linear is pkg.thin_linear)
 """
 
 

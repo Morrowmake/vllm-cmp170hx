@@ -303,6 +303,8 @@ def test_process_startup_warns_once_and_ignores_the_value():
     env["VLLM_GLM5_MOE_MASK_PADDING"] = "1"
     env["VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR"] = "/nonexistent"
     code = (
+        "from vllm.plugins import load_general_plugins\n"
+        "load_general_plugins()\n"
         "import vllm.envs as e\n"
         "from vllm.platforms.interface import Platform\n"
         "Platform.validate_environ(False)\n"

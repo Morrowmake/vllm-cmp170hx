@@ -579,14 +579,11 @@ def test_off_path_untouched():
     """Switch off: no hooks (the model state makes no call into the fold),
     no FoldState, layer records without fold buffers, the upstream plan,
     verify rows as record rows (the recover control-path test in
-    test_ampere_kda_recover.py runs this path end to end). The shared model
-    state module imports nothing of vllm_sm80 at import time."""
-    import ast
-    import inspect
+    test_ampere_kda_recover.py runs this path end to end). Importing the
+    shared model state module does not import the fold."""
     import subprocess
 
     from vllm_sm80.kernels.kda import recover as kr
-    from vllm.v1.worker.gpu.model_states import mamba_hybrid
 
     world = W.World(fold=False, block_size=16, nblocks=40)
     assert world.hooks is None
@@ -601,10 +598,6 @@ def test_off_path_untouched():
             _patched(world.state, "commit_step", lambda *a, **k: None):
         world.step([(0, 3, 1)])
     assert seen and all(s is None for s in seen)
-    tree = ast.parse(inspect.getsource(mamba_hybrid))
-    top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
-    names = [getattr(n, "module", None) or n.names[0].name for n in top]
-    assert not [m for m in names if m and m.startswith("vllm_sm80")], names
     code = ("import sys, vllm.v1.worker.gpu.model_states.mamba_hybrid; "
             "print('vllm_sm80.kernels.kda.recover' in sys.modules)")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,

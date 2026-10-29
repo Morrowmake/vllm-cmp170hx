@@ -25,6 +25,11 @@ import glob
 import os
 
 import vllm.envs as envs
+from vllm_sm80.plugin import register_fork_env_vars
+
+# The replay tests also run as scripts (interpreter children), where no
+# plugin entry point has registered the fork's variables.
+register_fork_env_vars()
 
 
 def root() -> str:

@@ -19,7 +19,7 @@ from vllm.v1.worker.gpu import cudagraph_utils as cgu
 
 
 @create_new_process_for_each_test("spawn")
-@pytest.mark.skipif(not cgu.current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_profile_registry_releases_pool_then_recaptures(monkeypatch):
     runner = _make_profiling_runner(CUDAGraphMode.FULL_AND_PIECEWISE)
     runner.compilation_config.static_forward_context = {}
@@ -93,7 +93,7 @@ def test_profile_registry_releases_pool_then_recaptures(monkeypatch):
 
 
 @create_new_process_for_each_test("spawn")
-@pytest.mark.skipif(not cgu.current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 @pytest.mark.parametrize("preserve_layout", [False, True])
 def test_graph_snapshots_do_not_retain_device_payload(preserve_layout):
     backing = torch.zeros((128, 4096), device="cuda")
@@ -141,7 +141,7 @@ def test_graph_snapshots_do_not_retain_device_payload(preserve_layout):
 
 
 @create_new_process_for_each_test("spawn")
-@pytest.mark.skipif(not cgu.current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_eager_snapshot_avoids_device_payload_and_preserves_prewrite_values():
     backing = torch.full((128, 4096), 3.0, device="cuda")
     source = backing[:, :2048]

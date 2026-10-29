@@ -1,24 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The development A/B switch setter (vllm_sm80/dev_ab.py)."""
-import ast
-import hashlib
-import pathlib
-import textwrap
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_sm80 import dev_ab
-
-REPO = pathlib.Path(__file__).resolve().parents[2]
-MODEL_RUNNER = REPO / "vllm" / "v1" / "worker" / "gpu" / "model_runner.py"
-# sha256 of GPUModelRunner.capture_model (decorator to end, dedented) in the
-# upstream-derived tree the hook was added to; the hook is the only change.
-UPSTREAM_CAPTURE_MODEL_SHA256 = (
-    "2dcdeba2e33d7885e14aed9cbbd2a6eda0b814a9ffc661c9f4e096bc0b41ae47"
-)
-HOOK = "@with_ab_capture\n"
 
 
 class _Trap:
@@ -81,20 +68,6 @@ class _Runner:
         return 100 if arm else 10
 
 
-def _method_source(path, cls, name):
-    text = path.read_text()
-    lines = text.splitlines(keepends=True)
-    for node in ast.walk(ast.parse(text)):
-        if isinstance(node, ast.ClassDef) and node.name == cls:
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == name:
-                    start = min(
-                        [d.lineno for d in item.decorator_list] + [item.lineno]
-                    )
-                    return textwrap.dedent("".join(lines[start - 1:item.end_lineno]))
-    raise AssertionError(f"{cls}.{name} not found")
-
-
 # --- switch unset: the off path --------------------------------------------
 
 
@@ -110,13 +83,25 @@ def test_unset_touches_nothing(monkeypatch, state, value):
     assert state == dev_ab._ArmState()
 
 
-def test_capture_model_is_upstream_plus_the_hook():
-    source = _method_source(MODEL_RUNNER, "GPUModelRunner", "capture_model")
-    assert source.count(HOOK) == 1
-    # The wrapper owns switching; the original capture body is byte-identical.
-    assert source.split("\n")[1] == "@with_ab_capture"
-    digest = hashlib.sha256(source.replace(HOOK, "").encode()).hexdigest()
-    assert digest == UPSTREAM_CAPTURE_MODEL_SHA256
+def test_fork_runner_captures_through_the_ab_wrapper(monkeypatch):
+    """The fork's model runner sends vLLM's capture through the A/B wrapper:
+    the both-arm capture's result when it captures, else vLLM's own capture.
+    (vLLM's capture_model itself is pinned as a seam.)"""
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm_sm80.spec_decode import warmup as spec_decode_warmup
+    from vllm_sm80.worker import cudagraph_mem, graph_mem_worker
+
+    cls = graph_mem_worker.runner_cls()
+    runner = cls.__new__(cls)
+    monkeypatch.setattr(spec_decode_warmup, "warmup_before_capture", lambda r, p: None)
+    monkeypatch.setattr(cudagraph_mem, "enabled", lambda: False)
+    monkeypatch.setattr(
+        GPUModelRunner, "capture_model", lambda self, *, profile_only=False: 10
+    )
+    monkeypatch.setattr(dev_ab, "capture_model_per_arm", lambda r, p: 110)
+    assert runner.capture_model() == 110
+    monkeypatch.setattr(dev_ab, "capture_model_per_arm", lambda r, p: None)
+    assert runner.capture_model() == 10
 
 
 # --- configuration -----------------------------------------------------------

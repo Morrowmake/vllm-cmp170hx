@@ -145,6 +145,8 @@ def test_gate_rejects_gate_bias_and_odd_x(on):
 def test_off_path_does_not_import_the_kernel(monkeypatch):
     """With the flag off, maybe_moe_route_v2 returns None before importing."""
     code = (
+        "from vllm_sm80.plugin import register_fork_env_vars\n"
+        "register_fork_env_vars()\n"
         "import sys, vllm_sm80.kernels.moe as a\n"
         "from types import SimpleNamespace as S\n"
         "import torch\n"

@@ -7,6 +7,7 @@ CPU only. The flag is read when the kernel modules are imported, so every
 case that depends on it runs in a fresh interpreter.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -20,9 +21,11 @@ import pytest
 triton = pytest.importorskip("triton")
 
 REPO = Path(__file__).resolve().parents[2]
+# The vendored FLA and KDA kernels are engine files (the vllm package's tree).
+ENGINE = Path(importlib.util.find_spec("vllm").origin).parents[1]
 KERNEL_DIRS = (
-    REPO / "vllm/third_party/flash_linear_attention/ops",
-    REPO / "vllm/models/glm5next/nvidia/ops/third_party/kda",
+    ENGINE / "vllm/third_party/flash_linear_attention/ops",
+    ENGINE / "vllm/models/glm5next/nvidia/ops/third_party/kda",
 )
 KERNEL_MODULES = (
     "vllm.third_party.flash_linear_attention.ops.chunk_delta_h",

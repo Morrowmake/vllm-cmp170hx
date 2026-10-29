@@ -45,6 +45,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import vllm
 
 from tests.kernels import test_ampere_pp_marlin_prefill as pp
 from vllm_sm80.kernels.marlin_moe import prefill as pmp
@@ -58,6 +59,7 @@ E, TOPK, K, N = pp.E, pp.TOPK, pp.K, pp.N
 gpu = pp.gpu
 ROOT = Path(__file__).resolve().parents[2]
 LIB = ROOT / "csrc" / "ampere_marlin"
+ENGINE = Path(vllm.__file__).parents[1]
 WIDE = {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)}
 TILES_BANNER = f"Marlin MoE prefill compiled tiles active ({SWITCH}, N=2048)"
 FAST_BANNER = f"Marlin MoE prefill fast dequant active ({SWITCH}, N=2048)"
@@ -547,7 +549,7 @@ def test_library_declares_the_explicit_tiles():
     # Built only by its own builder, from this directory's copy of the Marlin
     # MoE GEMM: vLLM's CMake build names none of it, and no unit reaches
     # vLLM's own Marlin MoE sources.
-    assert "ampere_marlin" not in (ROOT / "CMakeLists.txt").read_text()
+    assert "ampere_marlin" not in (ENGINE / "CMakeLists.txt").read_text()
     for path in LIB.iterdir():
         if path.suffix in (".cu", ".cuh", ".h", ".cpp"):
             assert "marlin_moe_wna16/" not in "".join(re.findall(

@@ -40,6 +40,7 @@ def _switches(monkeypatch, *, canonical: bool, sort: bool) -> None:
 
 
 @requires_qsa_kernels
+@requires_cuda_device
 @pytest.mark.parametrize("block_topk", [3, 512])
 def test_qsa_sorted_selection_preserves_packed_expansion(block_topk: int) -> None:
     """Sorted padded/strided selections keep the causal tail and count ABI."""

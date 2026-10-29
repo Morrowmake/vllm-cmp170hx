@@ -59,6 +59,8 @@ def test_off_path_does_not_import_the_fold_module():
     code = (
         "import sys, os\n"
         "os.environ.pop('VLLM_AMPERE_DECODE_IDX_GLUE', None)\n"
+        "from vllm_sm80.plugin import register_fork_env_vars\n"
+        "register_fork_env_vars()\n"
         "from vllm_sm80.kernels import _platform\n"
         "from vllm_sm80.kernels.idx_glue_gate import use_idx_glue\n"
         "_platform._SM80_CACHE = True\n"
