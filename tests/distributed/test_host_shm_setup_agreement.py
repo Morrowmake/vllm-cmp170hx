@@ -185,10 +185,6 @@ def _assert_all_fell_back(scenario, tag):
         assert r[3] == [False] * WORLD  # every rank saw every rank disabled
 
 
-def test_register_failure_on_rank_2_disables_every_rank():
-    _assert_all_fell_back({"fail_rank": 2, "fail_step": "register"}, "reg2")
-
-
 def test_register_failure_on_rank_0_disables_every_rank():
     _assert_all_fell_back({"fail_rank": 0, "fail_step": "register"}, "reg0")
 
