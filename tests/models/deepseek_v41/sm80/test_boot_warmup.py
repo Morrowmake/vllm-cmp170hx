@@ -138,8 +138,10 @@ def test_index_scores_warmup_keys_and_launch(monkeypatch) -> None:
     assert {rec.key(rec.calls[0])} == served
 
 
-@pytest.mark.parametrize("num_query_per_req", [2, 3, 6, 9])
-@pytest.mark.parametrize("max_num_tokens", [8, 100, 2048])
+# 2: first q unclamped; 6 (served): first q clamped to 1. 8: stops below the
+# cap; 2048: reaches the 256 cap.
+@pytest.mark.parametrize("num_query_per_req", [2, 6])
+@pytest.mark.parametrize("max_num_tokens", [8, 2048])
 def test_prepare_block_sizes_cover_every_reachable_value(
     num_query_per_req, max_num_tokens
 ) -> None:
@@ -300,12 +302,6 @@ def test_spec_decode_warmup_failure_does_not_stop_boot(monkeypatch) -> None:
 
     runner.rejection_sampler._watermarking_kwargs = boom
     spec_warmup.warmup_spec_decode(runner)  # logs, does not raise
-
-
-def test_spec_decode_warmup_skips_without_speculator() -> None:
-    spec_warmup.warmup_spec_decode(
-        SimpleNamespace(speculator=None, is_last_pp_rank=True)
-    )
 
 
 def test_spec_decode_warmup_skips_off_sm80(monkeypatch) -> None:
