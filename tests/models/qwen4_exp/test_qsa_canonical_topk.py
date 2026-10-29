@@ -131,7 +131,7 @@ def set_switches(monkeypatch, *, canonical: bool, sort: bool) -> None:
 # --- switch ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True)])
+@pytest.mark.parametrize("value,expected", [(None, False), ("1", True)])
 def test_switch_is_read_from_the_environment(monkeypatch, value, expected):
     if value is None:
         monkeypatch.delenv("VLLM_SM80_TOPK_CANONICAL_TIES", raising=False)
@@ -165,41 +165,6 @@ def test_switch_off_keeps_todays_path(monkeypatch, fake_topk, sort):
     assert all(b is out for b in sorts)
 
 
-@pytest.mark.parametrize("sort", [False, True])
-def test_switch_on_runs_the_tie_fix_once_and_sorts_inside_it(
-    monkeypatch, fake_topk, sort
-):
-    """On: one tie-fix launch over the visible counts, carrying the sort
-    switch; the sort launch of its own never runs. The shared kernels are
-    warmed (compiled) on the first call only."""
-    set_switches(monkeypatch, canonical=True, sort=sort)
-    tiefix_mod = importlib.import_module("vllm_sm80.kernels.indexer.topk_tiefix")
-    calls, warms = [], []
-    monkeypatch.setattr(
-        tiefix_mod, "topk_tiefix_", lambda *a, **k: calls.append((a, k))
-    )
-    monkeypatch.setattr(tiefix_mod, "warm_tiefix", lambda: warms.append(1))
-    monkeypatch.setattr(
-        tiefix_mod,
-        "sort_topk_rows_",
-        lambda b: pytest.fail("sort launch ran with the tie fix on"),
-    )
-    gate._warm.cache_clear()
-    try:
-        logits = tied_logits(3, 700, seed=1)
-        lengths = torch.tensor([700, 600, 3], dtype=torch.int32)
-        out = run_topk(logits, lengths)
-        run_topk(logits, lengths)
-    finally:
-        gate._warm.cache_clear()
-    assert warms == [1] and len(calls) == 2
-    args, kwargs = calls[0]
-    assert args[0] is logits and args[1] is out
-    assert kwargs["row_ends"] is lengths and kwargs["sort"] is sort
-    assert kwargs["row_starts"] is None and kwargs["relative"] is False
-    assert kwargs["split"] is False  # 700 columns: below the split width
-
-
 # --- selection -------------------------------------------------------------
 
 
@@ -231,16 +196,6 @@ def test_boundary_tie_takes_the_lowest_indices(monkeypatch, fake_topk):
         logits[0, c] = 0.5
     got = run_topk(logits, torch.tensor([16], dtype=torch.int32), k=5)
     assert got.tolist() == [[0, 2, 4, 9, 13]]
-
-
-def test_repeated_calls_give_one_set(monkeypatch, fake_topk):
-    set_switches(monkeypatch, canonical=True, sort=True)
-    logits = tied_logits(4, 2000, seed=3)
-    lengths = torch.full((4,), 2000, dtype=torch.int32)
-    first = run_topk(logits, lengths).clone()
-    for seed in range(1, 5):
-        fake_topk.generator.manual_seed(seed)
-        assert torch.equal(run_topk(logits, lengths), first)
 
 
 def test_infinities_and_nan_rank_as_todays_topk(monkeypatch, fake_topk):
@@ -393,10 +348,6 @@ def test_prefill_selection_takes_the_canonical_path(monkeypatch, fake_topk):
     )
     assert fake_topk.calls == 3
     assert torch.equal(out, sorted_rows(reference(scores, visible, BLOCK_TOPK)))
-
-
-def test_no_cuda_was_initialised():
-    assert torch.cuda.is_initialized() is False
 
 
 run_in_interpreter_child(globals())

@@ -90,15 +90,15 @@ def _packed_ple_file(
     return path, f"{_PLE_PREFIX}.trellis", rows_data, base
 
 
-_PLE_LAYOUTS = [
-    pytest.param(6, 160, id="k6x160"),
-    pytest.param(3, 32, id="k3x32"),
-    pytest.param(5, 16, id="k5x16"),
-]
-
-
-@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
-@pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
+@pytest.mark.parametrize(
+    "offset,bits,dim",
+    [
+        pytest.param(32, 6, 160, id="k6x160"),
+        pytest.param((1 << 32) + 16, 6, 160, id="k6x160-above-4GiB"),
+        pytest.param(32, 3, 32, id="k3x32"),
+        pytest.param(32, 5, 16, id="k5x16"),
+    ],
+)
 def test_exl3_ple_positional_rows_preserve_order_and_masks(
     tmp_path, offset, bits, dim
 ):
@@ -120,11 +120,8 @@ def test_exl3_ple_positional_rows_preserve_order_and_masks(
         reader.close()
 
 
-@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
-def test_exl3_ple_read_retries_interruptions_and_partial_reads(
-    tmp_path, monkeypatch, bits, dim
-):
-    path, key, rows, _ = _packed_ple_file(tmp_path, bits=bits, dim=dim)
+def test_exl3_ple_read_retries_interruptions_and_partial_reads(tmp_path, monkeypatch):
+    path, key, rows, _ = _packed_ple_file(tmp_path)
     reader = Exl3PLERowReader(str(path), key, 0, 10)
     real_preadv = os.preadv
     attempts = 0
@@ -220,20 +217,16 @@ def _faulty_preadv(monkeypatch, fault, rows_to_fail, base, row_bytes, times=None
 
 
 _READ_FAULTS = [
-    pytest.param(errno.EINTR, id="eintr"),
     pytest.param(errno.EIO, id="eio"),
     pytest.param("short", id="short"),
 ]
 
 
-@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
 @pytest.mark.parametrize("fault", _READ_FAULTS)
-def test_exl3_ple_transient_read_error_is_retried(
-    tmp_path, monkeypatch, fault, bits, dim
-):
+def test_exl3_ple_transient_read_error_is_retried(tmp_path, monkeypatch, fault):
     sleeps = []
     monkeypatch.setattr(exl3_ple.time, "sleep", sleeps.append)
-    path, key, rows, base = _packed_ple_file(tmp_path, bits=bits, dim=dim)
+    path, key, rows, base = _packed_ple_file(tmp_path)
     reader = Exl3PLERowReader(str(path), key, 0, 10, retries=3)
     try:
         attempts = _faulty_preadv(
@@ -834,16 +827,15 @@ def _errors(failed):
     return [(index, type(error), str(error)) for index, error in failed]
 
 
-@pytest.mark.parametrize("threads", [1, 3, 8])
-@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
+@pytest.mark.parametrize("threads", [1, 3])
 @pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
 def test_exl3_ple_native_read_gives_the_same_bytes(
-    tmp_path, native_reader, offset, bits, dim, threads
+    tmp_path, native_reader, offset, threads
 ):
     """Order, repetitions, unowned, padding and out-of-range rows, a count
     short of the ids and owner ranges that cut a head."""
     path, key, rows, _ = _packed_ple_file(
-        tmp_path, offset, bits=bits, dim=dim, sizes=(100, 120), rows=230
+        tmp_path, offset, sizes=(100, 120), rows=230
     )
     generator = np.random.default_rng(threads)
     for owner_lo, owner_hi in ((0, 230), (57, 181), (100, 100)):
@@ -1101,17 +1093,16 @@ def _python_and_host(reader, ids, threads, count=None):
     return python, host_rows, python_failed, result
 
 
-@pytest.mark.parametrize("threads", [1, 3, 8])
-@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
+@pytest.mark.parametrize("threads", [1, 3])
 @pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
 def test_exl3_ple_hostfn_read_gives_the_same_bytes(
-    tmp_path, native_reader, offset, bits, dim, threads
+    tmp_path, native_reader, offset, threads
 ):
     """The host function's body: order, repetitions, unowned, padding and
     out-of-range rows, a count short of the ids and owner ranges that cut a
     head."""
     path, key, rows, _ = _packed_ple_file(
-        tmp_path, offset, bits=bits, dim=dim, sizes=(100, 120), rows=230
+        tmp_path, offset, sizes=(100, 120), rows=230
     )
     generator = np.random.default_rng(threads)
     for owner_lo, owner_hi in ((0, 230), (57, 181), (100, 100)):

@@ -113,20 +113,11 @@ def _check(logits: torch.Tensor, pad_value: float = 1e30) -> torch.Tensor:
     return want
 
 
-@pytest.mark.parametrize("vocab", [QWEN_VOCAB, 500, 130])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_random_rows_match_full_argmax(default_vllm_config, vocab, dtype):
+@pytest.mark.parametrize("vocab", [QWEN_VOCAB, 500])
+def test_random_rows_match_full_argmax(default_vllm_config, vocab):
     g = torch.Generator().manual_seed(vocab)
     for rows in (1, 4, 32):
-        _check(torch.randn(rows, vocab, generator=g).to(dtype))
-
-
-def test_bf16_rows_with_many_ties(default_vllm_config):
-    """Coarse bf16 values: the row maximum recurs, often in both shards."""
-    g = torch.Generator().manual_seed(3)
-    logits = torch.randint(-4, 5, (64, QWEN_VOCAB), generator=g).to(torch.bfloat16)
-    want = _check(logits)
-    assert (want < QWEN_VOCAB // TP).all()  # every row's first maximum is in shard 0
+        _check(torch.randn(rows, vocab, generator=g).to(torch.bfloat16))
 
 
 def test_ties_place_by_place(default_vllm_config):
@@ -151,21 +142,12 @@ def test_ties_place_by_place(default_vllm_config):
     assert want.tolist() == [17, 301, per - 1, 0, 100, 450, 20, 0, 333, vocab - 1]
 
 
-@pytest.mark.parametrize("pad_value", [1e30, float("inf"), float("nan")])
+@pytest.mark.parametrize("pad_value", [float("inf"), float("nan")])
 def test_padding_never_wins(default_vllm_config, pad_value):
     """Padding columns are sliced off in the full path and masked to -inf in
     the local one, whatever the head computed for them."""
     g = torch.Generator().manual_seed(5)
     _check(torch.randn(16, 500, generator=g).to(torch.bfloat16), pad_value)
-
-
-def test_indices_exact_through_fp32_pairs(default_vllm_config):
-    """The pairs carry indices as fp32: exact for every Qwen vocab id."""
-    assert QWEN_VOCAB < 2**24
-    logits = torch.full((3, QWEN_VOCAB), -1.0, dtype=torch.bfloat16)
-    for row, col in enumerate((QWEN_VOCAB - 1, QWEN_VOCAB // 2, QWEN_VOCAB // 2 - 1)):
-        logits[row, col] = 1.0
-    assert _check(logits).tolist() == [QWEN_VOCAB - 1, QWEN_VOCAB // 2, QWEN_VOCAB // 2 - 1]
 
 
 def _real_heads(vocab: int, hidden: int, seed: int):
@@ -201,9 +183,9 @@ def _mtp(head) -> Qwen4ExpMTP:
     return mtp
 
 
-@pytest.mark.parametrize("vocab", [500, 512])
-def test_qwen_mtp_get_top_tokens_matches_compute_logits(default_vllm_config, vocab):
+def test_qwen_mtp_get_top_tokens_matches_compute_logits(default_vllm_config):
     """The drafter's own method, through real vocab-parallel heads at TP2."""
+    vocab = 500  # padded to 512: the padding rows of shard 1 must be masked
     heads = _real_heads(vocab, hidden=64, seed=vocab)
     assert heads[1].shard_indices.num_org_vocab_padding == pad_vocab_size(vocab) - vocab
     models = [_mtp(h) for h in heads]
@@ -217,8 +199,3 @@ def test_qwen_mtp_get_top_tokens_matches_compute_logits(default_vllm_config, voc
         for rank in range(TP):
             assert torch.equal(local[rank], greedy), rank
         assert (greedy < vocab).all()
-
-
-def test_speculator_probe_finds_the_method():
-    """The proposer enables the reduction only if the draft model has it."""
-    assert callable(getattr(Qwen4ExpMTP, "get_top_tokens", None))

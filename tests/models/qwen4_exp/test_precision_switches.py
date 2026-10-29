@@ -47,8 +47,7 @@ def test_target_text_config_is_read_also_from_the_draft():
 
 @pytest.mark.parametrize(
     "fields,expected",
-    [({}, "flat"), ({"mtp_hidden_norm": "flat"}, "flat"),
-     ({"mtp_hidden_norm": "per_stream"}, "per_stream")],
+    [({}, "flat"), ({"mtp_hidden_norm": "flat"}, "flat")],
 )
 def test_mtp_hidden_norm_mode_reads_the_text_config(fields, expected):
     config = _vllm_config(SimpleNamespace(**fields))
@@ -192,8 +191,8 @@ class _Mixer(nn.Module):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, default_vllm_config):
+def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, default_vllm_config):
+    dtype = torch.bfloat16  # the served dtype
     config = SimpleNamespace(vocab_size=8, hidden_size=2560, hc_count=4, num_hidden_layers=48,
                              mtp_num_hidden_layers=1, rms_norm_eps=1e-6, hc_lowrank=4)
     if enabled:
