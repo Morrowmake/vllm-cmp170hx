@@ -59,14 +59,19 @@ MOE_V2_CONFIGS = {
     # (expert parallel size 4); kernels and stages of their own (moe_v2.cu
     # DraftTiling: 16-row tiles, the hi/lo split in the MMA's C operand).
     (5120, 2304, 3, 32, 128): (8,),
+    # The drafter's experts split across tensor-parallel ranks: every expert
+    # local, a 640- or 512-column chunk each; the tensor-split stages above
+    # (moe_v2.cu LaneTiling<5120, 640 | 512>) at bits_x2 8.
+    (5120, 640, 3, 128, 128): (8,),
+    (5120, 512, 3, 128, 128): (8,),
 }
 # The MOE_V2_CONFIGS entries only VLLM_EXL3_MOE_V2_DRAFT opens (the DSpark
 # drafter's layers); VLLM_EXL3_MOE_V2 opens the others. The drafter's calls
-# are never folded (moe_out_v2_fold refuses bits_x2 8). The drafter's experts
-# split across tensor-parallel ranks (intermediate 640 or 512, all 128 local)
-# keep moe_out: moe_out_v2 has bits_x2 8 kernels for those shapes, but their
-# output has not been checked through the drafter's consumer.
-MOE_V2_DRAFT_CONFIGS = frozenset({(5120, 2304, 3, 32, 128)})
+# are never folded (moe_out_v2_fold refuses bits_x2 8). Only the
+# tensor-split layout (no --enable-expert-parallel) reaches the split ones.
+MOE_V2_DRAFT_CONFIGS = frozenset(
+    {(5120, 2304, 3, 32, 128), (5120, 640, 3, 128, 128), (5120, 512, 3, 128, 128)}
+)
 # moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
 # serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
 # validated range: one 3460-token prefill chunk).
@@ -652,12 +657,16 @@ def moe_out_v2_fold(
     )
 
 
-# VLLM_EXL3_MOE_V2_RING=1 (default off): the target model's
-# expert-parallel moe_out_v2 calls of exactly this configuration (hidden,
-# intermediate, top-k, local experts, global experts), bits_x2 6 or 4, 1..64
-# rows, take _exl3_C::moe_out_v2_try (csrc/exl3/moe_v2_try.cu) instead of
-# moe_out_v2 or moe_out_v2_fold: same arguments and output bits.
-MOE_V2_TRY_CONFIG = (5120, 2304, 6, 96, 384)
+# VLLM_EXL3_MOE_V2_RING=1 (default off): the target model's moe_out_v2 calls of
+# these configurations (hidden, intermediate, top-k, local experts, global
+# experts), bits_x2 6 or 4, 1..64 rows, take _exl3_C::moe_out_v2_try
+# (csrc/exl3/moe_v2_try.cu) instead of moe_out_v2 or moe_out_v2_fold: same
+# arguments and output bits. Whole experts at expert parallel size 4, or the
+# tensor-split chunks (only the layout without --enable-expert-parallel
+# reaches those).
+MOE_V2_TRY_CONFIGS = frozenset(
+    {(5120, 2304, 6, 96, 384), (5120, 640, 6, 384, 384), (5120, 512, 6, 384, 384)}
+)
 MOE_V2_TRY_BITS = (6, 4)
 _moe_v2_try_fake_registered = False
 
@@ -670,11 +679,11 @@ def moe_v2_try_open(
     global_experts: int,
     bits_x2: int,
 ) -> bool:
-    """VLLM_EXL3_MOE_V2_RING is set and the layer is the configuration it covers."""
+    """VLLM_EXL3_MOE_V2_RING is set and the layer is a configuration it covers."""
     return (
         envs.VLLM_EXL3_MOE_V2_RING
         and (hidden_size, intermediate_size, top_k, local_experts, global_experts)
-        == MOE_V2_TRY_CONFIG
+        in MOE_V2_TRY_CONFIGS
         and bits_x2 in MOE_V2_TRY_BITS
     )
 

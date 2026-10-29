@@ -1104,18 +1104,19 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_V2_FOLD": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_FOLD", "0"))
     ),
-    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu,
-    # DraftTiling) for calls of at most 64 rows of the configuration
-    # ops.MOE_V2_DRAFT_CONFIGS names: the DSpark drafter's experts of
-    # DeepSeek-V4.1-Flash (hidden 5120, intermediate 2304, top-3, 32 of 128
-    # experts local, every local expert matrix bits_x2 8 with codebook 2), on
-    # sm_80; independent of VLLM_EXL3_MOE_V2, which keeps the other
-    # configurations, and never folded (VLLM_EXL3_MOE_V2_FOLD does not apply).
-    # The drafter's experts split across tensor-parallel ranks (intermediate
-    # 640 or 512, all 128 local) keep moe_out with the flag on. Results
-    # differ from moe_out in the last bits. Needs an EXL3 extension
-    # built from this tree. Default OFF: unset, those calls take moe_out. Read
-    # in vllm_sm80/kernels/exl3/quant.py.
+    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
+    # of at most 64 rows of the configurations ops.MOE_V2_DRAFT_CONFIGS names:
+    # the DSpark drafter's experts of DeepSeek-V4.1-Flash (hidden 5120, top-3
+    # of 128, every local expert matrix bits_x2 8 with codebook 2), on sm_80:
+    # whole experts (intermediate 2304, 32 local; stages of their own,
+    # DraftTiling) or, in the tensor-split layout (no
+    # --enable-expert-parallel), every expert's 640- or 512-column chunk (all
+    # 128 local; the tensor-split stages). Independent of VLLM_EXL3_MOE_V2,
+    # which keeps the other configurations, and never folded
+    # (VLLM_EXL3_MOE_V2_FOLD does not apply). Results differ from moe_out in
+    # the last bits. Needs an EXL3 extension built from this tree. Default
+    # OFF: unset, those calls take moe_out. Read in
+    # vllm_sm80/kernels/exl3/quant.py.
     "VLLM_EXL3_MOE_V2_DRAFT": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_DRAFT", "0"))
     ),
@@ -1128,13 +1129,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS", "0")
     ),
-    # With VLLM_EXL3_MOE_V2: the moe_out_v2 calls of the whole-expert layers
-    # of ops.MOE_V2_TRY_CONFIG (hidden 5120, intermediate 2304, top-6, 96 of
-    # 384 experts local, bits_x2 6 or 4, 1..64 rows) take moe_out_v2_try
-    # (csrc/exl3/moe_v2_try.cu) in place of moe_out_v2 or moe_out_v2_fold:
-    # the lane GEMMs' trellis words through a per-warp cp.async shared ring,
-    # the same arguments, workspace contract and output bits. Needs an EXL3
-    # extension built from this tree. Default OFF. Read in
+    # With VLLM_EXL3_MOE_V2: the moe_out_v2 calls of the target layers of
+    # ops.MOE_V2_TRY_CONFIGS (hidden 5120, top-6, bits_x2 6 or 4, 1..64 rows;
+    # whole experts, intermediate 2304 with 96 of 384 local, or in the
+    # tensor-split layout every expert's 640- or 512-column chunk) take
+    # moe_out_v2_try (csrc/exl3/moe_v2_try.cu) in place of moe_out_v2 or
+    # moe_out_v2_fold: the lane GEMMs' trellis words through a per-warp
+    # cp.async shared ring, the same arguments, workspace contract and output
+    # bits. Needs an EXL3 extension built from this tree. Default OFF. Read in
     # vllm_sm80/kernels/exl3/ops.py (moe_v2_try_open).
     "VLLM_EXL3_MOE_V2_RING": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_RING", "0"))

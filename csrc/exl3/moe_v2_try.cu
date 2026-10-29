@@ -1,5 +1,5 @@
 // moe_out_v2_try (VLLM_EXL3_MOE_V2_RING): a faster moe_out_v2 for the target model's
-// expert-parallel routed experts, beside moe_out_v2.
+// routed experts, beside moe_out_v2.
 // Same arguments, workspace contract and output bits as moe_out_v2 of
 // csrc/exl3/moe_v2.cu at 7b31d6b252 (bitwise equal on the FP64-checked cases),
 // faster lane GEMMs:
@@ -13,8 +13,9 @@
 // other kernel of the library, moe_out_v2 and moe_out_v2_fold included, is
 // compiled exactly as without this file. The caller
 // (vllm_sm80/kernels/exl3/ops.py moe_v2_try_open) takes it only for hidden
-// 5120, intermediate 2304, top-6, 96 of 384 experts local, bits_x2 6 or 4,
-// 1..64 rows.
+// 5120, top-6, bits_x2 6 or 4, 1..64 rows, with intermediate 2304 and 96 of
+// 384 experts local (whole experts, expert parallel) or intermediate 640 or
+// 512 and all 384 local (the tensor-split experts, moe_v2.cu's K slices).
 //
 // Base: moe_v2.cu of 7b31d6b252, whose hidden-5120 shape follows Curtis
 // White's port (github.com/CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE at
@@ -1030,6 +1031,40 @@ struct LaneTiling<5120, 2304> {
   static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
 };
 
+// Hidden 5120, intermediate 640 and 512 (tensor-split routed experts: every
+// expert local, this rank's 640- or 512-column chunk of the 2304
+// intermediate): moe_v2.cu's K slices (gate/up 16 slices of 20 steps, down 2
+// slices of 20 or 16), so the output bits are moe_out_v2's, in column groups
+// of eight n16 tiles (5 or 4 groups of gate/up columns; 8 beat 4 on both
+// widths, 5, 10 and 20 at 640 and 16 and 32 at 512 on the census routes).
+template <>
+struct LaneTiling<5120, 640> {
+  using Bits = std::integer_sequence<int, 6, 4>;
+  static constexpr int kColumnTiles = 8;
+  static constexpr int kGateUpShortScaleK = 5120;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 20;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
+template <>
+struct LaneTiling<5120, 512> {
+  using Bits = std::integer_sequence<int, 6, 4>;
+  static constexpr int kColumnTiles = 8;
+  static constexpr int kGateUpShortScaleK = 5120;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 16;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
 template <int64_t kH, int64_t kI>
 struct LaneShape : LaneTiling<kH, kI> {
   using Tiling = LaneTiling<kH, kI>;
@@ -1066,7 +1101,7 @@ struct LaneShape : LaneTiling<kH, kI> {
 
 constexpr const char* kShapeMessage =
     "EXL3 MoE v2 supports padded hidden 2560 with intermediate 640 and padded hidden 5120 "
-    "with intermediate 2304 only";
+    "with intermediate 2304, 640 or 512 only";
 
 // f(LaneShape<hpad, ipad>{}) for a served shape; false for any other.
 template <class F>
@@ -1077,6 +1112,14 @@ bool with_shape(int64_t hpad, int64_t ipad, F&& f) {
   }
   if (hpad == 5120 && ipad == 2304) {
     f(LaneShape<5120, 2304>{});
+    return true;
+  }
+  if (hpad == 5120 && ipad == 640) {
+    f(LaneShape<5120, 640>{});
+    return true;
+  }
+  if (hpad == 5120 && ipad == 512) {
+    f(LaneShape<5120, 512>{});
     return true;
   }
   return false;

@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The EXL3 MoE switches VLLM_EXL3_MOE_V2_RING (moe_out_v2_try,
 csrc/exl3/moe_v2_try.cu) and VLLM_EXL3_MOE_PREFILL_UNCHUNKED
-(moe_out_prefill_try, csrc/exl3/moe_prefill_try.cu), both for the
-DeepSeek-V4.1 target's whole-expert layers (hidden 5120, intermediate 2304,
-top-6, 96 of 384 experts local, bits_x2 6 or 4).
+(moe_out_prefill_try, csrc/exl3/moe_prefill_try.cu), for the
+DeepSeek-V4.1 target's routed layers (hidden 5120, top-6, bits_x2 6 or 4):
+the ring for whole experts (intermediate 2304, 96 of 384 local) and the
+tensor-split chunks (640 or 512 columns, all 384 local), the unchunked
+prefill for whole experts only.
 
 CPU:
 - both switches are declared, off by default and read through vllm.envs;
-- the ring opens only for its configuration: not the hidden-2560 layers, the
-  tensor-split chunks (640 or 512 columns), the DSpark drafter (top-3, bits_x2
-  8) or bits_x2 8; the unchunked prefill likewise, read once at import;
+- the ring opens only for its configurations: not the hidden-2560 layers, the
+  DSpark drafter (top-3, bits_x2 8) or bits_x2 8; the unchunked prefill
+  only for whole experts, read once at import;
 - Exl3Experts.apply takes moe_out_v2_try for the calls moe_out_v2 serves when
   the layer's experts take it, before moe_out_v2_fold;
 - Exl3MoEMethod._moe_v2_try requires the operator, sizes the workspace for
@@ -22,9 +24,11 @@ CPU:
 GPU (SM 8.0): moe_out_v2_try returns moe_out_v2's output bytes for every
 routing scenario at 1..64 rows (rows without local routes, hot experts,
 masked and int64 ids, a 2-byte aligned weight set, the reached SwiGLU clamp),
-with NaN in the output and workspace before each call; calls repeat bitwise
-with a reused workspace holding garbage; a captured call replays bitwise
-without allocator events. moe_out_prefill_try returns moe_out_prefill_v2's
+with NaN in the output and workspace before each call, for whole experts and
+for synthetic tensor-split layers (640 and 512 columns, bits_x2 6 and 4);
+calls repeat bitwise with a reused workspace holding garbage; a captured call
+replays bitwise without allocator events. moe_out_prefill_try returns
+moe_out_prefill_v2's
 bytes at 65, 1024, 1025 and 2048 rows and on the routing scenarios, and
 repeats bitwise with a reused workspace.
 
@@ -59,19 +63,23 @@ def test_switch_declared_and_off_by_default(monkeypatch, name):
     assert getattr(envs, name) is False
 
 
-def test_ring_opens_only_with_its_switch_for_its_configuration(monkeypatch):
-    assert exl3_ops.MOE_V2_TRY_CONFIG == CONFIG
+SPLIT = ((5120, 640, 6, 384, 384), (5120, 512, 6, 384, 384))
+
+
+def test_ring_opens_only_with_its_switch_for_its_configurations(monkeypatch):
+    assert exl3_ops.MOE_V2_TRY_CONFIGS == {CONFIG, *SPLIT}
     monkeypatch.delenv("VLLM_EXL3_MOE_V2_RING", raising=False)
-    assert not any(exl3_ops.moe_v2_try_open(*CONFIG, b) for b in (6, 4))
+    for config in (CONFIG, *SPLIT):
+        assert not any(exl3_ops.moe_v2_try_open(*config, b) for b in (6, 4))
     monkeypatch.setenv("VLLM_EXL3_MOE_V2_RING", "1")
-    assert all(exl3_ops.moe_v2_try_open(*CONFIG, b) for b in (6, 4))
-    assert not exl3_ops.moe_v2_try_open(*CONFIG, 8)
+    for config in (CONFIG, *SPLIT):
+        assert all(exl3_ops.moe_v2_try_open(*config, b) for b in (6, 4)), config
+        assert not exl3_ops.moe_v2_try_open(*config, 8), config
     for other in (
         (2560, 640, 10, 256, 512),  # the hidden-2560 layers
-        (5120, 640, 6, 384, 384),  # the tensor-split chunks
-        (5120, 512, 6, 384, 384),
         (5120, 2304, 3, 32, 128),  # the DSpark drafter's experts
         (5120, 640, 3, 128, 128),
+        (5120, 640, 6, 96, 384),  # a split width with whole-expert locals
     ):
         assert not exl3_ops.moe_v2_try_open(*other, 6), other
 
@@ -326,6 +334,54 @@ def test_ring_graph_replay_is_bitwise_without_allocations(synthetic, rows):
     graph.replay()
     torch.cuda.synchronize()
     h2560._bitwise(out, h5120._v2(synthetic, x2, ids2, weights2), "replay new inputs")
+
+
+@pytest.fixture(
+    scope="module",
+    params=[(640, 6), (640, 4), (512, 6), (512, 4)],
+    ids=lambda p: f"i{p[0]}-bits_x2={p[1]}",
+)
+def split_layer(request):
+    """A synthetic tensor-split layer: every one of the 384 experts local
+    (the identity map), each a 640- or 512-column chunk."""
+    _require("moe_out_v2_try", "moe_workspace_size_v2_try", "moe_out_v2")
+    from tests.kernels.quantization import exl3_moe_v2_digests as digests
+
+    width, bits_x2 = request.param
+    owners, pointers, meta = digests._layer(
+        h5120.HIDDEN, width, h5120.GLOBAL, bits_x2, 1030 + width + bits_x2, "cuda"
+    )
+    expert_map = torch.arange(h5120.GLOBAL, dtype=torch.int32, device="cuda")
+    yield SimpleNamespace(width=width, bits_x2=bits_x2, pointers=pointers, meta=meta,
+                          expert_map=expert_map, owners=owners)
+    del owners
+
+
+def _split_call(op, size_fn, layer, x, ids, weights):
+    out = torch.full_like(x, float("nan"))
+    workspace = torch.full(
+        (size_fn(x.shape[0], h5120.HIDDEN, layer.width, h5120.TOPK, h5120.GLOBAL),),
+        float("nan"), device=x.device,
+    )  # fmt: skip
+    op(x, ids, weights, layer.pointers, layer.meta, layer.expert_map, layer.width,
+       out, workspace, swiglu_limit=h5120.SWIGLU_LIMIT, bits_x2=layer.bits_x2)
+    return out
+
+
+@needs_sm80
+def test_ring_is_bitwise_v2_for_the_tensor_split_chunks(split_layer):
+    assert (h5120.HIDDEN, split_layer.width, h5120.TOPK, h5120.GLOBAL,
+            h5120.GLOBAL) in exl3_ops.MOE_V2_TRY_CONFIGS
+    cases = [(s, r, scale) for s, r, scale in h5120.SCENARIOS]
+    cases += [("uniform", rows, 1.0) for rows in range(1, exl3_ops.MOE_V2_MAX_ROWS + 1)]
+    for scenario, rows, scale in cases:
+        x, ids, w = h5120._case(scenario, rows, 17 * rows + 3, scale)
+        ring = _split_call(exl3_ops.moe_out_v2_try, exl3_ops.moe_workspace_size_v2_try,
+                           split_layer, x, ids, w)
+        v2 = _split_call(exl3_ops.moe_out_v2, exl3_ops.moe_workspace_size_v2,
+                         split_layer, x, ids, w)
+        h2560._bitwise(ring, v2, f"{scenario} rows={rows}")
+        assert not torch.isnan(ring).any(), (scenario, rows)
 
 
 @pytest.fixture(scope="module", params=h5120.BITS, ids=lambda b: f"bits_x2={b}")
