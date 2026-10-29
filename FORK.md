@@ -340,11 +340,11 @@ Grouped by top-level directory.
 | Path | Lines |
 |---|---:|
 | `CITATION.cff` | 7 |
-| `COMMUNITY_RECIPES.md` | 68 |
-| `NOTICE` | 9 |
-| `README.md` | 326 |
+| `LICENSE` | 201 |
+| `NOTICE` | 10 |
+| `README.md` | 134 |
 | `pyproject.toml` | 46 |
-| **5 files** | **456** |
+| **5 files** | **398** |
 
 #### `.github/`
 
