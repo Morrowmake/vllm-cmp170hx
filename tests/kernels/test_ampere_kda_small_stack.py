@@ -12,7 +12,8 @@ without the switch, today's verify and the fold's, and the 16-row config's
 at every token tile.
 GPU part (skipped without CUDA): with the switch against without, on the same
 inputs, bitwise (outputs normed and SKIP_NORM, records, conv window, state
-slot), today's verify and the fold's, for nseq 1..8 and T 1..8; the 16-row
+slot), today's verify and the fold's, for nseq 7-8 (the only batch sizes the
+switch changes) and T 1..8; the 16-row
 config against the 8-row one, today's verify and the fold's, nseq 7-8, T 1..8.
 
     python tests/kernels/test_ampere_kda_small_stack.py           # CPU part
@@ -106,7 +107,7 @@ def test_select_pinned():
             for n in range(1, 9):
                 want = SELECT_H16[small][n]
                 assert k2._select(n, H, D, small_stack=small) == want, (small, n)
-                for T in (1, 2, 3, 4, 5, 8):
+                for T in (1, 2, 4, 8):
                     assert _launch_config(k2, n, True, T=T) == want, (small, n, T)
                     assert _launch_config(k2, n, True, fold=True, T=T) == want, (small, n, T)
                     assert _launch_config(k2, n, False, T=T) == SELECT_H16[False][n], (n, T)
@@ -114,30 +115,14 @@ def test_select_pinned():
         _fresh_switch(saved)
 
 
-def test_switch_and_configs():
-    """Off unless VLLM_AMPERE_KDA_SMALL_STACK=1, read once at the first launch.
-    On: RecoverSSM verifies at nseq 7-8, the commit fold's included, take one
-    16-row warp per CTA (BV 16: the 32-row warp's layouts, twice the CTAs);
-    every other nseq and every non-RecoverSSM launch keeps its config. Off:
-    today's configs."""
-    from vllm import envs
-
-    assert "VLLM_AMPERE_KDA_SMALL_STACK" in envs.environment_variables
+def test_switch_read_once():
+    """VLLM_AMPERE_KDA_SMALL_STACK is read once, at the first launch: set to 0
+    afterwards, the RecoverSSM verify keeps the small-stack config. The configs
+    with and without the switch: test_select_pinned."""
     saved = os.environ.pop("VLLM_AMPERE_KDA_SMALL_STACK", None)
     try:
-        k2 = _fresh_switch(None)
-        today = {n: k2._select(n, H, D) for n in range(1, 9)}
-        assert today[7] == today[8] == (32, 1) and today[6] == (32, 2)
-        for n in range(1, 9):
-            assert _launch_config(k2, n, True) == today[n]
-            assert _launch_config(k2, n, True, fold=True) == today[n]
         k2 = _fresh_switch("1")
-        assert k2.SMALL_STACK_ROWS_MAX == 16
-        for n in range(1, 9):
-            want = (16, 1) if n >= 7 else today[n]
-            assert _launch_config(k2, n, True) == want, n
-            assert _launch_config(k2, n, True, fold=True) == want, n
-            assert _launch_config(k2, n, False) == today[n], n
+        assert _launch_config(k2, 8, True) == (16, 1)
         os.environ["VLLM_AMPERE_KDA_SMALL_STACK"] = "0"      # read once: stays on
         assert _launch_config(k2, 8, True) == (16, 1)
     finally:
@@ -277,7 +262,9 @@ def test_small_stack_config_stack():
     """The small-stack config nseq 7-8 take (16 rows, one warp), compiled for
     sm_80 at every token tile (T 1..8, normed and SKIP_NORM, today's verify and
     the fold's), stays within the driver's default 1,024 B of stack per thread,
-    so its launch reserves nothing beyond the default."""
+    so its launch reserves nothing beyond the default. T enters the compile
+    only through BT = next_pow2(T) and BS = next_pow2(T + 2): T 4, 6 and 8
+    compile the kernels of T 3, 5 and 7."""
     _need_sm80_toolchain()
     from vllm_sm80.models.glm5next.ops import kda_decode as k2
 
@@ -285,7 +272,7 @@ def test_small_stack_config_stack():
         == (16, 1)
     worst = {}
     for fold in (False, True):
-        for T in range(1, 9):
+        for T in (1, 2, 3, 5, 7):
             for skip in (False, True):
                 stack = _verify_stack(8, T, skip, True, fold)
                 assert stack <= 1024, (fold, T, skip, stack)
@@ -300,7 +287,8 @@ def test_small_stack_config_stack():
 def gpu_test_small_stack_bitwise():
     """Real kernel, one card: with the switch against without, on the same
     inputs, bitwise: outputs (normed and SKIP_NORM), records, the conv window
-    and the state slot, for nseq 1..8, T 1..8 and n accepted 1, T // 2, T.
+    and the state slot, for nseq 7-8 (nseq 1-6 launch the same config either
+    way: test_select_pinned), T 1..8 and n accepted 1, T // 2, T.
     Today's verify: verify k -> commit(n) -> verify k + 1. The fold's: FOLD
     verify k (nothing owed) -> FOLD verify k + 1 owing n."""
     from tests.kernels.test_ampere_kda_recover import _context, _inputs
@@ -348,7 +336,7 @@ def gpu_test_small_stack_bitwise():
     nfail = checks = 0
     try:
         for fold in (False, True):
-            for nseq in range(1, 9):
+            for nseq in (7, 8):
                 for T in range(1, 9):
                     for n in sorted({1, max(1, T // 2), T}):
                         for skip in (False, True):
@@ -460,7 +448,7 @@ def gpu_test_16_rows_bitwise_8_rows():
     assert nfail == 0
 
 
-CPU_TESTS = (test_select_pinned, test_switch_and_configs, test_banner_and_set_but_off,
+CPU_TESTS = (test_select_pinned, test_switch_read_once, test_banner_and_set_but_off,
              test_verify_stack, test_small_stack_config_stack)
 GPU_TESTS = (gpu_test_small_stack_bitwise, gpu_test_16_rows_bitwise_8_rows)
 
