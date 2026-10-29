@@ -1,5 +1,8 @@
 <!-- Modified by Morrowmake: CMP 170HX presentation and source attribution. -->
 
+> **This branch is frozen at `12d6ed3ce0` and takes no more changes.** Development continues on [`plugin`](https://github.com/Morrowmake/vllm-cmp170hx/tree/plugin) (the sm_80 plugin) and the `queue/<upstream>` patch branches on unmodified upstream vLLM.
+> Released recipe tags (`<model>-recipe-<version>`) stay valid; for new work and where old paths moved, see the [`plugin` README](https://github.com/Morrowmake/vllm-cmp170hx/tree/plugin#contributing).
+
 <h1 align="center">vLLM for the NVIDIA CMP 170HX</h1>
 
 <p align="center">
