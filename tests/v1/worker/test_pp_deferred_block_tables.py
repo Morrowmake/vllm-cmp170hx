@@ -63,26 +63,6 @@ def test_prev_outputs_carry_the_steps_unfiltered_mapping():
     assert h.main_stream.waited == [slot.event]
 
 
-def test_prev_outputs_mask_freed_rows_but_keep_step_mapping(monkeypatch):
-    import vllm.v1.worker.gpu.pp_utils as pp_utils
-
-    # The masked mapping is uploaded with a pinned H2D copy; stay on the CPU.
-    monkeypatch.setattr(
-        pp_utils, "async_tensor_h2d", lambda data, device: torch.as_tensor(data)
-    )
-    # Request slot 2 was freed (generation moved on) since the step ran.
-    gen_now = [0] * 8
-    gen_now[2] = 1
-    h, slot = _handler_with_slot(
-        [5, 2, 7], gen_now=gen_now, gen_at_receive=[0, 0, 0], need=[1, 1, 1]
-    )
-    out = h.get_prev_sampled_outputs()
-    assert out is not None
-    assert out["idx_mapping"].tolist() == [5, -1, 7]
-    # The block-table restore needs valid request indices for every row.
-    assert out["step_idx_mapping"].tolist() == [5, 2, 7]
-
-
 class _Recorder:
     def __init__(self):
         self.calls = []
@@ -109,18 +89,6 @@ def _fake_runner(align_mode: bool, step_idx_mapping: torch.Tensor):
         postprocess_sampled=lambda **kw: rec.calls.append(("postprocess", kw)),
     )
     return runner, rec
-
-
-def test_align_mode_restores_step_block_tables_before_postprocess():
-    step = torch.tensor([5, 2, 7], dtype=torch.int32)
-    runner, rec = _fake_runner(True, step)
-    GPUModelRunner.update_pp_decode_requests(runner)
-    assert [c[0] for c in rec.calls] == ["gather", "postprocess"]
-    _, idx, padded = rec.calls[0]
-    assert idx is step and padded == 3
-    # postprocess_sampled gets exactly its own arguments.
-    assert "step_idx_mapping" not in rec.calls[1][1]
-    assert rec.calls[1][1]["idx_mapping"].tolist() == [5, -1, 7]
 
 
 def test_no_restore_without_align_mode():

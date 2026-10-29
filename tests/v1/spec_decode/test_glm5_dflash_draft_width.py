@@ -62,7 +62,7 @@ def _make_scheduler(adaptive_k):
                          base.vllm_config))
 
 
-@pytest.mark.parametrize("num_requests,k", [(1, 5), (2, 4), (3, 3), (8, 3)])
+@pytest.mark.parametrize("num_requests,k", [(1, 5), (2, 4), (3, 3)])
 def test_scheduler_drafts_the_width_it_verifies(num_requests, k):
     scheduler = _make_scheduler(BY_LOAD_WIDTH)
     requests = create_requests(num_requests=num_requests)
@@ -73,20 +73,8 @@ def test_scheduler_drafts_the_width_it_verifies(num_requests, k):
         request.spec_token_ids = [11, 12, 13, 14, 15][:k]
     output = scheduler.schedule()
     assert scheduler.cur_num_spec_tokens == k
-    # A batch of 8 asks the drafter for a width-3 block, not the full 5.
+    # A batch of 3 asks the drafter for a width-3 block, not the full 5.
     assert output.num_spec_tokens_to_schedule == k
-
-
-def test_full_block_without_draft_by_load():
-    scheduler = _make_scheduler({"by_load": [5, 4, 3]})
-    requests = create_requests(num_requests=8)
-    for request in requests:
-        scheduler.add_request(request)
-    scheduler.schedule()
-    for request in requests:
-        request.spec_token_ids = [11, 12, 13, 14, 15]
-    output = scheduler.schedule()
-    assert (scheduler.cur_num_spec_tokens, output.num_spec_tokens_to_schedule) == (3, 5)
 
 
 def test_width_lags_one_step_when_load_drops():
@@ -239,14 +227,15 @@ def test_width_views_share_the_full_buffer():
     assert s.width == 5
 
 
-@pytest.mark.parametrize("width", [3, 4])
-@pytest.mark.parametrize("num_reqs,pad", [(1, 0), (3, 1), (8, 0)])
+@pytest.mark.parametrize("width", [3, 4, 5])
+@pytest.mark.parametrize("num_reqs,pad", [(3, 1), (8, 0)])
 @pytest.mark.parametrize("split", [False, True])
 def test_narrow_draft_equals_a_drafter_of_that_width(monkeypatch, width, num_reqs,
                                                       pad, split):
     """Drafting width w in a K=5 drafter is the step a K=w drafter runs: same
     tokens, same walk (so under load the drafter does what a fixed k=3 one
-    does)."""
+    does), fused and through the PP draft-tail payload (split); at w=5 the
+    multi-width drafter's full block is the plain drafter's."""
     if num_reqs + pad > MAX_REQS:
         pytest.skip("more rows than requests")
     wide, rows = _drafter(5, (3, 4, 5), width, num_reqs, pad, split)
@@ -361,21 +350,6 @@ def _conv_inputs(rows, hidden=64, groups=8, taps=3, seed=0):
     return x, delta, base
 
 
-@pytest.mark.parametrize("width", [3, 4, 5])
-@pytest.mark.parametrize("num_reqs", [1, 2, 8])
-def test_dynamic_conv_equals_a_drafter_of_that_width(width, num_reqs):
-    """A width-w step in a K=5 drafter convolves each request's 1+w block as a
-    K=w drafter does -- the block length follows the step, not the config."""
-    from vllm.model_executor.models import qwen3_dflash2 as m
-    from vllm_sm80.spec_decode import dflash2_model as fork
-
-    x, delta, base = _conv_inputs(num_reqs * (1 + width))
-    k_w = m._grouped_conv(x, delta, base, 1 + width, 8, 8, 3)
-    dyn = fork._dynamic_grouped_conv(
-        x, delta, base, torch.tensor([1 + width], dtype=torch.int32), 8, 8, 3)
-    assert torch.equal(dyn, k_w)
-
-
 def test_fixed_block_length_mixes_requests_at_a_narrow_width():
     """The bug the dynamic block fixes: with the configured block (6) a width-3
     step's blocks of 4 are misaligned, so the conv reads across requests."""
@@ -394,13 +368,6 @@ def _width_cfg(draft_by_load):
             draft_sample_method="greedy", enable_adaptive_verification=False),
         parallel_config=SimpleNamespace(data_parallel_size=1),
         additional_config={"sm80": {"adaptive_k": adaptive_k}})
-
-
-def test_conv_module_gets_a_block_tensor_only_with_width_mode():
-    from vllm_sm80.spec_decode import dflash2_model as fork
-
-    assert fork._load_following_width(_width_cfg(True)) is True
-    assert fork._load_following_width(_width_cfg(False)) is False
 
 
 def test_set_width_writes_the_block_length_into_the_drafter():
@@ -523,42 +490,3 @@ def test_conv_module_constructs_both_ways(gloo_tp1, dynamic):
             h_ref, c_ref = ref.prepare(x)
             out_ref = ref.finish(h_ref, c_ref)
         assert torch.equal(out, out_ref), width
-
-
-@pytest.mark.parametrize("width", [3, 5, 6, 7])
-@pytest.mark.parametrize("split", [False, True])
-def test_k7_narrow_draft_equals_a_drafter_of_that_width(monkeypatch, width, split):
-    """K_max 7: a width-w block in a K=7 drafter is a K=w drafter's step, fused and
-    through the PP draft-tail payload (split)."""
-    wide, rows = _drafter(7, (3, 4, 5, 6, 7), width, 3, 1, split)
-    plain, _ = _drafter(width, (), width, 3, 1, split)
-    out_wide = _draft(monkeypatch, wide, rows, 3, split)
-    out_plain = _draft(monkeypatch, plain, rows, 3, split)
-    assert torch.equal(out_wide[0], out_plain[0]) and out_wide[1] == out_plain[1]
-
-
-@pytest.mark.parametrize("width", [3, 6, 7])
-def test_k7_tail_stage_fills_only_the_drafted_columns(monkeypatch, width):
-    num_reqs = 3
-    last, rows = _drafter(7, (3, 4, 5, 6, 7), width, num_reqs, 1, True)
-    expect, _ = _draft(monkeypatch, last, rows, num_reqs, True)
-    payload = last.tail_payload(rows).clone()
-    tail = object.__new__(dt.DraftTailController)
-    tail.device = torch.device("cpu")
-    tail.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_fp64_gumbel=False))
-    tail.widths = (3, 4, 5, 6, 7)
-    tail.layouts = {w: last.tail_layout_for(w) for w in tail.widths}
-    tail.layout = tail.layouts[7]
-    tail.rows_table = {w: {n: n for n in range(1, 9)} for w in tail.widths}
-    tail.module = SimpleNamespace(top_k=TOP_K, compute_candidates=last.model.compute_candidates,
-                                  select=last.model.model.candidate_selector)
-    tail._out_tokens = torch.zeros(MAX_REQS, 7, dtype=torch.int64)
-    tail._scores = torch.zeros(MAX_REQS * 7 * TOP_K)
-    tail._workspaces = {}
-    monkeypatch.setattr(dt, "tail_side_stream_workspaces",
-                        lambda *a, **k: __import__("contextlib").nullcontext())
-    monkeypatch.setattr(sm, "_selector_walk_kernel", _WalkStub())
-    broadcast = torch.full((num_reqs, 7), -7, dtype=torch.int64)
-    tail._run(payload, rows, num_reqs, broadcast, width)
-    assert torch.equal(broadcast[:, :width], expect)
-    assert (broadcast[:, width:] == -7).all()

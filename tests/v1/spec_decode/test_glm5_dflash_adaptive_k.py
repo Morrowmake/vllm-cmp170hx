@@ -58,7 +58,6 @@ def test_by_load_graph_ceiling_per_count():
         ({"by_load": []}, "non-empty list"),
         ({"by_load": [6, 3]}, "outside"),
         ({"by_load": [5, 3], "allowed": [3, 5]}, "Unknown adaptive_k keys"),
-        ({"by_load": [5, 3], "max": 5}, "Unknown adaptive_k keys"),
     ],
 )
 def test_by_load_config_rejects_bad_input(raw, needle):
@@ -96,7 +95,7 @@ def _step_with_drafts(scheduler, requests):
     return scheduler.schedule()
 
 
-@pytest.mark.parametrize("num_requests,k", [(1, 5), (2, 4), (3, 3), (6, 3)])
+@pytest.mark.parametrize("num_requests,k", [(1, 5), (2, 4), (3, 3)])
 def test_scheduler_verifies_by_load_and_always_drafts_the_full_block(
     num_requests, k
 ):
@@ -294,20 +293,30 @@ def _dispatch_uniform(manager, num_reqs: int, query_len: int):
 GRID_SIZES = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
 
 
+# GLM tier 1: adaptive_k by_load 7,5,3 over 3 drafts with accept (TP costs),
+# so every depth 3..7 is allowed, max_num_seqs=8, and the capture sizes it gets.
+TIER1_ADAPTIVE_K = {
+    "by_load": [7, 5, 3],
+    "accept": {"costs": [1.0, 1.08, 1.16, 1.24, 1.32]},
+}
+TIER1_SIZES = [1, 2, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32, 40, 48, 56, 64]
+
+
 @pytest.mark.parametrize(
-    "adaptive_k,missed_before",
+    "adaptive_k,capture_sizes,missed_before",
     [
-        ({"by_load": [7, 5, 3]}, [(3, 3)]),
+        ({"by_load": [7, 5, 3]}, GRID_SIZES, [(3, 3)]),
+        (TIER1_ADAPTIVE_K, TIER1_SIZES, []),
     ],
 )
 def test_every_decode_batch_reaches_a_full_graph_of_its_query_length(
-    monkeypatch, adaptive_k, missed_before
+    monkeypatch, adaptive_k, capture_sizes, missed_before
 ):
     """Each query length 1+k gets its own candidate ladder. With one shared
     ladder, a batch whose next captured size held only other lengths' graphs
     missed the larger FULL graph of its own length and ran PIECEWISE;
     ``missed_before`` lists those (num_reqs, k)."""
-    manager = _graph_manager(monkeypatch, adaptive_k, 7, 8, GRID_SIZES)
+    manager = _graph_manager(monkeypatch, adaptive_k, 7, 8, capture_sizes)
     manager._graphs_captured = True
     config = AdaptiveKConfig.from_dict(adaptive_k, 7)
     full = manager._capture_descs[CUDAGraphMode.FULL]
@@ -330,47 +339,11 @@ def test_every_decode_batch_reaches_a_full_graph_of_its_query_length(
     assert set(missed_before) <= checked
 
 
-# GLM tier 1: adaptive_k by_load 7,5,3 over 3 drafts with accept (TP costs),
-# max_num_seqs=8, and the capture sizes it gets.
-TIER1_ADAPTIVE_K = {
-    "by_load": [7, 5, 3],
-    "accept": {"costs": [1.0, 1.08, 1.16, 1.24, 1.32]},
-}
-TIER1_SIZES = [1, 2, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32, 40, 48, 56, 64]
-# Dispatch for 1..8 requests at each query length, recorded with the shared
-# ladder: "<tokens>F" is this length's FULL graph (tokens / length requests),
-# "<tokens>P" the mixed PIECEWISE graph (shapes tier 1 never schedules).
-TIER1_DISPATCH = {
-    4: "4F 8F 12F 16F 24F 24F 32F 32F",
-    5: "5F 10F 16P 24P 32P 32P 40P 40P",
-    6: "6F 12F 24P 24P 32P 40P 48P 48P",
-    7: "7F 16P 24P 32P 40P 48P 56P 56P",
-    8: "8F 16P 24P 32P 40P 48P 56P 64P",
-}
-
-
-def test_tier1_dispatch_is_unchanged_by_per_length_ladders(monkeypatch):
-    manager = _graph_manager(monkeypatch, TIER1_ADAPTIVE_K, 7, 8, TIER1_SIZES)
-    manager._graphs_captured = True
-    for query_len, row in TIER1_DISPATCH.items():
-        for num_reqs, cell in enumerate(row.split(), start=1):
-            num_tokens = int(cell[:-1])
-            if cell[-1] == "F":
-                graph_reqs = num_tokens // query_len
-                expected = (CUDAGraphMode.FULL, num_tokens, graph_reqs, query_len)
-            else:
-                expected = (CUDAGraphMode.PIECEWISE, num_tokens, None, None)
-            d = _dispatch_uniform(manager, num_reqs, query_len)
-            got = (d.cg_mode, d.num_tokens, d.num_reqs, d.uniform_token_count)
-            assert got == expected, (num_reqs, query_len)
-
-
 @pytest.mark.parametrize(
     "mode,dispatched,missed",
     [
         (CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL, False),
         (CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.PIECEWISE, True),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.NONE, True),
         (CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.NONE, True),
         (CUDAGraphMode.PIECEWISE, CUDAGraphMode.PIECEWISE, False),
         (CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE, True),

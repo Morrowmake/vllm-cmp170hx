@@ -11,7 +11,7 @@ import pytest
 pytestmark = pytest.mark.cpu_test
 
 
-def _exercise(model_name, operation, dim_first):
+def _exercise(operation, dim_first):
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -19,14 +19,12 @@ def _exercise(model_name, operation, dim_first):
 
     from tests.v1.worker.test_mamba_utils import _COPY_FUNCS, _MockCpuGpuBuffer
     from vllm_sm80.models.glm5next.model_state import Glm5NextModelState
-    from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
     from vllm.v1.worker.gpu.model_states import mamba_hybrid
     from vllm.v1.worker import mamba_utils
 
-    state_cls = {"glm": Glm5NextModelState, "qwen": Qwen4ExpModelState}[model_name]
-    state = object.__new__(state_cls)
+    state = object.__new__(Glm5NextModelState)
     state._align_mode = True
     state._mamba_group_ids = []
     state._mamba_spec = None
@@ -104,17 +102,16 @@ def _exercise(model_name, operation, dim_first):
         assert any(not torch.equal(a, b) for a, b in zip((conv, temporal), expected))
 
 
-@pytest.mark.parametrize("model_name", ["glm", "qwen"])
 @pytest.mark.parametrize("operation", ["precopy", "postprocess"])
 @pytest.mark.parametrize("dim_first", [False, True], ids=["SD", "DS"])
-def test_deferred_copies_preserve_request_slot_owner(model_name, operation, dim_first):
+def test_deferred_copies_preserve_request_slot_owner(operation, dim_first):
     env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="")
     result = subprocess.run(
-        [sys.executable, "-m", __name__, model_name, operation, str(int(dim_first))],
+        [sys.executable, "-m", __name__, operation, str(int(dim_first))],
         env=env, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":
-    _exercise(sys.argv[1], sys.argv[2], bool(int(sys.argv[3])))
+    _exercise(sys.argv[1], bool(int(sys.argv[2])))
