@@ -1079,8 +1079,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer, metadata, max_rows, workspace, draft=True
             )
             moe_v2_draft = bool(moe_v2_rows)
-        # VLLM_EXL3_MOE_V2_RING: the target layers' moe_out_v2 calls of the covered
-        # configuration take moe_out_v2_try (before moe_out_v2_fold).
+        # VLLM_EXL3_MOE_V2_RING: the target layers' moe_out_v2 calls of a covered
+        # configuration (ops.MOE_V2_TRY_CONFIGS) take moe_out_v2_try (before
+        # moe_out_v2_fold).
         moe_v2_try = False
         if moe_v2_rows and not moe_v2_draft:
             moe_v2_try, workspace = self._moe_v2_try(
@@ -1189,7 +1190,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             bits_x2,
             self.swiglu_limit,
         )
-        if draft:
+        if draft and self.intermediate_size != 2304:
+            logger.info_once(
+                "EXL3 MoE v2 drafter kernels active (VLLM_EXL3_MOE_V2_DRAFT): "
+                "tensor-core routed experts of the DSpark drafter's %d-column "
+                "tensor-split chunks (bits_x2 %d, the tensor-split stages: 8-row "
+                "tiles, no row tile floor) for MoE calls of 1..%d rows; larger "
+                "calls keep moe_out.",
+                self.intermediate_size,
+                bits_x2,
+                rows,
+            )
+        elif draft:
             logger.info_once(
                 "EXL3 MoE v2 drafter kernels active (VLLM_EXL3_MOE_V2_DRAFT): "
                 "tensor-core routed experts of the DSpark drafter (bits_x2 %d, "
@@ -1237,8 +1249,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def _moe_v2_try(self, layer, rows: int, bits_x2: int, workspace: int):
         """(True, a workspace size that fits moe_out_v2_try too) when
-        VLLM_EXL3_MOE_V2_RING is set and the layer is its configuration, after
-        warming the operator; else (False, workspace)."""
+        VLLM_EXL3_MOE_V2_RING is set and the layer is a configuration it
+        covers, after warming the operator; else (False, workspace)."""
         from vllm_sm80.kernels.exl3 import ops as exl3_ops
 
         if not exl3_ops.moe_v2_try_open(

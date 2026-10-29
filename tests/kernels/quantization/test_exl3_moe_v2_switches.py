@@ -24,13 +24,14 @@ CPU:
 GPU (SM 8.0): moe_out_v2_try returns moe_out_v2's output bytes for every
 routing scenario at 1..64 rows (rows without local routes, hot experts,
 masked and int64 ids, a 2-byte aligned weight set, the reached SwiGLU clamp),
-with NaN in the output and workspace before each call, for whole experts and
-for synthetic tensor-split layers (640 and 512 columns, bits_x2 6 and 4);
-calls repeat bitwise with a reused workspace holding garbage; a captured call
-replays bitwise without allocator events. moe_out_prefill_try returns
-moe_out_prefill_v2's
-bytes at 65, 1024, 1025 and 2048 rows and on the routing scenarios, and
-repeats bitwise with a reused workspace.
+with NaN in the output and workspace before each call; calls repeat bitwise
+with a reused workspace holding garbage; a captured call replays bitwise
+without allocator events. For synthetic tensor-split layers (640 and 512
+columns, bits_x2 6 and 4; every expert local, 16-byte aligned weights) it
+returns moe_out_v2's bytes on the same scenarios and at every row count.
+moe_out_prefill_try returns moe_out_prefill_v2's bytes at 65, 1024, 1025 and
+2048 rows and on the routing scenarios, and repeats bitwise with a reused
+workspace.
 
     pytest -q tests/kernels/quantization/test_exl3_moe_v2_switches.py
 """

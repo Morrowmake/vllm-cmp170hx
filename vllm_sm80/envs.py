@@ -1126,6 +1126,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # of its activations outside the MMA, a larger one inside), so a row's
     # result does not depend on how many rows of the call share its expert.
     # Set once per process (before the warm-up and graph capture). Default 0.
+    # Whole-expert drafter layers only: the tensor-split chunks' stages never
+    # depend on the other rows of a call.
     "VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS", "0")
     ),
