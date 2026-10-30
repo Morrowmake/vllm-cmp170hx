@@ -149,12 +149,33 @@ def test_expert_split_widths():
         quant.expert_split_widths((slice(0, 640), slice(0, 384)))
 
 
+@pytest.mark.parametrize("hidden,whole,size", [(2560, 2304, 4), (5120, 1408, 4),
+                                                (5120, 1664, 4)])
+def test_method_refuses_mixed_widths_the_operators_do_not_serve(monkeypatch, hidden,
+                                                                whole, size):
+    """Experts of two widths only at ops.MOE_MIXED_SHAPE (hidden 5120, widest
+    chunk 640): any other split is refused when the layer is built, not at its
+    first call."""
+    monkeypatch.setenv(SWITCH, "1")
+    moe = _moe_config(whole, size, 0, hidden=hidden, experts=8)
+    with pytest.raises(ValueError, match="mixed-width MoE operators serve"):
+        quant.Exl3MoEMethod(None, "model.layers.3.ffn.experts", moe)
+    # The served shape builds; without the switch the other shapes build too.
+    quant.Exl3MoEMethod(None, "model.layers.3.ffn.experts",
+                        _moe_config(2304, 4, 0, hidden=5120, experts=8))
+    monkeypatch.setenv(SWITCH, "0")
+    assert not quant.Exl3MoEMethod(None, "model.layers.3.ffn.experts", moe).mixed_widths
+
+
 @pytest.mark.parametrize("contiguous", [False, True])
 def test_synthetic_ranks_hold_their_experts_chunks_and_reassemble(
     monkeypatch, synthetic, contiguous  # noqa: F811
 ):
     config, intermediate, size = synthetic
     monkeypatch.setenv(SWITCH, "1")
+    # The synthetic hidden size: let the shape check take this checkpoint's split.
+    widest = max(_width(_chunk(r, 0, 0, size=size, whole=intermediate)) for r in range(size))
+    monkeypatch.setattr(exl3_ops, "MOE_MIXED_SHAPE", (HIDDEN, widest))
     for layer_index in range(LAYERS):
         prefix = f"model.layers.{layer_index}.mlp.experts"
         parts = {}

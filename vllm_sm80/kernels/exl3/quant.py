@@ -934,7 +934,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.prefix = prefix
         if moe.moe_parallel_config.tp_size != 1:
             self.expert_split = tensor_parallel_expert_split(moe, prefix)
-            self.mixed_widths = expert_split_widths(self.expert_split[1])[1]
+            widest, self.mixed_widths = expert_split_widths(self.expert_split[1])
+            if self.mixed_widths:
+                from vllm_sm80.kernels.exl3.ops import MOE_MIXED_SHAPE
+
+                if (moe.hidden_dim, widest) != MOE_MIXED_SHAPE:
+                    raise ValueError(
+                        "VLLM_EXL3_MOE_EXPERT_ROTATION: the mixed-width MoE operators "
+                        f"serve (hidden, widest chunk) = {MOE_MIXED_SHAPE} only, not "
+                        f"{(moe.hidden_dim, widest)} ({prefix}); unset the switch for "
+                        "this model or layout"
+                    )
         if moe.has_bias or moe.activation != MoEActivation.SILU:
             raise ValueError("EXL3 experts require bias-free SiLU gate/up/down")
         if moe.is_lora_enabled:

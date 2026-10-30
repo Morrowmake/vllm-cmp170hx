@@ -6,7 +6,7 @@ This branch is the `vllm-sm80` plugin of Morrowmake's vLLM fork for the NVIDIA C
 
 Upstream base: 330c5bffeeb48725c0502a351e8ead2b54bd81eb
 
-Queue: queue-p2/330c5bffee 0af5991c009e0c3ff4181f026a8e7dffe1370b45
+Queue: queue/330c5bffee 0af5991c009e0c3ff4181f026a8e7dffe1370b45
 
 Section 1 lists every file of this branch. Section 2 compares the queue (62 commits, one per upstream file) with its upstream base. This file is not listed in its own tables.
 
@@ -101,15 +101,15 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm_sm80/kernels/attention/triton_mla_sparse.py` | 612 |
 | `vllm_sm80/kernels/attention/triton_mqa_logits.py` | 628 |
 | `vllm_sm80/kernels/exl3/__init__.py` | 13 |
-| `vllm_sm80/kernels/exl3/capture_points.py` | 111 |
+| `vllm_sm80/kernels/exl3/capture_points.py` | 112 |
 | `vllm_sm80/kernels/exl3/dense_mma.py` | 151 |
 | `vllm_sm80/kernels/exl3/dense_prefill_tc.py` | 354 |
 | `vllm_sm80/kernels/exl3/hybrid.py` | 133 |
 | `vllm_sm80/kernels/exl3/layout.py` | 108 |
 | `vllm_sm80/kernels/exl3/loader.py` | 230 |
-| `vllm_sm80/kernels/exl3/ops.py` | 1,386 |
+| `vllm_sm80/kernels/exl3/ops.py` | 1,511 |
 | `vllm_sm80/kernels/exl3/override.py` | 128 |
-| `vllm_sm80/kernels/exl3/quant.py` | 1,794 |
+| `vllm_sm80/kernels/exl3/quant.py` | 1,898 |
 | `vllm_sm80/kernels/exl3/step_phase.py` | 100 |
 | `vllm_sm80/kernels/exl3/utils.py` | 401 |
 | `vllm_sm80/kernels/idx_glue_gate.py` | 75 |
@@ -145,7 +145,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm_sm80/kernels/thin_gemm/warmup.py` | 154 |
 | `vllm_sm80/kernels/warmup.py` | 132 |
 | `vllm_sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **18,846** |
+| **54 files** | **19,076** |
 
 ### `vllm_sm80/launch/`
 
@@ -195,13 +195,13 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm_sm80/distributed/step_errors.py` | 167 |
 | `vllm_sm80/engine_args.py` | 103 |
-| `vllm_sm80/envs.py` | 1,654 |
+| `vllm_sm80/envs.py` | 1,680 |
 | `vllm_sm80/failed_inputs.py` | 175 |
 | `vllm_sm80/fla/__init__.py` | 2 |
 | `vllm_sm80/fla/autotune_pins.py` | 210 |
 | `vllm_sm80/fla/pinned_autotune.py` | 384 |
 | `vllm_sm80/guard.py` | 68 |
-| `vllm_sm80/hot_swap.py` | 810 |
+| `vllm_sm80/hot_swap.py` | 824 |
 | `vllm_sm80/jit_extension.py` | 150 |
 | `vllm_sm80/kv_planning.py` | 655 |
 | `vllm_sm80/layers/__init__.py` | 4 |
@@ -265,7 +265,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **86 files** | **23,925** |
+| **86 files** | **23,965** |
 
 ### `csrc/exl3/`
 
@@ -287,30 +287,30 @@ The EXL3 native library (`vllm_sm80._exl3_C`).
 | `csrc/exl3/dense_splitk.h` | 26 |
 | `csrc/exl3/engram_fetch.cpp` | 862 |
 | `csrc/exl3/engram_fetch.h` | 41 |
-| `csrc/exl3/gemm.cu` | 489 |
-| `csrc/exl3/gemm.cuh` | 82 |
-| `csrc/exl3/module.cpp` | 103 |
-| `csrc/exl3/moe.cu` | 409 |
+| `csrc/exl3/gemm.cu` | 525 |
+| `csrc/exl3/gemm.cuh` | 89 |
+| `csrc/exl3/module.cpp` | 108 |
+| `csrc/exl3/moe.cu` | 484 |
 | `csrc/exl3/moe_prefill.cu` | 1,045 |
 | `csrc/exl3/moe_prefill.h` | 28 |
-| `csrc/exl3/moe_prefill_try.cu` | 1,283 |
-| `csrc/exl3/moe_prefill_try.h` | 23 |
+| `csrc/exl3/moe_prefill_try.cu` | 1,399 |
+| `csrc/exl3/moe_prefill_try.h` | 32 |
 | `csrc/exl3/moe_prefill_v2.cu` | 1,175 |
 | `csrc/exl3/moe_prefill_v2.h` | 30 |
-| `csrc/exl3/moe_v2.cu` | 2,143 |
-| `csrc/exl3/moe_v2.h` | 39 |
-| `csrc/exl3/moe_v2_try.cu` | 1,410 |
+| `csrc/exl3/moe_v2.cu` | 2,250 |
+| `csrc/exl3/moe_v2.h` | 48 |
+| `csrc/exl3/moe_v2_try.cu` | 1,559 |
 | `csrc/exl3/moe_v2_try/codec.cuh` | 223 |
 | `csrc/exl3/moe_v2_try/codec_moe_v2.cuh` | 92 |
 | `csrc/exl3/moe_v2_try/common.h` | 114 |
-| `csrc/exl3/moe_v2_try/ops.h` | 31 |
-| `csrc/exl3/ops.h` | 48 |
+| `csrc/exl3/moe_v2_try/ops.h` | 40 |
+| `csrc/exl3/ops.h` | 56 |
 | `csrc/exl3/ple.cu` | 234 |
 | `csrc/exl3/ple.h` | 53 |
 | `csrc/exl3/ple_read.cpp` | 373 |
 | `csrc/exl3/reference.cu` | 450 |
 | `csrc/exl3/row_read.h` | 279 |
-| **37 files** | **14,041** |
+| **37 files** | **14,571** |
 
 ### `csrc/ampere_marlin/`
 
@@ -371,9 +371,9 @@ Grouped by top-level directory.
 |---|---:|
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
-| `docs/features/quantization/exl3.md` | 146 |
+| `docs/features/quantization/exl3.md` | 165 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 168 |
-| **4 files** | **510** |
+| **4 files** | **529** |
 
 #### `licenses/`
 
@@ -410,7 +410,8 @@ Grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_dense_splitk.py` | 468 |
 | `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_expert_buffers.py` | 295 |
-| `tests/kernels/quantization/test_exl3_expert_split.py` | 509 |
+| `tests/kernels/quantization/test_exl3_expert_rotation.py` | 636 |
+| `tests/kernels/quantization/test_exl3_expert_split.py` | 511 |
 | `tests/kernels/quantization/test_exl3_fp32_out.py` | 213 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 324 |
 | `tests/kernels/quantization/test_exl3_kernels.py` | 369 |
@@ -421,11 +422,11 @@ Grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 86 |
 | `tests/kernels/quantization/test_exl3_moe_tp_shapes.py` | 102 |
 | `tests/kernels/quantization/test_exl3_moe_v2.py` | 618 |
-| `tests/kernels/quantization/test_exl3_moe_v2_draft.py` | 824 |
-| `tests/kernels/quantization/test_exl3_moe_v2_fold.py` | 1,029 |
+| `tests/kernels/quantization/test_exl3_moe_v2_draft.py` | 834 |
+| `tests/kernels/quantization/test_exl3_moe_v2_fold.py` | 1,030 |
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 594 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
-| `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 415 |
+| `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 499 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 147 |
 | `tests/kernels/quantization/test_sm80_capture.py` | 563 |
 | `tests/kernels/replay_inputs.py` | 46 |
@@ -482,7 +483,7 @@ Grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/export_mhc_consumer_cases.py` | 225 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
-| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,661 |
+| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,697 |
 | `tests/models/deepseek_v41/sm80/hybrid_consumer_cases.py` | 289 |
 | `tests/models/deepseek_v41/sm80/hybrid_fixture.py` | 189 |
 | `tests/models/deepseek_v41/sm80/hybrid_linear_cases.py` | 224 |
@@ -502,7 +503,7 @@ Grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica_gpu.py` | 113 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 379 |
-| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 1,286 |
+| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 1,287 |
 | `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_capture.py` | 349 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_capture_gpu.py` | 78 |
@@ -618,7 +619,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 320 |
 | `tests/sm80/test_gpu_lock_guard.py` | 77 |
-| `tests/sm80/test_hot_swap.py` | 701 |
+| `tests/sm80/test_hot_swap.py` | 750 |
 | `tests/sm80/test_hot_swap_gpu.py` | 124 |
 | `tests/sm80/test_import_cuda_init.py` | 168 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
@@ -689,7 +690,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **302 files** | **126,350** |
+| **303 files** | **127,169** |
 
 #### `tools/`
 
@@ -703,7 +704,7 @@ Grouped by top-level directory.
 
 ## 2. Patched upstream files (the queue)
 
-Every upstream path `queue-p2/330c5bffee` changes against the upstream base. Hunks are counted at zero context lines, so one hunk is one edit site. Tests, docs and `.github` are paths under `tests/`, `docs/` or `.github/` and Markdown files. Everything else is product code.
+Every upstream path `queue/330c5bffee` changes against the upstream base. Hunks are counted at zero context lines, so one hunk is one edit site. Tests, docs and `.github` are paths under `tests/`, `docs/` or `.github/` and Markdown files. Everything else is product code.
 
 ### Product code
 
@@ -841,6 +842,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_DENSE_SPLITK` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_EXPERTS_CONTIGUOUS` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_HYBRID` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_MOE_EXPERT_ROTATION` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_UNCHUNKED` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_V2` | `bool` | `False` | `'0'` |
@@ -906,7 +908,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **111 variables** | | | |
+| **112 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -922,14 +924,14 @@ Functions, methods and classes in plugin product files whose name occurs nowhere
 | `vllm_sm80/distributed/ce_ring_all_reduce.py` | 98 | `emulate_owner` | 7 | yes |
 | `vllm_sm80/kernels/exl3/quant.py` | 145 | `get_config_filenames` | 3 | no |
 | `vllm_sm80/kernels/exl3/quant.py` | 149 | `override_quantization_method` | 15 | yes |
-| `vllm_sm80/kernels/exl3/quant.py` | 1512 | `activation_format` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1516 | `_supports_current_device` | 5 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1522 | `_supports_no_act_and_mul` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1526 | `_supports_quant_scheme` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1530 | `_supports_activation` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1534 | `_supports_parallel_config` | 8 | yes |
-| `vllm_sm80/kernels/exl3/quant.py` | 1542 | `moe_problem_size` | 8 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1565 | `finalize_weight_and_reduce_impl` | 6 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1612 | `activation_format` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1616 | `_supports_current_device` | 5 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1622 | `_supports_no_act_and_mul` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1626 | `_supports_quant_scheme` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1630 | `_supports_activation` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1634 | `_supports_parallel_config` | 8 | yes |
+| `vllm_sm80/kernels/exl3/quant.py` | 1642 | `moe_problem_size` | 8 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1665 | `finalize_weight_and_reduce_impl` | 6 | no |
 | `vllm_sm80/models/deepseek_v41/ops/sm80_attn_core.py` | 914 | `forward_layer` | 19 | yes |
 | `vllm_sm80/models/deepseek_v41/ops/sm80_attn_pipeline.py` | 394 | `get_warmup_keys` | 8 | yes |
 | `vllm_sm80/models/deepseek_v41/ops/sm80_index_scores.py` | 183 | `get_warmup_keys` | 17 | yes |
@@ -956,11 +958,11 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 266 |
-| Plugin product lines | 85,861 |
+| Plugin product lines | 86,661 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |
 | Queue upstream product lines | +502 / -129 |
 | Queue upstream product hunks | 267 |
-| Fork environment variables (flags) | 111 |
+| Fork environment variables (flags) | 112 |
 | Unreferenced fork definitions | 33 (242 lines) |
