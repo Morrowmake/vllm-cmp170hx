@@ -7,7 +7,10 @@ The bitwise and timing checks against cross_device_reduce_2stage at four ranks
 need four peer-connected GPUs and run outside pytest. The two-rank bitwise check
 against upstream's custom all-reduce needs two peer-connected sm_80 GPUs and
 nvcc. Everything else runs without a GPU except the overrun test, which needs
-one sm_80 GPU; the compile tests need nvcc.
+one sm_80 GPU; the compile tests need nvcc. The compressed wire format
+(VLLM_SM80_ALLREDUCE_COMPRESS): dispatch, sizes and a lossless round trip of
+its codec (host C++ compiler) here; its four-rank bitwise check is
+test_custom_all_reduce_flags_z_gpu.py.
 """
 
 import ctypes
@@ -291,6 +294,185 @@ def test_capture_paths(monkeypatch):
     assert ca._flags.calls == [8192] and not ops_calls  # no registration either
 
 
+# ------------------------------------------- dispatch: compressed wire format
+class FakeZ(FakeFlags):
+    """The compressed kernel's FlagsAllreduce: records calls, writes 9s."""
+
+    def __init__(self, group, device, rank, world_size, max_bytes, create, free,
+                 compressed=False):
+        super().__init__(max_bytes)
+        assert compressed and world_size == 4
+        self.buffer_bytes = 3 * flags.z_stage_words(max_bytes) * 4
+
+    def all_reduce(self, inp, out=None):
+        self.calls.append(inp.nbytes)
+        if out is None:
+            return torch.full_like(inp, 9)
+        return out.fill_(9)
+
+
+def _z_ca(monkeypatch, algo="2stage", flags_max=524288, hot=False, rows=()):
+    """A four-rank custom all-reduce with the flags path (FakeFlags) and the
+    compressed one (FakeZ) set up by _init_flags_z, upstream's algorithm
+    choice ``algo`` ("" = unset) and these tuning rows."""
+    ca, ops_calls = _fake_ca(monkeypatch, with_flags=True)
+    ca._flags = FakeFlags(flags_max)
+    ca.group = object()
+    ca.device = torch.device("cpu")
+    if algo:
+        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", algo)
+    else:
+        monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raising=False)
+    use_rows(monkeypatch, *rows)
+    _current_config(monkeypatch, 5120)
+    ca._init_flags_z(SimpleNamespace(Z_WORLD_SIZE=4, FlagsAllreduce=FakeZ), hot)
+    return ca, ops_calls
+
+
+# (message bytes, path) at the served DeepSeek-V4.1 settings: flags limit
+# 512 KiB, VLLM_CUSTOM_ALLREDUCE_ALGO=2stage, raw cut-off 32 KiB (default).
+Z_SERVED = [
+    (16, "flags"),
+    (32768, "flags"),  # the cut-off: uncompressed
+    (32784, "z"),
+    (8 * 10240, "z"),  # 8 rows of 5120
+    (48 * 10240, "z"),  # the largest decode message
+    (524288, "z"),  # the flags limit
+    (524304, "z"),  # cross_device_reduce_2stage's range from here
+    (128 * 10240, "z"),  # the prefill replay tail
+    (8 * 1024 * 1024 - 16, "z"),  # the largest the custom all-reduce takes
+    (8 * 1024 * 1024, None),  # upstream refuses it (should_custom_ar)
+]
+
+
+@pytest.mark.parametrize("nbytes,path", Z_SERVED)
+def test_z_dispatch_served(monkeypatch, nbytes, path):
+    ca, ops_calls = _z_ca(monkeypatch)
+    assert ca._flags_z.max_bytes == 8 * 1024 * 1024 - 16
+    out = ca.custom_all_reduce(torch.zeros(nbytes // 2, dtype=torch.bfloat16))
+    took = {
+        "flags": bool(ca._flags.calls),
+        "z": bool(ca._flags_z.calls),
+        "upstream": bool(ops_calls),
+    }
+    if path is None:
+        assert out is None and not any(took.values())
+    else:
+        assert [k for k, v in took.items() if v] == [path]
+        assert torch.all(out == {"flags": 7, "z": 9}[path])
+
+
+@pytest.mark.parametrize(
+    "algo,flags_max,nbytes,path",
+    [
+        # unset: upstream runs the one-stage kernel (rank order) below 512 KiB
+        ("", 262144, 262144, "z"),
+        ("", 262144, 262160, "upstream"),
+        ("", 262144, 524272, "upstream"),
+        ("", 262144, 524288, "z"),
+        ("", 524288, 524304, "z"),
+        ("twoshot", 262144, 262160, "z"),
+        # one-stage forced: only the flags kernel's range
+        ("1stage", 524288, 524288, "z"),
+        ("1stage", 524288, 524304, "upstream"),
+        ("oneshot", 524288, 128 * 10240, "upstream"),
+    ],
+)
+def test_z_replaces_only_owner_order_kernels(monkeypatch, algo, flags_max, nbytes, path):
+    ca, ops_calls = _z_ca(monkeypatch, algo=algo, flags_max=flags_max)
+    ca.custom_all_reduce(torch.zeros(nbytes // 2, dtype=torch.bfloat16))
+    assert bool(ca._flags_z.calls) is (path == "z")
+    assert bool(ops_calls) is (path == "upstream") and not ca._flags.calls
+
+
+def test_z_one_stage_buffer_is_the_flags_limit(monkeypatch):
+    ca, _ = _z_ca(monkeypatch, algo="1stage")
+    assert ca._flags_z.max_bytes == 524288
+
+
+def test_z_raw_cut_off_from_the_tuning_table(monkeypatch):
+    ca, ops_calls = _z_ca(
+        monkeypatch,
+        rows=[("allreduce", "flags_raw_max_bytes", {"world_size": 4, "hidden": 5120}, 65536)],
+    )
+    assert ca._flags_z_min_bytes == 65536
+    ca.custom_all_reduce(torch.zeros(32768, dtype=torch.bfloat16))  # 64 KiB
+    assert ca._flags.calls == [65536] and not ca._flags_z.calls
+    ca.custom_all_reduce(torch.zeros(32776, dtype=torch.bfloat16))
+    assert ca._flags_z.calls == [65552]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_z_bf16_only(monkeypatch, dtype):
+    ca, ops_calls = _z_ca(monkeypatch)
+    ca.custom_all_reduce(torch.zeros(65536, dtype=dtype))
+    assert not ca._flags_z.calls and not ca._flags.calls and len(ops_calls) == 1
+
+
+def test_z_off_while_the_flags_path_is(monkeypatch):
+    """dev_ab.py's custom_allreduce_flags toggle sets _flags to None: every
+    message then takes upstream's kernel, the compressed path included."""
+    ca, ops_calls = _z_ca(monkeypatch)
+    flags_z = ca._flags_z
+    ca._flags = None
+    for numel in (8192, 65536, 128 * 5120):
+        ca.custom_all_reduce(torch.zeros(numel, dtype=torch.bfloat16))
+    assert not flags_z.calls and len(ops_calls) == 3
+
+
+def test_z_respects_should_custom_ar_once(monkeypatch):
+    ca, ops_calls = _z_ca(monkeypatch)
+    calls = []
+    check = car.CustomAllreduce.should_custom_ar
+    monkeypatch.setattr(
+        car.CustomAllreduce, "should_custom_ar",
+        lambda self, inp: calls.append(inp.nbytes) or check(self, inp),
+    )
+    ca.custom_all_reduce(torch.zeros(65536, dtype=torch.bfloat16))
+    assert calls == [131072] and ca._flags_z.calls == [131072]
+    ca.fully_connected = False  # incumbent refuses: so does the compressed path
+    assert ca.custom_all_reduce(torch.zeros(65536, dtype=torch.bfloat16)) is None
+    assert ca._flags_z.calls == [131072] and not ops_calls
+
+
+def test_z_capture_paths(monkeypatch):
+    ca, ops_calls = _z_ca(monkeypatch)
+    ca._IS_CAPTURING = True
+    x = torch.zeros(65536, dtype=torch.bfloat16)
+    out = ca.custom_all_reduce(x)  # warm-up before capture: no collective
+    assert out.shape == x.shape and not ca._flags_z.calls and not ops_calls
+    monkeypatch.setattr(car.torch.cuda, "is_current_stream_capturing", lambda: True)
+    ca.custom_all_reduce(x)
+    assert ca._flags_z.calls == [131072] and not ops_calls and not ca._flags.calls
+
+
+@pytest.mark.parametrize("nbytes,base", [(65536, "flags"), (128 * 10240, "upstream")])
+def test_z_hot_pair_site(monkeypatch, nbytes, base):
+    """Carried by the hot pair, every message the compressed kernel takes is a
+    pair site: the incumbent's kernel, then the compressed one into its
+    output; messages it does not take are not sites."""
+    from vllm_sm80 import hot_swap
+
+    ca, ops_calls = _z_ca(monkeypatch, hot=True)
+    sites = []
+
+    def pair(name, base_fn, cand_fn):
+        out = base_fn()
+        got = cand_fn(out)
+        assert got.data_ptr() == out.data_ptr()
+        sites.append(name)
+        return out
+
+    monkeypatch.setattr(hot_swap, "pair", pair)
+    out = ca.custom_all_reduce(torch.zeros(nbytes // 2, dtype=torch.bfloat16))
+    assert sites == [comm.COMPRESS_HOT_PAIR] and torch.all(out == 9)
+    assert ca._flags_z.calls == [nbytes]
+    assert bool(ca._flags.calls) is (base == "flags")
+    assert bool(ops_calls) is (base == "upstream")
+    ca.custom_all_reduce(torch.zeros(4096, dtype=torch.bfloat16))  # below the cut-off
+    assert sites == [comm.COMPRESS_HOT_PAIR]
+
+
 # ---------------------------------------------------------------- init + banner
 class _Capture(logging.Handler):
     def __init__(self):
@@ -322,6 +504,7 @@ def _init_ca(monkeypatch, world_size=4, capability=(8, 0), p2p=True, load_ok=Tru
     ca.rank = 0
     ca.group = object()
     ca.device = torch.device("cpu")
+    ca.max_size = 8192 * 1024
     monkeypatch.setattr(
         car.current_platform, "get_device_capability", lambda *a, **k: capability
     )
@@ -337,9 +520,12 @@ def _init_ca(monkeypatch, world_size=4, capability=(8, 0), p2p=True, load_ok=Tru
     made = []
 
     class FakeFA:
-        def __init__(self, group, device, rank, world_size, max_bytes, create, free):
+        def __init__(self, group, device, rank, world_size, max_bytes, create, free,
+                     compressed=False):
             self.world_size = world_size
             self.max_bytes = max_bytes
+            self.compressed = compressed
+            self.buffer_bytes = 3 * flags.z_stage_words(max_bytes) * 4 if compressed else 0
             self.limit_ns = int(60e9)
             made.append(self)
 
@@ -381,6 +567,73 @@ def test_init_gate_closed_banner(monkeypatch, log_capture, kw, why):
     assert any(
         "flags-in-data path requested" in m and why in m for m in log_capture.messages
     ), log_capture.messages
+
+
+def test_init_compress_off_builds_nothing(monkeypatch):
+    monkeypatch.delenv("VLLM_SM80_ALLREDUCE_COMPRESS", raising=False)
+    monkeypatch.delenv("VLLM_HOT_SWAP", raising=False)
+    ca, made = _init_ca(monkeypatch)
+    ca._init_flags(same_node=True)
+    assert len(made) == 1 and not made[0].compressed and ca._flags_z is None
+
+
+@pytest.mark.parametrize("algo,want_max", [("2stage", 8192 * 1024 - 16), ("1stage", 524288)])
+def test_init_compress_on_banner(monkeypatch, log_capture, algo, want_max):
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE_COMPRESS", "1")
+    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", algo)
+    use_rows(
+        monkeypatch,
+        ("allreduce", "flags_max_bytes", {"world_size": 4}, 524288),
+        # a cut-off no other test logs with: info_once drops a repeated banner
+        ("allreduce", "flags_raw_max_bytes", {"world_size": 4}, 49152),
+    )
+    ca, made = _init_ca(monkeypatch)
+    ca._init_flags(same_node=True)
+    assert [fa.compressed for fa in made] == [False, True]
+    assert ca._flags is made[0] and ca._flags_z is made[1] and not ca._flags_z_hot
+    assert made[1].max_bytes == want_max and ca._flags_z_min_bytes == 49152
+    assert any(
+        "compressed flags kernel on (VLLM_SM80_ALLREDUCE_COMPRESS=1)" in m
+        and f"to {want_max} bytes" in m and repr(algo) in m
+        for m in log_capture.messages
+    ), log_capture.messages
+
+
+def test_init_compress_two_ranks_off(monkeypatch, log_capture):
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE_COMPRESS", "1")
+    ca, made = _init_ca(monkeypatch, world_size=2)
+    ca._init_flags(same_node=True)
+    assert len(made) == 1 and ca._flags_z is None
+    assert any(
+        "compressed flags kernel requested" in m and "world size 2" in m
+        for m in log_capture.messages
+    ), log_capture.messages
+
+
+def test_init_compress_off_with_the_flags_path(monkeypatch, log_capture):
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE_COMPRESS", "1")
+    ca, made = _init_ca(monkeypatch, capability=(8, 9))
+    ca._init_flags(same_node=True)
+    assert not made and ca._flags_z is None
+    assert any(
+        "compute capability (8, 9)" in m and "so is its compressed wire format" in m
+        for m in log_capture.messages
+    ), log_capture.messages
+
+
+def test_init_compress_hot_pair(monkeypatch):
+    """Listed in VLLM_HOT_SWAP with the switch off, the compressed kernel is
+    built beside the flags one, and its calls become pair sites."""
+    from vllm_sm80 import hot_swap
+
+    monkeypatch.delenv("VLLM_SM80_ALLREDUCE_COMPRESS", raising=False)
+    monkeypatch.setenv("VLLM_HOT_SWAP", comm.COMPRESS_HOT_PAIR)
+    monkeypatch.setattr(
+        hot_swap, "_STATE", hot_swap._HotState(listed=(comm.COMPRESS_HOT_PAIR,))
+    )
+    ca, made = _init_ca(monkeypatch)
+    ca._init_flags(same_node=True)
+    assert [fa.compressed for fa in made] == [False, True] and ca._flags_z_hot
 
 
 def test_init_not_called_when_off():
@@ -573,6 +826,262 @@ def test_host_order_matches_incumbent(tmp_path):
     assert r.returncode == 0 and "HOST_ORDER PASS" in r.stdout, r.stdout
 
 
+# ------------------------------------------- compressed wire format on the CPU
+# The codec's own source text (KERNEL_SRC: encode_block, pack_block,
+# unpack_block, decode_block and their helpers) compiled for the host, its
+# warp run as 32 threads: every shuffle and reduction is a store, a barrier, a
+# read and a barrier. store_block (a volatile PTX store) is replaced by a plain
+# store into the slot; recv_blocks' polling is the GPU tests'.
+CXX = shutil.which("g++") or shutil.which("c++")
+
+Z_CODEC_PRELUDE = r"""
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <random>
+#include <thread>
+#include <vector>
+using std::max;
+using std::min;
+#define AFD static inline
+struct uint4 { uint32_t x, y, z, w; };
+static inline uint4 make_uint4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  return uint4{a, b, c, d};
+}
+constexpr uint32_t kSentinel = 0xFFFFFFFFu;
+static thread_local int t_lane = 0;
+static uint32_t g_vals[32];
+static std::atomic<unsigned> g_arrived{0}, g_phase{0};
+static void warp_bar() {
+  const unsigned phase = g_phase.load(std::memory_order_acquire);
+  if (g_arrived.fetch_add(1, std::memory_order_acq_rel) == 31) {
+    g_arrived.store(0, std::memory_order_relaxed);
+    g_phase.store(phase + 1, std::memory_order_release);
+  } else {
+    while (g_phase.load(std::memory_order_acquire) == phase) std::this_thread::yield();
+  }
+}
+static uint32_t __shfl_sync(unsigned, uint32_t v, int src) {
+  g_vals[t_lane] = v;
+  warp_bar();
+  const uint32_t r = g_vals[src & 31];
+  warp_bar();
+  return r;
+}
+static uint32_t __reduce_min_sync(unsigned, uint32_t v) {
+  g_vals[t_lane] = v;
+  warp_bar();
+  uint32_t r = g_vals[0];
+  for (int i = 1; i < 32; i++) r = min(r, g_vals[i]);
+  warp_bar();
+  return r;
+}
+static uint32_t __reduce_max_sync(unsigned, uint32_t v) {
+  g_vals[t_lane] = v;
+  warp_bar();
+  uint32_t r = g_vals[0];
+  for (int i = 1; i < 32; i++) r = max(r, g_vals[i]);
+  warp_bar();
+  return r;
+}
+"""
+
+Z_CODEC_MAIN = r"""
+using Block = std::array<uint4, 32>;
+static std::vector<Block> g_in, g_out, g_slots;
+static std::vector<std::array<int, 32>> g_rows;
+static uint4 g_slot[32];
+
+// One warp-collective round per block, as two_shot_z's sender and receiver.
+static void lane_main(int lane) {
+  t_lane = lane;
+  for (size_t b = 0; b < g_in.size(); b++) {
+    if (lane == 0)
+      for (auto& q : g_slot) q = make_uint4(kSentinel, kSentinel, kSentinel, kSentinel);
+    warp_bar();
+    uint32_t w[4];
+    const int rows = encode_block(g_in[b][lane], lane, w);
+    const Quad q = pack_block(w, rows, lane);
+    if (q.store) g_slot[q.at] = q.v;
+    g_rows[b][lane] = rows;
+    warp_bar();
+    g_out[b][lane] = unpack_block(g_slot[lane], g_slot[0].x, lane);
+    if (lane == 0)
+      for (int i = 0; i < 32; i++) g_slots[b][i] = g_slot[i];
+    warp_bar();
+  }
+}
+
+static uint16_t half(const uint4& v, int i) {
+  const uint32_t w = i < 2 ? v.x : i < 4 ? v.y : i < 6 ? v.z : v.w;
+  return (i & 1) ? (w >> 16) : (w & 0xFFFFu);
+}
+static uint32_t word(const uint4& v, int k) {
+  return k == 0 ? v.x : k == 1 ? v.y : k == 2 ? v.z : v.w;
+}
+
+// Block from 248 BF16 bit patterns (lanes 0..30; lane 31 and lanes past
+// `valid` zero), sanitized as the kernel sanitizes its input packs.
+static Block make_block(const std::vector<uint16_t>& h, int valid) {
+  Block blk{};
+  for (int l = 0; l < 31 && l < valid; l++) {
+    uint32_t w[4];
+    for (int k = 0; k < 4; k++) {
+      w[k] = uint32_t(h[8 * l + 2 * k]) | (uint32_t(h[8 * l + 2 * k + 1]) << 16);
+      if (w[k] == kSentinel) w[k] = 0x7FFF7FFFu;
+    }
+    blk[l] = make_uint4(w[0], w[1], w[2], w[3]);
+  }
+  return blk;
+}
+
+int main() {
+  std::mt19937 rng(1031);
+  auto r = [&](uint32_t n) { return uint32_t(rng() % n); };
+  auto val = [&](uint32_t e) { return uint16_t((r(2) << 15) | (e << 7) | r(128)); };
+  std::vector<int> valid;
+  // Every BF16 bit pattern once, in order: 248 consecutive patterns share a
+  // sign and span at most three exponents.
+  for (uint32_t s = 0; s < 65536; s += 248) {
+    std::vector<uint16_t> h(248);
+    for (int i = 0; i < 248; i++) h[i] = uint16_t((s + i) & 0xFFFF);
+    g_in.push_back(make_block(h, 31));
+    valid.push_back(31);
+  }
+  const uint16_t specials[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007F, 0x807F, 0x0080,
+                               0x7F7F, 0xFF7F, 0x7F80, 0xFF80, 0x7FC0, 0xFFC0, 0x7F81, 0xFFFF};
+  for (int b = 0; b < 3000; b++) {
+    std::vector<uint16_t> h(248);
+    const int kind = b % 10;
+    const uint32_t e0 = 1 + r(241);  // e0 + 13 <= 254
+    for (int i = 0; i < 248; i++) {
+      switch (kind) {
+        case 0: h[i] = r(8) ? val(e0 + r(10)) : 0; break;  // served-like
+        case 1: h[i] = uint16_t(r(65536)); break;  // any bits
+        case 2:  // +-0, subnormals
+          h[i] = r(3) ? val(e0 + r(14)) : uint16_t((r(2) << 15) | r(128));
+          break;
+        case 3: h[i] = val(i == 0 ? e0 : i == 1 ? e0 + 13 : e0 + r(14)); break;  // span 13
+        case 4: h[i] = val(i == 7 ? e0 : i == 200 ? e0 + 14 : e0 + 1 + r(13)); break;  // span 14
+        case 5: h[i] = r(64) ? val(e0 + r(4)) : specials[r(15)]; break;  // Inf, NaN, extremes
+        case 6: h[i] = r(2) ? 0x8000 : 0; break;  // only +-0
+        case 7: h[i] = val(241 + r(14)); break;  // top: max finite exponent 254
+        case 8: h[i] = r(2) ? val(1 + r(14)) : uint16_t((r(2) << 15) | r(128)); break;  // bottom
+        default: h[i] = val(e0 + r(6)); break;  // partial block below
+      }
+    }
+    if (kind == 5 && b % 20 == 5) h[0] = h[1] = 0xFFFF;  // a sentinel word
+    const int v = kind == 9 ? 1 + int(r(30)) : 31;
+    g_in.push_back(make_block(h, v));
+    valid.push_back(v);
+  }
+  g_out.resize(g_in.size());
+  g_slots.resize(g_in.size());
+  g_rows.resize(g_in.size());
+  std::vector<std::thread> warp;
+  for (int l = 0; l < 32; l++) warp.emplace_back(lane_main, l);
+  for (auto& t : warp) t.join();
+
+  long fails = 0, compressed = 0, raw = 0, zero_codes = 0, sentinel_in = 0;
+  for (size_t b = 0; b < g_in.size(); b++) {
+    // Expected format, from the definition: raw iff a nonzero exponent is 255
+    // or the nonzero exponents span more than 13.
+    uint32_t lo = 255, hi = 0;
+    bool has_zero_exp = false;
+    for (int l = 0; l < 31; l++)
+      for (int i = 0; i < 8; i++) {
+        const uint32_t e = (half(g_in[b][l], i) >> 7) & 0xFF;
+        if (e) lo = min(lo, e), hi = max(hi, e);
+        else if (l < valid[b]) has_zero_exp = true;
+      }
+    const bool want_raw = hi == 255 || (hi && hi - lo > 13);
+    const uint32_t want_hdr = want_raw ? 0x100u : (hi ? lo : 1u);
+    for (int l = 0; l < 32; l++)
+      if (g_rows[b][l] != (want_raw ? 4 : 3)) fails++;
+    if (g_slots[b][0].x != want_hdr) fails++;
+    // A compressed block is 24 contiguous quads, a raw one 32; no word sent is
+    // the sentinel, every quad not sent still is.
+    for (int qd = 0; qd < 32; qd++)
+      for (int k = 0; k < 4; k++) {
+        const bool sent = want_raw || qd < 24;
+        if ((word(g_slots[b][qd], k) == kSentinel) == sent) fails++;
+      }
+    // Lossless: every lane gets the pack that was sent, bit for bit.
+    for (int l = 0; l < 31; l++)
+      for (int k = 0; k < 4; k++)
+        if (word(g_out[b][l], k) != word(g_in[b][l], k)) fails++;
+    for (int l = 0; l < 31; l++)
+      for (int k = 0; k < 4; k++) sentinel_in += word(g_in[b][l], k) == 0x7FFF7FFFu;
+    (want_raw ? raw : compressed)++;
+    zero_codes += !want_raw && has_zero_exp;
+  }
+  printf("Z_ROUNDTRIP %s blocks=%zu compressed=%ld raw=%ld zero_codes=%ld sanitized=%ld\n",
+         fails ? "FAIL" : "PASS", g_in.size(), compressed, raw, zero_codes, sentinel_in);
+  return fails || !compressed || !raw || !zero_codes || !sentinel_in;
+}
+"""
+
+
+def _z_codec_source() -> str:
+    """The codec section of KERNEL_SRC, without the device-only stores and
+    polling (store_block, recv_blocks) and the kernel."""
+    src = flags.KERNEL_SRC
+    a = src.index("constexpr int kLanes = 32;")
+    b = src.index("AFD void store_block(")
+    c = src.index("AFD uint4 decode_block(")
+    d = src.index("// Warp-collective: receives and decodes")
+    assert a < b < c < d
+    return src[a:b] + src[c:d]
+
+
+@pytest.mark.skipif(CXX is None, reason="no host C++ compiler")
+def test_z_codec_round_trip_is_lossless(tmp_path):
+    """encode_block -> pack_block -> slot -> unpack_block (decode_block) gives
+    every lane its pack back, bit for bit: every BF16 pattern (both signs, +-0,
+    every subnormal, every exponent, Inf, every NaN payload), random and
+    served-like blocks, partial blocks, exponent spans 13 (compressed) and 14
+    (raw), the extremes, the sanitized sentinel word. The format is the one
+    documented in KERNEL_SRC; no word sent is the sentinel."""
+    (tmp_path / "z.cc").write_text(Z_CODEC_PRELUDE + _z_codec_source() + Z_CODEC_MAIN)
+    exe = tmp_path / "z"
+    r = subprocess.run(
+        [CXX, "-std=c++17", "-O2", "-pthread", str(tmp_path / "z.cc"), "-o", str(exe)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0 and "Z_ROUNDTRIP PASS" in r.stdout, r.stdout
+
+
+def test_z_sizes():
+    # 8 MiB - 16 (the largest message the custom all-reduce takes): the last
+    # rank's partition is 131074 packs = 4229 blocks of 31.
+    assert flags.z_block_slots(8 * 1024 * 1024 - 16) == 4229
+    assert flags.z_block_slots(8 * 1024 * 1024) == 4229
+    assert flags.z_stage_words(8 * 1024 * 1024 - 16) == 8 * 4229 * 128
+    assert 3 * flags.z_stage_words(8 * 1024 * 1024 - 16) * 4 == 51_965_952  # ~49.6 MiB
+    assert flags.z_block_slots(524288) == 265  # 8192 packs in the last partition
+    assert flags.z_block_slots(16) == 1 and flags.z_block_slots(31 * 16 * 4) == 1
+    assert flags.z_block_slots(32 * 16 * 4) == 2
+    # the binding's bound, mirrored: nb <= lb_max for every message up to the max
+    for nbytes in range(16, 200_000, 16):
+        L = flags.largest_part_packs(nbytes, 4)
+        assert -(-L // flags.Z_BLOCK_PACKS) <= flags.z_block_slots(200_000)
+
+
+def test_z_kernel_source_is_the_search_candidate():
+    """two_shot_z and its launch rule are present; the uncompressed kernel and
+    its binding are kept for two and four ranks."""
+    src = flags.KERNEL_SRC
+    assert "two_shot_z(Ptrs bufs" in src and "template __global__ void two_shot<2>" in src
+    assert "m.def(\"all_reduce_z\"" in flags.BIND_SRC and "m.def(\"all_reduce\"," in flags.BIND_SRC
+    assert "(3 * nb + warps_per_block - 1) / warps_per_block" in flags.BIND_SRC
+    assert flags.Z_BLOCK_PACKS == 31 and "kBlockPacks = 31" in src
+    assert flags.Z_SLOT_WORDS == 128 and "kSlotWords = 4 * kLanes" in src
+
+
 @pytest.mark.skipif(
     not HAVE_NVCC or os.environ.get("VLLM_TEST_FLAGS_JIT", "0") != "1",
     reason="JIT build test: set VLLM_TEST_FLAGS_JIT=1 (needs nvcc and ninja)",
@@ -582,6 +1091,7 @@ def test_jit_build(tmp_path, monkeypatch):
     monkeypatch.setattr(flags, "_MODULE", None)
     m = flags.load_module()
     assert hasattr(m, "all_reduce") and hasattr(m, "fill_sentinel")
+    assert hasattr(m, "all_reduce_z")
 
 
 
@@ -690,6 +1200,7 @@ def test_all_reduce_passes_limit_and_record(monkeypatch):
     fa = object.__new__(flags.FlagsAllreduce)
     fa.module, fa.ptrs, fa.rank, fa.stage_packs = m, [1, 2, 3, 4], 0, 32768
     fa.world_size = 4
+    fa.compressed = False
     fa.epoch = torch.zeros(16, dtype=torch.int32)
     fa.limit_ns = 1234
     seen = []
@@ -707,6 +1218,28 @@ def test_all_reduce_passes_limit_and_record(monkeypatch):
         assert len(seen) == 1 and "rank 3" in seen[0]
     finally:
         fa.errors._stop.set()
+
+
+def test_all_reduce_z_passes_its_buffer_and_launch_rule(monkeypatch):
+    m = _FakeModule()
+    m.all_reduce_z = lambda *args: m.calls.append(("z",) + args)
+    fa = object.__new__(flags.FlagsAllreduce)
+    fa.module, fa.ptrs, fa.rank, fa.world_size = m, [1, 2, 3, 4], 2, 4
+    fa.compressed = True
+    fa.lb_max = flags.z_block_slots(8 << 20)
+    fa.stage_words = flags.z_stage_words(8 << 20)
+    fa.epoch = torch.zeros(16, dtype=torch.int32)
+    fa.limit_ns = 1234
+    fa.errors = SimpleNamespace(dev_ptr=99, check=lambda: None)
+    fa._calls = 0
+    monkeypatch.setattr(flags.torch.cuda, "is_current_stream_capturing", lambda: False)
+    x = torch.zeros(65536, dtype=torch.bfloat16)
+    out = torch.empty_like(x)
+    assert fa.all_reduce(x, out) is out
+    (call,) = m.calls
+    assert call[0] == "z" and call[1] is x and call[2] is out
+    assert call[3:] == ([1, 2, 3, 4], fa.epoch.data_ptr(), 2, 8 * 4229 * 128, 4229,
+                        flags.THREADS, flags.MAX_BLOCKS, 1234, 99)
 
 
 # CPU model of the overrun path: four ranks run the two-shot protocol with a

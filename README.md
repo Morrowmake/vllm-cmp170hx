@@ -210,7 +210,9 @@ take one round trip through shared host memory; where peer access is granted
 (`VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`, kernel chosen by
 `VLLM_CUSTOM_ALLREDUCE_ALGO`), a PCIe custom all-reduce with a flags-in-data
 kernel runs in device memory instead and falls back to the host path on its
-own; prefill-sized sums a layer owns run on a copy-engine ring.
+own; at TP4 its lossless compressed wire format sends ~23 % fewer bytes,
+bitwise the same sums — `VLLM_SM80_ALLREDUCE_COMPRESS`; prefill-sized sums a
+layer owns run on a copy-engine ring.
 
 **KV accounting.** The KV reserve covers what prefill chunks in flight really
 hold, so the reported pool is one the server can fill —

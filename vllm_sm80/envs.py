@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_SM80_MHC_PREFILL: bool = False
     VLLM_SM80_SPARSE_MLA_PREFILL: bool = False
     VLLM_SM80_ALLREDUCE: bool = False
+    VLLM_SM80_ALLREDUCE_COMPRESS: bool = False
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
@@ -226,6 +227,20 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # communicator and dispatch.
     "VLLM_SM80_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM80_ALLREDUCE", "0"))
+    ),
+    # With VLLM_SM80_ALLREDUCE, at TP4: the flags-in-data two-shot kernel's
+    # lossless compressed wire format (custom_all_reduce_flags.py,
+    # two_shot_z: per 248-value block a base exponent, per value sign, 7-bit
+    # mantissa and a 4-bit exponent code, raw fallback per block) for the BF16
+    # messages above allreduce/flags_raw_max_bytes of the sm80 tuning table
+    # that the flags kernel takes, and, below the custom all-reduce's buffer
+    # size, those upstream's cross_device_reduce_2stage takes. Same
+    # partitions and owner-order FP32 sums, so bitwise the kernels it
+    # replaces; one more buffer set per rank (~50 MiB at the 8 MiB buffer).
+    # Hot-swap pair allreduce_compress. Default OFF: unset, nothing is built
+    # and every message takes today's path.
+    "VLLM_SM80_ALLREDUCE_COMPRESS": lambda: bool(
+        int(os.getenv("VLLM_SM80_ALLREDUCE_COMPRESS", "0"))
     ),
     # The sm_80 mHC pre-norm projection GEMM at prefill sizes
     # (vllm_sm80/kernels/mhc/prenorm.py) in place of the TileLang kernel, for

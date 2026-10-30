@@ -62,6 +62,14 @@ the same allocations, process groups and captured graph shapes. Not pairs:
   process; rows read while capturing pick each graph's kernels, rows read at
   load size workspaces and communicator buffers, and the arms carry no table.
 
+``VLLM_SM80_ALLREDUCE_COMPRESS`` is a pair (``allreduce_compress``): listed,
+the communicator builds the compressed flags kernel's buffers beside the
+flags-in-data ones when it is constructed (the KV cache is sized with both),
+and every all-reduce the compressed kernel would take is a pair site
+(communicator.py ``custom_all_reduce``): the flags-in-data or upstream kernel,
+then the compressed one into its output. Each kernel keeps its own buffers and
+device epoch, so a disabled variant leaves the other's protocol state alone.
+
 An eager candidate allocates its own scratch at its first call, after the KV
 cache is sized: the boot's memory profile sees the incumbents' eager steps.
 
@@ -250,6 +258,21 @@ def _splitkv_unavailable(runner) -> str | None:
     return None
 
 
+def _ar_compress_unavailable(runner) -> str | None:
+    """The TP group's custom all-reduce built the compressed flags kernel for
+    the pair (communicator.py ``_init_flags_z``)."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    ca = getattr(getattr(get_tp_group(), "device_communicator", None), "ca_comm", None)
+    if not getattr(ca, "_flags_z_hot", False):
+        return (
+            "the TP group's custom all-reduce carries no compressed flags "
+            "kernel: it needs VLLM_SM80_ALLREDUCE=1, "
+            "VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 and four sm_80 ranks"
+        )
+    return None
+
+
 HOT_PAIRS: dict[str, HotPair] = {
     p.name: p
     for p in (
@@ -281,6 +304,10 @@ HOT_PAIRS: dict[str, HotPair] = {
         HotPair(
             "splitkv_decode", "VLLM_DEEPSEEK_V41_SPLITKV_DECODE",
             _splitkv_unavailable,
+        ),
+        HotPair(
+            "allreduce_compress", "VLLM_SM80_ALLREDUCE_COMPRESS",
+            _ar_compress_unavailable, eager=True,
         ),
     )
 }
