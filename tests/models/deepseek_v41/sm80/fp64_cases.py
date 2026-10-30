@@ -113,6 +113,10 @@ unless named in full.
   outputs, stacked in rank order, are judged together, and the ranks' FP64
   partials must sum to the whole experts' FP64 output within FP64 rounding
   (``TP_SUM_RTOL`` of its largest magnitude), else the case is refused.
+  ``expert_rotation`` (with ``expert_tp``) replays the split rotated per
+  expert (VLLM_EXL3_MOE_EXPERT_ROTATION: rank r of layer L holds chunk
+  (r + L + e) mod the size of expert e), on each operator's mixed-width
+  form; a captured call whose experts differ in width is such a split.
 - ``mhc_delayed``: ``sm80_mhc:mhc_fused_post_pre_delayed`` (x, residual,
   post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
   hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, pre_mix, norm_weight,
@@ -202,12 +206,15 @@ class Source:
     the served launch's checkpoints ({role: directory}), for the
     families with several outputs the output the case judges and, for the
     EXL3 MoE families, the case's ``expert_tp`` (the tensor parallel size
-    of the split its whole-expert sources are replayed as)."""
+    of the split its whole-expert sources are replayed as) and
+    ``expert_rotation`` (that split rotated per expert,
+    VLLM_EXL3_MOE_EXPERT_ROTATION)."""
 
     meta: dict
     checkpoint: dict
     output: str | None = None
     expert_tp: int | None = None
+    expert_rotation: bool = False
 
 
 def picks(n: int) -> list[int]:
@@ -607,18 +614,22 @@ ROLES = ("gate_proj", "up_proj", "down_proj")
 TP_SUM_RTOL = 1e-9
 
 
-def expert_columns(intermediate: int, module_prefix: str, rank: int, size: int) -> slice:
-    """The intermediate columns rank ``rank`` of ``size`` holds of every
-    routed expert of the MoE layer ``module_prefix`` when the experts are
+def expert_columns(
+    intermediate: int, module_prefix: str, rank: int, size: int, expert: int = 0,
+    rotate: bool = False,
+) -> slice:
+    """The intermediate columns rank ``rank`` of ``size`` holds of routed
+    expert ``expert`` of the MoE layer ``module_prefix`` when the experts are
     split across the tensor-parallel ranks, as Exl3MoEMethod splits them:
     whole H128 blocks, the larger chunks first, rank r of layer L holding
-    chunk (r + L) mod ``size`` (block_shard rotated by the layer index)."""
+    chunk (r + L) mod ``size`` of every expert (block_shard rotated by the
+    layer index) or, with ``rotate`` (VLLM_EXL3_MOE_EXPERT_ROTATION), chunk
+    (r + L + expert) mod ``size``."""
     from vllm.model_executor.models.utils import extract_layer_index
     from vllm_sm80.kernels.exl3.utils import block_shard
 
-    return block_shard(
-        intermediate, intermediate, rank, size, extract_layer_index(module_prefix)
-    )
+    rotation = extract_layer_index(module_prefix) + (expert if rotate else 0)
+    return block_shard(intermediate, intermediate, rank, size, rotation)
 
 
 @functools.lru_cache(maxsize=2)
@@ -645,9 +656,10 @@ def expert_set(
     matrices are the model layout's expert matrices of ``module_prefix``.
     A ``packed_meta`` narrower than the checkpoint's experts is a split
     over the tensor-parallel ranks: each expert's columns of rank ``rank``
-    of ``size`` (expert_columns), the outputs of gate and up (trellis
-    columns, svh; the whole suh) and the inputs of down (trellis rows, suh;
-    the whole svh). The meta must be the recorded ``packed_meta``."""
+    of ``size`` (expert_columns; rotated per expert when the recorded experts
+    differ in width, VLLM_EXL3_MOE_EXPERT_ROTATION), the outputs of gate and
+    up (trellis columns, svh; the whole suh) and the inputs of down (trellis
+    rows, suh; the whole svh). The meta must be the recorded ``packed_meta``."""
     layout, resolver, ckpt = _expert_layout(str(checkpoint))
     owner = {}
     for g, local in enumerate(expert_map.tolist()):
@@ -664,16 +676,20 @@ def expert_set(
     columns = None
     if packed_meta.shape[0]:
         whole = ckpt.matrix(matrix_name(0, "gate_proj")).padded_out
-        recorded = int(packed_meta[0, 0, 1])
-        if recorded != whole:
+        recorded = {int(w) for w in packed_meta[:, 0, 1].tolist()}
+        if recorded != {whole}:
             if size <= 1:
                 raise ValueError(
                     "the checkpoint's expert layout differs from the recorded one: "
-                    f"{recorded} of {whole} intermediate columns, and a split needs "
-                    "the source's tensor parallel rank and size (meta.tp_rank, "
+                    f"{sorted(recorded)} of {whole} intermediate columns, and a split "
+                    "needs the source's tensor parallel rank and size (meta.tp_rank, "
                     "meta.tp_size)"
                 )
-            columns = expert_columns(whole, module_prefix, rank, size)
+            rotate = len(recorded) > 1
+            columns = [
+                expert_columns(whole, module_prefix, rank, size, owner[local], rotate)
+                for local in range(packed_meta.shape[0])
+            ]
     weights, pointers, meta = [], [], []
     for local in range(packed_meta.shape[0]):
         ptrs, rows = [], []
@@ -684,11 +700,13 @@ def expert_set(
             if columns is None:
                 parts = ckpt.whole(name)
             elif role == "down_proj":
-                parts = ckpt.shard(name, (columns.start, columns.stop), [(0, n)])
-                k = columns.stop - columns.start
+                cols = columns[local]
+                parts = ckpt.shard(name, (cols.start, cols.stop), [(0, n)])
+                k = cols.stop - cols.start
             else:
-                parts = ckpt.shard(name, (0, k), [(columns.start, columns.stop)])
-                n = columns.stop - columns.start
+                cols = columns[local]
+                parts = ckpt.shard(name, (0, k), [(cols.start, cols.stop)])
+                n = cols.stop - cols.start
             parts = [t.to(device) for t in parts]
             weights.append(parts)
             ptrs.append([p.data_ptr() for p in parts])
@@ -702,16 +720,20 @@ def expert_set(
     return weights, pointers, meta.to(device)
 
 
-def tp_call(a: dict, module_prefix: str, rank: int, size: int) -> dict:
+def tp_call(
+    a: dict, module_prefix: str, rank: int, size: int, rotate: bool = False
+) -> dict:
     """The arguments rank ``rank`` of ``size`` passes the experts' operator
     for the rows of the whole-expert call ``a`` (any expert map) when the
     routed experts are split across the tensor-parallel ranks: every rank
     routes the same rows (x, topk_ids, topk_weights unchanged) and holds
     every expert (the identity expert map) at the same columns
-    (expert_columns; ``intermediate_size`` is their width). ``packed_meta``
-    gives every expert the call's bit width and codebook of each projection,
-    gate and up narrowed to those outputs and down to those inputs.
-    ``size`` 1: every expert whole."""
+    (expert_columns; ``intermediate_size`` is their width) or, with
+    ``rotate`` (VLLM_EXL3_MOE_EXPERT_ROTATION), at each expert's own columns
+    (``intermediate_size`` the widest). ``packed_meta`` gives every expert
+    the call's bit width and codebook of each projection, gate and up
+    narrowed to those outputs and down to those inputs. ``size`` 1: every
+    expert whole."""
     meta = a["packed_meta"]
     inter = int(a["intermediate_size"])
     if meta.dim() != 3 or meta.shape[0] == 0 or tuple(meta.shape[1:]) != (3, 4):
@@ -729,16 +751,21 @@ def tp_call(a: dict, module_prefix: str, rank: int, size: int) -> dict:
             raise ValueError(f"the call's {role} matrices mix bit widths or codebooks: "
                              f"{sorted(kind)}")
         kinds.append(list(kind.pop()))
-    columns = expert_columns(inter, module_prefix, rank, size)
-    width = columns.stop - columns.start
     experts = a["expert_map"].numel()
-    row = [[hidden, width, *kinds[0]], [hidden, width, *kinds[1]],
-           [width, hidden, *kinds[2]]]
+    widths = [
+        expert_columns(inter, module_prefix, rank, size, expert, rotate)
+        for expert in range(experts)
+    ]
+    widths = [c.stop - c.start for c in widths]
+    rows = [
+        [[hidden, width, *kinds[0]], [hidden, width, *kinds[1]], [width, hidden, *kinds[2]]]
+        for width in widths
+    ]
     return dict(
         a,
-        packed_meta=torch.tensor([row] * experts, dtype=meta.dtype),
+        packed_meta=torch.tensor(rows, dtype=meta.dtype),
         expert_map=torch.arange(experts, dtype=a["expert_map"].dtype),
-        intermediate_size=width,
+        intermediate_size=max(widths),
     )
 
 
@@ -786,7 +813,8 @@ def _exl3_moe_call(
     rank: int, size: int,
 ) -> Call:
     """One call of ``name`` on the experts it records (rank ``rank`` of
-    ``size``'s columns of each when they are split)."""
+    ``size``'s columns of each when they are split). Experts of two widths
+    (VLLM_EXL3_MOE_EXPERT_ROTATION) run every operator's mixed-width form."""
     from vllm_sm80.kernels.exl3 import ops
 
     x, ids, tw, emap = (
@@ -814,6 +842,9 @@ def _exl3_moe_call(
     ):
         ops.require_moe_v2_try()
         cand = "moe_out_v2_try"
+    mixed = len({int(w) for w in a["packed_meta"][:, 0, 1].tolist()}) > 1
+    if mixed:
+        ops.require_moe_mixed()
 
     def run(op, rows):
         xr = x[rows]
@@ -825,6 +856,7 @@ def _exl3_moe_call(
         getattr(ops, op)(
             xr, ids[rows], tw[rows], pointers, meta, emap, inter, out, workspace,
             swiglu_limit=limit, **(extra if op in (name, cand) else {}),
+            **({"mixed": True} if mixed else {}),
         )
         return out
 
@@ -861,9 +893,10 @@ def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
     size = int(src.expert_tp)
     if size < 2:
         raise ValueError(f"expert_tp {src.expert_tp!r}: a split needs at least 2 ranks")
+    rotate = bool(src.expert_rotation)
     calls = [
-        _exl3_moe_call(name, tp_call(a, prefix, rank, size), device, checkpoint, prefix,
-                       rank, size)
+        _exl3_moe_call(name, tp_call(a, prefix, rank, size, rotate), device, checkpoint,
+                       prefix, rank, size)
         for rank in range(size)
     ]
     partials = torch.stack([c.exact for c in calls])
@@ -1434,8 +1467,11 @@ def case_row(
         expert_tp = case.get("expert_tp")
         if expert_tp is not None and family not in EXL3_MOE_FAMILIES:
             raise ValueError(f"{path}: expert_tp is for the EXL3 MoE families, not {family!r}")
+        rotation = bool(case.get("expert_rotation", False))
+        if rotation and expert_tp is None:
+            raise ValueError(f"{path}: expert_rotation needs expert_tp")
         src = Source(obj.get("meta") or {}, checkpoint, output if multi else None,
-                     expert_tp)
+                     expert_tp, rotation)
         call = FAMILIES[family](obj["tensors"], device, src)
         cs, cm, n = abs_errors(call.cand, call.exact)
         ref_exact = call.exact if call.ref_exact is None else call.ref_exact

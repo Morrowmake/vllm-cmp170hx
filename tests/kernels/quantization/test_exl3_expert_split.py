@@ -279,7 +279,9 @@ def test_method_builds_under_tp_and_reports_the_rank_width():
             method = quant.Exl3MoEMethod(None, f"model.layers.{layer}.ffn.experts", moe)
             intermediate, columns = method.expert_split
             assert intermediate == 2304
-            assert columns == block_shard(2304, 2304, rank, 4, layer)
+            # Without VLLM_EXL3_MOE_EXPERT_ROTATION every expert at the layer's chunk.
+            assert columns == (block_shard(2304, 2304, rank, 4, layer),) * 384
+            assert not method.mixed_widths
             assert method.maybe_roundup_sizes(
                 5120, 576, torch.bfloat16, moe.moe_parallel_config
             ) == (5120, widths[rank])

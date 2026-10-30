@@ -26,6 +26,14 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
              const torch::Tensor& packed_meta,
              const torch::Tensor& expert_map, int64_t intermediate_size,
              torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit);
+// moe_out for a layer whose local experts are intermediate_size or intermediate_size - 128 wide
+// each (packed_meta); hidden 5120 / intermediate 640 only. Same workspace; each route's
+// contribution is bitwise moe_out's at its expert's width.
+void moe_out_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                   const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                   const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                   int64_t intermediate_size, torch::Tensor& out, torch::Tensor& workspace,
+                   double swiglu_limit);
 
 // Test-only: today's scalar kernels, the bit-exact oracle for the operators
 // above (same signatures; their workspace needs never exceed the sizes above).

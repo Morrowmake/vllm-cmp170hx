@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
+    VLLM_EXL3_MOE_EXPERT_ROTATION: bool = False
     VLLM_SM80_TUNING_FILE: str = ""
     VLLM_SM80_CAPTURE: str = ""
     VLLM_SM80_REPLAY_DIR: str = ""
@@ -1174,6 +1175,26 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # bytes and the same kernels. Default OFF: one allocation per tensor.
     "VLLM_EXL3_EXPERTS_CONTIGUOUS": lambda: bool(
         int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
+    ),
+    # EXL3 routed experts split across the tensor-parallel ranks (no
+    # --enable-expert-parallel; quant.py tensor_parallel_expert_split): rank r
+    # holds chunk (r + L + e) mod the tensor parallel size of expert e in layer
+    # L instead of chunk (r + L) mod size of every expert, so each rank holds
+    # the larger (640-column) chunk of half the layer's experts and the smaller
+    # (512) of the other half, and every rank does the same expected routed work
+    # per layer instead of two ranks 25 % more. Each layer's calls take the
+    # mixed-width operators (moe_out_mixed, moe_out_v2_mixed,
+    # moe_out_v2_try_mixed, moe_out_prefill_try_mixed): every routed (row,
+    # expert) chunk product is bitwise the same as without the switch; each
+    # rank's partial output then sums other chunks of the row's experts before
+    # its BF16 rounding and the all-reduce, so outputs differ in the last bits
+    # (an order-changing change). No folded moe_out_v2 for these layers
+    # (VLLM_EXL3_MOE_V2_FOLD does not apply to them), and their prefill calls
+    # take the tensor cores only through VLLM_EXL3_MOE_PREFILL_UNCHUNKED. Needs an
+    # EXL3 extension built from this tree. Default OFF. Read in
+    # vllm_sm80/kernels/exl3/quant.py.
+    "VLLM_EXL3_MOE_EXPERT_ROTATION": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_EXPERT_ROTATION", "0"))
     ),
 
     # Diagnostic: the path of a size cut-off table (schema sm80-tuning/1, see

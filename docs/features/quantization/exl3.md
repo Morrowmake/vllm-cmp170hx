@@ -110,6 +110,25 @@ The block-aligned split rotated per layer follows the idea of the
 DeepSeek-V4.1-Flash CMP 170HX recipes of GNmac-lab and Curtis White
 (CurtisAccelerate); no code is taken from them.
 
+`VLLM_EXL3_MOE_EXPERT_ROTATION=1` (default `0`) rotates the chunks per expert
+as well: rank r of layer L holds chunk (r + L + e) mod the tensor parallel size
+of expert e. Each rank then holds every chunk of an equal share of a layer's
+experts (at tensor parallel size 4: the 640-column chunk of 192 of
+DeepSeek-V4.1-Flash's 384 target experts and the 512-column chunk of the other
+192; 64 and 64 of the drafter's 128), so the ranks hold the same columns in
+every layer and do the same expected routed work, instead of two ranks 25 %
+more. The rank's operators take the widest chunk as `intermediate_size` and
+each expert's own width from its metadata: `moe_out_mixed`,
+`moe_out_v2_mixed` (target and drafter layers, never folded),
+`moe_out_v2_try_mixed` (with `VLLM_EXL3_MOE_V2_RING`) and
+`moe_out_prefill_try_mixed` (prefill calls take the tensor cores only with
+`VLLM_EXL3_MOE_PREFILL_UNCHUNKED`), each the base operator's schema
+(`ops.MOE_MIXED_SHAPE`: hidden 5120, chunks of 640 and 512 columns). Every
+routed (row, expert) chunk product is bitwise the base operator's at the
+expert's width; a rank's partial output sums other chunks of the row's experts
+than without the switch before its BF16 rounding and the all-reduce, so the
+MoE output differs in the last bits.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.

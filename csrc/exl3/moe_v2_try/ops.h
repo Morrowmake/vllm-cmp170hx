@@ -28,4 +28,13 @@ void moe_out_fp32(const torch::Tensor& x, const torch::Tensor& topk_ids,
                   int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
                   torch::Tensor& workspace, double swiglu_limit);
 
+// moe_out for experts each intermediate_size (640) or intermediate_size - 128
+// (512) columns wide (packed_meta), hidden 5120: every route's down output is
+// moe_out's at its expert's width; workspace moe_workspace_size at 640.
+void moe_out_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                   const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                   const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                   int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
+                   torch::Tensor& workspace, double swiglu_limit);
+
 }  // namespace exl3_try

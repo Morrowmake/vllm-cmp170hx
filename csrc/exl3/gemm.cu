@@ -30,6 +30,8 @@ struct GemmConfig {
   static constexpr int kMinBlocks = MinBlocks;
   // Can form MoE gate/up activations in the block from BF16 rows.
   static constexpr bool kFuseInput = FuseInput;
+  // MoE experts of per-expert width (launch_gemm_mixed); MixedConfig sets it.
+  static constexpr bool kMixed = false;
   static constexpr int kWarps = Threads / 32;
   static constexpr int kRowsPerWarp = (BM + kWarps - 1) / kWarps;
   // Activations are stored k-major; rows are read as float4 when TM >= 4.
@@ -56,6 +58,14 @@ using TinyConfig = GemmConfig<128, 4, 32, 64, 1, 1, 4, true>;
 using SmallConfig = GemmConfig<128, 16, 32, 32, 4, 1, 4, true>;
 using MediumConfig = GemmConfig<128, 64, 64, 16, 8, 4, 3, false>;
 using LargeConfig = GemmConfig<256, 128, 128, 16, 8, 8, 2, false>;
+
+// The same block shape for MoE layers whose experts differ in width
+// (launch_gemm_mixed): a separate instantiation, so the configs above compile
+// exactly as without it.
+template <class Base>
+struct MixedConfig : Base {
+  static constexpr bool kMixed = true;
+};
 
 template <class Cfg>
 struct GemmSmem {
@@ -95,10 +105,13 @@ __device__ __forceinline__ void load_micro(const float* row, int t, float (&v)[T
   }
 }
 
+// k: the reduction length of a mixed-width MoE tile (the expert's padded_in);
+// every other tile reduces over p.k.
 template <int kBitsX2, int kCodebook, class Cfg>
 __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
                                          const uint16_t* trellis, int64_t tiles_n,
-                                         int64_t col0, int rows, float* c, const half* suh) {
+                                         int64_t col0, int rows, float* c, const half* suh,
+                                         int k) {
   using Ring = TileRing<kBitsX2>;
   constexpr int BK = Cfg::kBK;
   constexpr int T = Cfg::kThreads;
@@ -106,7 +119,7 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
   const int lane = tid & 31;
   const LaneWindow<kBitsX2> window(lane);
   const bool aligned = (reinterpret_cast<uintptr_t>(trellis) & 3) == 0;
-  const int chunks = p.k / BK;
+  const int chunks = (Cfg::kMixed ? k : p.k) / BK;
   const int64_t tile_col0 = col0 / 16;
 
   uint32_t words[Cfg::kTasksPerThread][Ring::kLoadWords];
@@ -299,6 +312,7 @@ gemm_kernel(GemmProblem p) {
     int64_t tiles_n = p.tiles_n;
     int format = p.format;
     int rows;
+    int k = p.k;
     if (moe) {
       // Tiles follow the sorted list, so a block never mixes experts.
       const int4 tile = reinterpret_cast<const int4*>(
@@ -309,6 +323,13 @@ gemm_kernel(GemmProblem p) {
       suh = reinterpret_cast<const half*>(ptrs[1]);
       tiles_n = meta[1] / 16;
       format = format_key(static_cast<int>(meta[2]), static_cast<int>(meta[3]));
+      if constexpr (Cfg::kMixed) {
+        // Per-expert width: gate/up columns from the expert's padded_out on do
+        // not exist (the whole block skips the item, before any barrier), and
+        // each projection reduces over the expert's padded_in.
+        if (projection < 2 && col0 >= meta[1]) continue;
+        k = static_cast<int>(meta[0]);
+      }
       rows = tile.z;
       for (int i = threadIdx.x; i < Cfg::kBM; i += Cfg::kThreads) {
         s.row[i] = i < rows ? sorted[tile.y + i] : -1;
@@ -323,7 +344,7 @@ gemm_kernel(GemmProblem p) {
     __syncthreads();
     switch (format) {
 #define EXL3_CASE(B, C) \
-      case format_key(B, C): run_tile<B, C, Cfg>(p, s, trellis, tiles_n, col0, rows, c, suh); \
+      case format_key(B, C): run_tile<B, C, Cfg>(p, s, trellis, tiles_n, col0, rows, c, suh, k); \
         break;
       EXL3_FORMATS(EXL3_CASE)
 #undef EXL3_CASE
@@ -482,6 +503,21 @@ void launch_gemm(const GemmProblem& problem, GemmShape shape, int64_t max_items,
     case GemmShape::kSmall: return launch<SmallConfig>(problem, max_items, stream);
     case GemmShape::kMedium: return launch<MediumConfig>(problem, max_items, stream);
     case GemmShape::kLarge: return launch<LargeConfig>(problem, max_items, stream);
+  }
+  TORCH_CHECK(false, "unknown EXL3 GEMM shape");
+}
+
+void launch_gemm_mixed(const GemmProblem& problem, GemmShape shape, int64_t max_items,
+                       cudaStream_t stream) {
+  TORCH_CHECK(problem.route != nullptr, "EXL3 mixed-width GEMM needs a MoE problem");
+  TORCH_CHECK(problem.x == nullptr || gemm_fuses_input(shape),
+              "EXL3 fused gate/up needs a MoE problem and a tiny or small shape");
+  switch (shape) {
+    case GemmShape::kTiny: return launch<MixedConfig<TinyConfig>>(problem, max_items, stream);
+    case GemmShape::kSmall: return launch<MixedConfig<SmallConfig>>(problem, max_items, stream);
+    case GemmShape::kMedium:
+      return launch<MixedConfig<MediumConfig>>(problem, max_items, stream);
+    case GemmShape::kLarge: return launch<MixedConfig<LargeConfig>>(problem, max_items, stream);
   }
   TORCH_CHECK(false, "unknown EXL3 GEMM shape");
 }

@@ -31,6 +31,15 @@ void moe_out_v2_fold(const torch::Tensor& x, const torch::Tensor& topk_ids,
                      const torch::Tensor& expert_map, int64_t intermediate_size,
                      int64_t bits_x2, torch::Tensor& out, torch::Tensor& workspace,
                      double swiglu_limit);
+// moe_out_v2's arguments for a layer whose experts are each intermediate_size
+// (640) or intermediate_size - 128 (512) columns wide (packed_meta), hidden
+// 5120, bits_x2 6, 4 or 8: each route's down output is moe_out_v2's at its
+// expert's width; workspace moe_workspace_size_v2 at 640.
+void moe_out_v2_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                      const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                      const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                      int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
+                      torch::Tensor& workspace, double swiglu_limit);
 // The smallest row tile kernel (8 or 16 rows) every bits_x2 8 row tile takes;
 // 0: each tile's by its rows (VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS). Set before
 // the first call and any graph capture.
