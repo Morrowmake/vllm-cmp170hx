@@ -65,10 +65,13 @@ the same allocations, process groups and captured graph shapes. Not pairs:
 ``VLLM_SM80_ALLREDUCE_COMPRESS`` is a pair (``allreduce_compress``): listed,
 the communicator builds the compressed flags kernel's buffers beside the
 flags-in-data ones when it is constructed (the KV cache is sized with both),
-and every all-reduce the compressed kernel would take is a pair site
-(communicator.py ``custom_all_reduce``): the flags-in-data or upstream kernel,
-then the compressed one into its output. Each kernel keeps its own buffers and
-device epoch, so a disabled variant leaves the other's protocol state alone.
+and every all-reduce the compressed or the one-shot kernel would take is a
+pair site (communicator.py ``custom_all_reduce``): the flags-in-data or
+upstream kernel, then the candidate into its output. The compressed kernel
+keeps its own buffers and device epoch; the one-shot runs on the
+flags-in-data kernel's buffers and epoch, but either variant of such a site
+advances that shared state the same way (one call), so a disabled variant
+leaves the other's protocol consistent.
 
 An eager candidate allocates its own scratch at its first call, after the KV
 cache is sized: the boot's memory profile sees the incumbents' eager steps.

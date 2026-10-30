@@ -9,24 +9,28 @@ message runs, in one process:
 
 * ``inc``: ``_custom_all_reduce_base``, the dispatch with the switch off (the
   flags-in-data kernel up to its limit, else upstream's two-stage kernel);
-* ``cand``: ``custom_all_reduce``, the dispatch with the switch on;
+* ``cand``: ``custom_all_reduce``, the dispatch with the switch on (one-shot,
+  flags-in-data, compressed);
 * ``z``: the compressed kernel itself (``_flags_z.all_reduce``) at every size
-  its buffer holds, also below the raw cut-off where the dispatch keeps the
-  uncompressed kernel.
+  of the custom all-reduce's range, also below the raw cut-off where the
+  dispatch keeps the uncompressed kernels;
+* ``one``: the one-shot kernel itself (``_flags.all_reduce(one_shot=True)``)
+  at every size up to 64 KiB, also above its cut-off.
 
 Messages: every captured served call of ``--real`` (all four ranks' inputs
-and the live output, which ``inc``, ``cand`` and ``z`` must all equal),
-messages composed of captured rows at every row count 1..64 and prefill sizes
-up to the largest the custom all-reduce takes, and generated kinds (randn,
-wide exponents, the order-sensitive ``cancel``, NaN/Inf/-0/subnormals and
-sentinel words, mostly zeros); then CUDA-graph replays of the decode sizes
-(one graph per size with ``cand``, replayed over many inputs, against eager
-``inc``). Per message: bits equal (NaN equals NaN), the input unchanged, every
-rank's result the same; at the end no wait timed out.
+and the live output, which ``inc``, ``cand``, ``z`` and ``one`` must all
+equal), messages composed of captured rows at every row count 1..64 and
+prefill sizes up to the largest the custom all-reduce takes, and generated
+kinds (randn, wide exponents, the order-sensitive ``cancel``,
+NaN/Inf/-0/subnormals and sentinel words, mostly zeros); then CUDA-graph
+replays of the decode sizes (one graph per size with ``cand``, replayed over
+many inputs, against eager ``inc``).
 
-Rank 0 prints one line per group and ``Z_BITS PASS`` or ``Z_BITS FAIL`` and
-writes the JSON at ``--out``; the exit code is 0 when every case ran.
-Not a pytest module: test_custom_all_reduce_flags_z_gpu.py runs it::
+Per message: bits equal (NaN equals NaN), the input unchanged, every rank's
+result the same; at the end no wait timed out (error records). Rank 0
+prints one line per group and ``Z_BITS PASS`` or ``Z_BITS FAIL`` and writes
+the JSON at ``--out``; the exit code is 0 when every case ran. Not a pytest
+module: test_custom_all_reduce_flags_z_gpu.py runs it::
 
     VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 VLLM_SM80_ALLREDUCE=1 \\
     VLLM_SM80_ALLREDUCE_COMPRESS=1 VLLM_CUSTOM_ALLREDUCE_ALGO=2stage \\
@@ -51,6 +55,7 @@ DECODE_ROWS = [1, 2, 3, 4, 6, 7, 8, 9, 12, 16, 24, 32, 40, 48]
 PREFILL_ROWS = [51, 52, 64, 65, 96, 128, 256, 512, 819]
 KINDS = ["randn", "wide", "cancel", "specials", "zeros"]
 GRAPH_REPLAYS = 16
+ONE_SHOT_FORCED_MAX = 65536
 
 
 def _sha256(path: str) -> str:
@@ -153,22 +158,38 @@ def main() -> None:
     z = ca._flags_z
     config = {
         "flags_max_bytes": ca._flags.max_bytes,
+        "one_shot_max_bytes": ca._flags_one_shot_max_bytes,
         "z_min_bytes": ca._flags_z_min_bytes,
         "z_upstream_from": ca._flags_z_upstream_from,
+        "z_range_max_bytes": ca._flags_z_max_bytes,
         "z_max_bytes": z.max_bytes,
         "z_buffer_bytes": z.buffer_bytes,
+        "custom_max_size": ca.max_size,
         "algo": os.environ.get("VLLM_CUSTOM_ALLREDUCE_ALGO", ""),
     }
 
     cases = []
 
+    def agree(t: torch.Tensor) -> bool:
+        got = [torch.empty_like(t) for _ in range(world)]
+        dist.all_gather(got, t)
+        return all(_mismatch(g, got[0]) == 0 for g in got[1:])
+
+    def route_of(x: torch.Tensor) -> str:
+        if ca._flags_z_takes(x):
+            return "z"
+        if ca._one_shot_takes(x):
+            return "one_shot"
+        return "flags" if ca._flags.eligible(x) else "custom"
+
     def run(group: str, name: str, x: torch.Tensor, live: torch.Tensor | None = None):
         before = x.clone()
-        route = "z" if ca._flags_z_takes(x) else (
-            "flags" if ca._flags.eligible(x) else "custom")
+        route = route_of(x)
         inc = ca._custom_all_reduce_base(x)
         cand = ca.custom_all_reduce(x)
-        forced = z.all_reduce(x) if x.nbytes <= z.max_bytes else None
+        forced = z.all_reduce(x) if x.nbytes <= ca._flags_z_max_bytes else None
+        one = (ca._flags.all_reduce(x, one_shot=True)
+               if x.nbytes <= min(ONE_SHOT_FORCED_MAX, ca._flags.max_bytes // 2) else None)
         torch.cuda.synchronize()
         case = {"group": group, "name": name, "bytes": x.nbytes, "route": route,
                 "input_unchanged": torch.equal(before.view(torch.int16), x.view(torch.int16))}
@@ -180,9 +201,9 @@ def main() -> None:
         case["inc_ne_live"] = _mismatch(inc, live) if live is not None else 0
         case["cand_ne"] = _mismatch(cand, ref)
         case["z_ne"] = _mismatch(forced, ref) if forced is not None else 0
-        got = [torch.empty_like(cand) for _ in range(world)]
-        dist.all_gather(got, cand)
-        case["ranks_agree"] = all(_mismatch(g, got[0]) == 0 for g in got[1:])
+        case["one_ne"] = _mismatch(one, ref) if one is not None else 0
+        case["one_forced"] = one is not None
+        case["ranks_agree"] = agree(cand)
         cases.append(case)
 
     # 1. Captured served calls.
@@ -215,9 +236,10 @@ def main() -> None:
         x = _partial("wide", rows, rank, packs, dev).view(-1)[: 8 * packs].contiguous()
         run("packs", f"packs{packs}", x)
 
-    # 3. CUDA-graph replays of the decode sizes (the switch-on dispatch).
-    for rows in DECODE_ROWS:
-        static = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+    # 3. CUDA-graph replays of the decode sizes and the slot sums (the switch-on dispatch).
+    graph_msgs = [(rows, HIDDEN) for rows in DECODE_ROWS] + [(1, 320), (2, 320), (8, 256), (24, 256)]
+    for shape in graph_msgs:
+        static = torch.zeros(shape, dtype=torch.bfloat16, device=dev)
         graph = torch.cuda.CUDAGraph()
         with graph_capture(dev) as gc:
             ca.custom_all_reduce(static)  # warm-up, as vLLM's capture runs it
@@ -225,20 +247,22 @@ def main() -> None:
                 outs = [ca.custom_all_reduce(static) for _ in range(3)]
         for i in range(GRAPH_REPLAYS):
             kind = KINDS[i % len(KINDS)]
-            if pool is not None and i % 2:
-                x = _composed(pool, rows, rank, 77 * i + rows)
+            if pool is not None and i % 2 and shape[1] == HIDDEN:
+                x = _composed(pool, shape[0], rank, 77 * i + shape[0])
                 kind = "composed"
             else:
-                x = _partial(kind, rows, rank, 77 * i + rows, dev)
+                rows = -(-shape[0] * shape[1] // HIDDEN)
+                x = _partial(kind, rows, rank, 77 * i + shape[0], dev).view(-1)[: static.numel()]
+                x = x.view(shape).contiguous()
             static.copy_(x)
             graph.replay()
             torch.cuda.synchronize()
             ref = ca._custom_all_reduce_base(x)
             torch.cuda.synchronize()
             ne = sum(_mismatch(o, ref) for o in outs)
-            cases.append({"group": "graph", "name": f"rows{rows}-{kind}-r{i}",
-                          "bytes": x.nbytes, "route": "z" if ca._flags_z_takes(x) else "flags",
-                          "cand_ne": ne, "z_ne": 0, "inc_ne_live": 0,
+            cases.append({"group": "graph", "name": f"{shape}-{kind}-r{i}",
+                          "bytes": x.nbytes, "route": route_of(x),
+                          "cand_ne": ne, "z_ne": 0, "one_ne": 0, "inc_ne_live": 0,
                           "input_unchanged": True, "ranks_agree": True})
         del graph
 
@@ -248,29 +272,35 @@ def main() -> None:
     if rank == 0:
         all_cases = [c for r in by_rank for c in r["cases"]]
         ran = [c for c in all_cases if not c.get("skipped")]
-        bad = [c for c in ran if c["cand_ne"] or c["z_ne"] or c["inc_ne_live"]
+        bad = [c for c in ran if c["cand_ne"] or c["z_ne"] or c["one_ne"] or c["inc_ne_live"]
                or not c["input_unchanged"] or not c["ranks_agree"]]
-        # Word 0 of an error record is set when a wait timed out (custom_all_reduce_flags.describe).
+        # Word 0 of an error record is set when a wait timed out
+        # (custom_all_reduce_flags.describe).
         no_errors = all(not rec[0] for r in by_rank for rec in r["errors"])
+        routes_all = ("one_shot", "flags", "z", "custom")
         groups = sorted({c["group"] for c in ran})
         for g in groups:
             gc_ = [c for c in ran if c["group"] == g]
-            routes = {r: sum(c["route"] == r for c in gc_) for r in ("flags", "z", "custom")}
-            print(f"{g:9s} cases {len(gc_):5d} routes {routes} "
+            routes = {r: sum(c["route"] == r for c in gc_) for r in routes_all}
+            routes = {r: n for r, n in routes.items() if n}
+            print(f"{g:15s} cases {len(gc_):5d} routes {routes} "
                   f"bad {sum(c in bad for c in gc_)}", flush=True)
         real = [c for c in ran if c["group"] == "real"]
-        z_for_upstream = sum(
-            c["route"] == "z" and c["bytes"] > config["flags_max_bytes"] for c in ran
-        )
-        ok = (not bad and no_errors and z_for_upstream > 0
+        counts = {
+            "z_for_upstream": sum(c["route"] == "z" and c["bytes"] > config["flags_max_bytes"]
+                                  for c in ran),
+            "one_shot": sum(c["route"] == "one_shot" for c in ran),
+            "one_forced": sum(bool(c.get("one_forced")) for c in ran),
+        }
+        ok = (not bad and no_errors and counts["z_for_upstream"] > 0 and counts["one_shot"] > 0
               and (not args.real or len(real) == world * len(idx["cases"])))
         print(f"Z_BITS {'PASS' if ok else 'FAIL'}: {len(ran)} case-ranks, {len(bad)} bad, "
               f"real {len(real) // world}, wait errors {'none' if no_errors else 'SET'}; "
-              f"config {config}", flush=True)
+              f"counts {counts}; config {config}", flush=True)
         with open(args.out, "w") as f:
             json.dump({"pass": ok, "config": config, "bad": bad[:50], "no_errors": no_errors,
-                       "real_calls": len(real) // world, "cases": len(ran),
-                       "z_for_upstream": z_for_upstream}, f, indent=1)
+                       "real_calls": len(real) // world, "cases": len(ran), **counts},
+                      f, indent=1)
     dist.barrier()
     dist.destroy_process_group()
 

@@ -58,31 +58,44 @@ peer-to-peer custom all-reduce. Messages above
 allreduce/flags_max_bytes in the sm80 tuning table (default 256 KiB, the
 largest measured) and other dtypes keep the incumbent kernel.
 
-Compressed wire format (four ranks)
------------------------------------
+Compressed wire format and one-shot (four ranks)
+------------------------------------------------
 ``two_shot_z`` (``FlagsAllreduce(..., compressed=True)``, taken by
 ``VLLM_SM80_ALLREDUCE_COMPRESS``, communicator.py) runs the same two shots
 and the same owner-order FP32 sums, but moves each partition as warp blocks of
-31 packs (248 values) in a lossless format: a per-block base exponent, and per
-value the sign, the 7-bit mantissa and a 4-bit exponent code (0 = exponent
-field 0, i.e. +-0 and subnormals); a block whose nonzero exponents span more
-than 14 codes or include 255 (Inf, NaN) goes raw. A compressed block is 384
-bytes for 248 values (12.4 bits per value, 23 % fewer link bytes than raw).
-Every partial a rank receives is the bits its peer sent, so every sum, and
-every output bit, is the uncompressed kernel's. No encoded word is the
-sentinel (each word's low nibble is a code <= 14). One warp encodes, or
-receives and decodes, one (block, peer) pair: encode and decode are dependent
-ALU chains that few warps cannot hide at decode sizes. Source: the all-reduce
-search (ampere-kernels dsv41_allreduce_tp4, candidate 0759c60ca9cc):
-the section from "Lossless compressed wire format" through ``two_shot_z``,
-and ``all_reduce_z``, are its flags.cu text verbatim, less the helpers the
-uncompressed kernel above already defines (ld_volatile16, st_volatile16,
-dirty, Pack); the uncompressed kernel's text is unchanged.
+31 packs (248 values) in a lossless format (v2): the block's largest exponent
+field T and a mask of wide lanes (5 header bytes), per value the sign and
+7-bit mantissa (one byte), and per 8-value lane a code stream of 3 bits per
+value (narrow: exponent T - c, every value within 7 octaves of T and none
+with exponent field 0) or 4 bits (wide: 0 = exponent field 0, i.e. +-0 and
+subnormals, c > 0 = exponent T + 1 - c). The slot carries 22 to 24 whole
+16-byte quads (raw: 32); a block with exponent 255 (Inf, NaN), a value more
+than 14 octaves below T, or an encoded word equal to the sentinel goes raw.
+Served data: ~27 % fewer link bytes than raw. Every partial a rank receives
+is the bits its peer sent, so every sum, and every output bit, is the
+uncompressed kernel's. One warp encodes, or receives and decodes, one
+(block, peer) pair through a per-warp shared-memory scratch.
 
-On 4x CMP 170HX (b2b CUDA-graph replay, per call, uncompressed ->
-compressed): 1 row x0.91, 2 rows x0.84, 4 rows x1.03, 8 rows x1.19, 24 rows
-x1.27, 48 rows x1.38 (5120-wide rows): below allreduce/flags_raw_max_bytes
-(32 KiB) the uncompressed kernel stays cheaper per call.
+``one_shot<4>`` (``all_reduce(..., one_shot=True)``, taken by the same switch
+for messages up to allreduce/flags_one_shot_max_bytes): every rank pushes its
+whole sanitized message to every peer and sums all four partials of every
+element itself in the element's two-shot owner order (owner = the partition
+holding it), rounded once: the two-shot's bits with one flag latency instead
+of two. It shares the flags-in-data buffers, stage rotation and refill
+bookkeeping of ``two_shot`` (it uses the stage prefix [0, 4 size)).
+
+Source: the all-reduce search (ampere-kernels dsv41_allreduce_tp4, candidate
+40bfe0649217, its best): KERNEL_SRC from "Lossless compressed wire format v2"
+on is its wire.cuh (less Pack, defined above) and flags.cu (store_block,
+recv_blocks2, one_shot, two_shot_z) verbatim; ``all_reduce_z`` and the
+one-shot launch rule are its bindings'. The uncompressed kernel's text is
+unchanged.
+
+On 4x CMP 170HX (CUDA-graph replay, per call): uncompressed two-shot ->
+one-shot 640 B 8.5 -> 6.2 us, 4 KiB 9.2 -> 7.2, 8 KiB 9.6 -> 9.1, 10 KiB
+10.0 -> 10.2 (the one-shot's 3x egress); compressed v2 against uncompressed
+loses at 1-2 rows of 5120, ties at 3-5 and wins from 6: below
+allreduce/flags_raw_max_bytes (32 KiB) the uncompressed kernels stay.
 
 Safety
 ------
@@ -440,35 +453,13 @@ template __global__ void two_shot<4>(Ptrs, const uint4* __restrict__,
                                      uint4* __restrict__, Epoch*, int, int, int,
                                      unsigned long long, long long*);
 
-// Lossless compressed wire format. A warp moves one block of 31 packs (248
-// BF16 values) of a partition per step: lane l < 31 carries pack l, lane 31 the
-// block header triple (header, 0, 0[, 0]). Lane l's words go to slot position
-// 3 * ((l + 1) & 31) + k (compressed) or 4 * ((l + 1) & 31) + k (raw), so the
-// header is always word 0, and the block leaves as one contiguous store per
-// peer (24 or 32 lanes of 16 bytes; peer writes cost per request).
-//   compressed (header = base exponent, 1..254; 3 words per lane): per value
-//     the sign and 7-bit mantissa (one byte) and a 4-bit exponent code, 0 =
-//     exponent field 0 (+-0, subnormals), c in 1..14 = exponent base + c - 1.
-//     w0 = codes 0-2 | bytes bits 0-19 << 12, w1 = codes 3-5 | bytes bits
-//     20-39 << 12, w2 = codes 6-7 | bytes bits 40-63 << 8. Each word's low
-//     nibble is a code <= 14, so no word is the sentinel.
-//   raw (header kRawHeader; 4 words per lane): the sanitized pack; a block
-//     whose nonzero exponents span more than 14 codes or hold 255.
-// Every word is checked for the sentinel on receipt, so no store ordering is
-// assumed.
+// Lossless compressed wire format v2 and the kernels that use it (four ranks,
+// VLLM_SM80_ALLREDUCE_COMPRESS). From here to the end of the namespace: the
+// all-reduce search's wire.cuh (less Pack, defined above) and its flags.cu
+// store_block, recv_blocks2, one_shot and two_shot_z, verbatim.
 constexpr int kLanes = 32;
 constexpr int kBlockPacks = 31;
 constexpr int kSlotWords = 4 * kLanes;
-constexpr uint32_t kRawHeader = 0x100u;
-constexpr uint32_t kMaxSpan = 13;
-
-AFD uint32_t pick3(uint32_t a, uint32_t b, uint32_t c, int k) {
-  return k == 0 ? a : (k == 1 ? b : c);
-}
-
-AFD uint32_t pick4(const uint4& v, int k) {
-  return k == 0 ? v.x : (k == 1 ? v.y : (k == 2 ? v.z : v.w));
-}
 
 AFD uint4 shfl4(const uint4& v, int src) {
   return make_uint4(__shfl_sync(0xFFFFFFFFu, v.x, src), __shfl_sync(0xFFFFFFFFu, v.y, src),
@@ -480,127 +471,164 @@ AFD uint32_t half_of(const uint4& v, int i) {
   return (i & 1) ? (w >> 16) : (w & 0xFFFFu);
 }
 
-// Warp-collective (all 32 lanes). v: this lane's sanitized pack (zero for lane
-// 31 and for lanes past the partition). Returns the rows to store (3 or 4).
-AFD int encode_block(const uint4& v, int lane, uint32_t (&w)[4]) {
-  uint32_t lo = 255u, hi = 0u;
-#pragma unroll
-  for (int i = 0; i < 8; i++) {
-    const uint32_t e = (half_of(v, i) >> 7) & 0xFFu;
-    if (e) {
-      lo = min(lo, e);
-      hi = max(hi, e);
-    }
-  }
-  lo = __reduce_min_sync(0xFFFFFFFFu, lo);
-  hi = __reduce_max_sync(0xFFFFFFFFu, hi);
-  const bool raw = hi == 255u || (hi != 0u && hi - lo > kMaxSpan);
-  const uint32_t base = hi ? lo : 1u;
-  if (lane == kLanes - 1) {
-    w[0] = raw ? kRawHeader : base;
-    w[1] = w[2] = w[3] = 0u;
-    return raw ? 4 : 3;
-  }
-  if (raw) {
-    w[0] = v.x;
-    w[1] = v.y;
-    w[2] = v.z;
-    w[3] = v.w;
-    return 4;
-  }
-  uint32_t C = 0u;
-  uint64_t B = 0ull;
-#pragma unroll
-  for (int i = 0; i < 8; i++) {
-    const uint32_t h = half_of(v, i);
-    const uint32_t e = (h >> 7) & 0xFFu;
-    const uint32_t c = e ? e - base + 1u : 0u;
-    const uint32_t byte = ((h >> 8) & 0x80u) | (h & 0x7Fu);
-    C |= c << (4 * i);
-    B |= static_cast<uint64_t>(byte) << (8 * i);
-  }
-  w[0] = (C & 0xFFFu) | static_cast<uint32_t>(B << 12);
-  w[1] = ((C >> 12) & 0xFFFu) | (static_cast<uint32_t>(B >> 20) << 12);
-  w[2] = (C >> 24) | (static_cast<uint32_t>(B >> 40) << 8);
-  w[3] = 0u;
-  return 3;
-}
-
-// Warp-collective: this lane's 16-byte share of the block slot (index `at`)
-// and whether it is stored (`rows` from encode_block: 3 compressed, 4 raw).
+// This lane's 16-byte share of a block slot (index `at`) and whether it is stored.
 struct Quad {
   uint4 v;
   int at;
   bool store;
 };
 
-AFD Quad pack_block(const uint32_t (&w)[4], int rows, int lane) {
-  if (rows == 4) return Quad{make_uint4(w[0], w[1], w[2], w[3]), (lane + 1) & (kLanes - 1), true};
-  uint32_t o[4];
+AFD void add_pack(float (&acc)[8], uint4 u) {
+  Pack x;
+  x.u = u;
 #pragma unroll
-  for (int t = 0; t < 4; t++) {
-    const int pos = 4 * lane + t;
-    const int from = (pos / 3 + kLanes - 1) & (kLanes - 1);
-    const uint32_t a = __shfl_sync(0xFFFFFFFFu, w[0], from);
-    const uint32_t b = __shfl_sync(0xFFFFFFFFu, w[1], from);
-    const uint32_t c = __shfl_sync(0xFFFFFFFFu, w[2], from);
-    o[t] = pick3(a, b, c, pos % 3);
+  for (int e = 0; e < 8; e++) acc[e] += __bfloat162float(x.h[e]);
+}
+
+// Format v2: one block of 31 packs per warp, in a slot of 128 words (a byte
+// stream):
+//   compressed: byte 0 = T, the block's largest exponent field (0..254, so
+//     word 0 is never the sentinel), bytes 1-4 = the wide-lane mask (bit l:
+//     lane l codes in 4 bits; bit 31 clear = compressed), words 2 + 2l and
+//     3 + 2l = lane l's sign / 7-bit mantissa bytes, and the code stream: the
+//     code fields in lane order, 3 bytes (8 x 3 bits) for a narrow lane, 4
+//     (8 x 4 bits) for a wide one; stream bytes 0-2 sit at slot bytes 5-7, byte
+//     k >= 3 at slot byte 253 + k. Wide code 0 = exponent field 0 (+-0,
+//     subnormals), c > 0 = exponent T + 1 - c; narrow code c = exponent T - c
+//     (a lane is narrow when it has no zero exponent field and every value is
+//     within 7 octaves of T). The slot carries z2_quads() whole quads
+//     (22..24; the tail is zero-padded: partial 16-byte stores cost more link
+//     time than the padding).
+//   raw (mask bit 31 set: quad 0 = (0, 0x80, 0, 0)): quad (l + 1) & 31 = lane
+//     l's sanitized pack. Taken when a value has exponent 255, a code would
+//     exceed 15, or a compressed word equals the sentinel.
+// The receiver checks every word it reads for the sentinel.
+constexpr uint32_t kZ2Sentinel = 0xFFFFFFFFu;
+constexpr uint32_t kZ2RawW1 = 0x80u;                              // word 1 of a raw slot's quad 0
+constexpr int kZ2FixedBytes = 256 + 3 * kBlockPacks - 3;         // 346: every lane narrow
+constexpr int kZ2PollQuads = (kZ2FixedBytes + kBlockPacks + 15) / 16;   // 24: the most a compressed slot has
+constexpr int kZ2Words = 128;                                   // warp scratch words
+
+AFD bool z2_raw(uint32_t w1) { return w1 & kZ2RawW1; }
+AFD uint32_t z2_mask(uint32_t w0, uint32_t w1) { return (w0 >> 8) | ((w1 & 0x7Fu) << 24); }
+AFD int z2_quads(uint32_t w0, uint32_t w1) {
+  return z2_raw(w1) ? kLanes : (kZ2FixedBytes + __popc(z2_mask(w0, w1)) + 15) >> 4;
+}
+AFD int z2_pos(int k) { return k < 3 ? 5 + k : 253 + k; }
+
+// Warp-collective. v: this lane's sanitized pack (zero for lane 31 and past
+// the partition); sm: the warp's kZ2Words scratch words. A compressed slot
+// longer than MaxQuads goes raw instead (raw word 0 is free for the caller).
+template <int MaxQuads = kZ2PollQuads>
+AFD Quad encode2(const uint4& v, int lane, uint32_t* sm) {
+  uint32_t T = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; i++) T = max(T, (half_of(v, i) >> 7) & 0xFFu);
+  T = __reduce_max_sync(0xFFFFFFFFu, T);
+  uint32_t maxc = 0u, c3 = 0u, c4 = 0u, b0 = 0u, b1 = 0u;
+  bool zero = false;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const uint32_t h = half_of(v, i);
+    const uint32_t e = (h >> 7) & 0xFFu;
+    const uint32_t c = e ? T + 1u - e : 0u;
+    const uint32_t byte = ((h >> 8) & 0x80u) | (h & 0x7Fu);
+    maxc = max(maxc, c);
+    zero |= e == 0u;
+    c3 |= ((c - 1u) & 7u) << (3 * i);
+    c4 |= c << (4 * i);
+    if (i < 4) b0 |= byte << (8 * i);
+    else b1 |= byte << (8 * (i - 4));
   }
-  return Quad{make_uint4(o[0], o[1], o[2], o[3]), lane, lane < 3 * kLanes / 4};
+  if (T != 255u && !__any_sync(0xFFFFFFFFu, maxc > 15u)) {
+    const bool wide = zero || maxc > 8u;
+    const uint32_t mask = __ballot_sync(0xFFFFFFFFu, wide) & 0x7FFFFFFFu;
+    sm[64 + lane] = 0u;
+    if (lane == kLanes - 1) sm[1] = mask >> 24;
+    __syncwarp();
+    if (lane < kBlockPacks) {
+      sm[2 + 2 * lane] = b0;
+      sm[3 + 2 * lane] = b1;
+      const int k = 3 * lane + __popc(mask & ((1u << lane) - 1u));
+      uint8_t* const by = reinterpret_cast<uint8_t*>(sm);
+      const uint32_t code = wide ? c4 : c3;
+      by[z2_pos(k)] = code & 0xFFu;
+      by[z2_pos(k + 1)] = (code >> 8) & 0xFFu;
+      by[z2_pos(k + 2)] = (code >> 16) & 0xFFu;
+      if (wide) by[z2_pos(k + 3)] = code >> 24;
+    } else {
+      sm[0] = T | (mask << 8);
+    }
+    __syncwarp();
+    const int nq = (kZ2FixedBytes + __popc(mask) + 15) >> 4;
+    const bool store = lane < nq;
+    uint4 q = make_uint4(0u, 0u, 0u, 0u);
+    if (store) q = reinterpret_cast<const uint4*>(sm)[lane];
+    const bool bad = store && (q.x == kZ2Sentinel || q.y == kZ2Sentinel ||
+                               q.z == kZ2Sentinel || q.w == kZ2Sentinel);
+    __syncwarp();
+    if (nq <= MaxQuads && !__any_sync(0xFFFFFFFFu, bad)) return Quad{q, lane, store};
+  }
+  if (lane == kLanes - 1) return Quad{make_uint4(0u, kZ2RawW1, 0u, 0u), 0, true};
+  return Quad{v, lane + 1, true};
+}
+
+// Warp-collective: lane l's pack from the received slot (lane j holds quad j;
+// w0, w1 = its words 0 and 1). sm: the warp's scratch.
+AFD uint4 decode2(const uint4& got, uint32_t w0, uint32_t w1, int lane, uint32_t* sm) {
+  if (z2_raw(w1)) return shfl4(got, (lane + 1) & (kLanes - 1));
+  reinterpret_cast<uint4*>(sm)[lane] = got;
+  __syncwarp();
+  uint32_t o4[4] = {0u, 0u, 0u, 0u};
+  if (lane < kBlockPacks) {
+    const uint32_t T = w0 & 0xFFu, mask = z2_mask(w0, w1);
+    const uint32_t b0 = sm[2 + 2 * lane], b1 = sm[3 + 2 * lane];
+    const bool wide = (mask >> lane) & 1u;
+    uint32_t code;
+    if (lane == 0) {
+      code = (w1 >> 8) | (static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(sm)[256]) << 24);
+    } else {
+      const int o = 253 + 3 * lane + __popc(mask & ((1u << lane) - 1u));
+      code = __funnelshift_r(sm[o >> 2], sm[(o >> 2) + 1], 8 * (o & 3));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const uint32_t byte = ((i < 4 ? b0 : b1) >> (8 * (i & 3))) & 0xFFu;
+      uint32_t e;
+      if (wide) {
+        const uint32_t c = (code >> (4 * i)) & 0xFu;
+        e = c ? T + 1u - c : 0u;
+      } else {
+        e = T - ((code >> (3 * i)) & 0x7u);
+      }
+      const uint32_t h = ((byte & 0x80u) << 8) | (e << 7) | (byte & 0x7Fu);
+      o4[i >> 1] |= h << (16 * (i & 1));
+    }
+  }
+  __syncwarp();
+  return make_uint4(o4[0], o4[1], o4[2], o4[3]);
 }
 
 AFD void store_block(uint32_t* slot, const Quad& q) {
   if (q.store) st_volatile16(reinterpret_cast<uint4*>(slot) + q.at, q.v);
 }
 
-AFD uint4 decode_block(const uint32_t (&w)[4], uint32_t hdr) {
-  if (hdr & kRawHeader) return make_uint4(w[0], w[1], w[2], w[3]);
-  const uint32_t C = (w[0] & 0xFFFu) | ((w[1] & 0xFFFu) << 12) | ((w[2] & 0xFFu) << 24);
-  const uint64_t B = static_cast<uint64_t>(w[0] >> 12) |
-                     (static_cast<uint64_t>(w[1] >> 12) << 20) |
-                     (static_cast<uint64_t>(w[2] >> 8) << 40);
-  uint32_t o[4] = {0u, 0u, 0u, 0u};
-#pragma unroll
-  for (int i = 0; i < 8; i++) {
-    const uint32_t c = (C >> (4 * i)) & 0xFu;
-    const uint32_t byte = static_cast<uint32_t>(B >> (8 * i)) & 0xFFu;
-    const uint32_t e = c ? c + hdr - 1u : 0u;
-    const uint32_t h = ((byte & 0x80u) << 8) | (e << 7) | (byte & 0x7Fu);
-    o[i >> 1] |= h << (16 * (i & 1));
-  }
-  return make_uint4(o[0], o[1], o[2], o[3]);
-}
-
-// Warp-collective: lane l's words from the received quads (lane j holds slot
-// quad j), then decoded.
-AFD uint4 unpack_block(const uint4& got, uint32_t hdr, int lane) {
-  const int me = (lane + 1) & (kLanes - 1);
-  if (hdr & kRawHeader) return shfl4(got, me);
-  uint32_t w[4];
-#pragma unroll
-  for (int k = 0; k < 3; k++) {
-    const int pos = 3 * me + k;
-    w[k] = pick4(shfl4(got, pos >> 2), pos & 3);
-  }
-  w[3] = 0u;
-  return decode_block(w, hdr);
-}
-
-// Warp-collective: receives and decodes block slots src[p] for the active
-// sources (warp-uniform), polling every outstanding quad of every source.
+// Format v2 receive (above): polls quads 0..kZ2PollQuads-1 of every active
+// source (a compressed slot has at most that many), then, once the header
+// (words 0, 1) is in, exactly the slot's quads.
 template <int N>
-AFD void recv_blocks(const uint32_t* const (&src)[N], const bool (&active)[N],
-                     const int (&peer)[N], int lane, int phase, uint4 (&out)[N],
-                     const WaitCtx& c) {
+AFD void recv_blocks2(const uint32_t* const (&src)[N], const bool (&active)[N],
+                      const int (&peer)[N], int lane, int phase, uint4 (&out)[N],
+                      uint32_t* sm, const WaitCtx& c) {
   uint4 got[N];
   bool need[N];
-  uint32_t hdr[N];
+  uint32_t hdr[N], mask[N];
   bool known[N];
 #pragma unroll
   for (int p = 0; p < N; p++) {
-    need[p] = active[p] && lane < 3 * kLanes / 4;
+    need[p] = active[p] && lane < kZ2PollQuads;
     known[p] = !active[p];
-    hdr[p] = 0u;
+    hdr[p] = mask[p] = 0u;
     got[p] = make_uint4(0u, 0u, 0u, 0u);
   }
   const unsigned long long t0 = now_ns();
@@ -621,10 +649,14 @@ AFD void recv_blocks(const uint32_t* const (&src)[N], const bool (&active)[N],
       if (!known[p]) {
         const bool ready = __shfl_sync(0xFFFFFFFFu, !need[p], 0);
         const uint32_t h = __shfl_sync(0xFFFFFFFFu, got[p].x, 0);
+        const uint32_t m = __shfl_sync(0xFFFFFFFFu, got[p].y, 0);
         if (ready) {
           known[p] = true;
           hdr[p] = h;
-          if ((h & kRawHeader) && lane >= 3 * kLanes / 4) need[p] = true;
+          mask[p] = m;
+          const int nq = z2_quads(h, m);
+          if (lane >= nq) need[p] = false;
+          else if (lane >= kZ2PollQuads) need[p] = true;
         }
       }
       pending |= need[p] || !known[p];
@@ -641,15 +673,72 @@ AFD void recv_blocks(const uint32_t* const (&src)[N], const bool (&active)[N],
   }
 #pragma unroll
   for (int p = 0; p < N; p++)
-    if (active[p]) out[p] = unpack_block(got[p], hdr[p], lane);
+    if (active[p]) out[p] = decode2(got[p], hdr[p], mask[p], lane, sm);
 }
 
-AFD void add_pack(float (&acc)[8], uint4 u) {
-  Pack x;
-  x.u = u;
+
+// One-shot for tiny messages (one flag latency instead of two): every rank
+// pushes its whole sanitized message to every peer (area s at s*size) and sums
+// all R partials of every element itself, in the element's two-shot owner
+// order (owner = partition of the element, part_len), rounded once: the same
+// bits as two_shot. Shares the stage rotation and refill bookkeeping of
+// two_shot (the used region is the prefix [0, R*size) of the stage), so both
+// kernels may run on one buffer. stage_packs >= R*size.
+template <int R>
+__global__ void __launch_bounds__(512, 1)
+    one_shot(Ptrs bufs, const uint4* __restrict__ in, uint4* __restrict__ out,
+             Epoch* ep, int rank, int size, int stage_packs,
+             unsigned long long limit_ns, long long* err) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = gridDim.x * blockDim.x;
+  const int stage = ep->w[0];
+  const int dirty_stage = (stage + 2) % 3;
+  const int dirty_size = ep->w[2 + dirty_stage];
+  __syncthreads();
+  if (threadIdx.x == 0) atomicAdd(&ep->w[1], 1u);
+  const Regs<R> b(bufs);
+  const WaitCtx wc{ep, err, limit_ns, rank, stage, size};
+
+  for (int idx = tid; idx < size; idx += stride) {
+    const uint4 v = sanitize(in[idx]);
 #pragma unroll
-  for (int e = 0; e < 8; e++) acc[e] += __bfloat162float(x.h[e]);
+    for (int i = 1; i < R; i++) {
+      const int q = (rank + i) & (R - 1);
+      st_volatile16(reinterpret_cast<uint4*>(b[q]) + stage * stage_packs + rank * size + idx, v);
+    }
+  }
+
+  uint4* self = reinterpret_cast<uint4*>(b[rank]);
+  uint4* dirty_base = self + dirty_stage * stage_packs;
+  const uint4 sent = make_uint4(kSentinel, kSentinel, kSentinel, kSentinel);
+  for (int idx = tid; idx < dirty_size; idx += stride) dirty_base[idx] = sent;
+
+  const uint4* cur = self + stage * stage_packs;
+  const int part = size / R;
+  for (int idx = tid; idx < size; idx += stride) {
+    const int owner = part ? min(idx / part, R - 1) : R - 1;
+    const uint4 own = sanitize(in[idx]);
+    uint4 v[R];
+#pragma unroll
+    for (int s = 0; s < R; s++) v[s] = own;
+    wait_peers<R>(cur + idx, size, rank, v, wc);
+    out[idx] = sanitize(reduce_owner_order<R>(v, owner));
+  }
+
+  if (tid == 0) {
+    volatile uint32_t* arrived = &ep->w[1];
+    while (*arrived < gridDim.x) {
+    }
+    ep->w[2 + stage] = R * size;
+    ep->w[1] = 0;
+    ep->w[8] += 1;
+    ep->w[0] = (stage + 1) % 3;
+  }
 }
+
+template __global__ void one_shot<4>(Ptrs, const uint4* __restrict__,
+                                     uint4* __restrict__, Epoch*, int, int, int,
+                                     unsigned long long, long long*);
 
 // R = 4 ranks. size: message length in 16-byte packs. Per stage: 2R areas
 // (reduce-scatter from sender s = area s, all-gather from owner q = area R+q)
@@ -680,6 +769,8 @@ __global__ void __launch_bounds__(512, 1)
   uint32_t* const b2 = reinterpret_cast<uint32_t*>(bufs.p[2]) + stage * stage_words;
   uint32_t* const b3 = reinterpret_cast<uint32_t*>(bufs.p[3]) + stage * stage_words;
   const WaitCtx wc{ep, err, limit_ns, rank, stage, size};
+  __shared__ __align__(16) uint32_t scratch[512 / kLanes][kZ2Words];
+  uint32_t* const sm = scratch[warp];
 
   const int part = size / kRanks;
   const int L = part_len<kRanks>(kRanks - 1, size);
@@ -702,9 +793,7 @@ __global__ void __launch_bounds__(512, 1)
       const int idx = b * kBlockPacks + lane;
       const bool valid = lane < kBlockPacks && idx < len(q);
       const uint4 v = valid ? sanitize(in[q * part + idx]) : make_uint4(0u, 0u, 0u, 0u);
-      uint32_t w[4];
-      const int rows = encode_block(v, lane, w);
-      store_block(slot(q, rank, b), pack_block(w, rows, lane));
+      store_block(slot(q, rank, b), encode2(v, lane, sm));
     }
   }
 
@@ -723,7 +812,7 @@ __global__ void __launch_bounds__(512, 1)
       src[i - 1] = slot(rank, peer[i - 1], b);
       active[i - 1] = true;
     }
-    recv_blocks<kRanks - 1>(src, active, peer, lane, 1, v, wc);
+    recv_blocks2<kRanks - 1>(src, active, peer, lane, 1, v, sm, wc);
     float acc[8];
     {
       Pack x;
@@ -738,8 +827,7 @@ __global__ void __launch_bounds__(512, 1)
     for (int e = 0; e < 8; e++) red.h[e] = __float2bfloat16(acc[e]);
     const uint4 r = valid ? sanitize(red.u) : make_uint4(0u, 0u, 0u, 0u);
     if (valid) out[rank * part + idx] = r;
-    uint32_t w[4];
-    const Quad qd = pack_block(w, encode_block(r, lane, w), lane);
+    const Quad qd = encode2(r, lane, sm);
 #pragma unroll
     for (int i = 1; i < kRanks; i++)
       store_block(slot((rank + i) & (kRanks - 1), kRanks + rank, b), qd);
@@ -761,7 +849,7 @@ __global__ void __launch_bounds__(512, 1)
       const bool active[1] = {true};
       const int peer[1] = {q};
       uint4 v[1];
-      recv_blocks<1>(src, active, peer, lane, 2, v, wc);
+      recv_blocks2<1>(src, active, peer, lane, 2, v, sm, wc);
       if (lane < kBlockPacks && idx < len(q)) out[q * part + idx] = v[0];
     }
   }
@@ -789,7 +877,7 @@ BIND_SRC = r"""
 void all_reduce(torch::Tensor inp, torch::Tensor out, std::vector<int64_t> bufs,
                 int64_t epoch_ptr, int64_t rank, int64_t stage_packs,
                 int64_t threads, int64_t max_blocks, int64_t limit_ns,
-                int64_t err_dev_ptr) {
+                int64_t err_dev_ptr, bool one_shot) {
   TORCH_CHECK(inp.scalar_type() == at::kBFloat16 &&
               out.scalar_type() == at::kBFloat16);
   TORCH_CHECK(inp.numel() == out.numel());
@@ -801,15 +889,20 @@ void all_reduce(torch::Tensor inp, torch::Tensor out, std::vector<int64_t> bufs,
   int size = static_cast<int>(inp.nbytes() / 16);
   int L = ranks == 2 ? arflags::part_len<2>(1, size)
                      : arflags::part_len<4>(3, size);
-  TORCH_CHECK(2 * ranks * L <= stage_packs,
+  // one_shot (four ranks): the one-shot kernel, every rank's whole message in
+  // the stage prefix [0, 4 size); else the two-shot.
+  TORCH_CHECK(!one_shot || ranks == 4, "the one-shot kernel serves 4 ranks");
+  const int work = one_shot ? size : L;
+  TORCH_CHECK((one_shot ? ranks * size : 2 * ranks * L) <= stage_packs,
               "message larger than the flags buffer");
   int blocks = static_cast<int>(
-      std::min<int64_t>(max_blocks, (L + threads - 1) / threads));
+      std::min<int64_t>(max_blocks, (work + threads - 1) / threads));
   blocks = std::max(blocks, 1);
   arflags::Ptrs p;
   for (int i = 0; i < arflags::kMaxRanks; i++)
     p.p[i] = i < ranks ? reinterpret_cast<void*>(bufs[i]) : nullptr;
-  auto kernel = ranks == 2 ? arflags::two_shot<2> : arflags::two_shot<4>;
+  auto kernel = one_shot ? arflags::one_shot<4>
+                         : (ranks == 2 ? arflags::two_shot<2> : arflags::two_shot<4>);
   kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       p, reinterpret_cast<const uint4*>(inp.data_ptr()),
       reinterpret_cast<uint4*>(out.data_ptr()),
@@ -872,9 +965,7 @@ std::vector<int64_t> alloc_error_record() {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("all_reduce", &all_reduce, "flags-in-data two-shot all-reduce");
-  m.def("all_reduce_z", &all_reduce_z,
-        "flags-in-data two-shot all-reduce, compressed wire format");
+  m.def("all_reduce", &all_reduce, "flags-in-data two-shot (or one-shot) all-reduce");
   m.def("all_reduce_z", &all_reduce_z,
         "flags-in-data two-shot all-reduce, compressed wire format");
   m.def("fill_sentinel", &fill_sentinel, "fill a buffer with the sentinel");
@@ -999,11 +1090,11 @@ def stage_packs(max_bytes: int, world_size: int) -> int:
     return 2 * world_size * largest_part_packs(max_bytes, world_size)
 
 
-def launch_blocks(nbytes: int, world_size: int) -> int:
-    return max(
-        1,
-        min(MAX_BLOCKS, math.ceil(largest_part_packs(nbytes, world_size) / THREADS)),
-    )
+def launch_blocks(nbytes: int, world_size: int, one_shot: bool = False) -> int:
+    """One thread per pack of the largest partition (the one-shot: of the
+    whole message), :data:`THREADS` per block, at most :data:`MAX_BLOCKS`."""
+    work = nbytes // 16 if one_shot else largest_part_packs(nbytes, world_size)
+    return max(1, min(MAX_BLOCKS, math.ceil(work / THREADS)))
 
 
 def z_block_slots(max_bytes: int) -> int:
@@ -1047,6 +1138,8 @@ class FlagsAllreduce:
 
     ``compressed``: the compressed wire format (``two_shot_z``, four ranks);
     its own buffers, epoch and error record, sized for ``max_bytes``.
+    Uncompressed at four ranks, :meth:`all_reduce` may run the one-shot
+    kernel on the same buffers and epoch (``one_shot``).
     Construction is collective over `group` (IPC handle exchange, barrier).
     """
 
@@ -1083,7 +1176,10 @@ class FlagsAllreduce:
     def eligible(self, inp: torch.Tensor) -> bool:
         return inp.dtype == torch.bfloat16 and 0 < inp.nbytes <= self.max_bytes
 
-    def all_reduce(self, inp: torch.Tensor, out: torch.Tensor | None = None):
+    def all_reduce(self, inp: torch.Tensor, out: torch.Tensor | None = None,
+                   one_shot: bool = False):
+        """``inp``'s sum into ``out`` (a new tensor if None). ``one_shot``:
+        the one-shot kernel (uncompressed, four ranks; the two-shot's bits)."""
         if out is None:
             out = torch.empty_like(inp)
         if self.compressed:
@@ -1109,9 +1205,10 @@ class FlagsAllreduce:
                 self.rank,
                 self.stage_packs,
                 THREADS,
-                launch_blocks(inp.nbytes, self.world_size),
+                launch_blocks(inp.nbytes, self.world_size, one_shot),
                 self.limit_ns,
                 self.errors.dev_ptr,
+                one_shot,
             )
         self._calls += 1
         if self._calls % CHECK_EVERY == 0 and not torch.cuda.is_current_stream_capturing():

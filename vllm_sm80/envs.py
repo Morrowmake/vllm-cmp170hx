@@ -230,13 +230,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # With VLLM_SM80_ALLREDUCE, at TP4: the flags-in-data two-shot kernel's
     # lossless compressed wire format (custom_all_reduce_flags.py,
-    # two_shot_z: per 248-value block a base exponent, per value sign, 7-bit
-    # mantissa and a 4-bit exponent code, raw fallback per block) for the BF16
-    # messages above allreduce/flags_raw_max_bytes of the sm80 tuning table
-    # that the flags kernel takes, and, below the custom all-reduce's buffer
-    # size, those upstream's cross_device_reduce_2stage takes. Same
-    # partitions and owner-order FP32 sums, so bitwise the kernels it
-    # replaces; one more buffer set per rank (~50 MiB at the 8 MiB buffer).
+    # two_shot_z, format v2: per 248-value block the largest exponent, per
+    # value sign and 7-bit mantissa, per 8-value lane 3- or 4-bit exponent
+    # codes, raw fallback per block) for the BF16 messages above
+    # allreduce/flags_raw_max_bytes of the sm80 tuning table that the flags
+    # kernel takes, and, below the custom all-reduce's buffer size, those
+    # upstream's cross_device_reduce_2stage takes; the one-shot kernel for
+    # BF16 messages up to allreduce/flags_one_shot_max_bytes. Same partitions
+    # and the same owner-order FP32 sums, so bitwise the kernels they
+    # replace; one more buffer set per rank (~50 MiB at the 8 MiB buffer).
     # Hot-swap pair allreduce_compress. Default OFF: unset, nothing is built
     # and every message takes today's path.
     "VLLM_SM80_ALLREDUCE_COMPRESS": lambda: bool(
