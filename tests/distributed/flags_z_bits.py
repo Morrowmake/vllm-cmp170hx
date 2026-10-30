@@ -250,7 +250,8 @@ def main() -> None:
         ran = [c for c in all_cases if not c.get("skipped")]
         bad = [c for c in ran if c["cand_ne"] or c["z_ne"] or c["inc_ne_live"]
                or not c["input_unchanged"] or not c["ranks_agree"]]
-        no_errors = all(not any(w) for r in by_rank for rec in r["errors"] for w in rec[:1])
+        # Word 0 of an error record is set when a wait timed out (custom_all_reduce_flags.describe).
+        no_errors = all(not rec[0] for r in by_rank for rec in r["errors"])
         groups = sorted({c["group"] for c in ran})
         for g in groups:
             gc_ = [c for c in ran if c["group"] == g]
