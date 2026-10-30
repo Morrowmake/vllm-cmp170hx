@@ -2094,6 +2094,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
+        sm80.stage_ple_rows(
+            self, input_batch, model_inputs, batch_desc.cg_mode, dummy_run
+        )
 
         # Update the EPLB meta.
         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
@@ -2172,6 +2175,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states = None
             aux_hidden_states = None
             output_intermediate_tensors = model_output
+        sm80.relay_failed_tokens(
+            self, model_inputs["intermediate_tensors"], output_intermediate_tensors
+        )
 
         finished_req_ids = scheduler_output.finished_req_ids
         # Propose no drafts (K=0) when no DP rank's scheduled requests can use them.
@@ -2310,7 +2316,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
-            failed_tokens=sm80.take_failed_tokens(self.model),
+            failed_tokens=sm80.failed_tokens(self),
             query_start_loc_np=input_batch.query_start_loc_np,
         )
 
