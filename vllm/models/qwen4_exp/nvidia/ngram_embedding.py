@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter, sp_shard
+from vllm_sm80.models.qwen4_exp import ple_staging
 from vllm.utils.math_utils import round_up
 
 from ..common.ngram_embedding import (
@@ -220,7 +221,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
-        embedding_cls = getattr(quant_config, "ple_embedding_cls", embedding_cls)
+        embedding_cls = ple_staging.embedding_cls(quant_config, embedding_cls)
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
