@@ -8,11 +8,13 @@
   finite code in every lane: each weight is the FP64 value of the code times
   2**(e-127) (0 with the code's sign for e = 0, Marlin's convention), and
   every multiply in it is exact.
-- The kernel compiled for sm_80 at every row tile: BF16 MMA with FP32
-  accumulation and none computed twice, every weight of a decode-sized call
-  decoded once per K step (twice in the prefill tiles, whose warps are
-  stacked along the rows), one rounding to BF16 at the store, no flush to
-  zero, no spills.
+- The kernel compiled for sm_80 at every row tile, plain and as the served
+  calls specialise it (aligned pointers and strides): BF16 MMA with FP32
+  accumulation and none computed twice, the MMA operands in the layout of
+  8-bit sources, every weight of a decode-sized call decoded once per K step
+  (twice in the prefill tiles, whose warps are stacked along the rows), one
+  rounding to BF16 at the store, no flush to zero, no spills; the block that
+  follows the impure (decode-once) decode only copies.
 - The host side: one launch over every group with the input's row and group
   strides (a row-padded or strided attention output is read in place), the
   output the only allocation, the row tiles and grid.
@@ -182,28 +184,19 @@ def _ptxas():
     return os.path.join(os.path.dirname(triton.__file__), "backends/nvidia/bin/ptxas")
 
 
-# A known Triton 3.8 regression: the second layout pass rematerialises the
-# weight decode into one dot's operand layout at MT=3 and MT=4.
-_DECODED_TWICE = pytest.mark.xfail(
-    strict=True,
-    reason="release-blocker:dsv41-flash: Triton 3.8 decodes the weights twice "
-    "per K step at 33-64 rows (layout rematerialisation); blocks the next "
-    "dsv41-flash release",
-)
+def test_copy_with_codes_is_a_copy():
+    """The block after an impure decode only copies the decoded weights."""
+    body = wg._COPY_WITH_CODES_ASM.value
+    assert [line.split() for line in body.strip(" ;").split(";")] == [
+        ["mov.b32", "$0,", "$2"], ["mov.b32", "$1,", "$3"],
+    ]  # fmt: skip
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        pytest.param(
-            c,
-            id=f"rows{c[0]}",
-            marks=_DECODED_TWICE if c[0] in (48, 64) else (),
-        )
-        for c in wg.CONFIGS
-    ],
-)
-def test_kernel_compiles_for_sm80(tmp_path, config):
+@pytest.mark.parametrize("served", [False, True], ids=["plain", "served"])
+@pytest.mark.parametrize("config", wg.CONFIGS, ids=lambda c: f"rows{c[0]}")
+def test_kernel_compiles_for_sm80(tmp_path, config, served):
+    """``served``: as the JIT specialises the served calls, every pointer and
+    both strides divisible by 16 (the K loop then pipelines its loads)."""
     import triton
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -214,12 +207,20 @@ def test_kernel_compiles_for_sm80(tmp_path, config):
              "M": "i32", "stride_xm": "i32", "stride_xg": "i32"}
     sig = {p: types.get(p, "constexpr") for p in kern.arg_names}
     consts = dict(G=2, R=1024, D=4096, BM=bm, MT=mt, BN=bn, BK=bk)
-    c = triton.compile(ASTSource(kern, sig, constexprs=consts),
+    aligned = ("x_ptr", "w_ptr", "s_ptr", "o_ptr", "stride_xm", "stride_xg")
+    attrs = {(i,): [["tt.divisibility", 16]]
+             for i, p in enumerate(kern.arg_names) if served and p in aligned}
+    c = triton.compile(ASTSource(kern, sig, constexprs=consts, attrs=attrs),
                        target=GPUTarget("cuda", 80, 32),
                        options={"num_warps": warps, "num_stages": stages})
     ptx = c.asm["ptx"]
+    assert ("cp.async" in ptx) == served
     mma = re.findall(r"mma\.sync\.aligned\.([a-z0-9.]+)", ptx)
     assert set(mma) == {"m16n8k16.row.col.f32.bf16.bf16.f32"}
+    # The MMA operands in the layout of 8-bit sources (4 consecutive K per
+    # thread): which K of a step meets which in an MMA does not change.
+    assert set(re.findall(r"opIdx = [01], parent = #mma, kWidth = (\d+)",
+                          c.asm["ttgir"])) == {"4"}
     # One K step of the row block in m16n8k16 MMAs over the warps, none twice.
     assert len(mma) * warps == (bm * mt // 16) * (bn // 8) * (bk // 16)
     # The weights of the step, 4 per decode block per thread: decoded once
