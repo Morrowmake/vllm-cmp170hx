@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
     VLLM_EXL3_MOE_EXPERT_ROTATION: bool = False
+    VLLM_EXL3_FAST_LOAD: bool = False
     VLLM_SM80_TUNING_FILE: str = ""
     VLLM_SM80_CAPTURE: str = ""
     VLLM_SM80_REPLAY_DIR: str = ""
@@ -1203,6 +1204,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_EXPERTS_CONTIGUOUS": lambda: bool(
         int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
     ),
+    # EXL3 weight loading, same bytes loaded (vllm_sm80/kernels/exl3/loader.py):
+    # (1) the plain tensors' model.load_weights calls (one per tensor) run with
+    # the routed experts' packed weights out of the module tree
+    # (loader.routed_experts_hidden), so the model's named_parameters() walks
+    # on every call skip their parameters (138k of a tensor-split
+    # DeepSeek-V4.1-Flash rank, 35k at EP4); (2) a thread reads the checkpoint
+    # spans of the next weights into the page cache (posix_fadvise WILLNEED,
+    # up to 4 GiB ahead, vllm_sm80/kernels/exl3/readahead.py), so the copies
+    # from the mapped files find them cached instead of faulting them in
+    # 128 KiB at a time. Default OFF.
+    "VLLM_EXL3_FAST_LOAD": lambda: bool(int(os.getenv("VLLM_EXL3_FAST_LOAD", "0"))),
     # EXL3 routed experts split across the tensor-parallel ranks (no
     # --enable-expert-parallel; quant.py tensor_parallel_expert_split): rank r
     # holds chunk (r + L + e) mod the tensor parallel size of expert e in layer

@@ -129,6 +129,27 @@ expert's width; a rank's partial output sums other chunks of the row's experts
 than without the switch before its BF16 rounding and the all-reduce, so the
 MoE output differs in the last bits.
 
+`VLLM_EXL3_FAST_LOAD=1` (default `0`) makes the loader faster without changing
+a loaded byte; it matters most for tensor-split routed experts, whose ranks
+hold four times the expert parameters and copy column chunks:
+
+- The plain (non-EXL3) tensors are loaded with one `model.load_weights` call
+  each, and DeepSeek-V4's `load_weights` walks `model.named_parameters()`
+  twice per call (its `params_dict` and the expert mapping's LoRA scan). With
+  the switch the routed experts' packed weights, all loaded by then and the
+  target of no plain tensor, are out of the module tree for those calls
+  (`loader.routed_experts_hidden`): a tensor-split DeepSeek-V4.1-Flash rank
+  holds 138k of them (three per expert matrix), 35k at EP4.
+- A thread beside the loader reads the checkpoint spans of the next loads into
+  the page cache (`posix_fadvise(WILLNEED)` in pieces of the device's
+  max(`read_ahead_kb`, `max_sectors_kb`), in the loader's order, up to 4 GiB
+  ahead; `vllm_sm80/kernels/exl3/readahead.py`). Without it the copies from
+  the memory-mapped files fault their pages in one 128 KiB read-around at a
+  time; a tensor-split rank copies a column chunk of every row of every gate
+  and up trellis, so it faults in whole tensors that way, and the four ranks
+  of a TP4 boot wait on the same faults. The copies are unchanged: same bytes
+  from the same mapped files.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.

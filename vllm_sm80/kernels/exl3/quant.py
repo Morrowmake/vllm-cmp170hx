@@ -465,6 +465,42 @@ class Exl3PackedWeight(nn.Module):
             ledger.mark(key, "consumed", prefix)
         self.loaded = True
 
+    def source_extents(self, manifest) -> list[tuple[Path, int, int]]:
+        """(file, first byte, end byte) of each checkpoint span load() copies
+        from: per output slice the trellis bytes from its first column in the
+        first input row to its last column in the last input row, and the suh
+        and svh slices (VLLM_EXL3_FAST_LOAD reads them into the page cache
+        ahead of load())."""
+        prefix = self.matrix.prefix
+        header = manifest.tensors[f"{prefix}.trellis"]
+        row = header.nbytes // header.shape[0]
+        tile = row // header.shape[1]
+        first = header.offset + self.input_slice.start // 16 * row
+        last = header.offset + (self.input_slice.stop // 16 - 1) * row
+        extents = [
+            (
+                header.path,
+                first + part.start // 16 * tile,
+                last + part.stop // 16 * tile,
+            )
+            for part in self.output_slices
+        ]
+        for suffix, slices in (
+            ("suh", [self.input_slice]),
+            ("svh", self.output_slices),
+        ):
+            header = manifest.tensors[f"{prefix}.{suffix}"]
+            item = header.nbytes // header.shape[0]
+            extents.extend(
+                (
+                    header.path,
+                    header.offset + part.start * item,
+                    header.offset + part.stop * item,
+                )
+                for part in slices
+            )
+        return extents
+
 
 class Exl3LinearMethod(LinearMethodBase):
     def __init__(self, matrices: list[PackedMatrix], uneven: bool = False):
