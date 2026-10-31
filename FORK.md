@@ -106,10 +106,11 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm_sm80/kernels/exl3/dense_prefill_tc.py` | 354 |
 | `vllm_sm80/kernels/exl3/hybrid.py` | 133 |
 | `vllm_sm80/kernels/exl3/layout.py` | 108 |
-| `vllm_sm80/kernels/exl3/loader.py` | 230 |
+| `vllm_sm80/kernels/exl3/loader.py` | 307 |
 | `vllm_sm80/kernels/exl3/ops.py` | 1,511 |
 | `vllm_sm80/kernels/exl3/override.py` | 128 |
-| `vllm_sm80/kernels/exl3/quant.py` | 1,898 |
+| `vllm_sm80/kernels/exl3/quant.py` | 1,934 |
+| `vllm_sm80/kernels/exl3/readahead.py` | 143 |
 | `vllm_sm80/kernels/exl3/step_phase.py` | 100 |
 | `vllm_sm80/kernels/exl3/utils.py` | 401 |
 | `vllm_sm80/kernels/idx_glue_gate.py` | 75 |
@@ -145,7 +146,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm_sm80/kernels/thin_gemm/warmup.py` | 154 |
 | `vllm_sm80/kernels/warmup.py` | 132 |
 | `vllm_sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **19,076** |
+| **55 files** | **19,332** |
 
 ### `vllm_sm80/launch/`
 
@@ -195,7 +196,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm_sm80/distributed/step_errors.py` | 167 |
 | `vllm_sm80/engine_args.py` | 103 |
-| `vllm_sm80/envs.py` | 1,707 |
+| `vllm_sm80/envs.py` | 1,719 |
 | `vllm_sm80/failed_inputs.py` | 175 |
 | `vllm_sm80/fla/__init__.py` | 2 |
 | `vllm_sm80/fla/autotune_pins.py` | 210 |
@@ -265,7 +266,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **86 files** | **24,763** |
+| **86 files** | **24,775** |
 
 ### `csrc/exl3/`
 
@@ -371,9 +372,9 @@ Grouped by top-level directory.
 |---|---:|
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
-| `docs/features/quantization/exl3.md` | 165 |
+| `docs/features/quantization/exl3.md` | 186 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 168 |
-| **4 files** | **529** |
+| **4 files** | **550** |
 
 #### `licenses/`
 
@@ -414,6 +415,7 @@ Grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_expert_buffers.py` | 295 |
 | `tests/kernels/quantization/test_exl3_expert_rotation.py` | 636 |
 | `tests/kernels/quantization/test_exl3_expert_split.py` | 511 |
+| `tests/kernels/quantization/test_exl3_fast_load.py` | 276 |
 | `tests/kernels/quantization/test_exl3_fp32_out.py` | 213 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 324 |
 | `tests/kernels/quantization/test_exl3_kernels.py` | 369 |
@@ -504,6 +506,7 @@ Grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica.py` | 459 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica_gpu.py` | 113 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
+| `tests/models/deepseek_v41/sm80/test_exl3_fast_load_model.py` | 81 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 379 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 1,287 |
 | `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
@@ -693,7 +696,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **306 files** | **128,356** |
+| **308 files** | **128,713** |
 
 #### `tools/`
 
@@ -845,6 +848,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE` | `str` | `'planned'` | `'planned'` |
 | `VLLM_EXL3_DENSE_SPLITK` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_EXPERTS_CONTIGUOUS` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_FAST_LOAD` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_HYBRID` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_EXPERT_ROTATION` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
@@ -913,7 +917,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **114 variables** | | | |
+| **115 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -929,14 +933,14 @@ Functions, methods and classes in plugin product files whose name occurs nowhere
 | `vllm_sm80/distributed/ce_ring_all_reduce.py` | 98 | `emulate_owner` | 7 | yes |
 | `vllm_sm80/kernels/exl3/quant.py` | 145 | `get_config_filenames` | 3 | no |
 | `vllm_sm80/kernels/exl3/quant.py` | 149 | `override_quantization_method` | 15 | yes |
-| `vllm_sm80/kernels/exl3/quant.py` | 1612 | `activation_format` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1616 | `_supports_current_device` | 5 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1622 | `_supports_no_act_and_mul` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1626 | `_supports_quant_scheme` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1630 | `_supports_activation` | 3 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1634 | `_supports_parallel_config` | 8 | yes |
-| `vllm_sm80/kernels/exl3/quant.py` | 1642 | `moe_problem_size` | 8 | no |
-| `vllm_sm80/kernels/exl3/quant.py` | 1665 | `finalize_weight_and_reduce_impl` | 6 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1648 | `activation_format` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1652 | `_supports_current_device` | 5 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1658 | `_supports_no_act_and_mul` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1662 | `_supports_quant_scheme` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1666 | `_supports_activation` | 3 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1670 | `_supports_parallel_config` | 8 | yes |
+| `vllm_sm80/kernels/exl3/quant.py` | 1678 | `moe_problem_size` | 8 | no |
+| `vllm_sm80/kernels/exl3/quant.py` | 1701 | `finalize_weight_and_reduce_impl` | 6 | no |
 | `vllm_sm80/models/deepseek_v41/ops/sm80_attn_core.py` | 924 | `forward_layer` | 19 | yes |
 | `vllm_sm80/models/deepseek_v41/ops/sm80_attn_pipeline.py` | 417 | `get_warmup_keys` | 8 | yes |
 | `vllm_sm80/models/deepseek_v41/ops/sm80_index_scores.py` | 183 | `get_warmup_keys` | 17 | yes |
@@ -962,12 +966,12 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 
 | Measure | Value |
 |---|---:|
-| Plugin product files | 266 |
-| Plugin product lines | 87,778 |
+| Plugin product files | 267 |
+| Plugin product lines | 88,046 |
 | Queue commits | 62 |
 | Queue upstream files | 62 |
 | Queue upstream product files | 57 |
 | Queue upstream product lines | +502 / -129 |
 | Queue upstream product hunks | 267 |
-| Fork environment variables (flags) | 114 |
+| Fork environment variables (flags) | 115 |
 | Unreferenced fork definitions | 33 (242 lines) |
