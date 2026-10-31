@@ -1,5 +1,6 @@
 /*
  * Modified by Neural Magic
+ * Modified by Morrowmake for CMP 170HX support; see repository history.
  * Copyright (C) Marlin.2024 Elias Frantar
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -398,12 +399,22 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          max_shared_mem_new);
 
+    // Launch with the shared memory the config uses, not the device maximum,
+    // so CTAs of kernels on other streams can share the SM. The kernel's
+    // layout is compile-time; is_a_8bit adds the activation-scale prefix.
+    int launch_shared_mem = min(
+        max_shared_mem_new,
+        get_kernel_cache_size(thread_tfg, thread_m_blocks, prob_m_split,
+                              prob_n, prob_k, num_bits, group_size, has_zp,
+                              is_zp_float, is_a_8bit, stages) +
+            (is_a_8bit ? 64 * thread_m_blocks : 0) + 1024);
+
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
-    kernel<<<blocks, num_threads, max_shared_mem_new, stream>>>(
+    kernel<<<blocks, num_threads, launch_shared_mem, stream>>>(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
         prob_m_split, prob_n, prob_k, lda, locks, has_bias, part_use_atomic_add,
         use_fp32_reduce, max_shared_mem_new);
