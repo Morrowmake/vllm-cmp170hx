@@ -31,3 +31,15 @@ Copyright Curtis White. Licensed under the Apache License, Version 2.0.
 
 csrc/exl3/moe_v2.cu adapts that port's hidden-5120 lane shape: two H128 blocks
 per gate/up input warp, column groups of four n16 tiles, and lane kernels
+per bit width; csrc/exl3/moe_v2_try.cu is based on that file and keeps the
+same shape. Modifications: the shape is applied to this distribution's own
+moe_v2 operator, whose fused activation and combine stages (moe_out_v2_fold),
+FP64 input, activation and combine stages, drafter tiling and vLLM native
+registration are not from that port.
+
+That portion is used under the Apache License, Version 2.0; the licence text
+is the LICENSE file at the root of this distribution
+(https://www.apache.org/licenses/LICENSE-2.0). The splitting of each routed
+expert across tensor-parallel ranks, rotated per layer, follows an idea from
+the same port and from GNmac-lab/deepseek-v41-flash-1017-cmp170hx; no code is
+taken from either for it.

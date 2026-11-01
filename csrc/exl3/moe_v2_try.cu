@@ -23,7 +23,7 @@
 //
 // Base: moe_v2.cu of 7b31d6b252, whose hidden-5120 shape follows Curtis
 // White's port (github.com/CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE at
-// 88eb6e1, Apache-2.0); see plugins/sm80/licenses/exl3/NOTICE.
+// 88eb6e1, Apache-2.0); see licenses/exl3/NOTICE.
 #include "moe_v2_try/ops.h"
 #include "moe_v2_try/common.h"
 #include "moe_v2_try/codec_moe_v2.cuh"

@@ -152,7 +152,7 @@ hold four times the expert parameters and copy column chunks:
 
 ## Third-party material
 
-Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.
+Codec adaptations preserve the upstream MIT grant and modification credit in [`licenses/exl3`](../../../licenses/exl3). The plugin distribution (`vllm-sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.
 
 The hidden-5120 shape of `moe_out_v2` follows Curtis White's Apache-2.0 port of that operator; its credit is in the same `NOTICE`.
 
