@@ -26,7 +26,7 @@
 // The hidden-5120 shape (two H128 blocks per input warp, column groups of four
 // n16 tiles, lane kernels per bit width) follows Curtis White's port of this
 // file to that shape (github.com/CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE
-// at 88eb6e1, Apache-2.0); see plugins/sm80/licenses/exl3/NOTICE.
+// at 88eb6e1, Apache-2.0); see licenses/exl3/NOTICE.
 
 #include "moe_v2.h"
 #include "ops.h"
