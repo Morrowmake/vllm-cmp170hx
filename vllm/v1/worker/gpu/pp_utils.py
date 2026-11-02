@@ -164,8 +164,10 @@ class PPHandler:
             draft_idx_mapping = slot.idx_mapping
             if exclude_mask.any():
                 keep = ~exclude_mask
-                keep_t = torch.as_tensor(keep, device=self.device)
-                draft_tokens = draft_tokens[keep_t]
+                # Integer indices copied asynchronously: a bool mask would
+                # sync the host on its copy and on the masked select's nonzero.
+                keep_t = async_tensor_h2d(np.flatnonzero(keep), device=self.device)
+                draft_tokens = draft_tokens.index_select(0, keep_t)
                 draft_idx_mapping = async_tensor_h2d(
                     slot.idx_mapping_np[keep], device=self.device
                 )
