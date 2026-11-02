@@ -196,7 +196,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm_sm80/distributed/step_errors.py` | 167 |
 | `vllm_sm80/engine_args.py` | 103 |
-| `vllm_sm80/envs.py` | 1,721 |
+| `vllm_sm80/envs.py` | 1,805 |
 | `vllm_sm80/failed_inputs.py` | 175 |
 | `vllm_sm80/fla/__init__.py` | 2 |
 | `vllm_sm80/fla/autotune_pins.py` | 210 |
@@ -266,7 +266,7 @@ The rest of the shared sm_80 code: the plugin entry points and guard, the sparse
 | `vllm_sm80/worker/target_argmax.py` | 278 |
 | `vllm_sm80/worker/trace_export.py` | 200 |
 | `vllm_sm80/worker/worker_hooks.py` | 127 |
-| **86 files** | **24,861** |
+| **86 files** | **24,945** |
 
 ### `csrc/exl3/`
 
@@ -652,7 +652,7 @@ Grouped by top-level directory.
 | `tests/sm80/test_tuning.py` | 288 |
 | `tests/sm80/tuning_rows.py` | 39 |
 | `tests/sm80/update_seams.py` | 266 |
-| `tests/test_retired_env_vars.py` | 322 |
+| `tests/test_retired_env_vars.py` | 369 |
 | `tests/tokenizers_/test_sm80_deepseek_v41.py` | 103 |
 | `tests/v1/attention/test_glm_metadata_reuse.py` | 228 |
 | `tests/v1/attention/test_indexer_logits_budget_exact.py` | 224 |
@@ -697,7 +697,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **309 files** | **129,107** |
+| **309 files** | **129,154** |
 
 #### `tools/`
 
@@ -969,7 +969,7 @@ Plugin product code is the files under `vllm_sm80/` or `csrc/` plus build files,
 | Measure | Value |
 |---|---:|
 | Plugin product files | 267 |
-| Plugin product lines | 88,214 |
+| Plugin product lines | 88,298 |
 | Queue commits | 63 |
 | Queue upstream files | 63 |
 | Queue upstream product files | 58 |

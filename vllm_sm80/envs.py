@@ -1271,10 +1271,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
 }
 
 
-# Environment variables retired in this release, with what replaces them. A
+# Environment variables retired from the fork, with what replaces them. A
 # retired name never supplies a value (no aliases): setting one only logs a
-# warning, once per process, when this module is imported. Remove this table,
-# warn_retired_env_vars() and its call below in the next release.
+# warning, once per process, when this module is imported. Most were retired
+# in this release; the last group left the GLM releases before
+# glm53-recipe-1.8.0 without a warning. Each name stays one release after it
+# first warns; remove this table, warn_retired_env_vars() and its call below
+# with the last name.
 RETIRED_ENV_VARS: dict[str, str] = {
     # Renamed: shared code is named after the feature, not the model.
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": (
@@ -1691,6 +1694,87 @@ RETIRED_ENV_VARS: dict[str, str] = {
         "removed; select the KDA fold test cases with pytest -k, or name them "
         "on the command line when running tests/kernels/test_ampere_kda_fold.py "
         "as a script"
+    ),
+    # Switches of the GLM releases glm53-recipe-1.3.0 to 1.7.2 that 1.8.0
+    # dropped without a warning.
+    "VLLM_GLM5_DFLASH_SKIP": (
+        "removed; GLM-5 DFlash verifies every draft row (the frozen-confidence "
+        "draft skip and its MoE row mask are gone); no replacement"
+    ),
+    "VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS": "removed with VLLM_GLM5_DFLASH_SKIP",
+    "VLLM_GLM5_DFLASH_CONFIDENCE_LOG": (
+        "removed with VLLM_GLM5_DFLASH_SKIP (its per-row draft confidence "
+        "records); no replacement"
+    ),
+    "VLLM_GLM5_DFLASH_DEPTH2": (
+        "removed; the acceptance-aware depth choice (--speculative-config "
+        "adaptive_k.accept) picks from the shallowest adaptive_k.by_load width "
+        "up, so a load width of 2 allows depth 2"
+    ),
+    "VLLM_GLM5_DECODE_KDA": (
+        "removed; with VLLM_AMPERE_DECODE_KERNELS=1 the fused v2 KDA decode "
+        "step runs every shape its gate covers and the unfused chain the rest"
+    ),
+    "VLLM_GLM5_DECODE_KDA_MAX_TOKENS": (
+        "removed with the first fused KDA decode kernel whose token bound it "
+        "set; the fused v2 step's shape gate decides"
+    ),
+    "VLLM_GLM5_DECODE_KDA_V2": (
+        "removed; the fused v2 KDA decode step is the decode path whenever "
+        "VLLM_AMPERE_DECODE_KERNELS=1"
+    ),
+    "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS": (
+        "removed; at 64 heads per card the fused v2 KDA decode step takes "
+        "its measured shapes of up to 8 sequences, with no sequence cap of its "
+        "own (VLLM_AMPERE_DECODE_KERNELS=1)"
+    ),
+    "VLLM_GLM5_DECODE_KDA_V2_DEEP": (
+        "removed; at 16 heads per card the fused v2 KDA decode step takes up "
+        "to 8 tokens per sequence for up to 4 sequences "
+        "(VLLM_AMPERE_DECODE_KERNELS=1)"
+    ),
+    "VLLM_GLM5_DECODE_KDA_STEP_TILE": (
+        "removed; the fused KDA decode kernels always size the token tile "
+        "from the step's max tokens per request"
+    ),
+    "VLLM_GLM5_KDA_RECOVER": (
+        "removed; RecoverSSM is on wherever its configuration holds with "
+        "VLLM_AMPERE_DECODE_KERNELS=1 (VLLM_AMPERE_KDA_RECOVER_OFF=1 is the "
+        "diagnostic that turns it off)"
+    ),
+    "VLLM_GLM5_PROLOGUE_FUSE": (
+        "removed; upstream's GDN metadata builder and Mamba block-table path "
+        "run (the fused decode prologue measured within noise of them)"
+    ),
+    "VLLM_GLM5_PROLOGUE_FUSE_GDN": "removed with VLLM_GLM5_PROLOGUE_FUSE",
+    "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT": "removed with VLLM_GLM5_PROLOGUE_FUSE",
+    "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER": (
+        "removed with VLLM_GLM5_PREFILL_OVERLAP (never validated on a GPU)"
+    ),
+    "VLLM_GLM5_REPLICATED_EMBED": (
+        "removed; the input embedding is vocab-sharded across TP ranks, as "
+        "upstream; no replacement"
+    ),
+    "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY": (
+        "removed; the sparse-MLA decode always uses the retuned schedule; no "
+        "replacement"
+    ),
+    "VLLM_GLM5_TOPK_CANONICAL": (
+        "removed; VLLM_SM80_TOPK_CANONICAL_TIES selects the same canonical "
+        "set (ties at the k-th score to the lowest indices) on the fast top-k "
+        "kernels"
+    ),
+    "VLLM_GLM5_TOPK_TIE_REPAIR": (
+        "removed; VLLM_SM80_TOPK_CANONICAL_TIES selects the same canonical "
+        "set and VLLM_SM80_TOPK_SORTED sorts each row"
+    ),
+    "VLLM_GLM5_MARLIN_PREFILL_CUDA": (
+        "removed with the compiled Marlin prefill it selected; the MoE "
+        "prefill switch is VLLM_SM80_MARLIN_PREFILL"
+    ),
+    "VLLM_GLM5_KPOOL_TAIL_LEGACY_RING": (
+        "removed; the kpool tail ring is sized for speculative decoding as in "
+        "upstream vLLM #58454, with no way back to the one-pool ring"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

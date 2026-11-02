@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Environment variables retired in this release (vllm_sm80/envs.py).
+"""Environment variables retired from the fork (vllm_sm80/envs.py).
 
 A retired name is never read for a value; setting it only logs one warning
 per process when vllm.envs is imported. vLLM's generic unknown-variable check
-may also name it. Remove this file with the table in the next release.
+may also name it. Remove this file with the table's last name.
 """
 
 import os
@@ -153,6 +153,34 @@ REPLACED_OR_REMOVED = {
     "KDA_FOLD_ONLY",
 }
 
+# Declared in the env table of a GLM release from glm53-recipe-1.3.0 to 1.7.2
+# and dropped before 1.8.0 without a warning: every fork name of those tags'
+# vllm/envs.py (against each tag's upstream merge base) that neither 1.8.0
+# nor this branch declares.
+GLM_RELEASE_REMOVED = {
+    "VLLM_GLM5_DECODE_KDA",
+    "VLLM_GLM5_DECODE_KDA_MAX_TOKENS",
+    "VLLM_GLM5_DECODE_KDA_STEP_TILE",
+    "VLLM_GLM5_DECODE_KDA_V2",
+    "VLLM_GLM5_DECODE_KDA_V2_DEEP",
+    "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS",
+    "VLLM_GLM5_DFLASH_CONFIDENCE_LOG",
+    "VLLM_GLM5_DFLASH_DEPTH2",
+    "VLLM_GLM5_DFLASH_SKIP",
+    "VLLM_GLM5_DFLASH_SKIP_COEFFICIENTS",
+    "VLLM_GLM5_KDA_RECOVER",
+    "VLLM_GLM5_KPOOL_TAIL_LEGACY_RING",
+    "VLLM_GLM5_MARLIN_PREFILL_CUDA",
+    "VLLM_GLM5_PREFILL_OVERLAP_CROSS_LAYER",
+    "VLLM_GLM5_PROLOGUE_FUSE",
+    "VLLM_GLM5_PROLOGUE_FUSE_GDN",
+    "VLLM_GLM5_PROLOGUE_FUSE_MAMBA_BT",
+    "VLLM_GLM5_REPLICATED_EMBED",
+    "VLLM_GLM5_SPARSE_MLA_DECODE_LEGACY",
+    "VLLM_GLM5_TOPK_CANONICAL",
+    "VLLM_GLM5_TOPK_TIE_REPAIR",
+}
+
 # Size cut-offs moved to the sm80 tuning table (vllm_sm80/tuning.py), with
 # the (op, param) rows that replace them and the shape key and default each
 # reader passes.
@@ -199,7 +227,7 @@ MOVED_TO_TABLE = {
 def test_table_lists_every_retired_name():
     assert set(fork_envs.RETIRED_ENV_VARS) == (
         set(RENAMED) | set(MERGED) | set(SPLIT) | REPLACED_OR_REMOVED
-        | set(MOVED_TO_TABLE)
+        | set(MOVED_TO_TABLE) | GLM_RELEASE_REMOVED
     )
     assert all(fork_envs.RETIRED_ENV_VARS.values())
 
@@ -208,11 +236,30 @@ def test_table_lists_every_retired_name():
     "name",
     sorted(
         set(RENAMED) | set(MERGED) | set(SPLIT) | REPLACED_OR_REMOVED
-        | set(MOVED_TO_TABLE)
+        | set(MOVED_TO_TABLE) | GLM_RELEASE_REMOVED
     ),
 )
 def test_retired_name_is_not_declared(name):
     assert name not in envs.environment_variables
+
+
+@pytest.mark.parametrize("name", sorted(GLM_RELEASE_REMOVED))
+def test_glm_release_switch_warns(monkeypatch, name):
+    retired = []
+    monkeypatch.setattr(fork_envs, "_warned_retired_env_vars", set())
+    monkeypatch.setattr(
+        fork_envs.logger,
+        "warning",
+        lambda msg, *args: retired.append(msg % args),
+    )
+    monkeypatch.setenv(name, "1")
+
+    fork_envs.warn_retired_env_vars()
+
+    prefix = f"{name} is retired and ignored: "
+    mine = [m for m in retired if m.startswith(prefix)]
+    assert len(mine) == 1, retired
+    assert mine[0].startswith(f"{prefix}removed"), mine[0]
 
 
 @pytest.mark.parametrize("old,new", sorted(RENAMED.items()))
