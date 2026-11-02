@@ -649,8 +649,8 @@ def test_prefill_holds_linear_outs_error_against_fp64(
 
 
 def _input_shapes():
-    # The lab's shape-gate V2 (tools session.py plan shapes): a shape-gate-shapes/1
-    # file, pinned input LAB_INPUT_SHAPES.
+    # The served shapes to check against FP64: a shape-gate-shapes/1 JSON file
+    # named by LAB_INPUT_SHAPES.
     path = os.environ.get("LAB_INPUT_SHAPES")
     if not path:
         return [

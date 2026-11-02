@@ -390,7 +390,7 @@ Grouped by top-level directory.
 |---|---:|
 | `tests/distributed/flags_z_bits.py` | 309 |
 | `tests/distributed/test_custom_all_reduce_flags.py` | 1,476 |
-| `tests/distributed/test_custom_all_reduce_flags_z_gpu.py` | 120 |
+| `tests/distributed/test_custom_all_reduce_flags_z_gpu.py` | 117 |
 | `tests/distributed/test_host_shm_all_reduce.py` | 570 |
 | `tests/distributed/test_host_shm_setup_agreement.py` | 242 |
 | `tests/distributed/test_pcie_p2p_gate.py` | 510 |
@@ -697,7 +697,7 @@ Grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **309 files** | **129,154** |
+| **309 files** | **129,151** |
 
 #### `tools/`
 

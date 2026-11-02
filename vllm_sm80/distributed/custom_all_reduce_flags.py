@@ -84,8 +84,8 @@ holding it), rounded once: the two-shot's bits with one flag latency instead
 of two. It shares the flags-in-data buffers, stage rotation and refill
 bookkeeping of ``two_shot`` (it uses the stage prefix [0, 4 size)).
 
-Source: the all-reduce search (ampere-kernels dsv41_allreduce_tp4, candidate
-40bfe0649217, its best): KERNEL_SRC from "Lossless compressed wire format v2"
+Source: a standalone TP4 all-reduce kernel, measured on captured served
+all-reduce calls: KERNEL_SRC from "Lossless compressed wire format v2"
 on is its wire.cuh (less Pack, defined above) and flags.cu (store_block,
 recv_blocks2, one_shot, two_shot_z) verbatim; ``all_reduce_z`` and the
 one-shot launch rule are its bindings'. The uncompressed kernel's text is

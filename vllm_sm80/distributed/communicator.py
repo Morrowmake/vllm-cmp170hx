@@ -458,8 +458,8 @@ class Sm80CudaCommunicator(CudaCommunicator):
 
     def _log_all_reduce_backend_selection(self) -> None:
         """Upstream's backend-selection line, with HOSTSHM in its dispatch
-        place and the PCIe peer-to-peer note. Parsed by the lab's startup
-        checks, so the format is upstream's."""
+        place and the PCIe peer-to-peer note. Startup-log checks parse it, so
+        the format is upstream's."""
         if self._defer_backend_log:
             return
         all_potential_ar_backends = [

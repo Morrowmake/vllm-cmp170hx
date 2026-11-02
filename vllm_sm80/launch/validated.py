@@ -95,7 +95,7 @@ class Generation:
 def read_generation(sd: SettingsDir, between: Callable[[], None] | None = None) -> Generation:
     """Read every file of the current generation.
 
-    In the lab ``validated`` is a symlink to ``validated.d/<gen>/``: the
+    When ``validated`` is a symlink to ``validated.d/<gen>/``, the
     reader holds a shared flock on ``validated.d/.lock`` from resolving the
     pointer to its last read and closes it before returning, so the server
     never inherits it. ``between`` runs after the first file (tests)."""

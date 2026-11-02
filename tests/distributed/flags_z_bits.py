@@ -37,7 +37,7 @@ module: test_custom_all_reduce_flags_z_gpu.py runs it::
     NCCL_P2P_LEVEL=SYS VLLM_SM80_TUNING_FILE=served.toml \\
     torchrun --standalone --nproc-per-node 4 \\
         tests/distributed/flags_z_bits.py --out result.json \\
-        --real ~/kernels/ampere-kernels/dsv41_allreduce_tp4/data/real_index.json
+        --real "$VLLM_TEST_AR_REAL_INDEX"
 """
 
 import argparse
