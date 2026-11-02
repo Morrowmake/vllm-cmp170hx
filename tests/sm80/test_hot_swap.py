@@ -506,6 +506,8 @@ def test_hot_pairs_are_ast_readable():
         "sparse_mla_prefill": "VLLM_SM80_SPARSE_MLA_PREFILL",
         "topk_canonical_ties": "VLLM_SM80_TOPK_CANONICAL_TIES",
         "topk_sorted": "VLLM_SM80_TOPK_SORTED",
+        "splitkv_decode": "VLLM_DEEPSEEK_V41_SPLITKV_DECODE",
+        "allreduce_compress": "VLLM_SM80_ALLREDUCE_COMPRESS",
     }
     assert set(names) == set(hot_swap.HOT_PAIRS)
     from vllm_sm80 import envs as sm80_envs
@@ -624,6 +626,24 @@ def test_argmax_pair_refuses_drafts_replaced_at_load(monkeypatch, listed):
     pair.apply(RUNNER, True)
     pair.apply(RUNNER, False)
     assert calls == [True, "warm", False, "warm"]
+
+
+def test_allreduce_compress_pair_needs_the_compressed_kernel(monkeypatch, listed):
+    """The pair is carried only where the TP group's custom all-reduce built
+    the compressed flags kernel for it (communicator.py _init_flags_z)."""
+    from vllm.distributed import parallel_state
+
+    listed("allreduce_compress")
+    pair = hot_swap.HOT_PAIRS["allreduce_compress"]
+    assert pair.eager and pair.apply is None
+    for ca in (None, SimpleNamespace(), SimpleNamespace(_flags_z_hot=False)):
+        group = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=ca))
+        monkeypatch.setattr(parallel_state, "get_tp_group", lambda g=group: g)
+        assert "VLLM_SM80_ALLREDUCE=1" in pair.unavailable(RUNNER)
+    group = SimpleNamespace(device_communicator=SimpleNamespace(
+        ca_comm=SimpleNamespace(_flags_z_hot=True)))
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    assert pair.unavailable(RUNNER) is None
 
 
 def test_sparse_mla_pair_targets_the_backend_layers(listed):

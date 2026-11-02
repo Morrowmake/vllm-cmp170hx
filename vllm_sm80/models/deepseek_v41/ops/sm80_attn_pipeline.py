@@ -237,12 +237,35 @@ class PipelineWorkspace:
         self.maxima = torch.empty((rows, triton.cdiv(width, 8)), dtype=torch.float32, device=device)
         self.selection = SelectionWorkspace(rows, width, device)
         self.attention_scores = torch.empty((rows, 16, 640), dtype=torch.float32, device=device)
+        # VLLM_DEEPSEEK_V41_SPLITKV_DECODE: the split-KV partials (FP32
+        # accumulators and their (max, sum)); nothing is allocated when off.
+        self.split_scratch = None
+        split_rows = _split_rows(rows)
+        if split_rows:
+            self.split_scratch = (
+                torch.empty(split_rows * 16 * 512, dtype=torch.float32, device=device),
+                torch.empty(split_rows * 16 * 2, dtype=torch.float32, device=device))
 
     @staticmethod
     def bytes(rows, width, qdim):
         return (rows * ((qdim + 512 + 16 * 512 + 32 * 128 + 32) * 2 + 9
                         + (width + triton.cdiv(width, 8) + 16 * 640) * 4)
+                + _split_rows(rows) * 16 * (512 + 2) * 4
                 + SelectionWorkspace.bytes(rows, width))
+
+
+def _split_rows(rows):
+    """Rows x splits of the split-KV scratch: 0 unless the switch is on or a
+    hot server carries the ``splitkv_decode`` pair (both arms captured)."""
+    import vllm.envs as envs
+
+    from vllm_sm80 import hot_swap
+
+    if not (envs.VLLM_DEEPSEEK_V41_SPLITKV_DECODE or hot_swap.listed("splitkv_decode")):
+        return 0
+    from vllm_sm80.models.deepseek_v41.ops.sm80_attn_fused import split_scratch_rows
+
+    return split_scratch_rows(rows)
 
 
 def workspace(rows, width, qdim, device, owner, *, execution_stream=None):
@@ -448,6 +471,21 @@ class PipelineWarmup(VllmJitKernel["PipelineWarmup.Key"]):
         q = prepare(cfg, weights, caches, batch, x, raw, iw, ws)
         out = torch.empty_like(ws.q)
         core.attend_layer(cfg, weights, caches, batch, q, out, pipeline=True, workspace=ws)
+        if ws.split_scratch is not None:
+            # VLLM_DEEPSEEK_V41_SPLITKV_DECODE: the split count is a compile-time
+            # constant of the row count; compile one call per distinct count.
+            from vllm_sm80.models.deepseek_v41.ops import sm80_attn_fused as fused
+
+            tiles = triton.cdiv(cfg.window_size, fused._BLOCK_N) + (
+                triton.cdiv(cfg.index_topk, fused._BLOCK_N) if cfg.compress_ratio else 0)
+            first = {}
+            for r in range(1, n + 1):
+                first.setdefault(fused.split_count(r, tiles), r)
+            for r in first.values():
+                fused.sparse_attention_triton(q[:r], pos[:r], weights.freqs, caches.swa,
+                    indices[:r], caches.comp, bt, caches.topk[:r] if cfg.compress_ratio else None,
+                    req[:r], weights.attn_sink, cfg.softmax_scale, post_rope=True,
+                    final_out=out[:r], split_scratch=ws.split_scratch)
 
 
 PIPELINE_WARMUP = PipelineWarmup()

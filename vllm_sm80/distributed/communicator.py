@@ -15,6 +15,10 @@ upstream it adds:
   ``custom_all_reduce_flags.py``) inside the custom all-reduce: ``ca_comm``
   becomes a :class:`Sm80CustomAllreduce`, whose ``custom_all_reduce`` tries
   the flags kernel first, at the same point upstream's own kernel is chosen;
+  with ``VLLM_SM80_ALLREDUCE_COMPRESS`` at TP4 its compressed wire format
+  takes the BF16 messages above allreduce/flags_raw_max_bytes that the flags
+  kernel or upstream's two-stage kernel would take, and its one-shot kernel
+  those up to allreduce/flags_one_shot_max_bytes (bitwise the same sums);
 - with ``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`` the bytes-moving
   ``gpu_p2p_access_check`` probe stays mandatory: ``VLLM_SKIP_P2P_CHECK`` is
   read as 0 while upstream builds the custom all-reduce;
@@ -29,14 +33,19 @@ capture):
    node; built only where it does not stand aside for working PCIe peer
    access under ``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P``;
 2. the custom all-reduce (PCIe peer access): the flags-in-data kernel for
-   BF16 up to its size limit at TP2/TP4, else upstream's kernel up to its
-   buffer size;
+   BF16 up to its size limit at TP2/TP4 (at TP4 with
+   ``VLLM_SM80_ALLREDUCE_COMPRESS``: the one-shot kernel up to
+   allreduce/flags_one_shot_max_bytes, the compressed one above
+   allreduce/flags_raw_max_bytes, also in place of upstream's two-stage
+   kernel), else upstream's kernel up to its buffer size;
 3. upstream's remaining backends (NCCL).
 
 Layer-owned sums of eager prefill-sized messages (DeepSeek-V4.1's wo_b and
 MoE outputs) go, ahead of 3., to the copy-engine ring
 (``ce_ring_all_reduce.py``; round-once sums take its owner sum); the model's
-own all-reduce helpers make that choice.
+own all-reduce helpers make that choice. The ring is built only under
+``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`` and where every rank can map the others'
+device IPC buffers; elsewhere those sums take 1.-3.
 
 Limitation: ``vllm.distributed.stateless_coordinator`` asserts that the
 platform's communicator class is upstream's ``CudaCommunicator``. Stateless
@@ -120,6 +129,15 @@ def allreduce_max_bytes(param: str, world_size: int, default: int) -> int:
     return tuning.lookup("allreduce", param, key, default)
 
 
+# The hot-swap pair of VLLM_SM80_ALLREDUCE_COMPRESS (vllm_sm80/hot_swap.py).
+COMPRESS_HOT_PAIR = "allreduce_compress"
+
+# Upstream's kernel choice at four fully connected ranks with
+# VLLM_CUSTOM_ALLREDUCE_ALGO unset (csrc/custom_all_reduce.cuh): one-stage
+# below this many bytes, two-stage from here on.
+UPSTREAM_TWO_STAGE_MIN_BYTES = 512 * 1024
+
+
 class Sm80CustomAllreduce(car.CustomAllreduce):
     """Upstream's custom all-reduce plus the flags-in-data two-shot path.
 
@@ -129,6 +147,18 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
 
     # Flags-in-data two-shot path (custom_all_reduce_flags.py); None = off.
     _flags = None
+    # Its compressed wire format (VLLM_SM80_ALLREDUCE_COMPRESS, or carried by
+    # the hot pair COMPRESS_HOT_PAIR); None = off. It takes bf16 messages over
+    # _flags_z_min_bytes up to the flags path's limit, and from
+    # _flags_z_upstream_from bytes up to _flags_z_max_bytes. The flags path's
+    # one-shot kernel takes bf16 messages up to _flags_one_shot_max_bytes
+    # (0 = never).
+    _flags_z = None
+    _flags_z_hot = False
+    _flags_z_min_bytes = 0
+    _flags_z_upstream_from = 0
+    _flags_z_max_bytes = 0
+    _flags_one_shot_max_bytes = 0
 
     def _init_flags(self, same_node: bool) -> None:
         """Set up the flags-in-data two-shot path, or log why it stays off.
@@ -159,8 +189,10 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
         if reason is not None:
             logger.info_once(
                 "Custom all-reduce flags-in-data path requested "
-                "(VLLM_SM80_ALLREDUCE=1) but off: %s",
+                "(VLLM_SM80_ALLREDUCE=1) but off: %s%s",
                 reason,
+                "; so is its compressed wire format (VLLM_SM80_ALLREDUCE_COMPRESS)"
+                if envs.VLLM_SM80_ALLREDUCE_COMPRESS else "",
                 scope="global",
             )
             return
@@ -182,8 +214,137 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
             self._flags.limit_ns / 1e9,
             scope="global",
         )
+        hot = False
+        if envs.VLLM_HOT_SWAP:
+            from vllm_sm80 import hot_swap
+
+            hot = hot_swap.listed(COMPRESS_HOT_PAIR)
+        if envs.VLLM_SM80_ALLREDUCE_COMPRESS or hot:
+            self._init_flags_z(flags, hot)
+
+    def _init_flags_z(self, flags, hot: bool) -> None:
+        """Set up the compressed flags kernel and the one-shot kernel (four
+        ranks), or log why not.
+
+        Both replace only kernels that sum in two-shot owner order as they
+        do: the flags kernel, and upstream's cross_device_reduce_2stage where
+        upstream would run it (not cross_device_reduce_1stage, rank order).
+        """
+        switch = (
+            f"VLLM_HOT_SWAP={COMPRESS_HOT_PAIR}" if hot
+            else "VLLM_SM80_ALLREDUCE_COMPRESS=1"
+        )
+        if self.world_size != flags.Z_WORLD_SIZE:
+            logger.info_once(
+                "Custom all-reduce compressed flags kernel requested (%s) but "
+                "off: world size %d (it serves %d ranks)",
+                switch, self.world_size, flags.Z_WORLD_SIZE, scope="global",
+            )
+            return
+        flags_max = self._flags.max_bytes
+        algo = envs.VLLM_CUSTOM_ALLREDUCE_ALGO
+        if algo in ("1stage", "oneshot"):
+            upstream_from = None
+        elif algo in ("2stage", "twoshot"):
+            upstream_from = flags_max + 16
+        else:
+            upstream_from = max(flags_max + 16, UPSTREAM_TWO_STAGE_MIN_BYTES)
+        # should_custom_ar admits messages below max_size, in 16-byte packs.
+        max_bytes = flags_max if upstream_from is None else self.max_size - 16
+        self._flags_z = flags.FlagsAllreduce(
+            self.group,
+            self.device,
+            self.rank,
+            self.world_size,
+            max_bytes,
+            self.create_shared_buffer,
+            self.free_shared_buffer,
+            compressed=True,
+        )
+        self._flags_z_hot = hot
+        self._flags_z_max_bytes = max_bytes
+        self._flags_z_min_bytes = allreduce_max_bytes(
+            "flags_raw_max_bytes", self.world_size, 32768
+        )
+        self._flags_z_upstream_from = (
+            max_bytes + 16 if upstream_from is None else upstream_from
+        )
+        self._flags_one_shot_max_bytes = allreduce_max_bytes(
+            "flags_one_shot_max_bytes", self.world_size, 8192
+        )
+        if upstream_from is None:
+            upstream = "; cross_device_reduce_1stage (rank order) keeps the rest"
+        else:
+            upstream = (
+                f", and from {upstream_from} to {max_bytes} bytes in place of "
+                "cross_device_reduce_2stage"
+            )
+        logger.info_once(
+            "Custom all-reduce compressed flags kernel on (%s) for bf16 "
+            "messages over %d bytes up to %d bytes in place of the flags kernel%s "
+            "(VLLM_CUSTOM_ALLREDUCE_ALGO=%r), and the one-shot kernel for those "
+            "up to %d bytes; lossless, bitwise the kernels they replace; %d MiB "
+            "of buffers per rank",
+            switch,
+            self._flags_z_min_bytes,
+            flags_max,
+            upstream,
+            algo,
+            self._flags_one_shot_max_bytes,
+            self._flags_z.buffer_bytes >> 20,
+            scope="global",
+        )
+
+    def _flags_z_takes(self, inp: torch.Tensor) -> bool:
+        # The flags path's wire format: off while the flags path is (dev_ab.py's
+        # custom_allreduce_flags toggle sets _flags to None).
+        flags = self._flags
+        if flags is None:
+            return False
+        n = inp.nbytes
+        return (
+            n > self._flags_z_min_bytes
+            and (n <= flags.max_bytes or self._flags_z_upstream_from <= n <= self._flags_z_max_bytes)
+            and self._flags_z.eligible(inp)
+        )
+
+    def _one_shot_takes(self, inp: torch.Tensor) -> bool:
+        flags = self._flags
+        return (
+            flags is not None
+            and inp.nbytes <= self._flags_one_shot_max_bytes
+            and flags.eligible(inp)
+        )
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
+        flags_z = self._flags_z
+        if flags_z is None:
+            return self._custom_all_reduce_base(input)
+        if self._flags_z_takes(input):
+            run = flags_z.all_reduce
+        elif self._one_shot_takes(input):
+            flags = self._flags
+
+            def run(inp, out=None):
+                return flags.all_reduce(inp, out, one_shot=True)
+        else:
+            return self._custom_all_reduce_base(input)
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+            # warm-up before capture: mimic the allocation pattern
+            return torch.empty_like(input)
+        if self._flags_z_hot:
+            from vllm_sm80 import hot_swap
+
+            return hot_swap.pair(
+                COMPRESS_HOT_PAIR,
+                lambda: self._custom_all_reduce_base(input),
+                lambda out: run(input, out),
+            )
+        return run(input)
+
+    def _custom_all_reduce_base(self, input: torch.Tensor) -> torch.Tensor | None:
         # Checks disabled/should_custom_ar once on either path (super() does it
         # for the existing kernel), as the inline version did.
         if self._flags is not None and self._flags.eligible(input):
@@ -202,6 +363,9 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
         if closing and self._flags is not None:
             self._flags.close()
             self._flags = None
+        if closing and self._flags_z is not None:
+            self._flags_z.close()
+            self._flags_z = None
 
 
 class Sm80CudaCommunicator(CudaCommunicator):

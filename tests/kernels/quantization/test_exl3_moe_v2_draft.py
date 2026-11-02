@@ -12,9 +12,9 @@ per request).
   operand, bits_x2 8 decoded from two ring words), activate_down_slice (one
   2^e per down K slice) and combine_routes.
 - Tensor-parallel experts (every expert local, a 640- or 512-column chunk of
-  the intermediate per rank): the gate stays closed (moe_out); moe_out_v2's
-  kernels for them (the tensor-parallel shapes' stages at bits_x2 8) are
-  tested on the GPU below.
+  the intermediate per rank; the tensor-split layout only): the gate opens
+  for VLLM_EXL3_MOE_V2_DRAFT, and moe_out_v2 runs the tensor-parallel shapes'
+  stages at bits_x2 8, tested on the GPU below.
 
 CPU:
 - both switches default off; the drafter's configurations open only for
@@ -181,18 +181,20 @@ def test_gate_opens_for_the_drafter_configurations_only_with_their_switch():
     )
     assert h5120._reason() is None
     assert h5120._reason(metadata=h5120._meta(4)) is None
-    assert {DRAFTER} == exl3_ops.MOE_V2_DRAFT_CONFIGS
+    assert {DRAFTER, *SPLIT_DRAFTERS} == exl3_ops.MOE_V2_DRAFT_CONFIGS
     for shape in exl3_ops.MOE_V2_DRAFT_CONFIGS:
         assert exl3_ops.MOE_V2_CONFIGS[shape] == (BITS_X2,)
 
 
+SPLIT_DRAFTERS = {(HIDDEN, w, TOPK, GLOBAL, GLOBAL) for w in (640, 512)}
+
+
 @pytest.mark.parametrize("width", [640, 512])
-def test_split_drafter_layers_keep_moe_out_with_the_switch(width):
-    # Not checked through the drafter's consumer: closed for both switches.
-    for draft in (True, False):
-        reason = _reason(draft=draft, **_split(width))
-        assert reason and f"(5120, {width}, 3, 128, 128)" in reason, (draft, reason)
-    assert (HIDDEN, width, TOPK, GLOBAL, GLOBAL) not in exl3_ops.MOE_V2_CONFIGS
+def test_split_drafter_layers_open_only_with_the_drafter_switch(width):
+    assert _reason(**_split(width)) is None
+    reason = _reason(draft=False, **_split(width))
+    assert reason and f"(5120, {width}, 3, 128, 128)" in reason, reason
+    assert _reason(**_split(width, metadata=_meta(6, intermediate=width, local=GLOBAL)))
 
 
 def _method(monkeypatch, calls):
@@ -332,14 +334,22 @@ SPLIT_KERNELS = {
     "moe_lane_kernel<4, 20, 8, NoFold>",
     "moe_lane_kernel<4, 16, 8, NoFold>",
     "route_and_gate_up_input<8, 2, 5120, 16, false>",
+    # VLLM_EXL3_MOE_EXPERT_ROTATION: the tensor-split stages for experts of 640
+    # and 512 columns in one call (moe_out_v2_mixed; down: 20 or 16 steps).
+    "moe_lane_kernel<4, 20, 8, NoFold, true, 0>",
+    "moe_lane_kernel<4, 20, 8, NoFold, true, 16>",
 }
 
 
+def _kernel_name(n):
+    """A demangled kernel name without its arguments and without the
+    mixed-width template defaults (", false, 0" of moe_lane_kernel)."""
+    name = re.sub(r"\s+>", ">", re.sub(r"\(.*", "", n).replace("void ", ""))
+    return re.sub(r"^(moe_lane_kernel<.*), false, 0>$", r"\1>", name)
+
+
 def test_sm80_build_has_the_drafter_kernels_and_no_folded_bits_x2_8(sm80_sass):  # noqa: F811
-    names = {
-        re.sub(r"\s+>", ">", re.sub(r"\(.*", "", n).replace("void ", "")): n
-        for n in sm80_sass
-    }
+    names = {_kernel_name(n): n for n in sm80_sass}
     assert set(names) >= DRAFT_KERNELS | SPLIT_KERNELS, sorted(
         (DRAFT_KERNELS | SPLIT_KERNELS) - set(names)
     )

@@ -50,7 +50,8 @@ read once; their 32-column tiles give 64 programs for G * R = 2048. Such a
 block is up to four 16-row MMA tiles over one decoded weight tile: one tile
 of 16 rows keeps the MMA's warps side by side along the columns, so no two
 warps decode the same weights (a taller tile would stack warps along the
-rows, each decoding the columns it multiplies).
+rows, each decoding the columns it multiplies); with several tiles the
+decode is kept from being copied per tile (:func:`_scaled_e4m3_to_bf16`).
 
 :class:`WoAGroupedGemmMethod` is the grouped method of such a ``wo_a``
 (DeepSeek-V4.1 attention adopts it with
@@ -128,8 +129,39 @@ _SCALED_E4M3_TO_BF16_ASM = tl.constexpr("""{
         }""")
 
 
+# Four scaled BF16 weights ($2: elements 0-1, $3: elements 2-3) and their
+# four E4M3 code bytes ($4) to the same four weights: a copy, for the
+# compiler only (see _scaled_e4m3_to_bf16).
+_COPY_WITH_CODES_ASM = tl.constexpr("mov.b32 $0, $2; mov.b32 $1, $3;")
+
+
 @triton.jit
-def _scaled_e4m3_to_bf16(w_u8, e8m0):
+def _scaled_e4m3_to_bf16(w_u8, e8m0, SHARED: tl.constexpr):
+    """The scaled BF16 weights of a tile of codes. ``SHARED``: the tile feeds
+    more than one ``tl.dot`` (row tiles). Triton 3.8 moves a pure decode into
+    the MMA operand layout for some of those dots only and keeps a second
+    decode, in the load layout, for the others. Not pure, the decode is never
+    copied: it runs once, in the load layout, and every dot reads its result.
+    The pure copy after it keeps the code bytes in the dot operand's backward
+    slice, so the MMA operands keep the layout Triton gives 8-bit sources
+    (kWidth 4) as with the pure decode: the same MMAs in the same K order."""
+    if SHARED:
+        w = tl.inline_asm_elementwise(
+            asm=_SCALED_E4M3_TO_BF16_ASM,
+            constraints="=r,=r,r,r",
+            args=[w_u8, e8m0],
+            dtype=tl.bfloat16,
+            is_pure=False,
+            pack=4,
+        )
+        return tl.inline_asm_elementwise(
+            asm=_COPY_WITH_CODES_ASM,
+            constraints="=r,=r,r,r,r",
+            args=[w, w_u8],
+            dtype=tl.bfloat16,
+            is_pure=True,
+            pack=4,
+        )
     return tl.inline_asm_elementwise(
         asm=_SCALED_E4M3_TO_BF16_ASM,
         constraints="=r,=r,r,r",
@@ -180,7 +212,7 @@ def _wo_a_grouped_kernel(
         wu = tl.load(w_cols + (k0 + offs_k)[:, None])  # [BK, BN]
         e = tl.load(s_cols + (k0 // 32 + offs_kb)[:, None])  # [BK / 32, BN]
         e = tl.reshape(tl.broadcast_to(e[:, None, :], (BK // 32, 32, BN)), (BK, BN))
-        w = _scaled_e4m3_to_bf16(wu, e)
+        w = _scaled_e4m3_to_bf16(wu, e, MT > 1)
         k = k0 + offs_k
         acc0 = tl.dot(_x_tile(x_rows, k, m0 < M), w, acc0)
         if MT > 1:

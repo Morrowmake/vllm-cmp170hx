@@ -78,5 +78,12 @@ bool moe_fuses_gate_up(GemmShape shape, int64_t assignments);
 // the items the problem actually has (MoE: known on the device only).
 void launch_gemm(const GemmProblem& problem, GemmShape shape, int64_t max_items,
                  cudaStream_t stream);
+// launch_gemm for a MoE problem whose local experts differ in width (each W
+// or less per packed_meta; problem.k, problem.n and the strides at the widest
+// W): a gate/up item at or past its expert's padded_out computes nothing, and
+// every tile reduces over its expert's padded_in instead of problem.k. A tile
+// of an expert w wide runs the exact chains launch_gemm runs at width w.
+void launch_gemm_mixed(const GemmProblem& problem, GemmShape shape, int64_t max_items,
+                       cudaStream_t stream);
 
 }  // namespace exl3

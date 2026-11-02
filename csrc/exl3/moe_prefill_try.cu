@@ -4,11 +4,14 @@
 // is bitwise equal on every input. Registered as _exl3_C::moe_out_prefill_try and
 // _exl3_C::moe_workspace_size_prefill_try with moe_out_prefill_v2's schema; vllm_sm80/kernels/exl3/ops.py
 // routes moe_out_prefill_v2's calls here when VLLM_EXL3_MOE_PREFILL_UNCHUNKED=1.
+// _exl3_C::moe_out_prefill_try_mixed (same schema) serves hidden 5120 / intermediate 640 layers whose
+// local experts are 640 or 512 wide (per packed_meta) in one launch sequence; see its entry point.
 //
 // EXL3 routed-expert MoE on the tensor cores for prefill-sized calls of the DeepSeek-V4.1-Flash
 // routed experts: moe_out_prefill (moe_prefill.cu) generalised from its one compile-time shape (hidden
 // 2560, intermediate 640, bits_x2 10) to one kernel family parameterised by (hidden, intermediate,
-// bits_x2), instantiated for hidden 5120, intermediate 2304 and bits_x2 6 and 4 (the decoder layers).
+// bits_x2), instantiated for hidden 5120 and bits_x2 6 and 4 (the decoder layers): intermediate 2304
+// (whole experts) and 640 or 512 (the tensor-split chunks, as moe_prefill_v2.cu).
 // Codebook 2 (mul1) only. The caller (vllm_sm80/kernels/exl3/quant.py) takes this
 // operator only for those configurations, for calls of more than 64 rows in prefill steps; every other
 // call keeps moe_out, moe_out_v2 or moe_out_prefill, which this file does not change.
@@ -80,7 +83,8 @@ __host__ __device__ constexpr int64_t tile_capacity(int64_t assignments, int64_t
 // Integers the route kernel writes into the workspace tail each call:
 //   [0] local assignment count, [1] route tile count, [2..3] unused,
 //   sorted[assignments]: local assignment ids grouped by local expert,
-//   tiles[tile_capacity] (16-byte aligned): {expert, first sorted position, rows, 0},
+//   tiles[tile_capacity] (16-byte aligned): {expert, first sorted position, rows, width} (width:
+//   the expert's intermediate width in the mixed-width instantiation, 0 otherwise),
 //   position[assignments]: sorted position of each assignment (-1: not local).
 struct Layout {
   static constexpr int64_t kHeader = 4;
@@ -189,8 +193,10 @@ __device__ __forceinline__ void block_scan2(int a, int b, int& a_before, int& b_
 // records each assignment's sorted position (one block). Order inside an
 // expert is arbitrary: a row's result never depends on its position. Traps
 // on an expert outside the configuration (the host checks cover the shapes;
-// formats and trellis alignment live in device metadata).
-template <class C>
+// formats and trellis alignment live in device metadata). kMixed: an expert is
+// C::kIntermediate or C::kIntermediate - 128 wide (gate/up padded_out == down
+// padded_in), recorded in its tiles.
+template <class C, bool kMixed>
 __global__ void __launch_bounds__(kRouteThreads)
 route(Routing routing, int64_t assignments, int* table) {
   extern __shared__ int route_shared[];
@@ -200,10 +206,15 @@ route(Routing routing, int64_t assignments, int* table) {
   int* tile_begin = row_begin + experts;   // experts + 1 entries
   for (int e = threadIdx.x; e < experts; e += blockDim.x) {
     cursor[e] = 0;
+    int64_t width = C::kIntermediate;
+    if constexpr (kMixed) {
+      width = routing.metadata[int64_t(e) * 12 + 1];
+      if (width != C::kIntermediate && width != C::kIntermediate - 128) __trap();
+    }
     for (int q = 0; q < 3; ++q) {
       const int64_t* meta = routing.metadata + int64_t(e) * 12 + q * 4;
-      const int64_t in = q < 2 ? C::kHidden : C::kIntermediate;
-      const int64_t out = q < 2 ? C::kIntermediate : C::kHidden;
+      const int64_t in = q < 2 ? C::kHidden : width;
+      const int64_t out = q < 2 ? width : C::kHidden;
       const uintptr_t trellis = static_cast<uintptr_t>(routing.pointers[int64_t(e) * 9 + q * 3]);
       if (meta[0] != in || meta[1] != out || meta[2] != C::kBitsX2 || meta[3] != kCodebook ||
           (trellis & 15) != 0) {
@@ -283,7 +294,9 @@ route(Routing routing, int64_t assignments, int* table) {
     }
     const int first = row_begin[lo] + (t - tile_begin[lo]) * kTileRows;
     const int end = lo + 1 < experts ? row_begin[lo + 1] : row_total;
-    tile_table[slot_begin[lo] + t - tile_begin[lo]] = make_int4(lo, first, min(kTileRows, end - first), 0);
+    const int width = kMixed ? static_cast<int>(routing.metadata[int64_t(lo) * 12 + 1]) : 0;
+    tile_table[slot_begin[lo] + t - tile_begin[lo]] =
+        make_int4(lo, first, min(kTileRows, end - first), width);
   }
   int* sorted = table + Layout::sorted_offset();
   int* position = table + Layout::position_offset(assignments, routing.local_experts);
@@ -512,14 +525,18 @@ __device__ __forceinline__ float down_input(float g, float u, float gate_svh, fl
 // C::kMidTail remaining blocks in the warp layout of hadamard128_warp (lane
 // holds k = base + lane + 32 i). The operand row (2 I halves) overwrites the
 // position's gate row (I floats) in place: the warp reads its whole gate and
-// up rows before the peak reduction and stores only after it.
-template <class C>
+// up rows before the peak reduction and stores only after it. kMixed: an expert
+// C::kIntermediate - 128 wide lacks the last tail block, which is neither loaded
+// (its svh / suh end before it) nor stored, and holds zeros, so the row peak is
+// that of the expert's own columns (a zero never raises a peak of absolute values).
+template <class C, bool kMixed>
 __global__ void __launch_bounds__(32 * kDownWarps)
 down_operand(Routing routing, const int* table, float* gate_result, const float* up_result,
              float* unscale, float limit) {
   constexpr int kFull = C::kMidFull;
   constexpr int kTail = C::kMidTail;
   constexpr int kTailBase = 512 * kFull;
+  static_assert(!kMixed || kTail > 0, "mixed widths drop the last tail block");
   const int lane = threadIdx.x & 31;
   const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
   const int* sorted = table + Layout::sorted_offset();
@@ -533,6 +550,9 @@ down_operand(Routing routing, const int* table, float* gate_result, const float*
     const bool vec = aligned16(gate_svh) && aligned16(up_svh) && aligned16(down_suh);
     const float* gate = gate_result + pos * C::kIntermediate;
     const float* up = up_result + pos * C::kIntermediate;
+    // Warp-uniform (one warp per position).
+    bool narrow = false;
+    if constexpr (kMixed) narrow = routing.metadata[expert * 12 + 1] != C::kIntermediate;
 
     float v[kFull > 0 ? kFull : 1][16];
 #pragma unroll
@@ -565,6 +585,11 @@ down_operand(Routing routing, const int* table, float* gate_result, const float*
     float w[kTail > 0 ? kTail : 1][4];
 #pragma unroll
     for (int t = 0; t < kTail; ++t) {
+      if (narrow && t == kTail - 1) {   // not the expert's columns: zeros
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[t][i] = 0.0f;
+        continue;
+      }
       const int base = kTailBase + 128 * t;
       float g[4];
       float u[4];
@@ -604,6 +629,7 @@ down_operand(Routing routing, const int* table, float* gate_result, const float*
     }
 #pragma unroll
     for (int t = 0; t < kTail; ++t) {
+      if (narrow && t == kTail - 1) continue;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int k = kTailBase + 128 * t + lane + 32 * i;
@@ -704,8 +730,13 @@ struct Gemm {
 // = 64 halves in eight 16-byte chunks, chunk c stored at c ^ (row & 7)) at
 // offset 0, then the block's kBlockTiles adjacent trellis tiles of each k16
 // step at kStageW.
-template <int K, int N, int Projections, int First, int TPW, int BitsX2>
+//
+// Mixed: the route tile's expert is N (gate/up) or K (down) wide or 128 less
+// (tile.w); a narrow gate/up expert's trellis has its own column-tile count and
+// its blocks past its width exit, a narrow down expert runs its own K chunks.
+template <int K, int N, int Projections, int First, int TPW, int BitsX2, bool Mixed = false>
 struct Shape {
+  static constexpr bool kMixed = Mixed;
   static constexpr int kK = K;
   static constexpr int kN = N;
   static constexpr int kProjections = Projections;
@@ -718,20 +749,26 @@ struct Shape {
   static constexpr int kColBlocks = N / (16 * kBlockTiles);
   static constexpr int kTilesN = N / 16;
   static constexpr int64_t kRowHalves = int64_t(Projections) * 2 * K;
-  static constexpr int64_t kWChunk = int64_t(kSteps) * kTilesN * kTileBytes;
   static constexpr uint32_t kStageW = 2 * kTileRows * kKC * 2;
   static constexpr uint32_t kStageBytes = kStageW + kSteps * kBlockTiles * kTileBytes;
   static constexpr int kSmemBytes = kStages * kStageBytes;
   static_assert(K % kKC == 0 && N % (16 * kBlockTiles) == 0 && kChunks >= kStages - 1,
                 "GEMM shape");
   static_assert(kStageBytes % 16 == 0 && kTileBytes % 16 == 0, "16-byte aligned stages and tiles");
+  static_assert(!Mixed || (First < 2 ? (N - 128) % (16 * kBlockTiles) == 0
+                                     : (K - 128) % kKC == 0 && (K - 128) / kKC >= kStages - 1),
+                "mixed-width GEMM shape");
 };
 // Two n16 tiles per warp (256-column blocks): every block streams its route tile's
-// hi/lo operand rows over the whole K, so wider blocks halve that traffic.
-template <class C, int Projections, int First>
-using GateUpShape = Shape<C::kHidden, C::kIntermediate, Projections, First, 2, C::kBitsX2>;
-template <class C>
-using DownShape = Shape<C::kIntermediate, C::kHidden, 1, 2, 2, C::kBitsX2>;
+// hi/lo operand rows over the whole K, so wider blocks halve that traffic. The
+// 640-column tensor-split chunk is not a whole number of 256-column blocks: one
+// tile per warp there (128-column blocks; as fast as two at 512 on the census
+// chunks, five tiles per warp twice as slow).
+template <class C, int Projections, int First, bool Mixed = false>
+using GateUpShape = Shape<C::kHidden, C::kIntermediate, Projections, First,
+                          C::kIntermediate % 256 == 0 ? 2 : 1, C::kBitsX2, Mixed>;
+template <class C, bool Mixed = false>
+using DownShape = Shape<C::kIntermediate, C::kHidden, 1, 2, 2, C::kBitsX2, Mixed>;
 
 template <class S>
 __device__ __forceinline__ uint32_t next_stage(uint32_t offset) {
@@ -753,10 +790,12 @@ __device__ __forceinline__ uint32_t lds32(uint32_t address) {
 // a k16 step overlap. The ldmatrix of group g + 1 is issued before the MMAs of
 // group g; each B fragment serves the warp's S::kTPW n16 tiles. Shared
 // addresses are per-lane constants plus the stage offset; `load` issues the
-// next chunk's copies into its own rotating stage.
+// next chunk's copies into its own rotating stage. `tile_chunks`: the K chunks
+// of a mixed-width down tile (S::kChunks otherwise, at compile time).
 template <int kG, class S, class Load>
 __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem, Load& load, int rows,
-                                         int first, int pi, int cb) {
+                                         int first, int pi, int cb, int tile_chunks) {
+  const int chunks = S::kMixed ? tile_chunks : S::kChunks;
   constexpr int TPW = S::kTPW;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -794,10 +833,10 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem, Load& loa
     copy_commit();
   }
   uint32_t read = 0;
-  for (int chunk = 0; chunk < S::kChunks; ++chunk) {
+  for (int chunk = 0; chunk < chunks; ++chunk) {
     copy_wait<kStages - 2>();
     __syncthreads();
-    if (chunk + kStages - 1 < S::kChunks) load();
+    if (chunk + kStages - 1 < chunks) load();
     copy_commit();
 #pragma unroll
     for (int step = 0; step < kSteps; ++step) {
@@ -876,6 +915,21 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
       p.pointers[int64_t(tile.x) * 9 + (S::kFirst + pi) * 3]);
   const __half* operand =
       p.operand + int64_t(tile.y) * S::kRowHalves + int64_t(pi) * 2 * S::kK;
+  // Mixed: a narrow gate/up expert's trellis rows hold tile.w / 16 column tiles and
+  // its column blocks from tile.w on exit (uniformly per block, before any copy or
+  // barrier); a narrow down expert's K is tile.w (its trellis rows end there, the
+  // operand rows keep the kK layout). Compile-time S values otherwise.
+  int tiles_n = S::kTilesN;
+  int tile_chunks = S::kChunks;
+  if constexpr (S::kMixed) {
+    if constexpr (S::kFirst < 2) {
+      if (cb * 16 * S::kBlockTiles >= tile.w) return;
+      tiles_n = tile.w / 16;
+    } else {
+      tile_chunks = tile.w / kKC;
+    }
+  }
+  const int64_t w_chunk = int64_t(kSteps) * tiles_n * S::kTileBytes;   // trellis bytes per K chunk
 
   // Per-thread cp.async work of a stage: operand vectors v = tid + kThreads i
   // (16 bytes: chunk v % 8 of row v / 8 % 64, part v / 512), i.e. rows r0 and
@@ -905,7 +959,7 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
   for (int j = 0; j < kWCopies; ++j) {
     const int w = j + 1 < kWCopies || w_last_live ? tid + j * kThreads : tid;
     w_src[j] = trellis +
-               (int64_t(w / kStepVectors) * S::kTilesN + int64_t(cb) * S::kBlockTiles) * S::kTileBytes +
+               (int64_t(w / kStepVectors) * tiles_n + int64_t(cb) * S::kBlockTiles) * S::kTileBytes +
                (w % kStepVectors) * 16;
   }
   const uint32_t w_dst = smem + S::kStageW + tid * 16;
@@ -925,7 +979,7 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
       if (j + 1 < kWCopies || w_last_live) {
         copy16_to(w_dst + stage + j * kThreads * 16, w_src[j], 16);
       }
-      w_src[j] += S::kWChunk;
+      w_src[j] += w_chunk;
     }
     src0 += kKC;
     src1 += kKC;
@@ -934,7 +988,7 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
 
   switch ((rows + 7) >> 3) {
 #define EXL3_GROUPS(G) \
-    case G: run_tile<G, S>(p, smem, load, rows, tile.y, pi, cb); break;
+    case G: run_tile<G, S>(p, smem, load, rows, tile.y, pi, cb, tile_chunks); break;
     EXL3_GROUPS(1) EXL3_GROUPS(2) EXL3_GROUPS(3) EXL3_GROUPS(4)
     EXL3_GROUPS(5) EXL3_GROUPS(6) EXL3_GROUPS(7) EXL3_GROUPS(8)
 #undef EXL3_GROUPS
@@ -1059,10 +1113,10 @@ int64_t sequence_elements(int64_t hidden, int64_t intermediate, int64_t rows, in
 }
 
 // Gate/up operand then GEMM for projections First .. First + Projections - 1.
-template <class C, int Projections, int First>
+template <class C, int Projections, int First, bool kMixed>
 void run_gate_up(const __nv_bfloat16* x, const Routing& routing, const Gemm& p, __half* operand,
                  float* unscale, int64_t assignments, int64_t max_tiles, cudaStream_t stream) {
-  using S = GateUpShape<C, Projections, First>;
+  using S = GateUpShape<C, Projections, First, kMixed>;
   gate_up_operand<C><<<warp_grid(assignments * Projections, 1), 32 * InputBlock<C>::kWarps, 0, stream>>>(
       x, routing, p.table, First, Projections, operand, unscale);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1070,7 +1124,7 @@ void run_gate_up(const __nv_bfloat16* x, const Routing& routing, const Gemm& p, 
 }
 
 // One launch sequence (route .. combine) over `rows` rows.
-template <class C, typename Out>
+template <class C, typename Out, bool kMixed>
 void run_rows(const __nv_bfloat16* x, const void* ids, bool ids64, const float* weights,
               const void* expert_map, bool map64, int64_t global_experts, const int64_t* pointers,
               const int64_t* metadata, int64_t local_experts, int64_t rows, int64_t topk, Out* out,
@@ -1090,12 +1144,13 @@ void run_rows(const __nv_bfloat16* x, const void* ids, bool ids64, const float* 
   int* table = reinterpret_cast<int*>(unscale + (assignments * projections + 3) / 4 * 4);
   // cursor, row_begin, tile_begin (+1), slot_begin, by_rank: up to 80 KB at kMaxExperts.
   static const bool route_configured = [] {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(route<C>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    C10_CUDA_CHECK(cudaFuncSetAttribute(route<C, kMixed>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         int((5 * kMaxExperts + 1) * sizeof(int))));
     return true;
   }();
   (void)route_configured;
-  route<C><<<1, kRouteThreads, (5 * local_experts + 1) * sizeof(int), stream>>>(
+  route<C, kMixed><<<1, kRouteThreads, (5 * local_experts + 1) * sizeof(int), stream>>>(
       routing, assignments, table);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int64_t max_tiles = tile_capacity(assignments, local_experts);
@@ -1108,14 +1163,14 @@ void run_rows(const __nv_bfloat16* x, const void* ids, bool ids64, const float* 
   p.out = gate_result;
   p.out_projection = up_result - gate_result;
   if (projections == 2) {
-    run_gate_up<C, 2, 0>(x, routing, p, operand, unscale, assignments, max_tiles, stream);
+    run_gate_up<C, 2, 0, kMixed>(x, routing, p, operand, unscale, assignments, max_tiles, stream);
   } else {
-    run_gate_up<C, 1, 0>(x, routing, p, operand, unscale, assignments, max_tiles, stream);
+    run_gate_up<C, 1, 0, kMixed>(x, routing, p, operand, unscale, assignments, max_tiles, stream);
     p.out = up_result;
-    run_gate_up<C, 1, 1>(x, routing, p, operand, unscale, assignments, max_tiles, stream);
+    run_gate_up<C, 1, 1, kMixed>(x, routing, p, operand, unscale, assignments, max_tiles, stream);
   }
-  using DN = DownShape<C>;
-  down_operand<C><<<warp_grid(assignments, kDownWarps), 32 * kDownWarps, 0, stream>>>(
+  using DN = DownShape<C, kMixed>;
+  down_operand<C, kMixed><<<warp_grid(assignments, kDownWarps), 32 * kDownWarps, 0, stream>>>(
       routing, table, gate_result, up_result, unscale, limit);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   p.operand = reinterpret_cast<const __half*>(gate_result);
@@ -1131,7 +1186,7 @@ void run_rows(const __nv_bfloat16* x, const void* ids, bool ids64, const float* 
 }
 
 // The call in row chunks of at most kChunkRows rows (each row depends only on itself).
-template <class C, typename Out>
+template <class C, typename Out, bool kMixed>
 void run_call(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::Tensor& topk_weights,
               const torch::Tensor& packed_ptrs, const torch::Tensor& packed_meta,
               const torch::Tensor& expert_map, Out* out, float* workspace, float limit,
@@ -1147,25 +1202,34 @@ void run_call(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch
   const int64_t chunk_rows = (rows + chunks - 1) / chunks;
   for (int64_t start = 0; start < rows; start += chunk_rows) {
     const int64_t n = std::min<int64_t>(chunk_rows, rows - start);
-    run_rows<C, Out>(xb + start * C::kHidden, ids + start * topk * id_bytes, ids64,
-                     weights + start * topk, expert_map.data_ptr(),
-                     expert_map.scalar_type() == at::kLong, expert_map.numel(),
-                     packed_ptrs.data_ptr<int64_t>(), packed_meta.data_ptr<int64_t>(),
-                     packed_ptrs.size(0), n, topk, out + start * C::kHidden, workspace, limit, stream);
+    run_rows<C, Out, kMixed>(xb + start * C::kHidden, ids + start * topk * id_bytes, ids64,
+                             weights + start * topk, expert_map.data_ptr(),
+                             expert_map.scalar_type() == at::kLong, expert_map.numel(),
+                             packed_ptrs.data_ptr<int64_t>(), packed_meta.data_ptr<int64_t>(),
+                             packed_ptrs.size(0), n, topk, out + start * C::kHidden, workspace,
+                             limit, stream);
   }
 }
 
-// The configurations this file is instantiated for: (hidden, intermediate, bits_x2), codebook 2.
-#define EXL3_MOE_PREFILL_CONFIGS(X) X(5120, 2304, 6) X(5120, 2304, 4)
+// The configurations this file is instantiated for: (hidden, intermediate, bits_x2), codebook 2;
+// mixed widths (experts intermediate or intermediate - 128 wide) for the second list.
+#define EXL3_MOE_PREFILL_CONFIGS(X)                                                            \
+  X(5120, 2304, 6) X(5120, 2304, 4) X(5120, 640, 6) X(5120, 640, 4) X(5120, 512, 6)            \
+      X(5120, 512, 4)
+#define EXL3_MOE_PREFILL_MIXED_CONFIGS(X) X(5120, 640, 6) X(5120, 640, 4)
 
-bool covered(int64_t hidden, int64_t intermediate, int64_t bits_x2) {
+bool covered(int64_t hidden, int64_t intermediate, int64_t bits_x2, bool mixed) {
 #define EXL3_COVERED(H, I, B) if (hidden == H && intermediate == I && bits_x2 == B) return true;
-  EXL3_MOE_PREFILL_CONFIGS(EXL3_COVERED)
+  if (mixed) {
+    EXL3_MOE_PREFILL_MIXED_CONFIGS(EXL3_COVERED)
+  } else {
+    EXL3_MOE_PREFILL_CONFIGS(EXL3_COVERED)
+  }
 #undef EXL3_COVERED
   return false;
 }
 
-template <typename Out>
+template <typename Out, bool kMixed>
 void dispatch(int64_t hidden, int64_t intermediate, int64_t bits_x2, const torch::Tensor& x,
               const torch::Tensor& topk_ids, const torch::Tensor& topk_weights,
               const torch::Tensor& packed_ptrs, const torch::Tensor& packed_meta,
@@ -1173,10 +1237,15 @@ void dispatch(int64_t hidden, int64_t intermediate, int64_t bits_x2, const torch
               cudaStream_t stream) {
 #define EXL3_DISPATCH(H, I, B)                                                                \
   if (hidden == H && intermediate == I && bits_x2 == B) {                                     \
-    return run_call<Config<H, I, B>, Out>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, \
-                                          expert_map, out, workspace, limit, stream);         \
+    return run_call<Config<H, I, B>, Out, kMixed>(x, topk_ids, topk_weights, packed_ptrs,     \
+                                                  packed_meta, expert_map, out, workspace,    \
+                                                  limit, stream);                             \
   }
-  EXL3_MOE_PREFILL_CONFIGS(EXL3_DISPATCH)
+  if constexpr (kMixed) {
+    EXL3_MOE_PREFILL_MIXED_CONFIGS(EXL3_DISPATCH)
+  } else {
+    EXL3_MOE_PREFILL_CONFIGS(EXL3_DISPATCH)
+  }
 #undef EXL3_DISPATCH
   TORCH_CHECK(false, "EXL3 MoE prefill: unsupported configuration");
 }
@@ -1186,7 +1255,8 @@ void dispatch(int64_t hidden, int64_t intermediate, int64_t bits_x2, const torch
 void moe(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::Tensor& topk_weights,
          const torch::Tensor& packed_ptrs, const torch::Tensor& packed_meta,
          const torch::Tensor& expert_map, int64_t intermediate_size, int64_t bits_x2,
-         torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit, bool fp32_out) {
+         torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit, bool fp32_out,
+         bool mixed) {
   const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
   check_tensor(x, x, at::kBFloat16, "x");
@@ -1212,9 +1282,15 @@ void moe(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::Ten
                   packed_meta.size(2) == 4, "EXL3 MoE pointer/metadata geometry mismatch");
   TORCH_CHECK(experts > 0 && experts <= kMaxExperts, "EXL3 MoE prefill needs 1..", kMaxExperts,
               " local experts");
-  TORCH_CHECK(covered(hidden, intermediate_size, bits_x2),
-              "EXL3 MoE prefill: unsupported (hidden, intermediate, bits_x2) = (", hidden, ", ",
-              intermediate_size, ", ", bits_x2, ")");
+  if (mixed) {
+    TORCH_CHECK(covered(hidden, intermediate_size, bits_x2, true),
+                "EXL3 MoE prefill mixed widths: supports (hidden, intermediate, bits_x2) = (5120, 640, "
+                "6 or 4) only, got (", hidden, ", ", intermediate_size, ", ", bits_x2, ")");
+  } else {
+    TORCH_CHECK(covered(hidden, intermediate_size, bits_x2, false),
+                "EXL3 MoE prefill: unsupported (hidden, intermediate, bits_x2) = (", hidden, ", ",
+                intermediate_size, ", ", bits_x2, ")");
+  }
   const int64_t required =
       moe_workspace_size_prefill_try(rows, hidden, intermediate_size, topk, experts);
   TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
@@ -1225,15 +1301,20 @@ void moe(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::Ten
   if (rows == 0) return;
   const c10::cuda::CUDAGuard guard(x.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
-  if (fp32_out) {
-    dispatch<float>(hidden, intermediate_size, bits_x2, x, topk_ids, topk_weights, packed_ptrs,
-                    packed_meta, expert_map, out.data_ptr<float>(), workspace.data_ptr<float>(),
-                    limit, stream);
+  if (mixed) {
+    dispatch<__nv_bfloat16, true>(hidden, intermediate_size, bits_x2, x, topk_ids, topk_weights,
+                                  packed_ptrs, packed_meta, expert_map,
+                                  reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+                                  workspace.data_ptr<float>(), limit, stream);
+  } else if (fp32_out) {
+    dispatch<float, false>(hidden, intermediate_size, bits_x2, x, topk_ids, topk_weights,
+                           packed_ptrs, packed_meta, expert_map, out.data_ptr<float>(),
+                           workspace.data_ptr<float>(), limit, stream);
   } else {
-    dispatch<__nv_bfloat16>(hidden, intermediate_size, bits_x2, x, topk_ids, topk_weights,
-                            packed_ptrs, packed_meta, expert_map,
-                            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-                            workspace.data_ptr<float>(), limit, stream);
+    dispatch<__nv_bfloat16, false>(hidden, intermediate_size, bits_x2, x, topk_ids, topk_weights,
+                                   packed_ptrs, packed_meta, expert_map,
+                                   reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+                                   workspace.data_ptr<float>(), limit, stream);
   }
 }
 
@@ -1262,13 +1343,47 @@ void moe_out_prefill_try(const torch::Tensor& x, const torch::Tensor& topk_ids,
                          int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
                          torch::Tensor& workspace, double swiglu_limit) {
   moe_prefill_try::moe(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
-                                  intermediate_size, bits_x2, out, workspace, swiglu_limit, false);
+                                  intermediate_size, bits_x2, out, workspace, swiglu_limit, false,
+                                  false);
+}
+
+// Mixed widths (local experts intermediate_size = W or W - 128 wide, per packed_meta; W 640,
+// hidden 5120): the base operator's kernels and launch sequence at W, workspace at W. Exact by
+// construction: every kernel is the base template on the same values, with only bounds,
+// strides and an early exit taken from the expert's width w (tile.w / packed_meta):
+// - route: the base grouping; it accepts w in {W, W - 128} (consistently across gate, up,
+//   down) and records w in the expert's tiles.
+// - gate/up operand: K = hidden for every expert; the base kernel, unchanged.
+// - gate/up GEMM: the base 128-column-block schedule; a narrow expert's trellis rows have w / 16
+//   column tiles and its blocks from w on exit. Each output element is the k16 MMA pair then an
+//   FP32 add per k16 step in increasing k over the same 64-wide K chunks, whatever TPW and the
+//   column blocking (run_tile), so its columns are bitwise those of the native w config (TPW 2).
+// - down operand: the W layout; a narrow expert skips the last tail block (not its columns), which
+//   holds zeros in the peak, so the row exponent and stored values are the native w config's
+//   (kMidTail one less); nothing is stored past w.
+// - down GEMM: K = w, i.e. w / 64 chunks over the same operand values and trellis k16 rows (the
+//   operand rows keep the W stride and hi/lo offset, the trellis its 320-tile stride), the same
+//   per-element order as the native config.
+// - combine: unchanged.
+// So each route's contribution equals the native-width operator's, and the output equals the base
+// operator's at intermediate_size = w when every expert of the call is w wide.
+void moe_out_prefill_try_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                               const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                               const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                               int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
+                               torch::Tensor& workspace, double swiglu_limit) {
+  moe_prefill_try::moe(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
+                       intermediate_size, bits_x2, out, workspace, swiglu_limit, false, true);
 }
 
 }  // namespace exl3
 
 TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
   m.def("moe_out_prefill_try(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+        "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
+        "int intermediate_size, int bits_x2, Tensor(a!) out, "
+        "Tensor(b!) workspace, float swiglu_limit=0.0) -> ()");
+  m.def("moe_out_prefill_try_mixed(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, int bits_x2, Tensor(a!) out, "
         "Tensor(b!) workspace, float swiglu_limit=0.0) -> ()");
@@ -1280,4 +1395,5 @@ TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
 
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("moe_out_prefill_try", &exl3::moe_out_prefill_try);
+  m.impl("moe_out_prefill_try_mixed", &exl3::moe_out_prefill_try_mixed);
 }

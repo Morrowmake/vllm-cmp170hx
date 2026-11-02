@@ -20,6 +20,10 @@ TORCH_LIBRARY(_exl3_C, m) {
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
         "float swiglu_limit=0.0) -> ()");
+  m.def("moe_out_mixed(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+        "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
+        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
+        "float swiglu_limit=0.0) -> ()");
   m.def("moe_out_v2(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, int bits_x2, Tensor(a!) out, "
@@ -66,6 +70,7 @@ TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("linear_out", &exl3::linear_out);
   m.impl("linear_out_splitk", &exl3::linear_out_splitk);
   m.impl("moe_out", &exl3::moe_out);
+  m.impl("moe_out_mixed", &exl3::moe_out_mixed);
   m.impl("moe_out_v2", &exl3::moe_out_v2);
   m.impl("moe_out_prefill", &exl3::moe_out_prefill);
   m.impl("ple_decode_out", &ple_decode_out);

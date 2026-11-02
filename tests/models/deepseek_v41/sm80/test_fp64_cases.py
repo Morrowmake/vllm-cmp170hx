@@ -876,7 +876,8 @@ def test_split_cases_run_end_to_end_and_partials_that_do_not_sum_refuse(
 
     columns = F.expert_columns
     monkeypatch.setattr(F, "expert_columns",
-                        lambda inter, prefix, rank, size: columns(inter, prefix, 0, size))
+                        lambda inter, prefix, rank, size, *rest: columns(inter, prefix, 0,
+                                                                         size, *rest))
     rc, _, rows = _run(tmp_path, [derived], target=mixed_checkpoint)
     assert rc == 1 and rows == {}
     monkeypatch.setattr(F, "expert_columns", columns)

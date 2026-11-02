@@ -94,7 +94,8 @@ def moe(
     name = func.__name__
     rec = capture.begin(
         "moe", f"exl3_{_MOE_POINTS.get(name, name)}", facts["prefix"], x.shape[0],
-        operator=name,
+        # The mixed-width form (VLLM_EXL3_MOE_EXPERT_ROTATION) is its own operator.
+        operator=f"{name}_mixed" if keywords.get("mixed") else name,
     )
     if rec is None:
         return

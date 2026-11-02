@@ -20,4 +20,13 @@ void moe_out_prefill_try(const torch::Tensor& x, const torch::Tensor& topk_ids,
                          int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
                          torch::Tensor& workspace, double swiglu_limit);
 
+// Mixed widths: local experts intermediate_size (= 640, hidden 5120 only) or intermediate_size - 128
+// wide per packed_meta; each route's contribution is bitwise the native-width operator's.
+// Workspace: moe_workspace_size_prefill_try at intermediate_size.
+void moe_out_prefill_try_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                               const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                               const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                               int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
+                               torch::Tensor& workspace, double swiglu_limit);
+
 }  // namespace exl3

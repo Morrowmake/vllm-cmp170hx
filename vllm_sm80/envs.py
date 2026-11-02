@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_SM80_MHC_PREFILL: bool = False
     VLLM_SM80_SPARSE_MLA_PREFILL: bool = False
     VLLM_SM80_ALLREDUCE: bool = False
+    VLLM_SM80_ALLREDUCE_COMPRESS: bool = False
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
@@ -96,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
+    VLLM_DEEPSEEK_V41_SPLITKV_DECODE: bool = False
     VLLM_SM80_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
@@ -122,6 +124,8 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
+    VLLM_EXL3_MOE_EXPERT_ROTATION: bool = False
+    VLLM_EXL3_FAST_LOAD: bool = False
     VLLM_SM80_TUNING_FILE: str = ""
     VLLM_SM80_CAPTURE: str = ""
     VLLM_SM80_REPLAY_DIR: str = ""
@@ -224,6 +228,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # communicator and dispatch.
     "VLLM_SM80_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM80_ALLREDUCE", "0"))
+    ),
+    # With VLLM_SM80_ALLREDUCE, at TP4: the flags-in-data two-shot kernel's
+    # lossless compressed wire format (custom_all_reduce_flags.py,
+    # two_shot_z, format v2: per 248-value block the largest exponent, per
+    # value sign and 7-bit mantissa, per 8-value lane 3- or 4-bit exponent
+    # codes, raw fallback per block) for the BF16 messages above
+    # allreduce/flags_raw_max_bytes of the sm80 tuning table that the flags
+    # kernel takes, and, below the custom all-reduce's buffer size, those
+    # upstream's cross_device_reduce_2stage takes; the one-shot kernel for
+    # BF16 messages up to allreduce/flags_one_shot_max_bytes. Same partitions
+    # and the same owner-order FP32 sums, so bitwise the kernels they
+    # replace; one more buffer set per rank (~50 MiB at the 8 MiB buffer).
+    # Hot-swap pair allreduce_compress. Default OFF: unset, nothing is built
+    # and every message takes today's path.
+    "VLLM_SM80_ALLREDUCE_COMPRESS": lambda: bool(
+        int(os.getenv("VLLM_SM80_ALLREDUCE_COMPRESS", "0"))
     ),
     # The sm_80 mHC pre-norm projection GEMM at prefill sizes
     # (vllm_sm80/kernels/mhc/prenorm.py) in place of the TileLang kernel, for
@@ -922,6 +942,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
     ),
+    # DeepSeek-V4.1 on sm_80, the attention pipeline's decode attention as
+    # split-KV: each row's window and selected compressed keys split a fixed
+    # number of ways per shape, probabilities applied as BF16 hi + lo parts
+    # (not rounded to BF16), merged in split order (bit stable run to run;
+    # changes rounding). Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/ops/sm80_attn_pipeline.py.
+    "VLLM_DEEPSEEK_V41_SPLITKV_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SPLITKV_DECODE", "0"))
+    ),
     # Greedy argmax over a vocabulary-parallel head without the all-gather of
     # the logits, for greedy target sampling and greedy drafting. Each TP rank
     # takes the argmax of its own vocabulary shard, the ranks exchange one
@@ -1106,18 +1135,19 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_V2_FOLD": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_FOLD", "0"))
     ),
-    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu,
-    # DraftTiling) for calls of at most 64 rows of the configuration
-    # ops.MOE_V2_DRAFT_CONFIGS names: the DSpark drafter's experts of
-    # DeepSeek-V4.1-Flash (hidden 5120, intermediate 2304, top-3, 32 of 128
-    # experts local, every local expert matrix bits_x2 8 with codebook 2), on
-    # sm_80; independent of VLLM_EXL3_MOE_V2, which keeps the other
-    # configurations, and never folded (VLLM_EXL3_MOE_V2_FOLD does not apply).
-    # The drafter's experts split across tensor-parallel ranks (intermediate
-    # 640 or 512, all 128 local) keep moe_out with the flag on. Results
-    # differ from moe_out in the last bits. Needs an EXL3 extension
-    # built from this tree. Default OFF: unset, those calls take moe_out. Read
-    # in vllm_sm80/kernels/exl3/quant.py.
+    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
+    # of at most 64 rows of the configurations ops.MOE_V2_DRAFT_CONFIGS names:
+    # the DSpark drafter's experts of DeepSeek-V4.1-Flash (hidden 5120, top-3
+    # of 128, every local expert matrix bits_x2 8 with codebook 2), on sm_80:
+    # whole experts (intermediate 2304, 32 local; stages of their own,
+    # DraftTiling) or, in the tensor-split layout (no
+    # --enable-expert-parallel), every expert's 640- or 512-column chunk (all
+    # 128 local; the tensor-split stages). Independent of VLLM_EXL3_MOE_V2,
+    # which keeps the other configurations, and never folded
+    # (VLLM_EXL3_MOE_V2_FOLD does not apply). Results differ from moe_out in
+    # the last bits. Needs an EXL3 extension built from this tree. Default
+    # OFF: unset, those calls take moe_out. Read in
+    # vllm_sm80/kernels/exl3/quant.py.
     "VLLM_EXL3_MOE_V2_DRAFT": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_DRAFT", "0"))
     ),
@@ -1127,16 +1157,19 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # of its activations outside the MMA, a larger one inside), so a row's
     # result does not depend on how many rows of the call share its expert.
     # Set once per process (before the warm-up and graph capture). Default 0.
+    # Whole-expert drafter layers only: the tensor-split chunks' stages never
+    # depend on the other rows of a call.
     "VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS", "0")
     ),
-    # With VLLM_EXL3_MOE_V2: the moe_out_v2 calls of the whole-expert layers
-    # of ops.MOE_V2_TRY_CONFIG (hidden 5120, intermediate 2304, top-6, 96 of
-    # 384 experts local, bits_x2 6 or 4, 1..64 rows) take moe_out_v2_try
-    # (csrc/exl3/moe_v2_try.cu) in place of moe_out_v2 or moe_out_v2_fold:
-    # the lane GEMMs' trellis words through a per-warp cp.async shared ring,
-    # the same arguments, workspace contract and output bits. Needs an EXL3
-    # extension built from this tree. Default OFF. Read in
+    # With VLLM_EXL3_MOE_V2: the moe_out_v2 calls of the target layers of
+    # ops.MOE_V2_TRY_CONFIGS (hidden 5120, top-6, bits_x2 6 or 4, 1..64 rows;
+    # whole experts, intermediate 2304 with 96 of 384 local, or in the
+    # tensor-split layout every expert's 640- or 512-column chunk) take
+    # moe_out_v2_try (csrc/exl3/moe_v2_try.cu) in place of moe_out_v2 or
+    # moe_out_v2_fold: the lane GEMMs' trellis words through a per-warp
+    # cp.async shared ring, the same arguments, workspace contract and output
+    # bits. Needs an EXL3 extension built from this tree. Default OFF. Read in
     # vllm_sm80/kernels/exl3/ops.py (moe_v2_try_open).
     "VLLM_EXL3_MOE_V2_RING": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_RING", "0"))
@@ -1153,9 +1186,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_PREFILL_TC": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_PREFILL_TC", "0"))
     ),
-    # With VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: moe_out_prefill_v2's calls of the
-    # whole-expert configuration (hidden 5120, intermediate 2304, top-6, 96
-    # of 384 experts local, bits_x2 6 or 4, 65..2048 rows) run
+    # With VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: moe_out_prefill_v2's calls of
+    # ops.TRY_MOE_PREFILL_SHAPES (hidden 5120, top-6, bits_x2 6 or 4, 65..2048
+    # rows; whole experts, intermediate 2304 with 96 of 384 local, or in the
+    # tensor-split layout every expert's 640- or 512-column chunk) run
     # moe_out_prefill_try (csrc/exl3/moe_prefill_try.cu) as one launch
     # sequence per call instead of one per 512-row chunk, so each touched
     # expert is decoded once per call; the same arithmetic, bitwise equal.
@@ -1171,6 +1205,37 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # bytes and the same kernels. Default OFF: one allocation per tensor.
     "VLLM_EXL3_EXPERTS_CONTIGUOUS": lambda: bool(
         int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
+    ),
+    # EXL3 weight loading, same bytes loaded (vllm_sm80/kernels/exl3/loader.py):
+    # (1) the plain tensors' model.load_weights calls (one per tensor) run with
+    # the routed experts' packed weights out of the module tree
+    # (loader.routed_experts_hidden), so the model's named_parameters() walks
+    # on every call skip their parameters (138k of a tensor-split
+    # DeepSeek-V4.1-Flash rank, 35k at EP4); (2) a thread reads the checkpoint
+    # spans of the next weights into the page cache (posix_fadvise WILLNEED,
+    # up to 4 GiB ahead, vllm_sm80/kernels/exl3/readahead.py), so the copies
+    # from the mapped files find them cached instead of faulting them in
+    # 128 KiB at a time. Default OFF.
+    "VLLM_EXL3_FAST_LOAD": lambda: bool(int(os.getenv("VLLM_EXL3_FAST_LOAD", "0"))),
+    # EXL3 routed experts split across the tensor-parallel ranks (no
+    # --enable-expert-parallel; quant.py tensor_parallel_expert_split): rank r
+    # holds chunk (r + L + e) mod the tensor parallel size of expert e in layer
+    # L instead of chunk (r + L) mod size of every expert, so each rank holds
+    # the larger (640-column) chunk of half the layer's experts and the smaller
+    # (512) of the other half, and every rank does the same expected routed work
+    # per layer instead of two ranks 25 % more. Each layer's calls take the
+    # mixed-width operators (moe_out_mixed, moe_out_v2_mixed,
+    # moe_out_v2_try_mixed, moe_out_prefill_try_mixed): every routed (row,
+    # expert) chunk product is bitwise the same as without the switch; each
+    # rank's partial output then sums other chunks of the row's experts before
+    # its BF16 rounding and the all-reduce, so outputs differ in the last bits
+    # (an order-changing change). No folded moe_out_v2 for these layers
+    # (VLLM_EXL3_MOE_V2_FOLD does not apply to them), and their prefill calls
+    # take the tensor cores only through VLLM_EXL3_MOE_PREFILL_UNCHUNKED. Needs an
+    # EXL3 extension built from this tree. Default OFF. Read in
+    # vllm_sm80/kernels/exl3/quant.py.
+    "VLLM_EXL3_MOE_EXPERT_ROTATION": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_EXPERT_ROTATION", "0"))
     ),
 
     # Diagnostic: the path of a size cut-off table (schema sm80-tuning/1, see

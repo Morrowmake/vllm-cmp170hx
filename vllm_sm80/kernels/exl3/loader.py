@@ -4,13 +4,14 @@
 
 import time
 from collections import Counter
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 from torch import nn
 
+from vllm import envs
 from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
@@ -20,10 +21,13 @@ from vllm_sm80.kernels.exl3.quant import (
     Exl3LinearMethod,
     Exl3MoEMethod,
 )
+from vllm_sm80.kernels.exl3.readahead import CheckpointReadahead
 from vllm_sm80.kernels.exl3.utils import Exl3LoadLedger
 from vllm.tracing import instrument
 
 logger = init_logger(__name__)
+
+PACKED_SUFFIXES = (".trellis", ".suh", ".svh", ".mcg", ".mul1")
 
 
 class Exl3ModelLoader(DefaultModelLoader):
@@ -97,6 +101,46 @@ def release_manifests(model: torch.nn.Module, quant: Exl3Config) -> None:
         owner.release_manifest()
 
 
+def packed_weights(modules: dict[str, nn.Module]) -> list:
+    """Every Exl3PackedWeight load_exl3_weights loads, in its order."""
+    weights = []
+    for module in modules.values():
+        method = getattr(module, "quant_method", None)
+        if isinstance(method, Exl3LinearMethod):
+            weights.extend(module.exl3_weights)
+        elif isinstance(method, Exl3MoEMethod):
+            weights.extend(w for expert in module.exl3_experts for w in expert)
+    return weights
+
+
+@contextmanager
+def routed_experts_hidden(modules: dict[str, nn.Module]):
+    """The routed experts' packed weights out of the module tree for the
+    block (VLLM_EXL3_FAST_LOAD): load_exl3_weights loads each plain tensor
+    with its own model.load_weights call, and a model's load_weights may walk
+    model.named_parameters() on every call (DeepSeek-V4's twice: its
+    params_dict and the expert mapping's LoRA scan). Three parameters per
+    expert matrix are most of those walks (138k of a tensor-split
+    DeepSeek-V4.1-Flash rank, 35k at EP4) and no plain tensor loads into them:
+    every one is loaded from packed sources before the plain tensors. Each
+    module gets them back in its children's order."""
+    hidden = [
+        (module, list(module._modules), module._modules.pop("exl3_experts"))
+        for module in modules.values()
+        if isinstance(getattr(module, "quant_method", None), Exl3MoEMethod)
+    ]
+    try:
+        yield
+    finally:
+        for module, order, experts in hidden:
+            children = module._modules
+            children["exl3_experts"] = experts
+            restored = {name: children[name] for name in order if name in children}
+            restored.update(children)
+            children.clear()
+            children.update(restored)
+
+
 def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     from vllm_sm80.kernels.exl3.ops import ensure_extension
 
@@ -128,6 +172,28 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             )
             for path in sorted({header.path for header in manifest.tensors.values()})
         }
+        fast = envs.VLLM_EXL3_FAST_LOAD
+        readahead = None
+        if fast:
+            logger.info_once(
+                "EXL3 fast load (VLLM_EXL3_FAST_LOAD): checkpoint readahead "
+                "ahead of the copies, and the plain tensors' load_weights calls "
+                "without the routed experts' packed weights in the module tree; "
+                "the same bytes are loaded."
+            )
+            plain = [
+                header
+                for name, header in manifest.tensors.items()
+                if name not in ledger.entries
+                and not name.endswith(PACKED_SUFFIXES)
+                and name.removesuffix(".bias") not in manifest.matrices
+            ]
+            readahead = stack.enter_context(
+                CheckpointReadahead(
+                    [w.source_extents(manifest) for w in packed_weights(modules)]
+                    + [[(h.path, h.offset, h.offset + h.nbytes)] for h in plain]
+                )
+            )
         for name, module in modules.items():
             method = getattr(module, "quant_method", None)
             if isinstance(method, Exl3LinearMethod):
@@ -136,6 +202,8 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
                     ledger.mark(key, "unused", "group assigned to another TP rank")
                 for weight in module.exl3_weights:
                     weight.load(files, ledger)
+                    if readahead is not None:
+                        readahead.loaded()
                     bias_key = f"{weight.matrix.prefix}.bias"
                     if bias_key in manifest.tensors:
                         bias = getattr(module, "bias", None)
@@ -178,19 +246,28 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
                 for expert in module.exl3_experts:
                     for weight in expert:
                         weight.load(files, ledger)
+                        if readahead is not None:
+                            readahead.loaded()
                 loaded.update(f"{name}.{key}" for key, _ in module.named_parameters())
 
-        for name, header in manifest.tensors.items():
-            if name in ledger.entries:
-                continue
-            if name.endswith((".trellis", ".suh", ".svh", ".mcg", ".mul1")):
-                raise ValueError(f"EXL3 packed tensor has no runtime owner: {name}")
-            tensor = files[header.path].get_tensor(name)
-            consumed = model.load_weights(iter([(name, tensor)]))
-            if not consumed:
-                raise ValueError(f"EXL3 plain tensor has no runtime owner: {name}")
-            loaded.update(consumed)
-            ledger.mark(name, "consumed", ",".join(sorted(consumed)))
+        with routed_experts_hidden(modules) if fast else nullcontext():
+            for name, header in manifest.tensors.items():
+                if name in ledger.entries:
+                    continue
+                if name.endswith(PACKED_SUFFIXES):
+                    raise ValueError(
+                        f"EXL3 packed tensor has no runtime owner: {name}"
+                    )
+                tensor = files[header.path].get_tensor(name)
+                consumed = model.load_weights(iter([(name, tensor)]))
+                if not consumed:
+                    raise ValueError(
+                        f"EXL3 plain tensor has no runtime owner: {name}"
+                    )
+                loaded.update(consumed)
+                ledger.mark(name, "consumed", ",".join(sorted(consumed)))
+                if readahead is not None:
+                    readahead.loaded()
         ledger.finish()
     missing = {
         name

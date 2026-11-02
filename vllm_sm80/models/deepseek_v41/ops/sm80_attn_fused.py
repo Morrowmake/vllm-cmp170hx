@@ -27,6 +27,13 @@ FP32 angles and products without FMA contraction. The attention runs as a
 score pass and an ordered value pass that walks the window, then the
 compressed rows, in the reference's order with an online softmax, a BF16
 probability before the value dot and the sink added to the denominator once.
+With ``VLLM_DEEPSEEK_V41_SPLITKV_DECODE`` the pipeline path instead splits
+each row's keys a fixed number of ways per shape (:func:`split_count`): each
+split runs the online softmax over its interleaved key tiles with in-place
+scores, its probabilities applied as two BF16 parts (p = hi + lo, two MMAs
+with FP32 accumulation, so p is not rounded to BF16), and one merge pass
+combines the splits in split order before the same epilogue, so results are
+run to run bit stable.
 No host sync, no data-dependent host branching; the scratch tensors come from
 the caching allocator (CUDA-graph pool under capture).
 
@@ -363,6 +370,197 @@ def _ordered_value_kernel(
     )
 
 
+# ---------------------------------------------------------------- split-KV decode
+# (VLLM_DEEPSEEK_V41_SPLITKV_DECODE, the pipeline path only)
+
+_SPLIT_MAX = 10
+_SPLIT_MIN = 3
+# rows x splits programs per call: about two resident partial programs per SM
+# on the 74-SM card (4 warps, a [16, 512] FP32 accumulator each).
+_SPLIT_PROGRAMS = 150
+_SPLIT_BLOCK_D = 32
+
+
+def split_count(rows: int, tiles: int) -> int:
+    """The fixed number of key splits of a call of ``rows`` rows over
+    ``tiles`` key tiles of ``_BLOCK_N``: a function of the shape only, so
+    a call's arithmetic order (and its bits) never depends on anything else."""
+    return max(1, min(tiles, _SPLIT_MAX, max(_SPLIT_MIN, _SPLIT_PROGRAMS // max(rows, 1))))
+
+
+def split_scratch_rows(max_rows: int) -> int:
+    """Rows x splits the split scratch must hold for calls of 1..``max_rows``
+    rows (the most key tiles a call can have: the window plus a full top-k)."""
+    tiles = triton.cdiv(WINDOW, _BLOCK_N) + triton.cdiv(TOPK, _BLOCK_N)
+    return max(r * split_count(r, tiles) for r in range(1, max_rows + 1))
+
+
+@triton.jit(do_not_specialize=["n_window", "n_comp"])
+def _split_partial_kernel(
+    q_ptr,
+    swa_ptr,
+    swa_idx_ptr,
+    comp_ptr,
+    comp_bt_ptr,
+    comp_idx_ptr,
+    req_ptr,
+    part_ptr,
+    ml_ptr,
+    n_heads,
+    n_window,
+    n_comp,
+    scale,
+    stride_qt,
+    stride_qh,
+    stride_sb,
+    stride_se,
+    stride_wi,
+    stride_cb,
+    stride_ce,
+    stride_bt,
+    stride_ci,
+    WINDOW_TILES: tl.constexpr,
+    SPLIT_TILES: tl.constexpr,
+    SPLITS: tl.constexpr,
+    SWA_E: tl.constexpr,
+    COMP_E: tl.constexpr,
+    HAS_COMP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """One program per (row, head block, split): the online softmax of the
+    key tiles ``split, split + SPLITS, ...`` (window tiles first, then the
+    compressed ones, as in the ordered value pass), with the scores computed
+    in place. Each FP32 probability weights the rows as two BF16 parts,
+    hi = bf16(p) and lo = bf16(p - hi), in two MMAs into the FP32 accumulator
+    (relative error of p at most ~2^-16 instead of the 2^-8 of one BF16 rounding).
+    Writes the unnormalised FP32 accumulator and its (max, sum)."""
+    t = tl.program_id(0).to(tl.int64)
+    split = tl.program_id(2)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    hmask = heads < n_heads
+    d = tl.arange(0, D)
+    n = tl.arange(0, BLOCK_N)
+    q = tl.load(
+        q_ptr + t * stride_qt + heads[:, None] * stride_qh + d[None, :],
+        mask=hmask[:, None],
+        other=0.0,
+    )
+    m = tl.full([BLOCK_H], -1.0e30, dtype=tl.float32)
+    l = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, D], dtype=tl.float32)
+    req = tl.load(req_ptr + t).to(tl.int64)
+    for i in range(SPLIT_TILES):
+        # Interleaved tiles keep the splits balanced when the top-k ends in
+        # padding (-1) entries.
+        tile = i * SPLITS + split
+        ok = tl.full([BLOCK_N], False, tl.int1)
+        off = tl.zeros([BLOCK_N], tl.int64)
+        if tile < WINDOW_TILES:
+            cols = tile * BLOCK_N + n
+            slot = tl.load(swa_idx_ptr + t * stride_wi + cols, mask=cols < n_window, other=-1)
+            ok = slot >= 0
+            s64 = tl.maximum(slot, 0).to(tl.int64)
+            off = (s64 // SWA_E) * stride_sb + (s64 % SWA_E) * stride_se
+        elif HAS_COMP:
+            cols = (tile - WINDOW_TILES) * BLOCK_N + n
+            j = tl.load(comp_idx_ptr + t * stride_ci + cols, mask=cols < n_comp, other=-1)
+            ok = j >= 0
+            j64 = tl.maximum(j, 0).to(tl.int64)
+            blk = tl.load(comp_bt_ptr + req * stride_bt + j64 // COMP_E, mask=ok, other=0)
+            off = blk.to(tl.int64) * stride_cb + (j64 % COMP_E) * stride_ce
+        # A tile with no valid key leaves (m, l, acc) unchanged; skip its work.
+        if tl.sum(ok.to(tl.int32), axis=0) > 0:
+            if tile < WINDOW_TILES:
+                kv = tl.load(swa_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0)
+            else:
+                kv = tl.load(comp_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0)
+            s = tl.dot(q, tl.trans(kv)) * scale
+            s = tl.where(ok[None, :], s, float("-inf"))
+            m_new = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(s - m_new[:, None])
+            l = l * alpha + tl.sum(p, axis=1)
+            hi = p.to(tl.bfloat16)
+            lo = (p - hi.to(tl.float32)).to(tl.bfloat16)
+            acc = tl.dot(lo, kv, tl.dot(hi, kv, acc * alpha[:, None]))
+            m = m_new
+    row = (t * SPLITS + split) * n_heads + heads
+    tl.store(part_ptr + row[:, None] * D + d[None, :], acc, mask=hmask[:, None])
+    tl.store(ml_ptr + row * 2, m, mask=hmask)
+    tl.store(ml_ptr + row * 2 + 1, l, mask=hmask)
+
+
+@triton.jit(do_not_specialize=["n_tokens"])
+def _split_merge_kernel(
+    part_ptr,
+    ml_ptr,
+    sink_ptr,
+    out_ptr,
+    positions_ptr,
+    freqs_ptr,
+    n_tokens,
+    n_heads,
+    stride_ot,
+    stride_oh,
+    stride_pos: tl.constexpr,
+    stride_freq: tl.constexpr,
+    RD: tl.constexpr,
+    SPLITS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """One program per (padded row, head block, channel block): merges the
+    splits in split order (fixed, so run to run bit stable), adds the sink
+    to the denominator once, then the ordered value pass's epilogue (BF16
+    result, inverse RoPE of the tail, FP8 qdq); padding rows get zeros."""
+    t = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    hmask = heads < n_heads
+    d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+    dmask = d < D
+    if t >= n_tokens:
+        tl.store(out_ptr + t * stride_ot + heads[:, None] * stride_oh + d[None, :],
+                 0.0, hmask[:, None] & dmask[None, :])
+        return
+    m = tl.full([BLOCK_H], -1.0e30, dtype=tl.float32)
+    for s in tl.static_range(SPLITS):
+        row = (t * SPLITS + s) * n_heads + heads
+        m = tl.maximum(m, tl.load(ml_ptr + row * 2, mask=hmask, other=-1.0e30))
+    l = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+    for s in tl.static_range(SPLITS):
+        row = (t * SPLITS + s) * n_heads + heads
+        w = tl.exp(tl.load(ml_ptr + row * 2, mask=hmask, other=-1.0e30) - m)
+        l = l + tl.load(ml_ptr + row * 2 + 1, mask=hmask, other=0.0) * w
+        acc = acc + tl.load(part_ptr + row[:, None] * D + d[None, :],
+                            mask=hmask[:, None] & dmask[None, :], other=0.0) * w[:, None]
+    sink = tl.load(sink_ptr + heads, mask=hmask, other=float("-inf"))
+    l = l + tl.exp(sink - m)
+    o = acc / l[:, None]
+    # The value result is stored to BF16 BEFORE inverse RoPE and QDQ.
+    o = o.to(tl.bfloat16).to(tl.float32)
+    if tl.program_id(2) * BLOCK_D >= D - RD:
+        local = tl.arange(0, BLOCK_D)
+        partner = tl.broadcast_to((local ^ 1)[None, :], (BLOCK_H, BLOCK_D))
+        b = tl.gather(o, partner, 1)
+        angle = tl.load(positions_ptr + t * stride_pos).to(tl.float32) * tl.load(
+            freqs_ptr + ((d - (D - RD)) // 2) * stride_freq)
+        sine = libdevice.sin(angle)
+        rotated = libdevice.add_rn(libdevice.mul_rn(o, libdevice.cos(angle)[None, :]),
+            libdevice.mul_rn(b, tl.where(d % 2 == 0, sine, -sine)[None, :]))
+        o = rotated.to(tl.bfloat16).to(tl.float32)
+    o = tl.reshape(qdq_fp8_tile(tl.reshape(o, (BLOCK_H * BLOCK_D // 32, 32))),
+                   (BLOCK_H, BLOCK_D))
+    tl.store(
+        out_ptr + t * stride_ot + heads[:, None] * stride_oh + d[None, :],
+        o.to(out_ptr.dtype.element_ty),
+        mask=hmask[:, None] & dmask[None, :],
+    )
+
+
 def sparse_attention_triton(
     q: torch.Tensor,
     positions: torch.Tensor,
@@ -375,10 +573,17 @@ def sparse_attention_triton(
     req: torch.Tensor,
     attn_sink: torch.Tensor,
     scale: float,
-    *, post_rope: bool = False, final_out=None, scores_out=None,
+    *, post_rope: bool = False, final_out=None, scores_out=None, split_scratch=None,
 ) -> torch.Tensor:
     """Attend with the seed schedule; optionally consume post-RoPE queries
-    and absorb the output rounding/RoPE/QDQ into the ordered-value store."""
+    and absorb the output rounding/RoPE/QDQ into the ordered-value store.
+
+    ``split_scratch`` (``(part, ml)`` FP32 buffers of at least
+    ``split_scratch_rows(n) * h * d`` and ``* h * 2`` elements; post-RoPE
+    queries with ``final_out`` only): the split-KV schedule instead
+    (``VLLM_DEEPSEEK_V41_SPLITKV_DECODE``), the keys of each row split
+    ``split_count`` ways, each split's online softmax with in-place scores,
+    then an ordered merge with the same epilogue."""
     n, h, d = q.shape
     out = final_out if final_out is not None else torch.empty(
         (n, h, d), dtype=torch.bfloat16, device=q.device)
@@ -408,6 +613,29 @@ def sparse_attention_triton(
     comp, comp_bt, comp_idx, s_cb, s_ce, s_bt, s_ci, n_comp, comp_e = comp_args
     n_window = swa_indices.shape[1]
     window_tiles = triton.cdiv(n_window, _BLOCK_N)
+    if split_scratch is not None:
+        if not post_rope or final_out is None:
+            raise ValueError("split-KV attention needs post-RoPE queries and final_out")
+        part, ml = split_scratch
+        tiles = window_tiles + triton.cdiv(n_comp, _BLOCK_N)
+        splits = split_count(n, tiles)
+        if part.numel() < n * splits * h * d or ml.numel() < n * splits * h * 2:
+            raise ValueError("split-KV scratch is smaller than the call needs")
+        _split_partial_kernel[(n, triton.cdiv(h, _BLOCK_H), splits)](
+            q, swa_cache, swa_indices, comp, comp_bt, comp_idx, req, part, ml,
+            h, n_window, n_comp, scale,
+            q.stride(0), q.stride(1), swa_cache.stride(0), swa_cache.stride(1),
+            swa_indices.stride(0), s_cb, s_ce, s_bt, s_ci,
+            WINDOW_TILES=window_tiles, SPLIT_TILES=triton.cdiv(tiles, splits), SPLITS=splits,
+            SWA_E=swa_cache.shape[1], COMP_E=comp_e, HAS_COMP=has_comp, D=d,
+            BLOCK_H=_BLOCK_H, BLOCK_N=_BLOCK_N, num_warps=4, num_stages=2,
+        )
+        _split_merge_kernel[(out.shape[0], triton.cdiv(h, _BLOCK_H), triton.cdiv(d, _SPLIT_BLOCK_D))](
+            part, ml, attn_sink, out, positions, freqs, n, h, out.stride(0), out.stride(1),
+            stride_pos=positions.stride(0), stride_freq=freqs.stride(0), RD=2 * freqs.numel(),
+            SPLITS=splits, D=d, BLOCK_D=_SPLIT_BLOCK_D, BLOCK_H=_BLOCK_H, num_warps=4,
+        )
+        return out
     score_tiles = max(window_tiles + triton.cdiv(n_comp, _BLOCK_N), 1)
     score_width = score_tiles * _BLOCK_N
     scores = (scores_out[:n, :, :score_width] if scores_out is not None else

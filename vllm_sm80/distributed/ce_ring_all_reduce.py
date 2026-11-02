@@ -324,10 +324,48 @@ def _memcpy_async_fn() -> Callable[[int, int, int, int], None]:
     return memcpy_async
 
 
+class PeerBuffersUnavailable(RuntimeError):
+    """A rank of the group could not map a peer's device IPC buffer."""
+
+
+def shared_buffer(size_in_bytes: int, group) -> list[int]:
+    """``CustomAllreduce.create_shared_buffer`` (the same allocation and handle
+    exchange) with the outcome agreed by every rank of the CPU ``group``: when
+    any rank cannot open a peer's handle (no PCIe peer access between the
+    cards: ``cudaErrorPeerAccessUnsupported``), every rank frees its own buffer
+    and raises :class:`PeerBuffersUnavailable`, so no rank is left in a
+    collective the others skip."""
+    import torch.distributed as dist
+
+    from vllm.distributed.device_communicators import custom_all_reduce as car
+
+    pointer, handle = car.ops.allocate_shared_buffer_and_handle(size_in_bytes)
+    world, rank = dist.get_world_size(group=group), dist.get_rank(group=group)
+    handles = [None] * world
+    dist.all_gather_object(handles, handle, group=group)
+    pointers: list[int] = []
+    error = None
+    for i, h in enumerate(handles):
+        if i == rank:
+            pointers.append(pointer)
+            continue
+        try:
+            pointers.append(car.ops.open_mem_handle(h))
+        except Exception as exc:  # the driver's refusal, whatever its type
+            error = f"rank {rank} could not open rank {i}'s device IPC buffer: {exc}"
+            break
+    if car._all_ranks_true(group, error is None):
+        return pointers
+    car.ops.free_shared_buffer(pointer)
+    raise PeerBuffersUnavailable(error or "another rank could not open a peer's device IPC buffer")
+
+
 class CeRingAllReduce:
     """The TP group's copy-engine ring: per rank one scratch slot per ring step
     for shards of messages up to ``capacity_bytes`` and one flag block, shared
-    across ranks through CUDA IPC (collective: every rank constructs it)."""
+    across ranks through CUDA IPC (collective: every rank constructs it, and
+    every rank raises :class:`PeerBuffersUnavailable` where the ranks cannot
+    share device buffers)."""
 
     def __init__(self, group, capacity_bytes: int):
         import torch.distributed as dist
@@ -343,8 +381,12 @@ class CeRingAllReduce:
         self.capacity_bytes = self.slot_bytes * self.world
         steps = 2 * (self.world - 1)
         cpu = group.cpu_group
-        self.scratch = CustomAllreduce.create_shared_buffer(self.slot_bytes * steps, group=cpu)
-        self.flags = CustomAllreduce.create_shared_buffer(flag_bytes(self.world), group=cpu)
+        self.scratch = shared_buffer(self.slot_bytes * steps, cpu)
+        try:
+            self.flags = shared_buffer(flag_bytes(self.world), cpu)
+        except PeerBuffersUnavailable:
+            CustomAllreduce.free_shared_buffer(self.scratch, group=cpu, rank=self.rank)
+            raise
         CudaRTLibrary().cudaMemset(ctypes.c_void_p(self.flags[self.rank]), 0, flag_bytes(self.world))
         torch.cuda.synchronize()
         dist.barrier(group=cpu)

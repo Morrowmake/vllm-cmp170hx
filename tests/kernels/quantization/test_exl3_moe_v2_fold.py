@@ -434,8 +434,9 @@ def test_sm80_build_has_every_fold_kernel_and_spill_free_gemm_loops(sm80_sass):
     lane = {}
     for name, instructions in sm80_sass.items():
         if "moe_lane_kernel<" in name:
-            key = re.sub(r"\(.*", "", name).replace("void ", "")
-            lane[re.sub(r"\s+>", ">", key)] = instructions
+            key = re.sub(r"\s+>", ">", re.sub(r"\(.*", "", name).replace("void ", ""))
+            # Without the mixed-width template defaults (VLLM_EXL3_MOE_EXPERT_ROTATION).
+            lane[re.sub(r", false, 0>$", ">", key)] = instructions
     assert LANE_KERNELS <= set(lane), sorted(LANE_KERNELS - set(lane))
     # No fold kernel beyond the bits_x2 the fold serves (the drafter's are
     # never folded).

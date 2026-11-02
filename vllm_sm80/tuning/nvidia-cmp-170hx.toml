@@ -315,6 +315,26 @@ key = {world_size = 2, hidden = 2560}
 value = 262144
 evidence = "seed: VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES default 262144; Qwen3.8-Flash-Next TP2"
 
+# allreduce/flags_raw_max_bytes: with VLLM_SM80_ALLREDUCE_COMPRESS (TP4), the
+# largest message the flags-in-data kernel still sends uncompressed (default
+# 32768 without a row).
+[[row]]
+op = "allreduce"
+param = "flags_raw_max_bytes"
+key = {world_size = 4, hidden = 5120}
+value = 32768
+evidence = "ampere-kernels dsv41_allreduce_tp4 search: format v2 (candidate 40bfe0649217) vs uncompressed per call, b2b graph, 5120-wide rows: 1-2 rows x0.83-0.89, 3-5 rows tie, from 6 rows wins"
+
+# allreduce/flags_one_shot_max_bytes: with VLLM_SM80_ALLREDUCE_COMPRESS
+# (TP4), the largest message the flags-in-data path sends by its one-shot
+# kernel (default 8192 without a row).
+[[row]]
+op = "allreduce"
+param = "flags_one_shot_max_bytes"
+key = {world_size = 4, hidden = 5120}
+value = 8192
+evidence = "ampere-kernels dsv41_allreduce_tp4 search, candidate 40bfe0649217: two-shot -> one-shot per call, graph, randn: 640 B 8.52 -> 6.22 us, 4 KiB 9.24 -> 7.19, 8 KiB 9.6-10.1 -> 9.0-9.1, 10 KiB 10.0 -> 10.2, 16 KiB 11.1 -> 13.3"
+
 # allreduce/host_max_bytes: largest message of the host-staged all-reduce.
 [[row]]
 op = "allreduce"

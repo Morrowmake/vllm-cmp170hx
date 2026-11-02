@@ -465,6 +465,42 @@ class Exl3PackedWeight(nn.Module):
             ledger.mark(key, "consumed", prefix)
         self.loaded = True
 
+    def source_extents(self, manifest) -> list[tuple[Path, int, int]]:
+        """(file, first byte, end byte) of each checkpoint span load() copies
+        from: per output slice the trellis bytes from its first column in the
+        first input row to its last column in the last input row, and the suh
+        and svh slices (VLLM_EXL3_FAST_LOAD reads them into the page cache
+        ahead of load())."""
+        prefix = self.matrix.prefix
+        header = manifest.tensors[f"{prefix}.trellis"]
+        row = header.nbytes // header.shape[0]
+        tile = row // header.shape[1]
+        first = header.offset + self.input_slice.start // 16 * row
+        last = header.offset + (self.input_slice.stop // 16 - 1) * row
+        extents = [
+            (
+                header.path,
+                first + part.start // 16 * tile,
+                last + part.stop // 16 * tile,
+            )
+            for part in self.output_slices
+        ]
+        for suffix, slices in (
+            ("suh", [self.input_slice]),
+            ("svh", self.output_slices),
+        ):
+            header = manifest.tensors[f"{prefix}.{suffix}"]
+            item = header.nbytes // header.shape[0]
+            extents.extend(
+                (
+                    header.path,
+                    header.offset + part.start * item,
+                    header.offset + part.stop * item,
+                )
+                for part in slices
+            )
+        return extents
+
 
 class Exl3LinearMethod(LinearMethodBase):
     def __init__(self, matrices: list[PackedMatrix], uneven: bool = False):
@@ -830,16 +866,19 @@ def expert_tp_closed_reason(parallel) -> str | None:
     return None
 
 
-def tensor_parallel_expert_split(moe, prefix: str) -> tuple[int, slice]:
-    """(whole intermediate, this rank's columns) of every routed expert of
-    the MoE layer ``prefix`` at MoE tensor parallel size > 1 (vLLM without
-    --enable-expert-parallel). Each rank holds whole H128 blocks of every
-    expert's intermediate, in chunks as even as the blocks allow with the
-    larger chunks first (block_shard); rank r of layer L holds chunk
-    (r + L) mod the tensor parallel size, so the larger chunks move between
-    ranks from layer to layer. Gate and up keep the chunk's output columns,
-    down its input rows. Routing is unchanged: every rank holds every expert,
-    and the MoE's all-reduce sums the ranks' partial outputs."""
+def tensor_parallel_expert_split(moe, prefix: str) -> tuple[int, tuple[slice, ...]]:
+    """(whole intermediate, this rank's columns of each global expert) of the
+    routed experts of the MoE layer ``prefix`` at MoE tensor parallel size > 1
+    (vLLM without --enable-expert-parallel). Each rank holds whole H128 blocks
+    of every expert's intermediate, in chunks as even as the blocks allow with
+    the larger chunks first (block_shard); rank r of layer L holds chunk
+    (r + L) mod the tensor parallel size of every expert, so the larger chunks
+    move between ranks from layer to layer, or with
+    VLLM_EXL3_MOE_EXPERT_ROTATION chunk (r + L + e) mod the size of expert e,
+    so each rank holds the larger chunk of an equal share of every layer's
+    experts. Gate and up keep the chunk's output columns, down its input rows.
+    Routing is unchanged: every rank holds every expert, and the MoE's
+    all-reduce sums the ranks' partial outputs."""
     from vllm.model_executor.models.utils import extract_layer_index
 
     parallel = moe.moe_parallel_config
@@ -849,38 +888,81 @@ def tensor_parallel_expert_split(moe, prefix: str) -> tuple[int, slice]:
     intermediate = moe.intermediate_size
     size, rank = parallel.tp_size, parallel.tp_rank
     layer_index = extract_layer_index(prefix)
+    rotate = envs.VLLM_EXL3_MOE_EXPERT_ROTATION
 
     def chunk(rotation: int) -> slice:
         return block_shard(intermediate, intermediate, rank, size, rotation)
 
-    columns = chunk(layer_index)
-    logger.info_once(
-        "EXL3 routed experts of %s are split across %d tensor-parallel ranks "
-        "(no expert parallelism): rank %d holds %s of each expert's %d "
-        "intermediate columns at layer index mod %d = 0..%d.",
-        re.sub(r"\d+", "<L>", prefix),
-        size,
-        rank,
-        tuple(part.stop - part.start for part in map(chunk, range(size))),
-        intermediate,
-        size,
-        size - 1,
+    columns = tuple(
+        chunk(layer_index + (expert if rotate else 0)) for expert in range(moe.num_experts)
     )
+    sizes = tuple(part.stop - part.start for part in map(chunk, range(size)))
+    if rotate:
+        widths = [part.stop - part.start for part in columns]
+        logger.info_once(
+            "EXL3 routed experts of %s are split across %d tensor-parallel ranks "
+            "(no expert parallelism) with per-expert chunk rotation "
+            "(VLLM_EXL3_MOE_EXPERT_ROTATION): rank %d holds chunk (rank + layer "
+            "index + expert) mod %d of each expert's %d intermediate columns, "
+            "chunks %s: %s of the %d experts of a layer.",
+            re.sub(r"\d+", "<L>", prefix),
+            size,
+            rank,
+            size,
+            intermediate,
+            sizes,
+            ", ".join(f"{widths.count(w)} at {w}" for w in sorted(set(widths), reverse=True)),
+            len(widths),
+        )
+    else:
+        logger.info_once(
+            "EXL3 routed experts of %s are split across %d tensor-parallel ranks "
+            "(no expert parallelism): rank %d holds %s of each expert's %d "
+            "intermediate columns at layer index mod %d = 0..%d.",
+            re.sub(r"\d+", "<L>", prefix),
+            size,
+            rank,
+            sizes,
+            intermediate,
+            size,
+            size - 1,
+        )
     logger.debug(
-        "EXL3 routed experts of %s: rank %d holds intermediate columns [%d, %d)",
+        "EXL3 routed experts of %s: rank %d holds intermediate columns %s",
         prefix,
         rank,
-        columns.start,
-        columns.stop,
+        sorted({(part.start, part.stop) for part in columns}),
     )
     return intermediate, columns
 
 
+def expert_split_widths(columns: tuple[slice, ...]) -> tuple[int, bool]:
+    """(widest chunk, whether the chunks differ in width) of a rank's columns
+    from tensor_parallel_expert_split: the intermediate this rank's operators
+    take, and whether they take the mixed-width ones (whose experts are that
+    wide or one H128 block narrower)."""
+    widths = {part.stop - part.start for part in columns}
+    widest = max(widths)
+    if not widths <= {widest, widest - 128}:
+        raise ValueError(f"EXL3 tensor-split experts of widths {sorted(widths)}")
+    return widest, len(widths) > 1
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
     # Routed experts at MoE tensor parallel size > 1: (whole intermediate,
-    # this rank's columns of every expert) from tensor_parallel_expert_split;
-    # None with whole experts per rank.
+    # this rank's columns of each global expert) from
+    # tensor_parallel_expert_split; None with whole experts per rank.
     expert_split = None
+    # The rank's experts differ in width by one H128 block
+    # (VLLM_EXL3_MOE_EXPERT_ROTATION): every call takes a mixed-width operator
+    # at the widest chunk (expert_split_widths).
+    mixed_widths = False
+
+    @property
+    def _mixed(self) -> dict:
+        """The ops gates' and warm-ups' keyword for this layer's experts: none
+        unless they differ in width (the calls are then as without the switch)."""
+        return {"mixed": True} if self.mixed_widths else {}
 
     def __init__(self, config, prefix, moe):
         super().__init__(moe)
@@ -888,6 +970,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.prefix = prefix
         if moe.moe_parallel_config.tp_size != 1:
             self.expert_split = tensor_parallel_expert_split(moe, prefix)
+            widest, self.mixed_widths = expert_split_widths(self.expert_split[1])
+            if self.mixed_widths:
+                from vllm_sm80.kernels.exl3.ops import MOE_MIXED_SHAPE
+
+                if (moe.hidden_dim, widest) != MOE_MIXED_SHAPE:
+                    raise ValueError(
+                        "VLLM_EXL3_MOE_EXPERT_ROTATION: the mixed-width MoE operators "
+                        f"serve (hidden, widest chunk) = {MOE_MIXED_SHAPE} only, not "
+                        f"{(moe.hidden_dim, widest)} ({prefix}); unset the switch for "
+                        "this model or layout"
+                    )
         if moe.has_bias or moe.activation != MoEActivation.SILU:
             raise ValueError("EXL3 experts require bias-free SiLU gate/up/down")
         if moe.is_lora_enabled:
@@ -913,13 +1006,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         moe_parallel_config,
     ):
         """Under tensor parallelism a rank's intermediate is its chunk of
-        whole H128 blocks (tensor_parallel_expert_split), not an even share."""
+        whole H128 blocks (tensor_parallel_expert_split; the widest of its
+        experts' chunks with VLLM_EXL3_MOE_EXPERT_ROTATION), not an even share."""
         hidden_size, intermediate = super().maybe_roundup_sizes(
             hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config
         )
         if self.expert_split is not None:
-            columns = self.expert_split[1]
-            intermediate = columns.stop - columns.start
+            intermediate = expert_split_widths(self.expert_split[1])[0]
         return hidden_size, intermediate
 
     def create_weights(
@@ -938,11 +1031,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             intermediate, columns = intermediate_size_per_partition, None
         else:
             intermediate, columns = self.expert_split
-            if intermediate_size_per_partition != columns.stop - columns.start:
+            widest = expert_split_widths(columns)[0]
+            if intermediate_size_per_partition != widest:
                 raise ValueError(
                     "EXL3 tensor-parallel experts need this rank's intermediate "
-                    f"{columns.stop - columns.start}, not "
-                    f"{intermediate_size_per_partition}"
+                    f"{widest}, not {intermediate_size_per_partition}"
                 )
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
@@ -975,10 +1068,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     part = (k, n, whole_in, whole_out)
                 elif role == "down_proj":
                     # Down keeps this rank's input rows and every output.
-                    part = (columns.stop - columns.start, n, columns, whole_out)
+                    rows = columns[expert]
+                    part = (rows.stop - rows.start, n, rows, whole_out)
                 else:
                     # Gate and up keep every input and this rank's outputs.
-                    part = (k, columns.stop - columns.start, whole_in, [columns])
+                    cols = columns[expert]
+                    part = (k, cols.stop - cols.start, whole_in, [cols])
                 local_matrices.append((local, matrix, part))
         views = [None] * len(local_matrices)
         if envs.VLLM_EXL3_EXPERTS_CONTIGUOUS and local_matrices:
@@ -1066,6 +1161,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.top_k,
             self.local_experts,
         )
+        if self.mixed_widths:
+            # Every operator of these layers takes the experts' own widths.
+            exl3_ops.require_moe_mixed()
         moe_v2_rows = moe_v2_bits_x2 = 0
         if envs.VLLM_EXL3_MOE_V2:
             moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
@@ -1079,8 +1177,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer, metadata, max_rows, workspace, draft=True
             )
             moe_v2_draft = bool(moe_v2_rows)
-        # VLLM_EXL3_MOE_V2_RING: the target layers' moe_out_v2 calls of the covered
-        # configuration take moe_out_v2_try (before moe_out_v2_fold).
+        # VLLM_EXL3_MOE_V2_RING: the target layers' moe_out_v2 calls of a covered
+        # configuration (ops.MOE_V2_TRY_CONFIGS) take moe_out_v2_try (before
+        # moe_out_v2_fold).
         moe_v2_try = False
         if moe_v2_rows and not moe_v2_draft:
             moe_v2_try, workspace = self._moe_v2_try(
@@ -1118,9 +1217,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_v2_bits_x2=moe_v2_bits_x2,
             moe_v2_fold=bool(moe_v2_rows)
             and not moe_v2_draft
+            and not self.mixed_widths
             and envs.VLLM_EXL3_MOE_V2_FOLD,
             moe_v2_draft=moe_v2_draft,
             moe_v2_try=moe_v2_try,
+            mixed_widths=self.mixed_widths,
             prefill_decode_len=prefill_decode_len,
             prefill_v2_bits_x2=prefill_v2_bits_x2,
             prefill_v2_decode_len=prefill_v2_decode_len,
@@ -1148,6 +1249,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.global_num_experts,
             metadata,
             draft=draft,
+            **self._mixed,
         )
         if reason is not None:
             if draft:
@@ -1188,8 +1290,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.top_k,
             bits_x2,
             self.swiglu_limit,
+            **self._mixed,
         )
-        if draft:
+        if draft and self.intermediate_size != 2304:
+            logger.info_once(
+                "EXL3 MoE v2 drafter kernels active (VLLM_EXL3_MOE_V2_DRAFT): "
+                "tensor-core routed experts of the DSpark drafter's %s-column "
+                "tensor-split chunks (bits_x2 %d, the tensor-split stages: 8-row "
+                "tiles, no row tile floor) for MoE calls of 1..%d rows; larger "
+                "calls keep moe_out.",
+                f"{self.intermediate_size}- and {self.intermediate_size - 128}"
+                if self.mixed_widths
+                else self.intermediate_size,
+                bits_x2,
+                rows,
+            )
+        elif draft:
             logger.info_once(
                 "EXL3 MoE v2 drafter kernels active (VLLM_EXL3_MOE_V2_DRAFT): "
                 "tensor-core routed experts of the DSpark drafter (bits_x2 %d, "
@@ -1214,6 +1330,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "layers (VLLM_EXL3_MOE_V2_DRAFT): their moe_out_v2 calls keep "
                     "five launches."
                 )
+        elif envs.VLLM_EXL3_MOE_V2_FOLD and self.mixed_widths:
+            logger.info_once(
+                "VLLM_EXL3_MOE_V2_FOLD does not apply to the routed experts with "
+                "per-expert chunk rotation (VLLM_EXL3_MOE_EXPERT_ROTATION): their "
+                "moe_out_v2 calls take moe_out_v2_mixed (five launches)."
+            )
         elif envs.VLLM_EXL3_MOE_V2_FOLD:
             exl3_ops.require_moe_v2_fold()
             exl3_ops.warmup_moe_v2(
@@ -1237,8 +1359,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def _moe_v2_try(self, layer, rows: int, bits_x2: int, workspace: int):
         """(True, a workspace size that fits moe_out_v2_try too) when
-        VLLM_EXL3_MOE_V2_RING is set and the layer is its configuration, after
-        warming the operator; else (False, workspace)."""
+        VLLM_EXL3_MOE_V2_RING is set and the layer is a configuration it
+        covers, after warming the operator; else (False, workspace)."""
         from vllm_sm80.kernels.exl3 import ops as exl3_ops
 
         if not exl3_ops.moe_v2_try_open(
@@ -1272,6 +1394,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             bits_x2,
             self.swiglu_limit,
             trial=True,
+            **self._mixed,
         )
         logger.info_once(
             "EXL3 MoE v2 ring kernel active (VLLM_EXL3_MOE_V2_RING): moe_out_v2_try "
@@ -1378,7 +1501,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.local_experts,
             layer.global_num_experts,
             metadata,
+            **self._mixed,
         )
+        if reason is None and self.mixed_widths and not exl3_ops.TRY_MOE_PREFILL:
+            reason = (
+                "the routed experts with per-expert chunk rotation "
+                "(VLLM_EXL3_MOE_EXPERT_ROTATION) take the prefill tensor cores "
+                "through moe_out_prefill_try_mixed only (VLLM_EXL3_MOE_PREFILL_UNCHUNKED)"
+            )
         if reason is None and max_rows < exl3_ops.MOE_PREFILL_MIN_ROWS:
             reason = f"MoE calls have at most {max_rows} rows"
         if reason is None:
@@ -1418,6 +1548,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.top_k,
             bits_x2,
             self.swiglu_limit,
+            **self._mixed,
         )
         decode_len = _prefill_v2_decode_len(vllm_config)
         logger.info_once(
@@ -1460,6 +1591,9 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
     moe_v2_draft = False
     # VLLM_EXL3_MOE_V2_RING: the moe_out_v2 calls take moe_out_v2_try.
     moe_v2_try = False
+    # VLLM_EXL3_MOE_EXPERT_ROTATION: the experts are intermediate_size or one
+    # H128 block narrower; every call takes its operator's mixed-width form.
+    mixed_widths = False
 
     def __init__(
         self,
@@ -1475,6 +1609,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         moe_v2_fold=False,
         moe_v2_draft=False,
         moe_v2_try=False,
+        mixed_widths=False,
         prefill_decode_len=0,
         prefill_v2_bits_x2=0,
         prefill_v2_decode_len=0,
@@ -1495,6 +1630,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.moe_v2_fold = moe_v2_fold
         self.moe_v2_draft = moe_v2_draft
         self.moe_v2_try = moe_v2_try
+        self.mixed_widths = mixed_widths
         # Nonzero (VLLM_EXL3_MOE_PREFILL_TC with its gate open): calls of more
         # than 64 rows in a step that schedules some request more than this
         # many tokens take moe_out_prefill.
@@ -1630,6 +1766,10 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             ]
         else:
             chunks = [rows_args]
+        if self.mixed_widths:
+            # The operator's form for experts of two widths (ops.py: each
+            # wrapper's ``mixed``).
+            operator = partial(operator, mixed=True)
         for x, ids, weights, out in chunks:
             operator(
                 x,

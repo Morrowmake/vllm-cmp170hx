@@ -195,9 +195,13 @@ __global__ void expert_input(const __nv_bfloat16* x, Routing routing, const int*
 // One warp per (local assignment, 128-column block): gate and up output
 // transforms (H128, svh), SiLU(gate) * up, down suh, then the down H128,
 // written over the gate rows; gate and up clamped first by swiglu_clamp.
-__global__ void activate_down_input(Routing routing, const int* table,
-                                    int64_t intermediate, int64_t ipad, float* gate,
-                                    const float* up, float limit) {
+// Mixed: an expert's width w is its down padded_in (a multiple of 128); a
+// block at or past w, whose gate/up rows the GEMM never wrote and whose
+// svh/suh entries do not exist, is written as zeros without reading them.
+template <bool kMixed>
+__device__ __forceinline__ void activate_blocks(Routing routing, const int* table,
+                                                int64_t intermediate, int64_t ipad, float* gate,
+                                                const float* up, float limit) {
   const int lane = threadIdx.x & 31;
   const int* sorted = table + RouteLayout::sorted_offset();
   const int64_t blocks = ipad / 128;
@@ -207,6 +211,13 @@ __global__ void activate_down_input(Routing routing, const int* table,
     const int64_t assignment = sorted[task / blocks];
     const int64_t base = (task % blocks) * 128 + lane;
     const int64_t expert = local_expert(routing, assignment);
+    if constexpr (kMixed) {
+      if (base - lane >= routing.metadata[expert * 12 + 2 * 4]) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) gate[assignment * ipad + base + 32 * i] = 0.0f;
+        continue;
+      }
+    }
     const half* gate_svh = expert_svh(routing, expert, 0);
     const half* up_svh = expert_svh(routing, expert, 1);
     const half* down_suh = expert_suh(routing, expert, 2);
@@ -236,6 +247,19 @@ __global__ void activate_down_input(Routing routing, const int* table,
 #pragma unroll
     for (int i = 0; i < 4; ++i) gate[assignment * ipad + base + 32 * i] = v[i];
   }
+}
+
+__global__ void activate_down_input(Routing routing, const int* table,
+                                    int64_t intermediate, int64_t ipad, float* gate,
+                                    const float* up, float limit) {
+  activate_blocks<false>(routing, table, intermediate, ipad, gate, up, limit);
+}
+
+// activate_down_input for experts of per-expert width (moe_out_mixed).
+__global__ void activate_down_input_mixed(Routing routing, const int* table,
+                                          int64_t intermediate, int64_t ipad, float* gate,
+                                          const float* up, float limit) {
+  activate_blocks<true>(routing, table, intermediate, ipad, gate, up, limit);
 }
 
 // One warp per (token, 128-column block): each local route's down output
@@ -292,12 +316,15 @@ int64_t moe_workspace_size(int64_t max_rows, int64_t hidden_size,
       RouteLayout::ints(assignments)));
 }
 
-void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
-             const torch::Tensor& topk_weights,
-             const torch::Tensor& packed_ptrs,
-             const torch::Tensor& packed_meta,
-             const torch::Tensor& expert_map, int64_t intermediate_size,
-             torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit) {
+namespace {
+
+// moe_out, or moe_out_mixed with kMixed (see there).
+template <bool kMixed>
+void run_moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                 const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                 const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                 int64_t intermediate_size, torch::Tensor& out, torch::Tensor& workspace,
+                 double swiglu_limit) {
   const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
   check_tensor(x, x, at::kBFloat16, "x");
@@ -327,6 +354,11 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
   const int64_t assignments = checked_mul(rows, topk);
   TORCH_CHECK(assignments <= std::numeric_limits<int>::max(),
               "EXL3 MoE has too many routed assignments");
+  if constexpr (kMixed) {
+    TORCH_CHECK(hidden == 5120 && intermediate_size == 640,
+                "EXL3 mixed-width MoE supports hidden 5120 with intermediate 640 (experts 640 "
+                "or 512 wide) only");
+  }
   const int64_t required = moe_workspace_size(rows, hidden, intermediate_size, topk, experts);
   TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 16 == 0,
@@ -341,6 +373,7 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
                   expert_map.numel(), experts, topk,
                   topk_ids.scalar_type() == at::kLong, expert_map.scalar_type() == at::kLong};
   float* input = workspace.data_ptr<float>();
+  constexpr auto* gemm = kMixed ? &launch_gemm_mixed : &launch_gemm;
   if (experts > 0 && assignments > 0) {
     float* gate = input + assignments * hpad;
     float* up = gate + assignments * ipad;
@@ -372,7 +405,7 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
       problem.c = gate;
       problem.c_up = up;
       problem.projection = 0;
-      launch_gemm(problem, shape, 2 * max_tiles * (ipad / block_cols), stream);
+      gemm(problem, shape, 2 * max_tiles * (ipad / block_cols), stream);
       problem.x = nullptr;
     } else {
       for (int projection = 0; projection < 2; ++projection) {
@@ -383,11 +416,17 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
         problem.a_stride = hpad;
         problem.c = projection == 0 ? gate : up;
         problem.projection = projection;
-        launch_gemm(problem, shape, max_tiles * (ipad / block_cols), stream);
+        gemm(problem, shape, max_tiles * (ipad / block_cols), stream);
       }
     }
-    activate_down_input<<<warp_blocks(assignments * (ipad / 128)), 32 * kWarpsPerBlock, 0,
-                          stream>>>(routing, table, intermediate_size, ipad, gate, up, limit);
+    const unsigned int activate_grid = warp_blocks(assignments * (ipad / 128));
+    if constexpr (kMixed) {
+      activate_down_input_mixed<<<activate_grid, 32 * kWarpsPerBlock, 0, stream>>>(
+          routing, table, intermediate_size, ipad, gate, up, limit);
+    } else {
+      activate_down_input<<<activate_grid, 32 * kWarpsPerBlock, 0, stream>>>(
+          routing, table, intermediate_size, ipad, gate, up, limit);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     problem.a = gate;
     problem.a_stride = ipad;
@@ -396,7 +435,7 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
     problem.k = static_cast<int>(ipad);
     problem.n = static_cast<int>(hpad);
     problem.projection = 2;
-    launch_gemm(problem, shape, max_tiles * (hpad / block_cols), stream);
+    gemm(problem, shape, max_tiles * (hpad / block_cols), stream);
   } else {
     routing.topk = 0;
   }
@@ -404,6 +443,42 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
       input, topk_weights.data_ptr<float>(), routing, rows, hidden, hpad,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
+             const torch::Tensor& topk_weights,
+             const torch::Tensor& packed_ptrs,
+             const torch::Tensor& packed_meta,
+             const torch::Tensor& expert_map, int64_t intermediate_size,
+             torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit) {
+  run_moe_out<false>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
+                     intermediate_size, out, workspace, swiglu_limit);
+}
+
+// Mixed widths: every local expert is intermediate_size (640) or 128 less wide per packed_meta
+// (padded_out of gate/up = padded_in of down = w_e). moe_out's launches, workspace layout and
+// strides at intermediate_size; only the expert GEMMs (launch_gemm_mixed) and the activation
+// (activate_down_input_mixed) differ, by loop bounds and an early exit. Exactness by construction:
+// a route of an expert w_e wide runs, on the same values, the code moe_out runs at
+// intermediate_size = w_e:
+// - route_assignments, expert_input and the fused x * suh forming take no width; the GEMM's
+//   block shape depends only on (assignments, global experts), and any shape gives the same rows;
+// - gate/up: the same gemm_kernel/run_tile template, tiles_n = w_e / 16 from meta as at w_e,
+//   K = padded_in = the hidden padding (= problem.k), the same item -> (rows, col0) tiles; items at
+//   or past w_e (absent at w_e) compute nothing. Results land at stride 640 instead of w_e;
+// - activation: blocks below w_e run the base code (col < 640 holds there as col < w_e does at
+//   w_e); blocks at or past w_e are zero and are never read;
+// - down: K = padded_in = w_e, so each output is the same sequential FMA chain over k < w_e on the
+//   same operand values and decoded weights as at w_e; columns and combine_routes unchanged.
+void moe_out_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                   const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                   const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                   int64_t intermediate_size, torch::Tensor& out, torch::Tensor& workspace,
+                   double swiglu_limit) {
+  run_moe_out<true>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
+                    intermediate_size, out, workspace, swiglu_limit);
 }
 
 }  // namespace exl3

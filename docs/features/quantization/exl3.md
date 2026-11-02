@@ -6,7 +6,7 @@ Each GPU block decodes a 16-row slab of trellis tiles once into shared memory an
 
 `VLLM_EXL3_MOE_V2=1` (default `0`) runs the routed experts of MoE calls with at most 64 rows on the tensor cores (`csrc/exl3/moe_v2.cu`, operator `moe_out_v2`), for two configurations only (`ops.MOE_V2_CONFIGS`), on SM 8.0 with BF16 activations and codebook 2: hidden size 2560, expert intermediate size 640, top-10 routing with 256 of 512 experts local, every expert matrix at `bits_x2` 10; and hidden size 5120, intermediate size 2304, top-6 routing with 96 of 384 whole experts local (expert parallel size 4), every expert matrix of a layer at one `bits_x2`, 6 or 4. Each warp decodes its own trellis tiles straight into `mma.m16n8k16` FP16 operands (decoded weights are exact FP16 values) and multiplies them with the activations as two FP16 parts, a high part and the rounded remainder (about 22 significant bits together, not the full FP32 value), after an exact scaling by a power of two per row (per row and 640-column group for the gate and up inputs of hidden-2560 calls of at least 160 routed assignments), starting every 16-deep product from zero and summing in FP32 in a fixed order; the input transform, activation and combine run in FP64 and round once. Results are deterministic and independent of the other rows, but differ from the default kernels in the last bits; at hidden size 5120 every call uses one K-slice layout, so a row's result also does not depend on the call's row count. Any other layer, and every call with more rows, keeps `moe_out`; a startup line per bit width says the path is active, or one says why the gate is closed.
 
-`VLLM_EXL3_MOE_V2_DRAFT=1` (default `0`) runs the DSpark drafter's routed experts of DeepSeek-V4.1-Flash (top-3 of 128 experts, every expert matrix at `bits_x2` 8, codebook 2) on `moe_out_v2` for MoE calls of at most 64 rows on SM 8.0, independently of `VLLM_EXL3_MOE_V2` (`ops.MOE_V2_DRAFT_CONFIGS`). At expert parallel size 4 (intermediate 2304, 32 whole experts local) the calls take stages of their own (`moe_v2.cu` `DraftTiling`): one gate/up scale per 640 columns, one down scale per K slice, row tiles of up to 16 rows whose low FP16 part (tiles of 5 to 16 rows) is summed in the MMA's C operand. The drafter's experts split across tensor-parallel ranks (intermediate 640 or 512, all 128 local) keep `moe_out`. These calls are never folded (`VLLM_EXL3_MOE_V2_FOLD` does not apply). A row's result depends on whether its tile holds 1..4 rows or more; the diagnostic `VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS` (0, 8 or 16) gives every tile at least that tile's kernel.
+`VLLM_EXL3_MOE_V2_DRAFT=1` (default `0`) runs the DSpark drafter's routed experts of DeepSeek-V4.1-Flash (top-3 of 128 experts, every expert matrix at `bits_x2` 8, codebook 2) on `moe_out_v2` for MoE calls of at most 64 rows on SM 8.0, independently of `VLLM_EXL3_MOE_V2` (`ops.MOE_V2_DRAFT_CONFIGS`). At expert parallel size 4 (intermediate 2304, 32 whole experts local) the calls take stages of their own (`moe_v2.cu` `DraftTiling`): one gate/up scale per 640 columns, one down scale per K slice, row tiles of up to 16 rows whose low FP16 part (tiles of 5 to 16 rows) is summed in the MMA's C operand; there a row's result depends on whether its tile holds 1..4 rows or more, and the diagnostic `VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS` (0, 8 or 16) gives every tile at least that tile's kernel. In the tensor-split layout (no `--enable-expert-parallel`) the drafter's experts split across the tensor-parallel ranks (intermediate 640 or 512, all 128 local) take the tensor-split stages at `bits_x2` 8, whose rows never depend on the call's other rows (`VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS` does not apply). These calls are never folded (`VLLM_EXL3_MOE_V2_FOLD` does not apply).
 
 `VLLM_EXL3_MOE_PREFILL_TC=1` (default `0`) runs the routed experts of MoE calls of 65 to 3,460 rows (one prefill chunk at the validated `--max-num-batched-tokens 3460`) in prefill steps on the tensor cores (`csrc/exl3/moe_prefill.cu`), for the hidden-2560 configuration `VLLM_EXL3_MOE_V2` covers (`ops.MOE_PREFILL_CONFIGS`) when every local expert's trellis starts at a 16-byte-aligned address, at tensor parallel size 2 without pipeline parallelism, and not with drafters that use parallel drafting slots (DFlash, DSpark). A step is a prefill step when the scheduler gave some request more than 1 + `num_speculative_tokens` tokens; the row count of a call never decides it, so decode steps of any size keep their kernels. The routed rows of each expert are grouped into 64-row tiles, and each tile's GEMMs run `mma.m16n8k16` FP16 on exactly decoded weights against the same high/low FP16 split of the activations, scaled by a power of two per row and projection, with every 16-deep product starting from zero and summed in FP32 in a fixed order. The input, activation and per-route output transforms are `moe_out`'s FP32 operations; the routes' weighted sum runs in FP64 and rounds once. Results are deterministic and independent of the other rows, but differ from `moe_out` in the last bits. The MoE workspace grows to fit the operator (at 3,460 rows per call, 846 MiB instead of 508 MiB per GPU). Calls of at most 64 rows keep `moe_out_v2` or `moe_out`, larger calls keep `moe_out`, and prefill steps padded to a captured CUDA graph size replay the kernels captured for decode; a startup line says whether the path is active or why the gate is closed.
 
@@ -109,6 +109,46 @@ rank width is up to their gates
 The block-aligned split rotated per layer follows the idea of the
 DeepSeek-V4.1-Flash CMP 170HX recipes of GNmac-lab and Curtis White
 (CurtisAccelerate); no code is taken from them.
+
+`VLLM_EXL3_MOE_EXPERT_ROTATION=1` (default `0`) rotates the chunks per expert
+as well: rank r of layer L holds chunk (r + L + e) mod the tensor parallel size
+of expert e. Each rank then holds every chunk of an equal share of a layer's
+experts (at tensor parallel size 4: the 640-column chunk of 192 of
+DeepSeek-V4.1-Flash's 384 target experts and the 512-column chunk of the other
+192; 64 and 64 of the drafter's 128), so the ranks hold the same columns in
+every layer and do the same expected routed work, instead of two ranks 25 %
+more. The rank's operators take the widest chunk as `intermediate_size` and
+each expert's own width from its metadata: `moe_out_mixed`,
+`moe_out_v2_mixed` (target and drafter layers, never folded),
+`moe_out_v2_try_mixed` (with `VLLM_EXL3_MOE_V2_RING`) and
+`moe_out_prefill_try_mixed` (prefill calls take the tensor cores only with
+`VLLM_EXL3_MOE_PREFILL_UNCHUNKED`), each the base operator's schema
+(`ops.MOE_MIXED_SHAPE`: hidden 5120, chunks of 640 and 512 columns). Every
+routed (row, expert) chunk product is bitwise the base operator's at the
+expert's width; a rank's partial output sums other chunks of the row's experts
+than without the switch before its BF16 rounding and the all-reduce, so the
+MoE output differs in the last bits.
+
+`VLLM_EXL3_FAST_LOAD=1` (default `0`) makes the loader faster without changing
+a loaded byte; it matters most for tensor-split routed experts, whose ranks
+hold four times the expert parameters and copy column chunks:
+
+- The plain (non-EXL3) tensors are loaded with one `model.load_weights` call
+  each, and DeepSeek-V4's `load_weights` walks `model.named_parameters()`
+  twice per call (its `params_dict` and the expert mapping's LoRA scan). With
+  the switch the routed experts' packed weights, all loaded by then and the
+  target of no plain tensor, are out of the module tree for those calls
+  (`loader.routed_experts_hidden`): a tensor-split DeepSeek-V4.1-Flash rank
+  holds 138k of them (three per expert matrix), 35k at EP4.
+- A thread beside the loader reads the checkpoint spans of the next loads into
+  the page cache (`posix_fadvise(WILLNEED)` in pieces of the device's
+  max(`read_ahead_kb`, `max_sectors_kb`), in the loader's order, up to 4 GiB
+  ahead; `vllm_sm80/kernels/exl3/readahead.py`). Without it the copies from
+  the memory-mapped files fault their pages in one 128 KiB read-around at a
+  time; a tensor-split rank copies a column chunk of every row of every gate
+  and up trellis, so it faults in whole tensors that way, and the four ranks
+  of a TP4 boot wait on the same faults. The copies are unchanged: same bytes
+  from the same mapped files.
 
 ## Third-party material
 

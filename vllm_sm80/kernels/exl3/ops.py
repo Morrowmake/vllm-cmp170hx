@@ -4,7 +4,7 @@
 
 import importlib
 import weakref
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 
@@ -59,14 +59,19 @@ MOE_V2_CONFIGS = {
     # (expert parallel size 4); kernels and stages of their own (moe_v2.cu
     # DraftTiling: 16-row tiles, the hi/lo split in the MMA's C operand).
     (5120, 2304, 3, 32, 128): (8,),
+    # The drafter's experts split across tensor-parallel ranks: every expert
+    # local, a 640- or 512-column chunk each; the tensor-split stages above
+    # (moe_v2.cu LaneTiling<5120, 640 | 512>) at bits_x2 8.
+    (5120, 640, 3, 128, 128): (8,),
+    (5120, 512, 3, 128, 128): (8,),
 }
 # The MOE_V2_CONFIGS entries only VLLM_EXL3_MOE_V2_DRAFT opens (the DSpark
 # drafter's layers); VLLM_EXL3_MOE_V2 opens the others. The drafter's calls
-# are never folded (moe_out_v2_fold refuses bits_x2 8). The drafter's experts
-# split across tensor-parallel ranks (intermediate 640 or 512, all 128 local)
-# keep moe_out: moe_out_v2 has bits_x2 8 kernels for those shapes, but their
-# output has not been checked through the drafter's consumer.
-MOE_V2_DRAFT_CONFIGS = frozenset({(5120, 2304, 3, 32, 128)})
+# are never folded (moe_out_v2_fold refuses bits_x2 8). Only the
+# tensor-split layout (no --enable-expert-parallel) reaches the split ones.
+MOE_V2_DRAFT_CONFIGS = frozenset(
+    {(5120, 2304, 3, 32, 128), (5120, 640, 3, 128, 128), (5120, 512, 3, 128, 128)}
+)
 # moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
 # serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
 # validated range: one 3460-token prefill chunk).
@@ -86,6 +91,22 @@ MOE_PREFILL_V2_CONFIGS = {
     (5120, 512, 6, 384, 384): (6, 4),
 }
 MOE_PREFILL_V2_MAX_ROWS = 2048
+# VLLM_EXL3_MOE_EXPERT_ROTATION: the (hidden, widest intermediate) of the layers
+# whose experts are that wide or one H128 block narrower (the tensor-split
+# DeepSeek-V4.1-Flash chunks of 640 and 512 columns with per-expert chunk
+# rotation). Their calls take the mixed-width operators, each the base
+# operator's schema at the widest intermediate: moe_out_mixed, moe_out_v2_mixed
+# (target and drafter configurations; never folded), moe_out_v2_try_mixed
+# (VLLM_EXL3_MOE_V2_RING) and moe_out_prefill_try_mixed
+# (VLLM_EXL3_MOE_PREFILL_UNCHUNKED); every route's down output is the base
+# operator's at its expert's width.
+MOE_MIXED_SHAPE = (5120, 640)
+_MOE_MIXED_OPERATORS = (
+    "moe_out_mixed",
+    "moe_out_v2_mixed",
+    "moe_out_v2_try_mixed",
+    "moe_out_prefill_try_mixed",
+)
 
 
 # Output dtypes of the dense linear: BF16 rounds the FP32 result once; FP32
@@ -348,6 +369,17 @@ def moe_v2_expert_meta(hidden_size: int, intermediate_size: int, bits_x2: int):
     ]
 
 
+def moe_expert_metas(
+    hidden_size: int, intermediate_size: int, bits_x2: int, mixed: bool = False
+) -> list[list[list[int]]]:
+    """The per-expert metadata a layer's local experts may store: the one
+    moe_v2_expert_meta, or with ``mixed`` (the mixed-width operators,
+    VLLM_EXL3_MOE_EXPERT_ROTATION) also that of an expert one H128 block
+    narrower."""
+    widths = [intermediate_size] + ([intermediate_size - 128] if mixed else [])
+    return [moe_v2_expert_meta(hidden_size, width, bits_x2) for width in widths]
+
+
 def _moe_closed_reason(
     configs: dict[tuple[int, ...], tuple[int, ...]],
     capability: tuple[int, int] | None,
@@ -358,6 +390,7 @@ def _moe_closed_reason(
     local_experts: int,
     global_experts: int,
     metadata: list[list[list[int]]],
+    mixed: bool = False,
 ) -> str | None:
     if capability != (8, 0):
         return f"device capability {capability}, not (8, 0)"
@@ -370,17 +403,23 @@ def _moe_closed_reason(
             f"(hidden, intermediate, top_k, local experts, global experts) = "
             f"{shape}, not one of {sorted(configs)}"
         )
+    if mixed and (hidden_size, intermediate_size) != MOE_MIXED_SHAPE:
+        return (
+            f"experts of two widths at (hidden, intermediate) = "
+            f"{(hidden_size, intermediate_size)}, not {MOE_MIXED_SHAPE}"
+        )
     if len(metadata) != local_experts:
         return f"{len(metadata)} expert entries for {local_experts} local experts"
     bits_x2 = metadata[0][0][2]
     if bits_x2 not in rates:
         return f"local expert 0 stores bits_x2 {bits_x2}, not one of {rates}"
-    expected = moe_v2_expert_meta(hidden_size, intermediate_size, bits_x2)
+    expected = moe_expert_metas(hidden_size, intermediate_size, bits_x2, mixed)
     for local, meta in enumerate(metadata):
-        if [list(m) for m in meta] != expected:
+        if [list(m) for m in meta] not in expected:
             return (
                 f"local expert {local} stores [padded_in, padded_out, bits_x2, "
-                f"codebook] {[list(m) for m in meta]}, not {expected}"
+                f"codebook] {[list(m) for m in meta]}, not "
+                f"{' or '.join(map(str, expected))}"
             )
     return None
 
@@ -395,6 +434,7 @@ def moe_v2_closed_reason(
     global_experts: int,
     metadata: list[list[list[int]]],
     draft: bool = False,
+    mixed: bool = False,
 ) -> str | None:
     """Why moe_out_v2 must not serve this layer, or None when it may (then
     every routed matrix has bits_x2 ``metadata[0][0][2]``).
@@ -403,7 +443,8 @@ def moe_v2_closed_reason(
     per-expert [padded_in, padded_out, bits_x2, codebook] list the layer's
     ``exl3_meta`` buffer is built from), never from device tensors.
     ``draft``: the configurations of MOE_V2_DRAFT_CONFIGS
-    (VLLM_EXL3_MOE_V2_DRAFT), else the others (VLLM_EXL3_MOE_V2).
+    (VLLM_EXL3_MOE_V2_DRAFT), else the others (VLLM_EXL3_MOE_V2). ``mixed``:
+    each expert may also be one H128 block narrower (moe_out_v2_mixed).
     """
     return _moe_closed_reason(
         {
@@ -419,6 +460,7 @@ def moe_v2_closed_reason(
         local_experts,
         global_experts,
         metadata,
+        mixed,
     )
 
 
@@ -455,8 +497,10 @@ def moe_prefill_v2_closed_reason(
     local_experts: int,
     global_experts: int,
     metadata: list[list[list[int]]],
+    mixed: bool = False,
 ) -> str | None:
-    """moe_v2_closed_reason for moe_out_prefill_v2 (MOE_PREFILL_V2_CONFIGS)."""
+    """moe_v2_closed_reason for moe_out_prefill_v2 (MOE_PREFILL_V2_CONFIGS);
+    ``mixed``: moe_out_prefill_try_mixed."""
     return _moe_closed_reason(
         MOE_PREFILL_V2_CONFIGS,
         capability,
@@ -467,6 +511,7 @@ def moe_prefill_v2_closed_reason(
         local_experts,
         global_experts,
         metadata,
+        mixed,
     )
 
 
@@ -548,11 +593,16 @@ def moe_out(
     out,
     workspace,
     swiglu_limit: float = 0.0,
+    *,
+    mixed: bool = False,
 ) -> None:
     """Routed experts; ``swiglu_limit`` > 0 clamps the FP32 gate from above
-    and up on both sides before SiLU(gate) * up (csrc/exl3/moe.cu)."""
+    and up on both sides before SiLU(gate) * up (csrc/exl3/moe.cu).
+    ``mixed``: moe_out_mixed, the experts intermediate_size or one H128 block
+    narrower (MOE_MIXED_SHAPE; callers check require_moe_mixed first)."""
     ensure_extension()
-    torch.ops._exl3_C.moe_out(
+    op = torch.ops._exl3_C.moe_out_mixed if mixed else torch.ops._exl3_C.moe_out
+    op(
         x,
         topk_ids,
         topk_weights,
@@ -579,11 +629,15 @@ def moe_out_v2(
     swiglu_limit: float = 0.0,
     *,
     bits_x2: int,
+    mixed: bool = False,
 ) -> None:
     """moe_out's contract on the tensor cores; see csrc/exl3/moe_v2.cu.
-    ``bits_x2`` is the one bit width of every routed matrix of the layer."""
+    ``bits_x2`` is the one bit width of every routed matrix of the layer.
+    ``mixed``: moe_out_v2_mixed (MOE_MIXED_SHAPE; callers check
+    require_moe_mixed first)."""
     ensure_extension()
-    torch.ops._exl3_C.moe_out_v2(
+    op = torch.ops._exl3_C.moe_out_v2_mixed if mixed else torch.ops._exl3_C.moe_out_v2
+    op(
         x,
         topk_ids,
         topk_weights,
@@ -652,12 +706,16 @@ def moe_out_v2_fold(
     )
 
 
-# VLLM_EXL3_MOE_V2_RING=1 (default off): the target model's
-# expert-parallel moe_out_v2 calls of exactly this configuration (hidden,
-# intermediate, top-k, local experts, global experts), bits_x2 6 or 4, 1..64
-# rows, take _exl3_C::moe_out_v2_try (csrc/exl3/moe_v2_try.cu) instead of
-# moe_out_v2 or moe_out_v2_fold: same arguments and output bits.
-MOE_V2_TRY_CONFIG = (5120, 2304, 6, 96, 384)
+# VLLM_EXL3_MOE_V2_RING=1 (default off): the target model's moe_out_v2 calls of
+# these configurations (hidden, intermediate, top-k, local experts, global
+# experts), bits_x2 6 or 4, 1..64 rows, take _exl3_C::moe_out_v2_try
+# (csrc/exl3/moe_v2_try.cu) instead of moe_out_v2 or moe_out_v2_fold: same
+# arguments and output bits. Whole experts at expert parallel size 4, or the
+# tensor-split chunks (only the layout without --enable-expert-parallel
+# reaches those).
+MOE_V2_TRY_CONFIGS = frozenset(
+    {(5120, 2304, 6, 96, 384), (5120, 640, 6, 384, 384), (5120, 512, 6, 384, 384)}
+)
 MOE_V2_TRY_BITS = (6, 4)
 _moe_v2_try_fake_registered = False
 
@@ -670,11 +728,11 @@ def moe_v2_try_open(
     global_experts: int,
     bits_x2: int,
 ) -> bool:
-    """VLLM_EXL3_MOE_V2_RING is set and the layer is the configuration it covers."""
+    """VLLM_EXL3_MOE_V2_RING is set and the layer is a configuration it covers."""
     return (
         envs.VLLM_EXL3_MOE_V2_RING
         and (hidden_size, intermediate_size, top_k, local_experts, global_experts)
-        == MOE_V2_TRY_CONFIG
+        in MOE_V2_TRY_CONFIGS
         and bits_x2 in MOE_V2_TRY_BITS
     )
 
@@ -724,11 +782,16 @@ def moe_out_v2_try(
     swiglu_limit: float = 0.0,
     *,
     bits_x2: int,
+    mixed: bool = False,
 ) -> None:
     """moe_out_v2's arguments and output bits (VLLM_EXL3_MOE_V2_RING; callers check
-    moe_v2_try_open and require_moe_v2_try first)."""
+    moe_v2_try_open and require_moe_v2_try first). ``mixed``:
+    moe_out_v2_try_mixed (MOE_MIXED_SHAPE; callers check require_moe_mixed)."""
     ensure_extension()
-    torch.ops._exl3_C.moe_out_v2_try(
+    op = (
+        torch.ops._exl3_C.moe_out_v2_try_mixed if mixed else torch.ops._exl3_C.moe_out_v2_try
+    )
+    op(
         x,
         topk_ids,
         topk_weights,
@@ -741,6 +804,31 @@ def moe_out_v2_try(
         workspace,
         swiglu_limit,
     )
+
+
+_moe_mixed_fakes_registered = False
+
+
+def require_moe_mixed() -> None:
+    """Refuse a library without the mixed-width MoE operators
+    (_MOE_MIXED_OPERATORS, VLLM_EXL3_MOE_EXPERT_ROTATION) and register their
+    fake implementations once per process."""
+    global _moe_mixed_fakes_registered
+    ensure_extension()
+    for name in _MOE_MIXED_OPERATORS:
+        try:
+            torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"VLLM_EXL3_MOE_EXPERT_ROTATION needs _exl3_C::{name}: rebuild the "
+                "EXL3 extension from this tree (python csrc/exl3/build_standalone.py "
+                f"--out vllm), or unset the flag. Detail: {exc}"
+            ) from exc
+    if not _moe_mixed_fakes_registered:
+        torch.library.register_fake("_exl3_C::moe_out_mixed")(_moe_fake)
+        for name in _MOE_MIXED_OPERATORS[1:]:
+            torch.library.register_fake(f"_exl3_C::{name}")(_moe_v2_fake)
+        _moe_mixed_fakes_registered = True
 
 
 def require_moe_v2_draft() -> None:
@@ -772,7 +860,8 @@ def moe_v2_draft_force_rows(rows: int) -> None:
     torch.ops._exl3_C.moe_v2_draft_force_rows(rows)
 
 
-# (device, hidden, intermediate, bits_x2, fold, trial) warmed by warmup_moe_v2.
+# (device, hidden, intermediate, bits_x2, fold, trial, mixed) warmed by
+# warmup_moe_v2.
 _moe_v2_warm: set[tuple] = set()
 
 
@@ -788,9 +877,11 @@ def warmup_moe_v2(
     swiglu_limit: float = 0.0,
     fold: bool = False,
     trial: bool = False,
+    mixed: bool = False,
 ) -> None:
-    """Run moe_out_v2 (fold: moe_out_v2_fold; trial: moe_out_v2_try) per
-    device, shape and bits_x2 before any CUDA graph capture.
+    """Run moe_out_v2 (fold: moe_out_v2_fold; trial: moe_out_v2_try; mixed:
+    their mixed-width form) per device, shape and bits_x2 before any CUDA
+    graph capture.
 
     Each lane kernel instance's first call queries the SM count and the
     kernel's occupancy and keeps them (moe_v2.cu launch_lane). The operator
@@ -798,13 +889,16 @@ def warmup_moe_v2(
     hidden 2560; hidden 5120 has one layout), so one call of one row and one
     of MOE_V2_MAX_ROWS rows, all with local routes, launch every kernel it can
     pick for the layer's shape and bits_x2, and no capture is a first call.
+    (A mixed call runs the same kernels whatever widths its experts have.)
     The temporary buffers are freed again.
     """
     device = packed_ptrs.device
-    key = (device, hidden_size, intermediate_size, bits_x2, fold, trial)
+    key = (device, hidden_size, intermediate_size, bits_x2, fold, trial, mixed)
     if key in _moe_v2_warm:
         return
     operator = moe_out_v2_try if trial else moe_out_v2_fold if fold else moe_out_v2
+    if mixed:
+        operator = partial(operator, mixed=True)
     rows = MOE_V2_MAX_ROWS
     ids = torch.tensor(
         [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
@@ -970,16 +1064,25 @@ def require_moe_prefill_v2() -> None:
                     ) from exc
             torch.library.register_fake("_exl3_C::moe_out_prefill_try")(_moe_v2_fake)
             logger.info_once(
-                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of 65..2048 rows of the "
-                "whole-expert configuration (hidden 5120, intermediate 2304, top-6, "
-                "96 of 384 experts local, bits_x2 6 or 4) run moe_out_prefill_try."
+                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of 65..2048 rows of "
+                "hidden 5120, top-6, bits_x2 6 or 4 (whole experts, intermediate 2304 with 96 "
+                "of 384 local, or the tensor-split 640/512-column chunks of all 384) run "
+                "moe_out_prefill_try."
             )
         _moe_prefill_v2_fake_registered = True
 
 
+# (hidden, intermediate, top-k, local experts) moe_out_prefill_try covers: whole
+# experts at expert parallel size 4, and the tensor-split chunks (only the layout
+# without --enable-expert-parallel reaches those).
+TRY_MOE_PREFILL_SHAPES = frozenset(
+    {(5120, 2304, 6, 96), (5120, 640, 6, 384), (5120, 512, 6, 384)}
+)
+
+
 def _try_moe_prefill(hidden: int, intermediate: int, topk: int, local: int) -> bool:
-    """VLLM_EXL3_MOE_PREFILL_UNCHUNKED is set and the shape is the one it covers."""
-    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) == (5120, 2304, 6, 96)
+    """VLLM_EXL3_MOE_PREFILL_UNCHUNKED is set and the shape is one it covers."""
+    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) in TRY_MOE_PREFILL_SHAPES
 
 
 @lru_cache(maxsize=None)
@@ -1016,15 +1119,19 @@ def moe_out_prefill_v2(
     swiglu_limit: float = 0.0,
     *,
     bits_x2: int,
+    mixed: bool = False,
 ) -> None:
     """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
     a MOE_PREFILL_V2_CONFIGS configuration; see csrc/exl3/moe_prefill_v2.cu.
     ``bits_x2`` is the one bit width of every routed matrix of the layer.
     A call whose experts are stored in another format is refused on the host
-    (_check_moe_prefill_v2_formats), never launched."""
+    (_check_moe_prefill_v2_formats), never launched. ``mixed``: experts
+    intermediate_size or one H128 block narrower, served by
+    moe_out_prefill_try_mixed only (callers check require_moe_mixed and that
+    VLLM_EXL3_MOE_PREFILL_UNCHUNKED covers the layer)."""
     ensure_extension()
     _check_moe_prefill_v2_formats(
-        packed_ptrs, packed_meta, x.shape[1], intermediate_size, bits_x2
+        packed_ptrs, packed_meta, x.shape[1], intermediate_size, bits_x2, mixed
     )
     op = torch.ops._exl3_C.moe_out_prefill_v2
     if (
@@ -1034,7 +1141,18 @@ def moe_out_prefill_v2(
         and bits_x2 in (6, 4)
         and TRY_MOE_PREFILL_ROWS[0] <= x.shape[0] <= TRY_MOE_PREFILL_ROWS[1]
     ):
-        op = torch.ops._exl3_C.moe_out_prefill_try
+        op = (
+            torch.ops._exl3_C.moe_out_prefill_try_mixed
+            if mixed
+            else torch.ops._exl3_C.moe_out_prefill_try
+        )
+    elif mixed:
+        raise RuntimeError(
+            "EXL3 MoE prefill: experts of two widths take moe_out_prefill_try_mixed "
+            f"only (VLLM_EXL3_MOE_PREFILL_UNCHUNKED, {TRY_MOE_PREFILL_ROWS[0]}.."
+            f"{TRY_MOE_PREFILL_ROWS[1]} rows of {sorted(TRY_MOE_PREFILL_SHAPES)}), "
+            f"not {x.shape[0]} rows of {(x.shape[1], intermediate_size)}"
+        )
     op(
         x,
         topk_ids,
@@ -1062,16 +1180,18 @@ def _check_moe_prefill_v2_formats(
     hidden_size: int,
     intermediate_size: int,
     bits_x2: int,
+    mixed: bool = False,
 ) -> None:
     """Refuse on the host a moe_out_prefill_v2 call whose local experts are not
-    every one stored as (hidden_size, intermediate_size, bits_x2), codebook 2,
-    with 16-byte aligned trellis bases: the kernels hold that layout at compile
-    time and would stop the device on any other (their route kernel's check).
-    The two tensors are read once per pair and format, on the first call, which
-    must not be under CUDA graph capture (warmup_moe_prefill_v2 checks every
-    layer's pair before any capture)."""
+    every one stored as (hidden_size, intermediate_size, bits_x2) (``mixed``:
+    or one H128 block narrower), codebook 2, with 16-byte aligned trellis
+    bases: the kernels hold that layout at compile time and would stop the
+    device on any other (their route kernel's check). The two tensors are read
+    once per pair and format, on the first call, which must not be under CUDA
+    graph capture (warmup_moe_prefill_v2 checks every layer's pair before any
+    capture)."""
     key = (id(packed_meta), id(packed_ptrs))
-    fmt = (hidden_size, intermediate_size, bits_x2)
+    fmt = (hidden_size, intermediate_size, bits_x2, mixed)
     entry = _moe_prefill_v2_checked.get(key)
     pointers = (packed_meta.data_ptr(), packed_ptrs.data_ptr())
     if entry is not None and entry[:2] == pointers and fmt in entry[2]:
@@ -1082,10 +1202,13 @@ def _check_moe_prefill_v2_formats(
             "experts' formats were not checked on the host first "
             "(warmup_moe_prefill_v2)"
         )
-    want = moe_v2_expert_meta(hidden_size, intermediate_size, bits_x2)
+    wants = moe_expert_metas(hidden_size, intermediate_size, bits_x2, mixed)
     meta = packed_meta.tolist()
     trellis = packed_ptrs[..., 0].tolist()
     for local, (stored, bases) in enumerate(zip(meta, trellis)):
+        # The expert's width is its gate's padded_out (a mixed layer's experts
+        # have one of two).
+        want = next((w for w in wants if w[0] == stored[0]), wants[0])
         for projection in range(3):
             if stored[projection] != want[projection]:
                 raise RuntimeError(
@@ -1107,7 +1230,7 @@ def _check_moe_prefill_v2_formats(
     entry[2].add(fmt)
 
 
-# (device, hidden, intermediate, bits_x2) warmed by warmup_moe_prefill_v2.
+# (device, hidden, intermediate, bits_x2, mixed) warmed by warmup_moe_prefill_v2.
 _moe_prefill_v2_warm: set[tuple] = set()
 
 
@@ -1121,9 +1244,10 @@ def warmup_moe_prefill_v2(
     top_k: int,
     bits_x2: int,
     swiglu_limit: float = 0.0,
+    mixed: bool = False,
 ) -> None:
-    """Run moe_out_prefill_v2 once per device, shape and bits_x2 before any
-    CUDA graph capture.
+    """Run moe_out_prefill_v2 (``mixed``: its mixed-width form) once per
+    device, shape and bits_x2 before any CUDA graph capture.
     Each GEMM kernel sets its shared-memory limit on its first call, and the
     operator launches the same kernels at every row count (route tiles are
     chosen on the device), so one call of MOE_PREFILL_MIN_ROWS rows, all with
@@ -1132,10 +1256,10 @@ def warmup_moe_prefill_v2(
     formats checked on the host here, warmed key or not.
     """
     _check_moe_prefill_v2_formats(
-        packed_ptrs, packed_meta, hidden_size, intermediate_size, bits_x2
+        packed_ptrs, packed_meta, hidden_size, intermediate_size, bits_x2, mixed
     )
     device = packed_ptrs.device
-    key = (device, hidden_size, intermediate_size, bits_x2)
+    key = (device, hidden_size, intermediate_size, bits_x2, mixed)
     if key in _moe_prefill_v2_warm:
         return
     rows_list = [MOE_PREFILL_MIN_ROWS]
@@ -1168,6 +1292,7 @@ def warmup_moe_prefill_v2(
             workspace,
             swiglu_limit=swiglu_limit,
             bits_x2=bits_x2,
+            mixed=mixed,
         )
     torch.cuda.synchronize(device)
     _moe_prefill_v2_warm.add(key)

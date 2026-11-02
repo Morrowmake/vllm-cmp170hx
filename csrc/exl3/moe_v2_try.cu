@@ -1,5 +1,5 @@
 // moe_out_v2_try (VLLM_EXL3_MOE_V2_RING): a faster moe_out_v2 for the target model's
-// expert-parallel routed experts, beside moe_out_v2.
+// routed experts, beside moe_out_v2.
 // Same arguments, workspace contract and output bits as moe_out_v2 of
 // csrc/exl3/moe_v2.cu at 7b31d6b252 (bitwise equal on the FP64-checked cases),
 // faster lane GEMMs:
@@ -13,8 +13,13 @@
 // other kernel of the library, moe_out_v2 and moe_out_v2_fold included, is
 // compiled exactly as without this file. The caller
 // (vllm_sm80/kernels/exl3/ops.py moe_v2_try_open) takes it only for hidden
-// 5120, intermediate 2304, top-6, 96 of 384 experts local, bits_x2 6 or 4,
-// 1..64 rows.
+// 5120, top-6, bits_x2 6 or 4, 1..64 rows, with intermediate 2304 and 96 of
+// 384 experts local (whole experts, expert parallel) or intermediate 640 or
+// 512 and all 384 local (the tensor-split experts, moe_v2.cu's K slices).
+// moe_out_v2_try_mixed (VLLM_EXL3_MOE_EXPERT_ROTATION): the tensor-split experts
+// with per-expert chunk rotation, each expert 640 or 512 wide in one call
+// (run_lanes kMixed); every route's down output is moe_out_v2_try's at its
+// expert's width.
 //
 // Base: moe_v2.cu of 7b31d6b252, whose hidden-5120 shape follows Curtis
 // White's port (github.com/CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE at
@@ -301,7 +306,11 @@ struct DownHalves {
 // slices of partials, then each further chunk (all of a chunk's loads in
 // flight at once, summed after it lands: the same additions in the same
 // order).
-template <int kSlices>
+// kMixed (moe_out_v2_try_mixed): each expert is intermediate or intermediate -
+// 128 wide (its gate padded_out); a block past the expert's width reads
+// nothing (its svh/suh end there) and gives zeros, so the row peak and the
+// values of the expert's own blocks are those of a call at its width.
+template <int kSlices, bool kMixed = false>
 __device__ __forceinline__ bool activation_block(const Routing& routing, const int* table,
                                                  int64_t assignments, int64_t intermediate,
                                                  int64_t ipad, const float* gate, const float* up,
@@ -314,6 +323,13 @@ __device__ __forceinline__ bool activation_block(const Routing& routing, const i
   assignment = __ldg(sorted + pos);
   const int64_t expert = __ldg(sorted_experts + pos);
   if (pos >= count) return false;
+  if constexpr (kMixed) {
+    if (block * 128 >= __ldg(routing.metadata + expert * 12 + 1)) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = 0.0;
+      return true;
+    }
+  }
   const int64_t base = block * 128 + lane;
   const half* gate_svh = expert_svh(routing, expert, 0);
   const half* up_svh = expert_svh(routing, expert, 1);
@@ -378,7 +394,7 @@ __device__ __forceinline__ bool activation_block(const Routing& routing, const i
 // tensor-core operand with one 2^e per row (down_slices copies of 2^-e). One
 // thread block per sorted position (kRowBlocks warps = ipad / 128, one per
 // H128 block), the row peak from the warps' peaks in shared memory.
-template <int kSlices, int kRowBlocks>
+template <int kSlices, int kRowBlocks, bool kMixed = false>
 __global__ void __launch_bounds__(32 * kRowBlocks)
 activate_down_row(Routing routing, const int* table, int64_t assignments, int64_t intermediate,
                   int64_t ipad, const float* gate, const float* up, int64_t slice_stride,
@@ -390,8 +406,9 @@ activate_down_row(Routing routing, const int* table, int64_t assignments, int64_
   for (int64_t pos = blockIdx.x; pos < assignments; pos += gridDim.x) {
     double v[4];
     int64_t assignment;
-    if (!activation_block<kSlices>(routing, table, assignments, intermediate, ipad, gate, up,
-                                   slice_stride, pos, block, lane, limit, v, assignment)) {
+    if (!activation_block<kSlices, kMixed>(routing, table, assignments, intermediate, ipad, gate,
+                                           up, slice_stride, pos, block, lane, limit, v,
+                                           assignment)) {
       break;
     }
     float f[4];
@@ -776,7 +793,15 @@ __device__ __noinline__ void lane_tiles_unaligned(LaneProblem p, int pi, int sli
 
 // Warp items: (route tile, projection, K slice, column group of kNT n16
 // tiles), column groups fastest so a block's warps share B rows in L1.
-template <int kNT, int kKT, int kBitsX2>
+// kMixed (moe_out_v2_try_mixed): a route tile's expert is p.n_tiles (gate/up)
+// or p.k_tiles (down) x 16 wide, or 128 narrower. Gate/up: a column group at
+// or past the tile's own columns (tiles_n) has nothing to do. Down
+// (kNarrowKT > 0): a narrow tile's K (its gate tile columns) runs kNarrowKT k
+// steps per slice, the same slice count (static_assert in run_lanes). Either
+// way an item runs the lane_tiles of a call at the expert's width: same
+// trellis, B values, k steps per slice and n0; only the B row stride (the
+// widest expert's) differs.
+template <int kNT, int kKT, int kBitsX2, bool kMixed = false, int kNarrowKT = 0>
 __global__ void __launch_bounds__(kLaneThreads, 2)
 moe_lane_kernel(LaneProblem p) {
   const int lane = threadIdx.x & 31;
@@ -812,22 +837,37 @@ moe_lane_kernel(LaneProblem p) {
     const int rows = tile.z;
     const int row_of = lane < rows ? sorted[tile.y + lane] : 0;
     const int n0 = column_group * kNT;
+    if constexpr (kMixed) {
+      if (n0 >= tiles_n) continue;
+    }
     constexpr bool kRing = lane_uses_ring(kNT, kBitsX2);
     constexpr int kLoad = kRing ? kLaneRing : kLaneWords;
     const bool aligned = (reinterpret_cast<uintptr_t>(trellis) & (kRing ? 15 : 3)) == 0;
     float* out = (pi == 0 ? p.out0 : p.out1) + slice * p.slice_stride;
-#define EXL3_LANE_GROUPS(G)                                                                     \
+#define EXL3_LANE_GROUPS(G, KT)                                                                 \
     if (aligned) {                                                                              \
-      lane_tiles<G, kNT, kKT, kBitsX2, kLoad>(p, pi, slice, row_of, rows, trellis, tiles_n, n0, \
-                                              lane, window, ring, out);                         \
+      lane_tiles<G, kNT, KT, kBitsX2, kLoad>(p, pi, slice, row_of, rows, trellis, tiles_n, n0,  \
+                                             lane, window, ring, out);                          \
     } else {                                                                                    \
-      lane_tiles_unaligned<G, kNT, kKT, kBitsX2>(p, pi, slice, row_of, rows, trellis, tiles_n,  \
-                                                 n0, lane, out);                                \
+      lane_tiles_unaligned<G, kNT, KT, kBitsX2>(p, pi, slice, row_of, rows, trellis, tiles_n,   \
+                                                n0, lane, out);                                 \
     }
-    if (rows <= 4) {
-      EXL3_LANE_GROUPS(1);
+    bool narrow = false;
+    if constexpr (kMixed && kNarrowKT > 0) {
+      narrow = __ldg(tile_columns + tile_index * 3) != p.k_tiles;
+    }
+    if (narrow) {
+      if constexpr (kNarrowKT > 0) {
+        if (rows <= 4) {
+          EXL3_LANE_GROUPS(1, kNarrowKT);
+        } else {
+          EXL3_LANE_GROUPS(2, kNarrowKT);
+        }
+      }
+    } else if (rows <= 4) {
+      EXL3_LANE_GROUPS(1, kKT);
     } else {
-      EXL3_LANE_GROUPS(2);
+      EXL3_LANE_GROUPS(2, kKT);
     }
 #undef EXL3_LANE_GROUPS
   }
@@ -1030,6 +1070,40 @@ struct LaneTiling<5120, 2304> {
   static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
 };
 
+// Hidden 5120, intermediate 640 and 512 (tensor-split routed experts: every
+// expert local, this rank's 640- or 512-column chunk of the 2304
+// intermediate): moe_v2.cu's K slices (gate/up 16 slices of 20 steps, down 2
+// slices of 20 or 16), so the output bits are moe_out_v2's, in column groups
+// of eight n16 tiles (5 or 4 groups of gate/up columns; 8 beat 4 on both
+// widths, 5, 10 and 20 at 640 and 16 and 32 at 512 on the census routes).
+template <>
+struct LaneTiling<5120, 640> {
+  using Bits = std::integer_sequence<int, 6, 4>;
+  static constexpr int kColumnTiles = 8;
+  static constexpr int kGateUpShortScaleK = 5120;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 20;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
+template <>
+struct LaneTiling<5120, 512> {
+  using Bits = std::integer_sequence<int, 6, 4>;
+  static constexpr int kColumnTiles = 8;
+  static constexpr int kGateUpShortScaleK = 5120;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 16;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
 template <int64_t kH, int64_t kI>
 struct LaneShape : LaneTiling<kH, kI> {
   using Tiling = LaneTiling<kH, kI>;
@@ -1066,7 +1140,7 @@ struct LaneShape : LaneTiling<kH, kI> {
 
 constexpr const char* kShapeMessage =
     "EXL3 MoE v2 supports padded hidden 2560 with intermediate 640 and padded hidden 5120 "
-    "with intermediate 2304 only";
+    "with intermediate 2304, 640 or 512 only";
 
 // f(LaneShape<hpad, ipad>{}) for a served shape; false for any other.
 template <class F>
@@ -1077,6 +1151,14 @@ bool with_shape(int64_t hpad, int64_t ipad, F&& f) {
   }
   if (hpad == 5120 && ipad == 2304) {
     f(LaneShape<5120, 2304>{});
+    return true;
+  }
+  if (hpad == 5120 && ipad == 640) {
+    f(LaneShape<5120, 640>{});
+    return true;
+  }
+  if (hpad == 5120 && ipad == 512) {
+    f(LaneShape<5120, 512>{});
     return true;
   }
   return false;
@@ -1093,9 +1175,9 @@ void check_assignments(int64_t assignments) {
               "EXL3 MoE v2 supports at most 1024 routed assignments per call");
 }
 
-template <int kNT, int kKT, int kBitsX2>
+template <int kNT, int kKT, int kBitsX2, bool kMixed = false, int kNarrowKT = 0>
 void launch_lane(const LaneProblem& p, int64_t max_tiles, cudaStream_t stream) {
-  auto* kernel = &moe_lane_kernel<kNT, kKT, kBitsX2>;
+  auto* kernel = &moe_lane_kernel<kNT, kKT, kBitsX2, kMixed, kNarrowKT>;
   constexpr int kRingBytes = lane_ring_bytes(kNT, kBitsX2);
   static const int64_t resident = [kernel] {
     int device = 0;
@@ -1149,8 +1231,36 @@ struct LaneCall {
   cudaStream_t stream;
 };
 
-template <class S, int kBitsX2>
+// The expert width 128 below S's of a mixed call (moe_out_v2_try_mixed); S
+// itself otherwise (never used).
+template <class S, bool kMixed>
+using NarrowShape =
+    std::conditional_t<kMixed, LaneShape<S::kHidden, S::kIntermediate - 128>, S>;
+
+// kMixed: every expert is S::kIntermediate or 128 narrower (moe_out_v2_try_mixed).
+// The workspace and B operand layouts are S's; each stage runs the code of a call
+// at the expert's width (activate_down_row, moe_lane_kernel), and the narrow
+// shape's K slices have the same counts as S's, so the combine reads the same
+// slices for every route.
+template <class S, int kBitsX2, bool kMixed = false>
 void run_lanes(const LaneCall& c) {
+  using N = NarrowShape<S, kMixed>;
+  if constexpr (kMixed) {
+    static_assert(N::kGateUpShortSliceTiles == S::kGateUpShortSliceTiles &&
+                      N::kGateUpLongSliceTiles == S::kGateUpLongSliceTiles &&
+                      N::kGateUpShortScaleK == S::kGateUpShortScaleK &&
+                      N::kGateUpLongScaleK == S::kGateUpLongScaleK &&
+                      N::kColumnTiles == S::kColumnTiles &&
+                      N::kLongSliceAssignments == S::kLongSliceAssignments &&
+                      N::kLongDownAssignments == S::kLongDownAssignments &&
+                      N::kDownShortSlices == S::kDownShortSlices &&
+                      N::kDownLongSlices == S::kDownLongSlices &&
+                      S::kIntermediate / 16 / N::kDownShortSliceTiles == N::kDownShortSlices &&
+                      S::kIntermediate / 16 / N::kDownLongSliceTiles == N::kDownLongSlices &&
+                      std::is_same_v<typename N::Bits, typename S::Bits>,
+                  "a mixed call's narrow experts take the wide shape's gate/up stages and "
+                  "slice counts (lane_tiles counts down slices from the wide K)");
+  }
   Routing routing = c.routing;
   const int64_t assignments = c.assignments;
   const int64_t hpad = c.hpad;
@@ -1215,17 +1325,19 @@ void run_lanes(const LaneCall& c) {
     const bool long_down = assignments >= S::kLongDownAssignments;
     const int down_used = long_down ? S::kDownLongSlices : S::kDownShortSlices;
     const auto activate = [&](auto slices) {
-      activate_down_row<decltype(slices)::value, S::kRowBlocks>
+      activate_down_row<decltype(slices)::value, S::kRowBlocks, kMixed>
           <<<launch_blocks(assignments), 32 * S::kRowBlocks, 0, c.stream>>>(
               routing, table, assignments, c.intermediate, ipad, gate, up, gate_up_stride,
               DownHalves{down_halves, down_unscale}, down_used, c.limit);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
     if (long_slices) {
-      launch_lane<S::kColumnTiles, S::kGateUpLongSliceTiles, kBitsX2>(p, max_tiles, c.stream);
+      launch_lane<S::kColumnTiles, S::kGateUpLongSliceTiles, kBitsX2, kMixed>(p, max_tiles,
+                                                                            c.stream);
       activate(std::integral_constant<int, S::kGateUpLongSlices>{});
     } else {
-      launch_lane<S::kColumnTiles, S::kGateUpShortSliceTiles, kBitsX2>(p, max_tiles, c.stream);
+      launch_lane<S::kColumnTiles, S::kGateUpShortSliceTiles, kBitsX2, kMixed>(p, max_tiles,
+                                                                             c.stream);
       activate(std::integral_constant<int, S::kGateUpShortSlices>{});
     }
     p.k_tiles = static_cast<int>(ipad / 16);
@@ -1238,9 +1350,11 @@ void run_lanes(const LaneCall& c) {
     p.halves = down_halves;
     p.unscale = down_unscale;
     if (long_down) {
-      launch_lane<S::kColumnTiles, S::kDownLongSliceTiles, kBitsX2>(p, max_tiles, c.stream);
+      launch_lane<S::kColumnTiles, S::kDownLongSliceTiles, kBitsX2, kMixed,
+                  kMixed ? N::kDownLongSliceTiles : 0>(p, max_tiles, c.stream);
     } else {
-      launch_lane<S::kColumnTiles, S::kDownShortSliceTiles, kBitsX2>(p, max_tiles, c.stream);
+      launch_lane<S::kColumnTiles, S::kDownShortSliceTiles, kBitsX2, kMixed,
+                  kMixed ? N::kDownShortSliceTiles : 0>(p, max_tiles, c.stream);
     }
   } else {
     // No local expert or no route: every row is exactly zero.
@@ -1294,13 +1408,17 @@ int64_t moe_workspace_size(int64_t max_rows, int64_t hidden_size,
 }
 
 namespace {
+// The one shape whose experts may be mixed (moe_out_v2_try_mixed): the tensor-split
+// DeepSeek-V4.1-Flash chunks, 640 or 512 columns of each expert's 2304.
+using MixedShape = moe_v2::LaneShape<5120, 640>;
+
 void moe_out_any(const torch::Tensor& x, const torch::Tensor& topk_ids,
                  const torch::Tensor& topk_weights,
                  const torch::Tensor& packed_ptrs,
                  const torch::Tensor& packed_meta,
                  const torch::Tensor& expert_map, int64_t intermediate_size,
                  int64_t bits_x2, torch::Tensor& out, torch::Tensor& workspace,
-                 double swiglu_limit, bool out_fp32) {
+                 double swiglu_limit, bool out_fp32, bool mixed = false) {
   using namespace moe_v2;
   const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
@@ -1339,6 +1457,10 @@ void moe_out_any(const torch::Tensor& x, const torch::Tensor& topk_ids,
               kShapeMessage);
   TORCH_CHECK(built, "EXL3 MoE v2 has no bits_x2 ", bits_x2, " kernels for padded hidden ",
               hpad, " and intermediate ", ipad);
+  TORCH_CHECK(!mixed || (hpad == MixedShape::kHidden && ipad == MixedShape::kIntermediate),
+              "EXL3 MoE v2 mixed-width experts: padded hidden 5120 with experts of 640 or 512 "
+              "columns (intermediate_size 640) only, not hidden ", hpad, " and intermediate ",
+              ipad);
   const int64_t required =
       moe_workspace_size(rows, hidden, intermediate_size, topk, experts);
   TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
@@ -1367,6 +1489,12 @@ void moe_out_any(const torch::Tensor& x, const torch::Tensor& topk_ids,
       assignments,
       limit,
       stream};
+  if (mixed) {
+    with_bits(MixedShape::Bits{}, bits_x2, [&](auto bits) {
+      run_lanes<MixedShape, decltype(bits)::value, true>(call);
+    });
+    return;
+  }
   with_shape(hpad, ipad, [&](auto shape) {
     with_bits(typename decltype(shape)::Bits{}, bits_x2, [&](auto bits) {
       run_lanes<decltype(shape), decltype(bits)::value>(call);
@@ -1393,10 +1521,30 @@ void moe_out_fp32(const torch::Tensor& x, const torch::Tensor& topk_ids,
               intermediate_size, bits_x2, out, workspace, swiglu_limit, true);
 }
 
+// moe_out for a layer whose experts are each intermediate_size (640) or
+// intermediate_size - 128 (512) columns wide (packed_meta; the tensor-split
+// experts with per-expert chunk rotation, VLLM_EXL3_MOE_EXPERT_ROTATION). Each
+// route's down output is bitwise moe_out's at its expert's width (run_lanes
+// kMixed: the same stage code per expert width; the narrow experts use the
+// first 512 columns of the 640-wide workspace rows); the combine is moe_out's.
+// Workspace: moe_workspace_size at 640.
+void moe_out_mixed(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                   const torch::Tensor& topk_weights, const torch::Tensor& packed_ptrs,
+                   const torch::Tensor& packed_meta, const torch::Tensor& expert_map,
+                   int64_t intermediate_size, int64_t bits_x2, torch::Tensor& out,
+                   torch::Tensor& workspace, double swiglu_limit) {
+  moe_out_any(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
+              intermediate_size, bits_x2, out, workspace, swiglu_limit, false, true);
+}
+
 }  // namespace exl3_try
 
 TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
   m.def("moe_out_v2_try(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+        "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
+        "int intermediate_size, int bits_x2, Tensor(a!) out, "
+        "Tensor(b!) workspace, float swiglu_limit) -> ()");
+  m.def("moe_out_v2_try_mixed(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, int bits_x2, Tensor(a!) out, "
         "Tensor(b!) workspace, float swiglu_limit) -> ()");
@@ -1407,4 +1555,5 @@ TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
 
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("moe_out_v2_try", &exl3_try::moe_out);
+  m.impl("moe_out_v2_try_mixed", &exl3_try::moe_out_mixed);
 }

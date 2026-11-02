@@ -70,6 +70,17 @@ the same allocations, process groups and captured graph shapes. Not pairs:
   process; rows read while capturing pick each graph's kernels, rows read at
   load size workspaces and communicator buffers, and the arms carry no table.
 
+``VLLM_SM80_ALLREDUCE_COMPRESS`` is a pair (``allreduce_compress``): listed,
+the communicator builds the compressed flags kernel's buffers beside the
+flags-in-data ones when it is constructed (the KV cache is sized with both),
+and every all-reduce the compressed or the one-shot kernel would take is a
+pair site (communicator.py ``custom_all_reduce``): the flags-in-data or
+upstream kernel, then the candidate into its output. The compressed kernel
+keeps its own buffers and device epoch; the one-shot runs on the
+flags-in-data kernel's buffers and epoch, but either variant of such a site
+advances that shared state the same way (one call), so a disabled variant
+leaves the other's protocol consistent.
+
 An eager candidate allocates its own scratch at its first call, after the KV
 cache is sized: the boot's memory profile sees the incumbents' eager steps.
 
@@ -257,6 +268,34 @@ def _topk_unavailable(runner) -> str | None:
     return None
 
 
+def _splitkv_unavailable(runner) -> str | None:
+    """DeepSeek-V4.1 attention layers of this rank on the attention pipeline,
+    whose decode attention is the pair site (``sm80_attn_core.attend_layer``);
+    the pipeline workspace holds the split-KV scratch while the pair is listed."""
+    if not any(
+        getattr(m, "_sm80_attn_pipeline_enabled", False)
+        and getattr(m, "_sm80_attn_pipeline_eligible", False)
+        for m in runner.model.modules()
+    ):
+        return "no DeepSeek-V4.1 attention layer on the attention pipeline (VLLM_DEEPSEEK_V41_ATTN_PIPELINE)"
+    return None
+
+
+def _ar_compress_unavailable(runner) -> str | None:
+    """The TP group's custom all-reduce built the compressed flags kernel for
+    the pair (communicator.py ``_init_flags_z``)."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    ca = getattr(getattr(get_tp_group(), "device_communicator", None), "ca_comm", None)
+    if not getattr(ca, "_flags_z_hot", False):
+        return (
+            "the TP group's custom all-reduce carries no compressed flags "
+            "kernel: it needs VLLM_SM80_ALLREDUCE=1, "
+            "VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 and four sm_80 ranks"
+        )
+    return None
+
+
 HOT_PAIRS: dict[str, HotPair] = {
     p.name: p
     for p in (
@@ -294,6 +333,18 @@ HOT_PAIRS: dict[str, HotPair] = {
         ),
         HotPair(
             "topk_sorted", "VLLM_SM80_TOPK_SORTED", _topk_unavailable,
+            collective_neutral=True,
+        ),
+        HotPair(
+            "splitkv_decode", "VLLM_DEEPSEEK_V41_SPLITKV_DECODE",
+            _splitkv_unavailable,
+            collective_neutral=True,  # a rank-local attention kernel
+        ),
+        HotPair(
+            "allreduce_compress", "VLLM_SM80_ALLREDUCE_COMPRESS",
+            _ar_compress_unavailable, eager=True,
+            # each site is one all-reduce in either arm; the committed arm
+            # alone picks its kernel, on every rank at once
             collective_neutral=True,
         ),
     )

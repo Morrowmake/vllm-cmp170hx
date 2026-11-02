@@ -128,3 +128,48 @@ def test_allreduce_default_off(monkeypatch) -> None:
     assert getattr(envs, name) is False
     monkeypatch.setenv(name, "1")
     assert getattr(envs, name) is True
+
+
+def _ring_model():
+    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=2048))
+    return SimpleNamespace(vllm_config=cfg, config=SimpleNamespace(hidden_size=4096))
+
+
+@pytest.mark.parametrize("pcie_p2p,built", [("0", False), ("1", True)])
+def test_ring_is_built_only_with_pcie_peer_access(monkeypatch, pcie_p2p, built) -> None:
+    """Issue #3 (dsv41 recipe): the ring maps the other cards' device memory, so with the recipe's
+    P2P check failed (VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=0) it is not built, rather than failing the
+    boot in cudaIpcOpenMemHandle; with peer access it is built as before."""
+    from vllm.distributed import parallel_state
+    from vllm_sm80.models.deepseek_v41 import sm80_model
+
+    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_PCIE_P2P", pcie_p2p)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=4))
+    calls = []
+
+    def init(group, capacity_bytes):
+        calls.append(capacity_bytes)
+        return SimpleNamespace(capacity_bytes=capacity_bytes, device_bytes=capacity_bytes)
+
+    monkeypatch.setattr(ce, "init_ce_ring", init)
+    sm80_model._init_ce_ring(_ring_model())
+    assert calls == ([2048 * 4096 * 4] if built else [])
+
+
+def test_ring_unavailable_is_not_fatal(monkeypatch) -> None:
+    """Where the ranks cannot share device IPC buffers although the P2P switch is on, the model
+    starts without the ring (the sums take the other transports) instead of failing the boot."""
+    from vllm.distributed import parallel_state
+    from vllm_sm80.models.deepseek_v41 import sm80_model
+
+    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_PCIE_P2P", "1")
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=4))
+
+    def init(group, capacity_bytes):
+        raise ce.PeerBuffersUnavailable("rank 1 could not open rank 0's device IPC buffer")
+
+    monkeypatch.setattr(ce, "init_ce_ring", init)
+    sm80_model._init_ce_ring(_ring_model())
+    assert ce.ce_ring() is None
