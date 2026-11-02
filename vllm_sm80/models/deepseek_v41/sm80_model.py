@@ -411,15 +411,31 @@ def _init_ce_ring(model) -> None:
     """VLLM_SM80_ALLREDUCE: build the TP group's copy-engine ring
     (collective), the transport of the layer-owned sums the host-staged and
     custom all-reduce do not take, sized for the largest FP32 ``wo_b`` sum of
-    a step: ``max_num_batched_tokens`` rows of the hidden size in FP32."""
+    a step: ``max_num_batched_tokens`` rows of the hidden size in FP32.
+
+    The ring copies into the other cards' memory over PCIe peer-to-peer, so it
+    is built only under VLLM_CUSTOM_ALLREDUCE_PCIE_P2P (the hardware gate of
+    every peer-to-peer path; the recipe's P2P check clears it where peer access
+    does not work) and only where every rank can map the others' device IPC
+    buffers. Without it those sums take the TP group's other transports
+    (host-staged where it takes the message, else NCCL)."""
     from vllm.distributed.parallel_state import get_tp_group
-    from vllm_sm80.distributed.ce_ring_all_reduce import init_ce_ring
+    from vllm_sm80.distributed.ce_ring_all_reduce import PeerBuffersUnavailable, init_ce_ring
+    from vllm_sm80.distributed.pcie_p2p import pcie_p2p_custom_allreduce_allowed
 
     group = get_tp_group()
     if group.world_size < 2:
         return
+    off = "DeepSeek-V4.1 sm_80: copy-engine ring off (%s); prefill-sized TP all-reduces take the other transports"
+    if not pcie_p2p_custom_allreduce_allowed():
+        logger.info_once(off, "no PCIe peer access: VLLM_CUSTOM_ALLREDUCE_PCIE_P2P is off", scope="global")
+        return
     rows = model.vllm_config.scheduler_config.max_num_batched_tokens
-    ring = init_ce_ring(group, rows * model.config.hidden_size * 4)
+    try:
+        ring = init_ce_ring(group, rows * model.config.hidden_size * 4)
+    except PeerBuffersUnavailable as exc:
+        logger.warning_once(off, str(exc), scope="global")
+        return
     logger.info_once(
         "DeepSeek-V4.1 sm_80: prefill-sized TP all-reduces run on the copy-engine "
         "ring (VLLM_SM80_ALLREDUCE=1): messages up to %d bytes, "

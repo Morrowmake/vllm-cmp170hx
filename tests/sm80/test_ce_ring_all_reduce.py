@@ -286,3 +286,74 @@ def test_step_error_word_names_the_ring_timeout() -> None:
         with pytest.raises(ValueError, match=text):
             check.raise_if_failed()
     step_errors.ErrorCheck([torch.tensor(0, dtype=torch.int32)]).raise_if_failed()
+
+
+class _NoPeerOps:
+    """``vllm._custom_ops``' shared-buffer calls on the host: buffers are numbers, and opening a
+    peer's handle raises (as cudaIpcOpenMemHandle does without peer access) on ``fail_ranks``
+    from this rank's ``fail_from``-th buffer on."""
+
+    def __init__(self, rank, fail_ranks, fail_from):
+        self.rank, self.fail, self.fail_from = rank, rank in fail_ranks, fail_from
+        self.allocated, self.freed, self.buffers = [], [], 0
+
+    def allocate_shared_buffer_and_handle(self, size):
+        self.buffers += 1
+        ptr = 1000 * (self.rank + 1) + self.buffers
+        self.allocated.append(ptr)
+        return ptr, torch.tensor([ptr])
+
+    def open_mem_handle(self, handle):
+        if self.fail and self.buffers >= self.fail_from:
+            raise RuntimeError("CUDA error: peer access is not supported between these two devices")
+        return int(handle[0]) + 10**6
+
+    def free_shared_buffer(self, ptr):
+        self.freed.append(ptr)
+
+
+def _ring_rank(rank, world, store, fail_ranks, fail_from, out):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from vllm.distributed.device_communicators import custom_all_reduce as car
+
+    dist.init_process_group("gloo", init_method="file://" + store, rank=rank, world_size=world,
+                            timeout=timedelta(seconds=20))
+    ops = car.ops = _NoPeerOps(rank, fail_ranks, fail_from)
+    group = SimpleNamespace(world_size=world, rank_in_group=rank, cpu_group=dist.group.WORLD)
+    try:
+        ce.init_ce_ring(group, 1 << 20)
+        got = "built"
+    except Exception as exc:
+        got = type(exc).__name__
+    out.put((rank, got, sorted(ops.allocated) == sorted(ops.freed)))
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("fail_ranks,fail_from", [((0, 1, 2, 3), 1), ((2,), 1), ((1,), 2)],
+                         ids=["no-peer-host", "one-rank-scratch", "one-rank-flags"])
+def test_ring_without_peer_access_fails_on_every_rank_without_leaking(tmp_path, fail_ranks,
+                                                                      fail_from) -> None:
+    """Issue #3 (dsv41 recipe): where a rank cannot open a peer's device IPC buffer, every rank
+    raises PeerBuffersUnavailable (the caller starts without the ring), none waits in a collective
+    the others skipped, and each frees the buffers it allocated."""
+    import multiprocessing as mp
+
+    world = 4
+    ctx = mp.get_context("fork")
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_ring_rank, args=(r, world, str(tmp_path / "store"), fail_ranks,
+                                                 fail_from, out)) for r in range(world)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+    alive = [p for p in procs if p.is_alive()]
+    for p in alive:
+        p.kill()
+    results = sorted(out.get(timeout=5) for _ in range(world - len(alive)))
+    assert not alive, results
+    assert results == [(r, "PeerBuffersUnavailable", True) for r in range(world)]

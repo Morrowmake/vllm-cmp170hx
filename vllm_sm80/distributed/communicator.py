@@ -43,7 +43,9 @@ capture):
 Layer-owned sums of eager prefill-sized messages (DeepSeek-V4.1's wo_b and
 MoE outputs) go, ahead of 3., to the copy-engine ring
 (``ce_ring_all_reduce.py``; round-once sums take its owner sum); the model's
-own all-reduce helpers make that choice.
+own all-reduce helpers make that choice. The ring is built only under
+``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`` and where every rank can map the others'
+device IPC buffers; elsewhere those sums take 1.-3.
 
 Limitation: ``vllm.distributed.stateless_coordinator`` asserts that the
 platform's communicator class is upstream's ``CudaCommunicator``. Stateless
