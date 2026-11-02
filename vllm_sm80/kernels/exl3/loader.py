@@ -12,8 +12,8 @@ from safetensors import safe_open
 from torch import nn
 
 from vllm import envs
-from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.config import ModelConfig, ParallelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm_sm80.kernels.exl3.quant import (
@@ -28,6 +28,23 @@ from vllm.tracing import instrument
 logger = init_logger(__name__)
 
 PACKED_SUFFIXES = (".trellis", ".suh", ".svh", ".mcg", ".mul1")
+
+
+def _verify_pipeline_parallel(
+    model_config: ModelConfig, parallel_config: ParallelConfig
+) -> None:
+    if parallel_config.pipeline_parallel_size == 1:
+        return
+    if (
+        model_config.hf_config.model_type
+        not in ("qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp")
+        or parallel_config.tensor_parallel_size != 1
+        or parallel_config.pipeline_parallel_size != 2
+    ):
+        raise ValueError(
+            "EXL3 pipeline parallelism supports Qwen4Exp at PP=2, TP=1; "
+            "other EXL3 layouts require PP=1"
+        )
 
 
 class Exl3ModelLoader(DefaultModelLoader):
@@ -55,8 +72,7 @@ class Exl3ModelLoader(DefaultModelLoader):
             offload = vllm_config.offload_config
             if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
                 raise ValueError("EXL3 does not support runtime weight offload")
-            if vllm_config.parallel_config.pipeline_parallel_size != 1:
-                raise ValueError("EXL3 requires pipeline parallel size one")
+            _verify_pipeline_parallel(model_config, vllm_config.parallel_config)
             if vllm_config.lora_config is not None:
                 raise ValueError("EXL3 does not support LoRA")
             ensure_extension()
@@ -84,10 +100,16 @@ def manifest_still_needed(vllm_config, is_draft: bool) -> bool:
 
     The MTP draft is constructed and loaded after the target, and its top
     module and the loader use the target's quantization config (the inner
-    draft layers use a second config of their own).
+    draft layers use a second config of their own). Under PP only the last
+    target stage constructs that draft.
     """
     spec = vllm_config.speculative_config
-    return not is_draft and spec is not None and spec.draft_model_config is not None
+    if is_draft or spec is None or spec.draft_model_config is None:
+        return False
+    return (
+        vllm_config.parallel_config.pipeline_parallel_size == 1
+        or get_pp_group().is_last_rank
+    )
 
 
 def release_manifests(model: torch.nn.Module, quant: Exl3Config) -> None:
@@ -152,8 +174,7 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     manifest = quant.manifest
     if manifest is None:
         raise ValueError("EXL3 checkpoint manifest was not initialized")
-    if config.parallel_config.pipeline_parallel_size != 1:
-        raise ValueError("EXL3 loading currently requires pipeline parallel size one")
+    _verify_pipeline_parallel(model_config, config.parallel_config)
     ledger = Exl3LoadLedger(manifest)
     layout = quant.layout
     is_draft = layout.is_draft(model_config)

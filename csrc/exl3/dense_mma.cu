@@ -66,10 +66,9 @@ bool served_format(int64_t bits_x2, int64_t codebook) {
 }
 
 // The matrices this path serves (padded_in, padded_out, bits_x2), codebook
-// 2: the dense matrices of one tensor-parallel rank of Qwen3.8-Flash-Next at
-// TP2, the only shapes its plans were measured and validated on (the Python
-// gate also requires TP2, PP1 and 74 SMs). Any other matrix keeps
-// linear_out_splitk.
+// 2: Qwen3.8-Flash-Next at TP2/PP1 and the full-width TP1/PP2 matrices.
+// The Python gate also requires one of these layouts and 74 SMs.
+// Any other matrix keeps linear_out_splitk.
 constexpr int64_t kServedShapes[][3] = {
     {2560, 256, 14},     // attention k/v
     {2560, 640, 14},     // shared expert gate/up
@@ -81,6 +80,12 @@ constexpr int64_t kServedShapes[][3] = {
     {640, 2560, 14},     // shared expert down
     {3072, 2560, 14},    // output projections
     {2560, 124160, 12},  // LM head (half the vocabulary)
+    {2560, 512, 14},     // PP2 attention k/v
+    {2560, 2560, 12},    // PP2 drafter embedding / hidden-state projections
+    {6144, 2560, 14},    // PP2 output projections
+    {2560, 10240, 14},   // PP2 linear-attention qkv
+    {2560, 12288, 14},   // PP2 attention q (with output gate)
+    {2560, 248320, 12},  // PP2 LM head (full vocabulary)
 };
 
 bool served_shape(int64_t k, int64_t n, int64_t bits_x2) {

@@ -1156,6 +1156,20 @@ seams:
   sha256: 8cc657afbab1501d3a933cccfe772da21f9b58034c69375e3575765d1319ecf9
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, req_states: vllm.v1.worker.gpu.states.RequestState) -> dict[str, typing.Any]'
 
+- id: qwen4-model-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpModel.__init__
+  why: builds embed_tokens (a PPMissingLayer off the first stage) with self.vocab_size, hyper_connection_mixer (None off the last stage) and make_empty_intermediate_tensors (factory over hidden_states); sm80_model.adopt_exl3_stages replaces the None mixer by a PPMissingLayer and builds embed_tokens on the last stage for a sharing EXL3 drafter
+  sha256: a8912eae8fba637aa410d0f1f7578c63b5fd0e33194fb60040c70c3f16c2c061
+  signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
+
+- id: eagle-share-target-embed
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.eagle.utils:maybe_share_target_embed
+  why: under pipeline parallelism it shares the target embedding only with a drafter that declares has_own_embed_tokens; the fork Qwen4ExpMTP declares False when it shares the target's, and the target embedding must then exist on the drafter's (last) stage
+  sha256: 2a98186356214062d23ca95f641e0ad9cd21e254c3b766a1287749d97dbe68df
+  signature: '(draft_model: torch.nn.modules.module.Module, draft_inner: torch.nn.modules.module.Module, target_inner: torch.nn.modules.module.Module) -> None'
+
 - id: kv-coordinator-init
   kind: method
   target: vllm.v1.core.kv_cache_coordinator:KVCacheCoordinator.__init__
@@ -1948,14 +1962,14 @@ seams:
 - id: qwen4-conditional-init
   kind: method
   target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpForConditionalGeneration.__init__
-  why: builds self.language_model = Qwen4ExpForCausalLM(prefix language_model) directly (not through the registry), so the fork wrapper adopts it after construction
+  why: builds self.language_model = Qwen4ExpForCausalLM(prefix language_model) directly (not through the registry), so the fork wrapper adopts it after construction; self.make_empty_intermediate_tensors is the language model's, which adopt_pp_failed_tokens wraps on the wrapper
   sha256: e98cad3d01aca9e9ca9f528e827cd1026a34a88b6baefface7790fa8d14a3da1
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = ''model'') -> None'
 
 - id: qwen4-mtp-init
   kind: method
   target: vllm.models.qwen4_exp.nvidia.mtp:Qwen4ExpMTP.__init__
-  why: builds self.model (the predictor) and lm_head (the tied embedding, a ParallelLMHead or a PPMissingLayer), with self.quant_config and self.config set; the fork drops both for PPMissingLayer when the quantization config's mtp_shares_target_embeddings says so
+  why: builds self.model (the predictor) and lm_head (the tied embedding, a ParallelLMHead or a PPMissingLayer), with self.quant_config and self.config set; the fork drops both for PPMissingLayer when the quantization config's mtp_shares_target_embeddings says so, and declares has_own_embed_tokens False (the class does not define it)
   sha256: 19155e6eebd83beb3e3bd980c0dce698bd93cce53f7f16a64c8b19cdacf252e2
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
 

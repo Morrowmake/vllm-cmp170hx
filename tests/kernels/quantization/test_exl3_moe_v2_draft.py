@@ -176,8 +176,9 @@ def test_gate_opens_for_the_drafter_configurations_only_with_their_switch():
     assert "(8, 6)" in closed["capability"]
     # VLLM_EXL3_MOE_V2 alone keeps its configurations and its reasons.
     assert closed["VLLM_EXL3_MOE_V2"].endswith(
-        "not one of [(2560, 640, 10, 256, 512), (5120, 512, 6, 384, 384), "
-        "(5120, 640, 6, 384, 384), (5120, 2304, 6, 96, 384)]"
+        "not one of [(2560, 640, 10, 256, 512), (2560, 640, 10, 512, 512), "
+        "(5120, 512, 6, 384, 384), (5120, 640, 6, 384, 384), "
+        "(5120, 2304, 6, 96, 384)]"
     )
     assert h5120._reason() is None
     assert h5120._reason(metadata=h5120._meta(4)) is None

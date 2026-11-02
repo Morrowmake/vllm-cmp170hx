@@ -394,7 +394,7 @@ def test_linear_output_is_the_selected_operator_bitwise(monkeypatch, switch):
     _extension_or_skip()
     m = _matrix(11, 2560, 640, 14)
     x = _inputs(12, 37, 2560)  # chunks of 16, 16 and 5 rows
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device=x.device)
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device=x.device)
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", switch)
     out = exl3_ops._linear(x, m["trellis"], m["suh"], m["svh"], 14, 2, 640, 16)

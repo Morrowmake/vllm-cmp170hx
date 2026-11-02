@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
@@ -53,6 +54,36 @@ from vllm_sm80.kernels.exl3.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+# (tensor, pipeline) layout -> local experts that moe_out_v2 and
+# moe_out_prefill are validated with for Qwen3.8-Flash-Next (hidden 2560,
+# 512 experts): TP2 with expert parallelism splits the experts, PP2 keeps all
+# of them on every stage. The DeepSeek configurations have no layout gate.
+_VALIDATED_MOE_PARTITIONS = {(2, 1): 256, (1, 2): 512}
+
+
+def _moe_partition_closed_reason(
+    vllm_config, hidden_size: int, local_experts: int, global_experts: int
+) -> str | None:
+    """Why the Qwen MoE tensor-core operators must not serve this layout and
+    expert partition, or None. ops' gates are keyed by matrix shape only."""
+    if (hidden_size, global_experts) != (2560, 512):
+        return None
+    validated = _VALIDATED_MOE_PARTITIONS
+    if vllm_config is None:
+        return "no vLLM config is set to pair a layout with its partition"
+    parallel = vllm_config.parallel_config
+    layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
+    if layout not in validated:
+        first, second = tuple(validated)
+        return f"(tensor, pipeline) parallel size {layout}, not {first} or {second}"
+    if local_experts != validated[layout]:
+        return (
+            f"layout {layout} holds {local_experts} experts locally, not the "
+            f"{validated[layout]} it is validated with"
+        )
+    return None
 
 
 def _verify_launch_options(vllm_config) -> None:
@@ -997,7 +1028,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # Set by set_moe_prefill_v2 before the weights load: this layer's
         # prefill calls may take moe_out_prefill_v2 (its gate decides at load).
         self.prefill_v2 = False
-
     def maybe_roundup_sizes(
         self,
         hidden_size,
@@ -1239,6 +1269,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         from vllm_sm80.kernels.exl3 import ops as exl3_ops
 
         device = layer.exl3_ptrs.device
+        config = get_current_vllm_config_or_none()
         reason = exl3_ops.moe_v2_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
             self.moe.in_dtype,
@@ -1251,6 +1282,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             draft=draft,
             **self._mixed,
         )
+        if reason is None:
+            reason = _moe_partition_closed_reason(
+                config, self.hidden_size, self.local_experts, layer.global_num_experts
+            )
         if reason is not None:
             if draft:
                 logger.info_once(
@@ -1431,7 +1466,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
         vllm_config = get_current_vllm_config()
         if reason is None:
-            reason = _prefill_layout_closed_reason(vllm_config)
+            reason = _prefill_layout_closed_reason(vllm_config, self.local_experts)
         if reason is not None:
             logger.info_once(
                 "VLLM_EXL3_MOE_PREFILL_TC is set but the gate is closed: %s; "
@@ -1835,15 +1870,14 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         return operator
 
 
-def _prefill_layout_closed_reason(vllm_config) -> str | None:
+def _prefill_layout_closed_reason(vllm_config, local_experts: int) -> str | None:
     """Why moe_out_prefill must not serve this engine, or None: it is
-    validated at tensor parallel size 2 without pipeline parallelism, and its
+    validated for the layouts and expert partitions above, and its
     prefill-step rule (step_phase) cannot tell the decode steps of drafters
     with parallel drafting slots (DFlash, DSpark) from prefill steps."""
-    parallel = vllm_config.parallel_config
-    layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
-    if layout != (2, 1):
-        return f"(tensor, pipeline) parallel size {layout}, not (2, 1)"
+    reason = _moe_partition_closed_reason(vllm_config, 2560, local_experts, 512)
+    if reason is not None:
+        return reason
     spec = vllm_config.speculative_config
     if spec is not None and (
         getattr(spec, "parallel_drafting", False)
