@@ -19,7 +19,14 @@ Each class builds the upstream model and then, before any weight loads:
   ``mtp_hidden_norm="per_stream"`` (``precision.adopt_mtp_hidden_norm``), and
   no embedding or LM head of its own when the quantization config says the
   drafter shares the target's (``mtp_shares_target_embeddings``; the loader
-  aliases them).
+  aliases them);
+- an EXL3 checkpoint under pipeline parallelism (``adopt_exl3_stages``): a
+  PPMissingLayer for the final HC mixer of a stage without it, by which the
+  EXL3 loader accounts for that stage's unowned tensors; the target
+  embedding on the last stage too when the MTP drafter there shares it
+  (upstream builds it on the first stage only); and the ``failed_tokens``
+  field of the intermediate tensors, which carries the SSD read failures of
+  the PLE stage to the sampling stage (``vllm_sm80.failed_inputs``).
 
 What the classes add, for ``VLLM_SM80_SHARD_ARGMAX``
 (``vllm_sm80/worker/target_argmax.py``,
@@ -39,7 +46,11 @@ What the classes add, for ``VLLM_SM80_SHARD_ARGMAX``
 import torch
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.qwen4_exp.nvidia import model as qwen_model
 from vllm.models.qwen4_exp.nvidia import mtp as qwen_mtp
@@ -50,12 +61,71 @@ from vllm_sm80.models.qwen4_exp.precision import (
 from vllm_sm80.worker.target_argmax import ShardArgmaxLogits
 
 
+def _exl3_pipeline(vllm_config: VllmConfig) -> bool:
+    model_config = vllm_config.model_config
+    return (
+        vllm_config.parallel_config.pipeline_parallel_size > 1
+        and model_config is not None
+        and model_config.quantization == "exl3"
+    )
+
+
+def adopt_exl3_stages(
+    lm: qwen_model.Qwen4ExpForCausalLM, vllm_config: VllmConfig
+) -> None:
+    """The stage-local modules of an EXL3 checkpoint under pipeline
+    parallelism, before any weight loads."""
+    if not _exl3_pipeline(vllm_config):
+        return
+    model = lm.model
+    if model.hyper_connection_mixer is None:
+        model.hyper_connection_mixer = PPMissingLayer()
+    spec = vllm_config.speculative_config
+    shares = getattr(lm.quant_config, "mtp_shares_target_embeddings", None)
+    if (
+        get_pp_group().is_last_rank
+        and isinstance(model.embed_tokens, PPMissingLayer)
+        and spec is not None
+        and spec.method == "mtp"
+        and shares is not None
+        and shares(lm.config)
+    ):
+        # The drafter on this stage takes the target embedding
+        # (Qwen4ExpMTP.has_own_embed_tokens = False).
+        model.embed_tokens = VocabParallelEmbedding(
+            model.vocab_size, lm.config.hidden_size
+        )
+
+
+def adopt_pp_failed_tokens(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
+    """Add the ``failed_tokens`` field to the intermediate tensors of an EXL3
+    PLE model under pipeline parallelism: each stage's receive buffers get
+    it, and ``failed_inputs.relay_failed_tokens`` fills it on each sending
+    stage (``pp_failed_tokens``)."""
+    if not _exl3_pipeline(vllm_config) or not getattr(
+        vllm_config.model_config.hf_text_config, "ple_layer_ids", None
+    ):
+        return
+    make = model.make_empty_intermediate_tensors
+
+    def make_with_failed_tokens(batch_size, dtype, device):
+        tensors = make(batch_size, dtype, device)
+        tensors.tensors["failed_tokens"] = torch.zeros(
+            batch_size, dtype=torch.bool, device=device
+        )
+        return tensors
+
+    model.make_empty_intermediate_tensors = make_with_failed_tokens
+    model.pp_failed_tokens = True
+
+
 def adopt_text_model(
     lm: qwen_model.Qwen4ExpForCausalLM, vllm_config: VllmConfig, prefix: str
 ) -> None:
     """The sm_80 changes to an upstream-built ``Qwen4ExpForCausalLM`` whose
     prefix is ``prefix``."""
     adopt_router_precision(vllm_config, lm)
+    adopt_exl3_stages(lm, vllm_config)
     # A pipeline stage without the head (upstream builds a PPMissingLayer
     # there) keeps it.
     if lm.quant_config is None or isinstance(lm.lm_head, PPMissingLayer):
@@ -75,6 +145,7 @@ class Qwen4ExpForCausalLM(qwen_model.Qwen4ExpForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         adopt_text_model(self, vllm_config, prefix)
+        adopt_pp_failed_tokens(self, vllm_config)
 
 
 class Qwen4ExpForConditionalGeneration(
@@ -89,6 +160,7 @@ class Qwen4ExpForConditionalGeneration(
                 vllm_config,
                 maybe_prefix(prefix, "language_model"),
             )
+            adopt_pp_failed_tokens(self, vllm_config)
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         lm = self.language_model
@@ -106,6 +178,9 @@ class Qwen4ExpMTP(qwen_mtp.Qwen4ExpMTP):
             self.model.embed_tokens = PPMissingLayer()
             self.lm_head = None
             self.lm_head = PPMissingLayer()
+            # Declared, so the target embedding is shared under pipeline
+            # parallelism too (eagle.utils.maybe_share_target_embed).
+            self.has_own_embed_tokens = False
 
     def compute_logits_local(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

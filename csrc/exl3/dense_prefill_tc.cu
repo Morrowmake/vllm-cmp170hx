@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <limits>
+#include <type_traits>
 
 namespace exl3 {
 namespace dense_prefill_tc {
@@ -173,10 +174,13 @@ __device__ __forceinline__ uint32_t rest_part(uint32_t w, uint32_t wh) {
   return *reinterpret_cast<const uint32_t*>(&r);
 }
 
-
-// kSplit = false: whole tile (blockIdx.y, blockIdx.x). kSplit = true: block blockIdx.x's stream-K share.
-template <int kBitsX2, int kCodebook, typename Out, bool kSplit>
-__global__ void __launch_bounds__(kThreads, 1) prefill_gemm(PrefillProblem p, Out* out) {
+// kSplit = false: whole tile (blockIdx.y, blockIdx.x). kSplit = true: block
+// blockIdx.x's stream-K share. kTwoProduct: the two-product combine of
+// set_prefill_arithmetic(1); false is the exact dominant-term one.
+template <int kBitsX2, int kCodebook, typename Out, bool kSplit,
+          bool kTwoProduct>
+__global__ void __launch_bounds__(kThreads, 1)
+    prefill_gemm(PrefillProblem p, Out* out) {
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ int finishes_tile;
   using Ring = TileRing<kBitsX2>;
@@ -297,21 +301,45 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_gemm(PrefillProblem p, Ou
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const uint4 a = wfrag[(ks * kWarps + 4 * wn + q) * 32 + lane];
-          const uint4 wh = make_uint4(grid_part(a.x), grid_part(a.y), grid_part(a.z), grid_part(a.w));
-          const uint4 wl = make_uint4(rest_part(a.x, wh.x), rest_part(a.y, wh.y), rest_part(a.z, wh.z),
-                                      rest_part(a.w, wh.w));
+          if constexpr (kTwoProduct) {
+            // The two-product variant (set_prefill_arithmetic, the validated
+            // TP1/PP2 full-width layout): W stays in its original exact FP16
+            // representation; W * hi and W * lo (|lo| <= 1/2) are independent
+            // tensor-core sums.
 #pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            // wh * hi: integers on the 2^-7 grid, |sum| <= 16 * 2^11 * 2^9: exact in FP32, no truncation.
-            float dh[4], dl[4], dw[4];
-            mma_k16(wh, b[j].x, b[j].y, dh);
-            // The small terms W * lo and wl * hi (|lo| <= 1/2, |wl| <= 2^-8): independent tensor-core sums.
-            mma_k16(a, b[j].z, b[j].w, dl);
-            mma_k16(wl, b[j].x, b[j].y, dw);
+            for (int j = 0; j < 4; ++j) {
+              float dh[4], dl[4];
+              mma_k16(a, b[j].x, b[j].y, dh);
+              mma_k16(a, b[j].z, b[j].w, dl);
 #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-              acc[q][j][e] = __fmaf_rn(__fadd_rn(dh[e], __fadd_rn(dl[e], dw[e])), e & 1 ? scale[j].y : scale[j].x,
-                                       acc[q][j][e]);
+              for (int e = 0; e < 4; ++e) {
+                acc[q][j][e] =
+                    __fmaf_rn(__fadd_rn(dh[e], dl[e]),
+                              e & 1 ? scale[j].y : scale[j].x, acc[q][j][e]);
+              }
+            }
+          } else {
+            const uint4 wh = make_uint4(grid_part(a.x), grid_part(a.y),
+                                        grid_part(a.z), grid_part(a.w));
+            const uint4 wl =
+                make_uint4(rest_part(a.x, wh.x), rest_part(a.y, wh.y),
+                           rest_part(a.z, wh.z), rest_part(a.w, wh.w));
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              // wh * hi: integers on the 2^-7 grid, |sum| <= 16 * 2^11 * 2^9:
+              // exact in FP32, no truncation.
+              float dh[4], dl[4], dw[4];
+              mma_k16(wh, b[j].x, b[j].y, dh);
+              // The small terms W * lo and wl * hi (|lo| <= 1/2, |wl| <= 2^-8):
+              // independent tensor-core sums.
+              mma_k16(a, b[j].z, b[j].w, dl);
+              mma_k16(wl, b[j].x, b[j].y, dw);
+#pragma unroll
+              for (int e = 0; e < 4; ++e) {
+                acc[q][j][e] =
+                    __fmaf_rn(__fadd_rn(dh[e], __fadd_rn(dl[e], dw[e])),
+                              e & 1 ? scale[j].y : scale[j].x, acc[q][j][e]);
+              }
             }
           }
         }
@@ -414,27 +442,37 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_gemm(PrefillProblem p, Ou
   }
 }
 
-template <int kBitsX2, int kCodebook, typename Out, bool kSplit>
-void launch_gemm_mode(const PrefillProblem& p, Out* out, dim3 grid, cudaStream_t stream) {
+template <int kBitsX2, int kCodebook, typename Out, bool kSplit,
+          bool kTwoProduct>
+void launch_gemm_mode(const PrefillProblem& p, Out* out, dim3 grid,
+                      cudaStream_t stream) {
   static const bool configured = [] {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(prefill_gemm<kBitsX2, kCodebook, Out, kSplit>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(prefill_gemm<kBitsX2, kCodebook, Out, kSplit>,
-                                        cudaFuncAttributePreferredSharedMemoryCarveout,
-                                        cudaSharedmemCarveoutMaxShared));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        prefill_gemm<kBitsX2, kCodebook, Out, kSplit, kTwoProduct>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        prefill_gemm<kBitsX2, kCodebook, Out, kSplit, kTwoProduct>,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared));
     return true;
   }();
   (void)configured;
-  prefill_gemm<kBitsX2, kCodebook, Out, kSplit><<<grid, kThreads, kSmemBytes, stream>>>(p, out);
+  prefill_gemm<kBitsX2, kCodebook, Out, kSplit, kTwoProduct>
+      <<<grid, kThreads, kSmemBytes, stream>>>(p, out);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Whole tiles first (grid = dp_grid: column blocks x row blocks of the whole-tile rectangle), then the split
 // tiles (grid = sk_ctas) in a second launch.
-template <int kBitsX2, int kCodebook, typename Out>
-void launch_gemm(const PrefillProblem& p, Out* out, dim3 dp_grid, cudaStream_t stream) {
-  if (dp_grid.x > 0 && dp_grid.y > 0) launch_gemm_mode<kBitsX2, kCodebook, Out, false>(p, out, dp_grid, stream);
-  if (p.sk_ctas > 0) launch_gemm_mode<kBitsX2, kCodebook, Out, true>(p, out, dim3(p.sk_ctas), stream);
+template <int kBitsX2, int kCodebook, typename Out, bool kTwoProduct>
+void launch_gemm(const PrefillProblem& p, Out* out, dim3 dp_grid,
+                 cudaStream_t stream) {
+  if (dp_grid.x > 0 && dp_grid.y > 0)
+    launch_gemm_mode<kBitsX2, kCodebook, Out, false, kTwoProduct>(
+        p, out, dp_grid, stream);
+  if (p.sk_ctas > 0)
+    launch_gemm_mode<kBitsX2, kCodebook, Out, true, kTwoProduct>(
+        p, out, dim3(p.sk_ctas), stream);
 }
 
 struct Schedule {
@@ -482,6 +520,13 @@ Schedule plan_schedule(int64_t row_blocks, int64_t col_blocks, int64_t stages, i
 
 // 0: plan_schedule; 1: whole tiles only (set_prefill_schedule).
 std::atomic<int> schedule_mode{0};
+
+// 0: the exact dominant-term arithmetic (three tensor-core products per k16
+// step, every layout); 1: the cheaper two-product combine
+// (set_prefill_arithmetic, validated only for the full-width matrices of the
+// TP1/PP2 layout; taken only for a BF16 out, an FP32 out always keeps mode 0's
+// arithmetic). Process-wide; set before any launch.
+std::atomic<int> two_product_mode{0};
 
 bool format_covered(int64_t bits_x2, int64_t codebook) {
 #define EXL3_PREFILL_TC_COVERED(B, C) \
@@ -536,9 +581,17 @@ void prefill_linear(const __nv_bfloat16* x, const half* suh, const half* svh, co
   p.sk_ctas = plan.sk_ctas;
   p.k = static_cast<int>(padded_in);
   const dim3 dp_grid(static_cast<unsigned int>(plan.dp_cols), static_cast<unsigned int>(plan.dp_rows));
+  // An FP32 out never takes the two-product kernels: they were validated only
+  // against the BF16 output of the TP1/PP2 deployment (mode 1 keeps the
+  // three-product arithmetic for it).
   switch (format) {
-#define EXL3_PREFILL_TC_CASE(B, C) \
-    case format_key(B, C): return launch_gemm<B, C, Out>(p, out, dp_grid, stream);
+#define EXL3_PREFILL_TC_CASE(B, C)                                    \
+  case format_key(B, C):                                              \
+    if constexpr (std::is_same_v<Out, __nv_bfloat16>) {               \
+      if (two_product_mode.load(std::memory_order_relaxed) == 1)      \
+        return launch_gemm<B, C, Out, true>(p, out, dp_grid, stream); \
+    }                                                                 \
+    return launch_gemm<B, C, Out, false>(p, out, dp_grid, stream);
     EXL3_PREFILL_TC_FORMATS(EXL3_PREFILL_TC_CASE)
 #undef EXL3_PREFILL_TC_CASE
   }
@@ -561,6 +614,14 @@ bool linear_prefill_applies(int64_t rows, int64_t padded_in, int64_t padded_out,
 void set_prefill_schedule(int64_t mode) {
   TORCH_CHECK(mode == 0 || mode == 1, "EXL3 prefill schedule must be 0 (planned) or 1 (whole tiles)");
   dense_prefill_tc::schedule_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+void set_prefill_arithmetic(int64_t mode) {
+  TORCH_CHECK(
+      mode == 0 || mode == 1,
+      "EXL3 prefill arithmetic must be 0 (three products) or 1 (two products)");
+  dense_prefill_tc::two_product_mode.store(static_cast<int>(mode),
+                                           std::memory_order_relaxed);
 }
 
 void linear_out_prefill(const torch::Tensor& x, const torch::Tensor& trellis, const torch::Tensor& suh,
@@ -624,6 +685,8 @@ TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
   m.def("linear_prefill_applies(int rows, int padded_in, int padded_out, int bits_x2, "
         "int codebook) -> bool", &exl3::linear_prefill_applies);
   m.def("set_prefill_schedule(int mode) -> ()", &exl3::set_prefill_schedule);
+  m.def("set_prefill_arithmetic(int mode) -> ()",
+        &exl3::set_prefill_arithmetic);
 }
 
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {

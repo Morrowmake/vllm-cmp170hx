@@ -1110,9 +1110,65 @@ seams:
 - id: qwen4-ngram-embedding-init
   kind: method
   target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.__init__
-  why: exl3.loader._setup_ple_file reads ngram_embedding, ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers set here
-  sha256: bd9bf99b75a30333fae31a5bb540f048684a50117bffaac48cdbc399c5573dbb
+  why: exl3.loader._setup_ple_file reads ngram_embedding, ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers set here; the storage class comes from ple_staging.embedding_cls (queue hook), is built with the upstream keyword set, and with supports_prefetch gets self._prefetch_ids [max_total_tokens, ngram_heads], which ple_staging.stage_rows fills before the forward
+  sha256: 2d9504902de43105fe4ef93143668aa98a2c52d4091904cb3148d9d2cf5e2f46
   signature: '(self, config: transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig, embedding_dim: int, ple_dense_layer_id: int, max_total_tokens: int, *, data_parallel_rank: int, prefix: str, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, params_dtype: torch.dtype | None = None, use_sequence_parallel: bool = False) -> None'
+
+- id: qwen4-ngram-embedding-forward
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.forward
+  why: a storage with supports_prefetch is read only through finalize_prefetch(total_tokens=input_ids.shape[0]); the staging storages (mmap PLE, EXL3 PLE under FULL graphs) return their staged rows there
+  sha256: 37ea6bf7db30c92eff60a2122b51ece3e0970428bd6c7cb6d6b6e7ff61689ec3
+  signature: '(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, query_start_loc: torch.Tensor, ngram_context: torch.Tensor) -> torch.Tensor'
+
+- id: qwen4-ngram-embedding-start-prefetch
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.start_prefetch
+  why: computes the ids into self._prefetch_ids[:n] and calls storage.start_prefetch(ids) only; a staged step's storage ignores the call, and stage_rows has consumed the buffer's previous ids before the forward
+  sha256: 75a4ebc2da50f2a50159c5320f7e5ec62c981294634b247b3badf4f491756b8f
+  signature: '(self, input_ids: torch.Tensor, query_start_loc: torch.Tensor, ngram_context: torch.Tensor) -> None'
+
+- id: qwen4-ngram-embedding-compute-ids
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.compute_ngram_ids
+  why: ple_staging.stage_rows calls it with (input_ids[:n], query_start_loc, ngram_context, output=self._prefetch_ids[:n]) for the [n, ngram_heads] row ids the forward would compute
+  sha256: a277d7dace60b0b92ad8c4974fb2189a4c9e36fe9380109fc0efd869fa780c9e
+  signature: '(self, input_ids: torch.Tensor, query_start_loc: torch.Tensor, ngram_context: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor'
+
+- id: qwen4-ngram-embedding-load-weights
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.load_weights
+  why: a checkpoint shard ngram_embedding.shard_<i>.weight reaches storage.weight.weight_loader(param, tensor, checkpoint_start=i * ceil(org_vocab_size / split_ngram_parts)) as the loader yields it; mmap_ple retains the lazy safetensors mapping there instead of copying
+  sha256: 234d493f3f9587ed715e420f95dad687728e4d0aa03085d961df90f71c7a645d
+  signature: '(self, weights: collections.abc.Iterable[tuple[str, torch.Tensor]]) -> set[str]'
+
+- id: qwen4-ple-weight-loader
+  kind: method
+  target: vllm.models.qwen4_exp.common.ple:PLEVocabParallelEmbedding.weight_loader
+  why: the weight parameter's weight_loader is the storage's bound weight_loader (VocabParallelEmbedding passes weight_loader=self.weight_loader), which mmap_ple overrides with the same (param, loaded_weight, checkpoint_start) signature
+  sha256: 0b6b294f5f2ec63c223448dcca146f3580ddea58c2e3877986e70c9c8f906a14
+  signature: '(self, param: torch.Tensor, loaded_weight: torch.Tensor, checkpoint_start: int | None = None) -> None'
+
+- id: qwen4-model-state-prepare-inputs
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.model_state:Qwen4ExpModelState.prepare_inputs
+  why: with PLE layers it returns query_start_loc and ngram_context, prepared on every PP stage, which ple_staging.stage_rows passes to compute_ngram_ids before the forward
+  sha256: 8cc657afbab1501d3a933cccfe772da21f9b58034c69375e3575765d1319ecf9
+  signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, req_states: vllm.v1.worker.gpu.states.RequestState) -> dict[str, typing.Any]'
+
+- id: qwen4-model-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpModel.__init__
+  why: builds embed_tokens (a PPMissingLayer off the first stage) with self.vocab_size, hyper_connection_mixer (None off the last stage) and make_empty_intermediate_tensors (factory over hidden_states); sm80_model.adopt_exl3_stages replaces the None mixer by a PPMissingLayer and builds embed_tokens on the last stage for a sharing EXL3 drafter
+  sha256: a8912eae8fba637aa410d0f1f7578c63b5fd0e33194fb60040c70c3f16c2c061
+  signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
+
+- id: eagle-share-target-embed
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.eagle.utils:maybe_share_target_embed
+  why: under pipeline parallelism it shares the target embedding only with a drafter that declares has_own_embed_tokens; the fork Qwen4ExpMTP declares False when it shares the target's, and the target embedding must then exist on the drafter's (last) stage
+  sha256: 2a98186356214062d23ca95f641e0ad9cd21e254c3b766a1287749d97dbe68df
+  signature: '(draft_model: torch.nn.modules.module.Module, draft_inner: torch.nn.modules.module.Module, target_inner: torch.nn.modules.module.Module) -> None'
 
 - id: kv-coordinator-init
   kind: method
@@ -1719,8 +1775,8 @@ seams:
 - id: worker-runner-sample-tokens
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample_tokens
-  why: the fork runner reads execute_model_state.num_spec_tokens_to_schedule before it clears the state; a non-last stage then calls pp_handler.receive(input_batch), and the last stage broadcast_drafts after the drafter
-  sha256: 26f4768c4ea736ffbf7c2c651ddf086ea7ac241bf567452883dfd29d916374f1
+  why: the fork runner reads execute_model_state.num_spec_tokens_to_schedule before it clears the state; a non-last stage then calls pp_handler.receive(input_batch), and the last stage broadcast_drafts after the drafter; AsyncOutput takes the failed-token mask relayed by runner_hooks.failed_tokens
+  sha256: a5a1818cc0a60a0385fbef1dc3c95fab97b0f8b6709731b041a5d9b9b34cad0f
   signature: '(self, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> vllm.v1.worker.gpu.async_utils.AsyncOutput | vllm.v1.outputs.ModelRunnerOutput | None'
 
 - id: worker-runner-load-model
@@ -1906,14 +1962,14 @@ seams:
 - id: qwen4-conditional-init
   kind: method
   target: vllm.models.qwen4_exp.nvidia.model:Qwen4ExpForConditionalGeneration.__init__
-  why: builds self.language_model = Qwen4ExpForCausalLM(prefix language_model) directly (not through the registry), so the fork wrapper adopts it after construction
+  why: builds self.language_model = Qwen4ExpForCausalLM(prefix language_model) directly (not through the registry), so the fork wrapper adopts it after construction; self.make_empty_intermediate_tensors is the language model's, which adopt_pp_failed_tokens wraps on the wrapper
   sha256: e98cad3d01aca9e9ca9f528e827cd1026a34a88b6baefface7790fa8d14a3da1
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = ''model'') -> None'
 
 - id: qwen4-mtp-init
   kind: method
   target: vllm.models.qwen4_exp.nvidia.mtp:Qwen4ExpMTP.__init__
-  why: builds self.model (the predictor) and lm_head (the tied embedding, a ParallelLMHead or a PPMissingLayer), with self.quant_config and self.config set; the fork drops both for PPMissingLayer when the quantization config's mtp_shares_target_embeddings says so
+  why: builds self.model (the predictor) and lm_head (the tied embedding, a ParallelLMHead or a PPMissingLayer), with self.quant_config and self.config set; the fork drops both for PPMissingLayer when the quantization config's mtp_shares_target_embeddings says so, and declares has_own_embed_tokens False (the class does not define it)
   sha256: 19155e6eebd83beb3e3bd980c0dce698bd93cce53f7f16a64c8b19cdacf252e2
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
 

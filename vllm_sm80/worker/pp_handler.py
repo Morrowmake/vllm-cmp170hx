@@ -130,8 +130,10 @@ class Sm80PPHandler(PPHandler):
         if keep.all():
             idx_mapping_np = pending.idx_mapping_np
         else:
-            keep_t = torch.as_tensor(keep, device=draft_tokens.device)
-            draft_tokens = draft_tokens[keep_t]
+            # Integer indices copied asynchronously: a bool mask would sync
+            # the host on its copy and on the masked select's nonzero.
+            keep_t = pp_utils.async_tensor_h2d(np.flatnonzero(keep), device=self.device)
+            draft_tokens = draft_tokens.index_select(0, keep_t)
             idx_mapping_np = pending.idx_mapping_np[keep]
         idx_mapping = pp_utils.async_tensor_h2d(idx_mapping_np, device=self.device)
         draft_tokens_to_update[idx_mapping] = draft_tokens

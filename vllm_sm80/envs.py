@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
     VLLM_EXL3_PLE_OVERLAP: bool = False
+    VLLM_SM80_PLE_MMAP: bool = False
     VLLM_EXL3_DENSE_PREFILL_TC: bool = False
     VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE: str = "planned"
     VLLM_EXL3_PLE_NATIVE_READ: bool = False
@@ -1004,6 +1005,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_OVERLAP", "0"))
     ),
+    # Qwen4Exp BF16/FP16 PLE tables stay file-backed: the lazy safetensors
+    # loader keeps each checkpoint shard memory-mapped, and every step copies
+    # only its selected rows to a persistent GPU buffer
+    # (vllm_sm80/models/qwen4_exp/mmap_ple.py). Needs TP=1 and no sequence
+    # parallelism; not for EXL3 checkpoints, whose PLE has its own storage.
+    # Off by default.
+    "VLLM_SM80_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_SM80_PLE_MMAP", "0"))),
     # Dense EXL3 launches of prefill steps with more than 64 rows and at
     # least 16 output tiles, for bits_x2 10/12/14 with codebook 2 on sm_80
     # with 74 multiprocessors, take linear_out_prefill

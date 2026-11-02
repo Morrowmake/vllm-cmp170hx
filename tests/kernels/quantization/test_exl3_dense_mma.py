@@ -2,18 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EXL3 dense tensor-core blocks (VLLM_EXL3_DENSE_MMA, csrc/exl3/dense_mma.cu).
 
-CPU: the switch and diagnostic override defaults, the gate (split-K active,
-sm_80, 74 multiprocessors, TP2 and PP1), the override parsing, the one-time
-resolution with its log lines (through vLLM's own logger) and library calls,
-its place in ensure_extension, and the library's plan rule where it needs no
-device (matrices and launches outside the blocks, the LM head's wide plan,
-the override).
+CPU: split-K, SM80, SM-count and parallel-layout eligibility; diagnostic
+override parsing; missing-library rejection; and device-independent plan
+boundaries for both vocabulary-head widths and unsupported matrices.
 
 GPU (SM 8.0 only): on the tensor-core path the result is held to
 linear_out's error against an FP64 reference (pooled mean <= 1.10x, max <=
 1.25x, BF16 rounding ties forgiven, exact where linear_out is exact) for
-every served matrix but the LM head (whose FP64 check is the real-input
-test's), row counts 1-32 and every forced plan, and is deterministic;
+every served matrix, including both vocabulary-head widths, row counts
+1-32 and every forced plan, and is deterministic;
 launches outside the path (other matrices, formats, row counts) are the
 split-K operator bit for bit; the LM head runs mma_kernel and neither
 gemm_kernel nor pipe_kernel (profiler kernel names through exl3_linear's
@@ -44,11 +41,10 @@ from vllm_sm80.kernels.exl3 import dense_mma
 from vllm_sm80.kernels.exl3 import ops as exl3_ops
 
 SMS = 74  # the multiprocessor count the plan rule was measured on
-# The LM head of the TP2 rank: K 2560, N 124160 (half the vocabulary), 6 bpw.
-HEAD = (2560, 124160, 12, 2)
-# (padded_in, padded_out, bits_x2) of the matrices the blocks serve, codebook
-# 2: one Qwen3.8-Flash-Next rank at TP2 (csrc/exl3/dense_mma.cu
-# kServedShapes).
+# Half-vocabulary TP2 and full-vocabulary PP2 heads, 6 bpw.
+HEADS = ((2560, 124160, 12, 2), (2560, 248320, 12, 2))
+# (padded_in, padded_out, bits_x2), codebook 2: the union of the TP2/PP1
+# and TP1/PP2 dense projections in csrc/exl3/dense_mma.cu.
 SERVED_DENSE = [
     (2560, 256, 14),  # attention k/v
     (2560, 640, 14),  # shared expert gate/up
@@ -59,24 +55,23 @@ SERVED_DENSE = [
     (2560, 6144, 14),  # attention q (with output gate)
     (640, 2560, 14),  # shared expert down
     (3072, 2560, 14),  # output projections
+    (2560, 512, 14),  # PP2 attention k/v
+    (2560, 2560, 12),  # PP2 drafter projections
+    (6144, 2560, 14),  # PP2 output projections
+    (2560, 10240, 14),  # PP2 linear-attention qkv
+    (2560, 12288, 14),  # PP2 attention q
 ]
-SERVED_SHAPES = [*SERVED_DENSE, HEAD[:3]]
+SERVED_SHAPES = [*SERVED_DENSE, *(head[:3] for head in HEADS)]
 # N of a matrix just wide enough for the 4-tile plan at 74 SMs: not served.
 WIDE_74 = 64 * 8 * SMS
 # Matrices of the served formats that the blocks do not serve.
 UNSERVED = [
     (2560, WIDE_74, 14),
-    (2560, 12288, 14),  # attention q at TP1
-    (6144, 2560, 14),  # attention output at TP1
-    (2560, 248320, 12),  # the LM head at TP1
     (2560, 640, 12),  # a served shape in another served format
     (2560, 1280, 14),
     (4224, 256, 14),
     (640, 384, 14),
 ]
-
-
-# ---------------------------------------------------------------- CPU tests
 
 
 def test_switches_default_off(monkeypatch):
@@ -92,6 +87,9 @@ def test_switches_default_off(monkeypatch):
     assert envs.VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE == "2,8,2"
 
 
+# ---------------------------------------------------------------- CPU tests
+
+
 def _config(tp=2, pp=1):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -100,17 +98,26 @@ def _config(tp=2, pp=1):
     )
 
 
-def test_gate_needs_split_k_sm80_74_sms_and_the_tp2_layout():
-    reason = dense_mma.closed_reason
-    assert reason(True, (8, 0), SMS, _config()) is None
-    assert "split-K operator is not active" in reason(False, (8, 0), SMS, _config())
-    assert "(8, 6)" in reason(True, (8, 6), SMS, _config())
-    assert "None" in reason(True, None, None, _config())
-    assert "70 multiprocessors, not 74" in reason(True, (8, 0), 70, _config())
-    assert "no vLLM config" in reason(True, (8, 0), SMS, None)
-    assert "(1, 1), not (2, 1)" in reason(True, (8, 0), SMS, _config(tp=1))
-    assert "(2, 2), not (2, 1)" in reason(True, (8, 0), SMS, _config(pp=2))
-    assert "(4, 1), not (2, 1)" in reason(True, (8, 0), SMS, _config(tp=4))
+@pytest.mark.parametrize(
+    "splitk,capability,sms,config,allowed",
+    [
+        (True, (8, 0), SMS, _config(), True),
+        (True, (8, 0), SMS, _config(tp=1, pp=2), True),
+        (False, (8, 0), SMS, _config(tp=1, pp=2), False),
+        (True, (8, 6), SMS, _config(tp=1, pp=2), False),
+        (True, None, None, _config(), False),
+        (True, (8, 0), 70, _config(tp=1, pp=2), False),
+        (True, (8, 0), SMS, None, False),
+        (True, (8, 0), SMS, _config(tp=1), False),
+        (True, (8, 0), SMS, _config(pp=2), False),
+        (True, (8, 0), SMS, _config(tp=4), False),
+        (True, (8, 0), SMS, _config(tp=1, pp=4), False),
+    ],
+)
+def test_gate_checks_device_split_k_and_parallel_layout(
+    splitk, capability, sms, config, allowed
+):
+    assert (dense_mma.closed_reason(splitk, capability, sms, config) is None) == allowed
 
 
 def test_shape_override_parsing():
@@ -225,11 +232,13 @@ def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
         closed.format("device capability (8, 6), not (8, 0)"),
         closed.format("70 multiprocessors, not 74"),
         closed.format("no vLLM config is set, so the parallel layout is unknown"),
-        closed.format("(tensor, pipeline) parallel size (1, 1), not (2, 1)"),
+        closed.format(
+            "(tensor, pipeline) parallel size (1, 1), not in ((2, 1), (1, 2))"
+        ),
         "EXL3 dense MMA active (VLLM_EXL3_DENSE_MMA): dense launches of 1..32 rows "
-        "of the validated TP2 matrices (bits_x2 10/12/14, codebook 2; the LM head "
-        "included) run on tensor-core blocks inside linear_out_splitk; other "
-        "launches keep the split-K operator's path.",
+        "of the validated TP2/PP1 or TP1/PP2 matrices (bits_x2 10/12/14, "
+        "codebook 2; the LM head included) run on tensor-core blocks inside "
+        "linear_out_splitk; other launches keep the split-K operator's path.",
         "EXL3 dense MMA plan forced by VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE: mt=4 kw=1 "
         "splits=1 on every tensor-core launch (diagnostic).",
     ]
@@ -265,12 +274,11 @@ def test_plan_rule_without_a_device():
     _extension_or_skip()
     plan = torch.ops._exl3_C.linear_mma_plan
     override = torch.ops._exl3_C.set_dense_mma_shape_override
-    k, n, bits_x2, codebook = HEAD
-    # The LM head has >= 8 four-tile column groups per SM: 4-tile groups over
-    # all of K at every decode row count (N / 64 >= 8 x SMs up to 242 SMs).
-    for rows in range(1, 33):
-        assert plan(rows, k, n, SMS, bits_x2, codebook) == [4, 1, 1], rows
-    assert plan(1, k, n, 242, bits_x2, codebook) == [4, 1, 1]
+    # Both vocabulary widths use four-tile groups over all of K.
+    for k, n, bits_x2, codebook in HEADS:
+        for rows in range(1, 33):
+            assert plan(rows, k, n, SMS, bits_x2, codebook) == [4, 1, 1], rows
+        assert plan(1, k, n, 242, bits_x2, codebook) == [4, 1, 1]
     # Outside the blocks: more than 32 rows, matrices outside the served set
     # (wide or not), other formats.
     for rows in (0, 33, 48, 64, 128, 3200):
@@ -332,7 +340,7 @@ def _plan(rows, padded_in, padded_out, bits_x2, codebook=2):
 
 
 @needs_sm80
-@pytest.mark.parametrize("padded_in,padded_out,bits_x2", SERVED_DENSE)
+@pytest.mark.parametrize("padded_in,padded_out,bits_x2", SERVED_SHAPES)
 def test_mma_holds_linear_outs_error_against_fp64(
     mma_switch, padded_in, padded_out, bits_x2
 ):
@@ -430,10 +438,11 @@ def _is_mma_kernel(name):
 
 
 @needs_sm80
-def test_lm_head_runs_mma_kernel_not_gemm_kernel(monkeypatch, mma_switch):
-    k, n, bits_x2, codebook = HEAD
+@pytest.mark.parametrize("head_shape", HEADS)
+def test_lm_head_runs_mma_kernel_not_gemm_kernel(monkeypatch, mma_switch, head_shape):
+    k, n, bits_x2, codebook = head_shape
     m = _matrix(31, k, n, bits_x2)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device="cuda")
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device="cuda")
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", True)
     row_chunk = exl3_ops.linear_row_chunk(k, n)
@@ -467,9 +476,9 @@ def test_lm_head_runs_mma_kernel_not_gemm_kernel(monkeypatch, mma_switch):
         # Chunks of 8, 8 and 5 rows, all on the blocks: out slices at row
         # offsets 8 and 16.
         (2560, 256, 14, 21, 8),
-        # The LM head's own row chunk (66 rows, the split-K operator's path)
-        # and a 4-row tail on the blocks at row offset 66.
-        (*HEAD[:3], None, None),
+        # Each head's own row chunk uses split-K, with a four-row MMA tail.
+        (*HEADS[0][:3], None, None),
+        (*HEADS[1][:3], None, None),
     ],
 )
 def test_mma_through_linear_on_row_chunk_tails(
@@ -479,7 +488,7 @@ def test_mma_through_linear_on_row_chunk_tails(
         row_chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
         rows = row_chunk + 4
     m = _matrix(41, padded_in, padded_out, bits_x2)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device="cuda")
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device="cuda")
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", True)
     x = _inputs(42, rows, padded_in)
@@ -514,25 +523,27 @@ def _allocations():
 
 @needs_sm80
 @pytest.mark.parametrize(
-    "rows,padded_out,bits_x2,expected",
+    "rows,padded_in,padded_out,bits_x2,expected",
     [
-        (1, 256, 14, (2, None, 2)),  # 2-tile groups, K split over 2 blocks
-        (32, 640, 14, (2, None, None)),  # 2-tile groups
-        (8, HEAD[1], HEAD[2], (4, 1, 1)),  # the LM head: wide
+        (1, 2560, 256, 14, (2, None, 2)),  # two blocks split K
+        (32, 2560, 640, 14, (2, None, None)),
+        (8, 6144, 2560, 14, (2, None, None)),  # full-width PP2 input
+        (8, *HEADS[0][:3], (4, 1, 1)),
+        (8, *HEADS[1][:3], (4, 1, 1)),
     ],
 )
 def test_mma_graph_replay_is_bitwise_eager_without_allocations(
-    mma_switch, rows, padded_out, bits_x2, expected
+    mma_switch, rows, padded_in, padded_out, bits_x2, expected
 ):
-    plan = _plan(rows, 2560, padded_out, bits_x2)
+    plan = _plan(rows, padded_in, padded_out, bits_x2)
     # The NaN-filled workspace below proves the captured zeroing only on a
     # plan that splits K over 2 blocks.
     assert all(e is None or p == e for p, e in zip(plan, expected)), plan
-    m = _matrix(21, 2560, padded_out, bits_x2)
-    x = _inputs(22, rows, 2560)
+    m = _matrix(21, padded_in, padded_out, bits_x2)
+    x = _inputs(22, rows, padded_in)
     out = torch.empty(rows, padded_out, dtype=torch.bfloat16, device=x.device)
     workspace = torch.empty(
-        exl3_ops.linear_workspace_size(rows, 2560, padded_out), device=x.device
+        exl3_ops.linear_workspace_size(rows, padded_in, padded_out), device=x.device
     )
     # resolve()'s warm-up: no capture below is an instantiation's first call.
     torch.ops._exl3_C.dense_mma_prepare()
@@ -546,7 +557,7 @@ def test_mma_graph_replay_is_bitwise_eager_without_allocations(
             m["svh"],
             bits_x2,
             2,
-            2560,
+            padded_in,
             padded_out,
             out,
             workspace,
@@ -581,7 +592,7 @@ def test_mma_graph_replay_is_bitwise_eager_without_allocations(
     torch.cuda.synchronize()
     _bitwise(out, eager, "replay vs eager")
     # New inputs in the captured buffer: the replay recomputes them.
-    x2 = _inputs(23, rows, 2560)
+    x2 = _inputs(23, rows, padded_in)
     x.copy_(x2)
     graph.replay()
     torch.cuda.synchronize()

@@ -18,6 +18,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbedding,
@@ -30,6 +31,7 @@ from vllm_sm80.kernels.exl3.utils import (
     read_headers,
     read_metadata,
 )
+from vllm_sm80.models.qwen4_exp import ple_staging
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -434,9 +436,17 @@ class Exl3PLEEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
 
 
 class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
-    """One bounded slot, reused only after its graph-output copy completes."""
+    """One bounded slot, reused only after its graph-output copy completes.
+
+    Steps that replay a FULL CUDA graph cannot run the SSD reads inside it:
+    with FULL graphs configured and ETP within one DP rank
+    (``staging_enabled``), those steps read and decode their rows before the
+    forward into a persistent buffer (``ple_staging.stage_rows``), and the
+    forward's prefetch returns that buffer.
+    """
 
     supports_prefetch = True
+    staging_enabled = False
 
     def __init__(self, *args, num_ngram_heads=1, max_total_tokens=0, **kwargs):
         super().__init__(
@@ -462,6 +472,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._pool = None
         self._slot: Exl3PLESlot | None = None
         self._failed_tokens: torch.Tensor | None = None
+        self._staged_rows: torch.Tensor | None = None
         self._timing: Exl3PLETiming | None = None
         # SSD reads run at finalize, after the layers before this one queue.
         self.overlap_reads = envs.VLLM_EXL3_PLE_OVERLAP
@@ -472,6 +483,12 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self.hostfn_reads = envs.VLLM_EXL3_PLE_HOSTFN_READ
         self._host_reader = None
         self._host_reads_in_flight = 0
+        graph_mode = get_current_vllm_config().compilation_config.cudagraph_mode
+        self.staging_enabled = (
+            self.supports_external_staging
+            and graph_mode is not None
+            and graph_mode.has_full_cudagraphs()
+        )
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
@@ -706,8 +723,14 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
             self._reader.close()
         self._slot = None
 
-    @eager_break_during_capture
     def start_prefetch(self, ngram_ids):
+        """Start this step's reads, unless the step's rows were staged."""
+        if self.staging_enabled and ple_staging.forward_is_staged():
+            return
+        self._start_prefetch(ngram_ids)
+
+    @eager_break_during_capture
+    def _start_prefetch(self, ngram_ids):
         self.check_ready()
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("EXL3 PLE requires eager or split CUDA graphs")
@@ -937,10 +960,73 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         return failed
 
     def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:
-        """Finish the prefetched lookup into new output storage."""
+        """Finish the prefetched lookup into new output storage, or return
+        the staged rows of a FULL-graph step."""
+        if self.staging_enabled and ple_staging.forward_is_staged():
+            return self.view(total_tokens)
         output = self._decoded.new_empty((total_tokens, self._output_dim))
         self._finalize_prefetch(output)
         return output
+
+    @property
+    def supports_external_staging(self) -> bool:
+        # Cross-DP ETP needs metadata from the forward context, which is not
+        # available yet when the runner prepares model inputs.
+        return self.etp_data_parallel_size == 1
+
+    def view(self, total_tokens: int) -> torch.Tensor:
+        """Persistent rows consumed by full graph replays."""
+        self.check_ready()
+        if not self.supports_external_staging:
+            raise RuntimeError(
+                "External EXL3 PLE staging requires ETP within one DP rank"
+            )
+        capacity = self._capacity // self._heads
+        if not 0 <= total_tokens <= capacity:
+            raise ValueError(f"PLE rows capacity exceeded: {total_tokens}/{capacity}")
+        if self._staged_rows is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "EXL3 PLE rows must be allocated before graph capture"
+                )
+            # Separate from the reader's decoded slot: that slot can be reused
+            # once the copy completes, while the model still consumes these rows.
+            self._staged_rows = self._decoded.new_empty((capacity, self._output_dim))
+        return self._staged_rows[:total_tokens]
+
+    def prepare(self, ngram_ids: torch.Tensor, num_tokens_after_padding: int) -> None:
+        """Read/decode outside capture with the existing slot and failure rules."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("EXL3 PLE rows must be prepared outside graph capture")
+        if ngram_ids.ndim != 2 or ngram_ids.shape[1] != self._heads:
+            raise ValueError("PLE staging requires one row index per head and token")
+        tokens = ngram_ids.shape[0]
+        if tokens > num_tokens_after_padding:
+            raise ValueError(
+                "PLE rows cannot be padded to fewer than the active tokens"
+            )
+        rows = self.view(num_tokens_after_padding)
+        if tokens:
+            self._start_prefetch(ngram_ids)
+            self._finalize_prefetch(rows[:tokens])
+        else:
+            self._failed_tokens = None
+        rows[tokens:].zero_()
+
+    def stages(self, cg_mode) -> bool:
+        """Only steps that replay a FULL graph are staged."""
+        from vllm.config.compilation import CUDAGraphMode
+
+        return self.staging_enabled and cg_mode == CUDAGraphMode.FULL
+
+    def finalize_staging(self) -> None:
+        """After loading: allocate the row buffer before graph capture."""
+        self.view(0)
+
+    def zero_rows(self, total_tokens: int) -> None:
+        """Prepare dummy inputs without retaining a previous request's failures."""
+        self.view(total_tokens).zero_()
+        self._failed_tokens = None
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         raise RuntimeError(

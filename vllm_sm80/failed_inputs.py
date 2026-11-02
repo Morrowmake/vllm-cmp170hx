@@ -6,7 +6,8 @@ A model module may report, after a forward, a bool mask over the forward's
 tokens whose inputs it could not produce (for example an EXL3 PLE row that
 storage failed to read): ``take_failed_tokens() -> torch.Tensor | None``,
 which also clears the mask. The GPU model runner collects the masks with
-:func:`take_failed_tokens`, ``AsyncOutput`` maps them to request IDs with
+:func:`relay_failed_tokens` (under pipeline parallelism it carries them to
+the sampling stage), ``AsyncOutput`` maps them to request IDs with
 :func:`failed_request_ids` into ``ModelRunnerOutput.failed_req_ids``, and the
 scheduler calls :func:`handle_failed_inputs`: those requests finish with
 FINISHED_ERROR, and the KV computed from their failed step on leaves the
@@ -28,6 +29,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.sequence import IntermediateTensors
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -58,6 +60,44 @@ def take_failed_tokens(model: nn.Module) -> torch.Tensor | None:
         if mask is not None
     ]
     return functools.reduce(torch.logical_or, masks) if masks else None
+
+
+def relay_failed_tokens(
+    model: nn.Module,
+    incoming: "IntermediateTensors | None",
+    outgoing: "IntermediateTensors | None",
+) -> torch.Tensor | None:
+    """The forward's failed-token mask across pipeline stages
+    (``runner_hooks.relay_failed_tokens``, after the forward).
+
+    A stage that sends intermediate tensors adds the mask received from the
+    stage before it, OR this stage's own, as their ``failed_tokens`` field
+    (the model declares the field with ``pp_failed_tokens``, so the receiving
+    stage's buffers have it) and returns None; a model without the field
+    leaves its masks to the sampling stage alone, as before the relay. The
+    sampling stage returns the combined mask, or None when nothing failed.
+    """
+    if outgoing is not None and not getattr(model, "pp_failed_tokens", False):
+        return None
+    local = take_failed_tokens(model)
+    previous = incoming.tensors.get("failed_tokens") if incoming is not None else None
+    if outgoing is not None:
+        hidden = next(iter(outgoing.tensors.values()))
+        mask = torch.zeros(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+        if previous is not None:
+            mask.copy_(previous[: mask.shape[0]])
+        if local is not None:
+            mask[: local.shape[0]].logical_or_(local)
+        outgoing.tensors["failed_tokens"] = mask
+        return None
+    if previous is None:
+        return local
+    # The next forward overwrites the persistent receive buffer. AsyncOutput
+    # must retain an independent mask until its device-to-host copy completes.
+    result = previous.clone()
+    if local is not None:
+        result[: local.shape[0]].logical_or_(local)
+    return result
 
 
 def failed_request_ids(
@@ -105,7 +145,6 @@ def apply(output) -> None:
     if failed:
         output.model_runner_output.failed_req_ids = failed
 
-
 def evict_blocks_from(
     kv_cache_manager: "KVCacheManager", request_id: str, num_tokens: int
 ) -> tuple[set[int], ...]:
@@ -141,6 +180,7 @@ def handle_failed_inputs(scheduler: "Scheduler", failed_req_ids: set[str]) -> se
     Returns:
         Set of request IDs to skip in update_from_output and finish with
         FINISHED_ERROR.
+
     """
     kv_cache_manager = scheduler.kv_cache_manager
     affected: set[str] = set()

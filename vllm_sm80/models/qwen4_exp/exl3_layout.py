@@ -123,6 +123,8 @@ class Qwen4ExpExl3Layout(Exl3Layout):
         return model_config.hf_config.model_type == "qwen4_exp_mtp"
 
     def assign_owners(self, model, config, ledger, model_config, is_draft):
+        # The base marks tensors whose module another pipeline stage builds.
+        super().assign_owners(model, config, ledger, model_config, is_draft)
         manifest = config.manifest
         shared: set[str] = set()
         if is_draft and self.mtp_shares_target_embeddings(

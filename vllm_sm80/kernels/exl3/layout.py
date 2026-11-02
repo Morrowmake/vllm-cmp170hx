@@ -34,7 +34,8 @@ LAYOUTS = {
 
 
 class Exl3Layout:
-    """Checkpoint names are module names; every tensor has a runtime owner."""
+    """Checkpoint names are module names; every tensor has a runtime owner
+    on this stage."""
 
     # Layout attributes the family's own model code looks up on its
     # quantization config with getattr (Exl3Config.__getattr__ answers them),
@@ -95,7 +96,24 @@ class Exl3Layout:
     ) -> set[str]:
         """Mark in ``ledger`` the tensors another model owns and join any
         file-backed sources; return the runtime parameter names that load
-        without a checkpoint tensor of this directory."""
+        without a checkpoint tensor of this directory.
+
+        The base marks only tensors whose module another pipeline stage
+        builds (a PPMissingLayer after the model's own name mapping); with
+        PP=1 none exist. Families extend this with their cross-model rules.
+        """
+        from vllm.model_executor.models.utils import is_pp_missing_parameter
+
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        assert config.manifest is not None
+        for name in config.manifest.tensors:
+            if name in ledger.entries:
+                continue
+            mapped_name = mapper.map_name(name) if mapper is not None else name
+            if mapped_name is not None and is_pp_missing_parameter(mapped_name, model):
+                ledger.mark(
+                    name, "unused", "module assigned to another pipeline/model stage"
+                )
         return set()
 
 

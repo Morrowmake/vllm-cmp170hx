@@ -14,10 +14,13 @@ before.
 from __future__ import annotations
 
 import functools
+import sys
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+# Called directly by the model runner of queues before the PP relay
+# (queue/330c5bffee); later queues call relay_failed_tokens / failed_tokens.
 from vllm_sm80.failed_inputs import take_failed_tokens  # noqa: F401
 from vllm_sm80.spec_decode.dspark_row_mask_kernel import (  # noqa: F401
     begin_target_step,
@@ -26,6 +29,7 @@ from vllm_sm80.spec_decode.dspark_row_mask_reject import cap_drafts  # noqa: F40
 from vllm_sm80.worker.mem_attribution import ProfileStages  # noqa: F401
 
 if TYPE_CHECKING:
+    from vllm.sequence import IntermediateTensors
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -40,7 +44,10 @@ __all__ = [
     "configure_aux_fc_fold",
     "copy_hop_rows",
     "draft_combiner",
+    "failed_tokens",
     "pp_handler",
+    "relay_failed_tokens",
+    "stage_ple_rows",
     "store_drafts",
     "take_failed_tokens",
 ]
@@ -91,8 +98,9 @@ def configure_aux_fc_fold(runner: GPUModelRunner, load_dummy_weights: bool) -> N
 
 def after_drafter_load(runner: GPUModelRunner) -> None:
     """``load_model``, after the drafter is loaded, inside the load's memory
-    window: the folded drafter takes the fc output, and the draft-tail stage
-    allocates its lm_head and selector copy."""
+    window: the folded drafter takes the fc output, the draft-tail stage
+    allocates its lm_head and selector copy, and the Qwen4Exp PLE storages
+    that stage rows check their tables and allocate their row buffers."""
     from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
     if getattr(runner, "aux_fc_folded", False) and isinstance(
@@ -104,6 +112,9 @@ def after_drafter_load(runner: GPUModelRunner) -> None:
     draft_tail = getattr(runner, "draft_tail", None)
     if draft_tail is not None:
         draft_tail.load(runner.model, runner.dtype)
+    ple_staging = _ple_staging()
+    if ple_staging is not None:
+        ple_staging.finalize(runner.model)
 
 
 def after_kv(is_profiling: bool) -> Any:
@@ -159,6 +170,56 @@ def apply_late_drafts(runner: GPUModelRunner, dummy_run: bool) -> None:
     if args is not None:
         _combine()(*args)
         runner._late_combine_args = None
+
+
+def _ple_staging():
+    # Loaded with Qwen4Exp's n-gram embedding module (queue hook); runs of
+    # other models skip it and the upstream qwen4_exp package it imports.
+    return sys.modules.get("vllm_sm80.models.qwen4_exp.ple_staging")
+
+
+def stage_ple_rows(
+    runner: GPUModelRunner,
+    input_batch: InputBatch,
+    model_inputs: dict[str, Any],
+    cg_mode: Any,
+    dummy_run: bool,
+) -> None:
+    """``execute_model``, after the model inputs are prepared: the step's
+    Qwen4Exp PLE rows for storages that stage them before the forward
+    (``vllm_sm80.models.qwen4_exp.ple_staging``)."""
+    ple_staging = _ple_staging()
+    if ple_staging is not None:
+        ple_staging.stage_rows(
+            runner.model,
+            input_batch,
+            runner.req_states,
+            model_inputs,
+            cg_mode,
+            dummy_run,
+        )
+
+
+def relay_failed_tokens(
+    runner: GPUModelRunner,
+    incoming: IntermediateTensors | None,
+    outgoing: IntermediateTensors | None,
+) -> None:
+    """``execute_model``, after the forward: collect the forward's
+    failed-token mask; a sending pipeline stage adds it to the intermediate
+    tensors, the sampling stage keeps it for :func:`failed_tokens`
+    (``vllm_sm80.failed_inputs``)."""
+    from vllm_sm80.failed_inputs import relay_failed_tokens as relay
+
+    runner.sm80_failed_tokens = relay(runner.model, incoming, outgoing)
+
+
+def failed_tokens(runner: GPUModelRunner) -> torch.Tensor | None:
+    """``sample_tokens``, for ``AsyncOutput``: the mask
+    :func:`relay_failed_tokens` kept for this step, taken once."""
+    mask = getattr(runner, "sm80_failed_tokens", None)
+    runner.sm80_failed_tokens = None
+    return mask
 
 
 def cg_miss(
