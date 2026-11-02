@@ -1,9 +1,10 @@
-vllm-cmp170hx
+vllm-sm80
 Portions Copyright 2026 Morrowmake
 
-This product is a fork of vLLM (https://github.com/vllm-project/vllm),
-Copyright contributors to the vLLM project, licensed under the Apache License, Version 2.0.
+This product is vllm-sm80, a plugin and patch queue for vLLM
+(https://github.com/vllm-project/vllm), Copyright contributors to the vLLM
+project, licensed under the Apache License, Version 2.0.
 
 NVIDIA CMP 170HX (sm_80) support - the vllm_sm80 package, its kernels and the
-related engine changes - was developed by Morrowmake:
+patch queue on upstream vLLM - was developed by Morrowmake:
 https://github.com/Morrowmake/vllm-cmp170hx
