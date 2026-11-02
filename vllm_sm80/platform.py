@@ -25,6 +25,9 @@ where the fork needs it:
 - ``check_and_update_config``: upstream's, then, with ``VLLM_DEV_AB_SWITCH``
   or ``VLLM_HOT_SWAP`` set, the development A/B setter's worker extension
   (``vllm_sm80.dev_ab``).
+- ``check_and_update_config``: upstream's, then, with
+  ``VLLM_SM80_PLE_MMAP``, the lazy safetensors loader that keeps Qwen4Exp
+  PLE tables file-backed (``vllm_sm80.models.qwen4_exp.ple_staging``).
 - ``check_and_update_config``: last, the fork scheduler
   (``vllm_sm80.sched.scheduler``) when no scheduler class is configured.
 - ``apply_config_platform_defaults``: upstream's, then the adaptive_k
@@ -127,8 +130,8 @@ class _Sm80CudaPlatformMixin:
 
     @classmethod
     def check_and_update_config(cls, vllm_config) -> None:
-        """Upstream config, optional graph-memory worker, A/B extension, then
-        the fork scheduler."""
+        """Upstream config, optional graph-memory worker, A/B extension, the
+        file-backed PLE loader, then the fork scheduler."""
         super().check_and_update_config(vllm_config)  # type: ignore[misc]
         from vllm_sm80.worker.cudagraph_mem import select_worker
         from vllm_sm80.dev_ab import configure
@@ -136,6 +139,11 @@ class _Sm80CudaPlatformMixin:
 
         select_worker(vllm_config.parallel_config)
         configure(vllm_config)
+        if envs.VLLM_SM80_PLE_MMAP:
+            # Imported only when set: the package loads vllm.models.qwen4_exp.
+            from vllm_sm80.models.qwen4_exp import ple_staging
+
+            ple_staging.configure(vllm_config)
         configure_scheduler(vllm_config)
 
 
